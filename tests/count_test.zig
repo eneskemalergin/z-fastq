@@ -74,7 +74,6 @@ test "count: file expectations" {
         }
     }
 }
-
 test "count: exits 3 when input file is missing" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

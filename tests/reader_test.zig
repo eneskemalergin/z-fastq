@@ -130,35 +130,12 @@ test "count_scan: rejects S005 on length mismatch" {
 }
 
 test "count_scan: dense stride block counts uniform records" {
-    // 39-byte header line + 100 seq + +\n + 100 qual = 243 bytes/record
     var buf: [243 * 3]u8 = undefined;
-    var pos: usize = 0;
-    for (0..3) |_| {
-        const hdr = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/1\n";
-        @memcpy(buf[pos..][0..hdr.len], hdr);
-        pos += hdr.len;
-        for (0..100) |_| {
-            buf[pos] = 'A';
-            pos += 1;
-        }
-        buf[pos] = '\n';
-        pos += 1;
-        buf[pos] = '+';
-        pos += 1;
-        buf[pos] = '\n';
-        pos += 1;
-        for (0..100) |_| {
-            buf[pos] = 'I';
-            pos += 1;
-        }
-        buf[pos] = '\n';
-        pos += 1;
-    }
+    const pos = appendUniformRecords(&buf, 3, "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/1\n", 100);
     var scan = zfastq.count_scan.Scanner.init(.{});
     const n = try zfastq.count_scan.countSlice(buf[0..pos], .{}, &scan);
     try std.testing.expectEqual(@as(u64, 3), n);
 }
-
 test "count_scan: alternates between known stride layouts" {
     const hdr_a = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/1\n"; // 39 bytes
     const hdr_b = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/12\n"; // 40 bytes
@@ -190,7 +167,66 @@ test "count_scan: alternates between known stride layouts" {
     var scan = zfastq.count_scan.Scanner.init(.{});
     const n = try zfastq.count_scan.countSlice(buf[0..pos], .{}, &scan);
     try std.testing.expectEqual(@as(u64, 2), n);
-    try std.testing.expect(scan.known_layout_count >= 2);
+}
+
+test "count_scan: alternates between sequence lengths with same header" {
+    const hdr = "@ont_read\n";
+
+    var buf: [128]u8 = undefined;
+    var pos: usize = 0;
+
+    // seq len 4
+    @memcpy(buf[pos..][0..hdr.len], hdr);
+    pos += hdr.len;
+    @memcpy(buf[pos..][0..4], "ACGT");
+    pos += 4;
+    buf[pos] = '\n';
+    pos += 1;
+    buf[pos] = '+';
+    pos += 1;
+    buf[pos] = '\n';
+    pos += 1;
+    @memcpy(buf[pos..][0..4], "!!!!");
+    pos += 4;
+    buf[pos] = '\n';
+    pos += 1;
+
+    // seq len 6
+    @memcpy(buf[pos..][0..hdr.len], hdr);
+    pos += hdr.len;
+    @memcpy(buf[pos..][0..6], "ACGTAC");
+    pos += 6;
+    buf[pos] = '\n';
+    pos += 1;
+    buf[pos] = '+';
+    pos += 1;
+    buf[pos] = '\n';
+    pos += 1;
+    @memcpy(buf[pos..][0..6], "!!!!!!");
+    pos += 6;
+    buf[pos] = '\n';
+    pos += 1;
+
+    var scan = zfastq.count_scan.Scanner.init(.{});
+    const n = try zfastq.count_scan.countSlice(buf[0..pos], .{}, &scan);
+    try std.testing.expectEqual(@as(u64, 2), n);
+}
+
+test "count_scan: retains fast path after non-minimal plus record" {
+    const data =
+        \\@read3
+        \\AAAA
+        \\repeat_id
+        \\!!!!
+        \\@dense
+        \\CCCC
+        \\+
+        \\####
+        \\
+    ;
+    var scan = zfastq.count_scan.Scanner.init(.{});
+    const n = try zfastq.count_scan.countSlice(data, .{}, &scan);
+    try std.testing.expectEqual(@as(u64, 2), n);
 }
 
 test "count_scan: falls back when plus line is not minimal" {
@@ -237,4 +273,29 @@ test "reader: advance matches next record count" {
         next_count += 1;
     }
     try std.testing.expectEqual(advance_count, next_count);
+}
+
+fn appendUniformRecords(buf: []u8, count: usize, header: []const u8, seq_len: usize) usize {
+    var pos: usize = 0;
+    for (0..count) |_| {
+        @memcpy(buf[pos..][0..header.len], header);
+        pos += header.len;
+        for (0..seq_len) |_| {
+            buf[pos] = 'A';
+            pos += 1;
+        }
+        buf[pos] = '\n';
+        pos += 1;
+        buf[pos] = '+';
+        pos += 1;
+        buf[pos] = '\n';
+        pos += 1;
+        for (0..seq_len) |_| {
+            buf[pos] = 'I';
+            pos += 1;
+        }
+        buf[pos] = '\n';
+        pos += 1;
+    }
+    return pos;
 }

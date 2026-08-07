@@ -2,7 +2,6 @@
 .zig*
 zig*
 
-
 # Development related folder
 tools/
 data/
@@ -10,6 +9,3 @@ data/
 !tests/data/**
 plan/
 ref/
-
-
-

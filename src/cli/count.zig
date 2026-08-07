@@ -1,4 +1,4 @@
-//! `z-fastq count` — count records in plain FASTQ files.
+//! `z-fastq count`: count records in plain FASTQ files.
 
 const std = @import("std");
 const zfastq = @import("z-fastq");
@@ -9,11 +9,9 @@ pub const Options = struct {
 
 pub fn run(
     io: std.Io,
-    gpa: std.mem.Allocator,
     paths: []const []const u8,
     options: Options,
 ) u8 {
-    _ = gpa;
     if (paths.len == 0) {
         std.Io.File.writeStreamingAll(.stderr(), io, "error: count requires at least one file path\n") catch {};
         return 2;
@@ -22,7 +20,6 @@ pub fn run(
     var exit_code: u8 = 0;
     for (paths) |path| {
         const count_result = countFile(io, path, options) catch |err| switch (err) {
-            error.Usage => return 2,
             error.Io => {
                 printPathError(io, path, "I/O error");
                 exit_code = @max(exit_code, 3);
@@ -52,7 +49,6 @@ pub fn run(
 // --- Private helpers ---
 
 const CountError = error{
-    Usage,
     Io,
     Format,
     Limit,
@@ -76,8 +72,11 @@ fn countFile(
     };
     defer file.close(io);
 
-    var scanner = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = options.max_line_bytes });
-    const count = zfastq.count_scan.countPlainFile(io, file, .{ .max_line_bytes = options.max_line_bytes }, &scanner) catch |err| {
+    var scanner: zfastq.count_scan.Scanner = undefined;
+    const scan_options = zfastq.count_scan.Options{
+        .max_line_bytes = options.max_line_bytes,
+    };
+    const count = zfastq.count_scan.countPlainFile(io, file, scan_options, &scanner) catch |err| {
         return mapScanError(io, path, &scanner, err);
     };
     return count;

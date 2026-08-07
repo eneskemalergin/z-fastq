@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
             };
         }
 
-        const code = cli.count.run(io, gpa, positional.items, .{
+        const code = cli.count.run(io, positional.items, .{
             .max_line_bytes = max_line_bytes,
         });
         std.process.exit(code);
