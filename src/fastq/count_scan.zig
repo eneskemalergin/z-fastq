@@ -17,18 +17,31 @@ const NO_LAYOUT_INDEX = 255;
 
 // Fixed tail geometry for `+\n` plus lines: `seq\n`, `+\n`, `qual\n`.
 const DenseLayout = struct {
-    seq_len: usize,
+    sequence_start: usize,
+    sequence_end: usize,
+    plus_start: usize,
+    quality_start: usize,
+    quality_end: usize,
     record_stride: usize,
-    header_line_bytes: usize,
 
     fn fromRecordEnd(record_bytes: usize, seq_len: usize) ?DenseLayout {
         const doubled = std.math.mul(usize, seq_len, 2) catch return null;
         const tail = std.math.add(usize, doubled, 4) catch return null;
         if (record_bytes <= tail) return null;
+        const sequence_start = record_bytes - tail;
+        const sequence_end = std.math.add(usize, sequence_start, seq_len) catch return null;
+        const plus_start = std.math.add(usize, sequence_end, 1) catch return null;
+        const quality_start = std.math.add(usize, plus_start, 2) catch return null;
+        const quality_end = std.math.add(usize, quality_start, seq_len) catch return null;
+        const derived_record_bytes = std.math.add(usize, quality_end, 1) catch return null;
+        if (derived_record_bytes != record_bytes) return null;
         return .{
-            .seq_len = seq_len,
+            .sequence_start = sequence_start,
+            .sequence_end = sequence_end,
+            .plus_start = plus_start,
+            .quality_start = quality_start,
+            .quality_end = quality_end,
             .record_stride = record_bytes,
-            .header_line_bytes = record_bytes - tail,
         };
     }
 
@@ -40,30 +53,22 @@ const DenseLayout = struct {
     ) bool {
         const end = std.math.add(usize, off, layout.record_stride) catch return false;
         if (end > data.len) return false;
-        const h = layout.header_line_bytes;
-        const s = layout.seq_len;
-        if (h == 0 or h > layout.record_stride) return false;
-        const seq_start = std.math.add(usize, off, h) catch return false;
-        const seq_end = std.math.add(usize, seq_start, s) catch return false;
-        const plus_start = std.math.add(usize, seq_end, 1) catch return false;
-        const qual_start = std.math.add(usize, plus_start, 2) catch return false;
-        const qual_end = std.math.add(usize, qual_start, s) catch return false;
-        if (qual_end >= end or qual_end + 1 != end) return false;
-        const header = data[off .. seq_start - 1];
-        const sequence = data[seq_start..seq_end];
-        const quality = data[qual_start..qual_end];
+        const record = data[off..end];
+        const header = record[0 .. layout.sequence_start - 1];
+        const sequence = record[layout.sequence_start..layout.sequence_end];
+        const quality = record[layout.quality_start..layout.quality_end];
         const sequence_len = lineContentLen(sequence);
         const quality_len = lineContentLen(quality);
-        return data[off] == '@' and
-            data[seq_start - 1] == '\n' and
+        return record[0] == '@' and
+            record[layout.sequence_start - 1] == '\n' and
             !containsNewline(header) and
             lineContentLen(header) <= max_line_bytes and
-            data[seq_end] == '\n' and
+            record[layout.sequence_end] == '\n' and
             !containsNewline(sequence) and
             sequence_len <= max_line_bytes and
-            data[plus_start] == '+' and
-            data[plus_start + 1] == '\n' and
-            data[qual_end] == '\n' and
+            record[layout.plus_start] == '+' and
+            record[layout.plus_start + 1] == '\n' and
+            record[layout.quality_end] == '\n' and
             !containsNewline(quality) and
             quality_len <= max_line_bytes and
             quality_len == sequence_len;
@@ -195,7 +200,7 @@ pub const Scanner = struct {
 
         if (self.layout) |active| {
             const already_tried = tried_stride != null and active.record_stride == tried_stride.?;
-            const header_ok = header_bytes == null or active.header_line_bytes == header_bytes.?;
+            const header_ok = header_bytes == null or active.sequence_start == header_bytes.?;
             if (!already_tried and header_ok) {
                 const run = self.tryStrideBlock(data, active);
                 if (run.count > 0) return run;
@@ -212,7 +217,7 @@ pub const Scanner = struct {
                 if (layout.record_stride == active.record_stride) continue;
             }
             if (header_bytes) |h| {
-                if (layout.header_line_bytes != h) continue;
+                if (layout.sequence_start != h) continue;
             }
             const run = self.tryStrideBlock(data, layout);
             if (run.count > 0) return run;
@@ -261,7 +266,7 @@ pub const Scanner = struct {
             var i: usize = 0;
             while (i < self.known_layout_count) : (i += 1) {
                 const layout = self.known_layouts[i];
-                if (layout.header_line_bytes != h) continue;
+                if (layout.sequence_start != h) continue;
                 if (DenseLayout.validateRecordAt(data, 0, layout, self.options.max_line_bytes)) {
                     self.layout = layout;
                     return layout.record_stride;
@@ -320,8 +325,8 @@ pub const Scanner = struct {
         var i: usize = 0;
         while (i < self.known_layout_count) : (i += 1) {
             if (self.known_layouts[i].record_stride == layout.record_stride) {
-                if (layout.header_line_bytes < self.layout_by_header.len) {
-                    self.layout_by_header[layout.header_line_bytes] = @intCast(i);
+                if (layout.sequence_start < self.layout_by_header.len) {
+                    self.layout_by_header[layout.sequence_start] = @intCast(i);
                 }
                 return;
             }
@@ -330,8 +335,8 @@ pub const Scanner = struct {
             const idx = self.known_layout_count;
             self.known_layouts[idx] = layout;
             self.known_layout_count += 1;
-            if (layout.header_line_bytes < self.layout_by_header.len) {
-                self.layout_by_header[layout.header_line_bytes] = idx;
+            if (layout.sequence_start < self.layout_by_header.len) {
+                self.layout_by_header[layout.sequence_start] = idx;
             }
         }
     }
@@ -507,4 +512,23 @@ pub fn countSlice(
     _ = try scanner.feed(data);
     try scanner.finishEof();
     return scanner.record_index;
+}
+
+test "DenseLayout construction: precomputes complete record offsets" {
+    const layout = DenseLayout.fromRecordEnd(11, 2).?;
+
+    try std.testing.expect(layout.sequence_start == 3);
+    try std.testing.expect(layout.sequence_end == 5);
+    try std.testing.expect(layout.plus_start == 6);
+    try std.testing.expect(layout.quality_start == 8);
+    try std.testing.expect(layout.quality_end == 10);
+    try std.testing.expect(layout.record_stride == 11);
+}
+
+test "DenseLayout construction: rejects impossible geometry" {
+    const max = std.math.maxInt(usize);
+
+    try std.testing.expect(DenseLayout.fromRecordEnd(0, 0) == null);
+    try std.testing.expect(DenseLayout.fromRecordEnd(8, 2) == null);
+    try std.testing.expect(DenseLayout.fromRecordEnd(max, max) == null);
 }
