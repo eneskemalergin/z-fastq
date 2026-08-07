@@ -1,0 +1,13 @@
+# Zig build artifacts
+.zig*
+zig*
+
+
+# Development related folder
+tools/
+data/
+plan/
+ref/
+
+
+
