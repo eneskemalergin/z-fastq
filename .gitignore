@@ -6,6 +6,8 @@ zig*
 # Development related folder
 tools/
 data/
+!tests/data/
+!tests/data/**
 plan/
 ref/
 

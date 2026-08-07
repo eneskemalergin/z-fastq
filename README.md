@@ -1,30 +1,28 @@
 # z-fastq
 
-Fast Zig FASTQ I/O library and CLI (work in progress).
+Fast Zig FASTQ I/O library and CLI.
 
-## Status
+## Build
 
-Planning phase. See `plan/v0.0.1-plan.md` for the active milestone (plain parser + count). Public **v0.1.0** is a later target.
-
-## Build (once implemented)
+Requires Zig 0.16.0 at `./zig-0.16.0/zig` (use the `./zig` wrapper).
 
 ```bash
-# Requires zig-0.16.0 at ./zig-0.16.0/zig and ./zig wrapper
 ./zig build
-./zig build test --summary all
+./zig build test
 ./zig build -Doptimize=ReleaseFast
 ```
 
-## Data corpus (local only)
-
-`data/` is gitignored. Fetch fixtures on each machine:
+## Usage
 
 ```bash
-bash scripts/download_corpus.sh --benchmark
-bash scripts/build_demo_extracts.sh
+./zig-out/bin/z-fastq count file.fastq [file2.fastq ...]
 ```
 
-See `data/README.md` (local file after first download).
+Each input file prints one record count on stdout (one decimal line per file). Non-zero exit status indicates an error; parse failures include record index, line number, and byte offset on stderr.
+
+## Library
+
+Import the `z-fastq` module from `src/root.zig`: `Reader`, `Writer`, `Record`, `count_scan`, and `io` adapters for plain files and slices.
 
 ## License
 

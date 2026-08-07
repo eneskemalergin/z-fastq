@@ -1,0 +1,20 @@
+@read1 run=1 lane=1
+ACGTACGTACGT
++
+IIIIIIIIIIII
+@read2 run=1 lane=1 description=optional
+TGCA
++
+JJJJ
+@read3_with_plus_header
+AAAA
+@read3_with_plus_header
+!!!!
+@read4_empty_seq
+
++
+
+@read5_phred_zero
+A
++
+!
