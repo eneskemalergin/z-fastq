@@ -16,13 +16,13 @@ pub const SliceSource = struct {
 
     pub fn byteSource(self: *SliceSource) ByteSource {
         return .{
-            .vtable = &slice_vtable,
+            .vtable = &SLICE_VTABLE,
             .ctx = self,
         };
     }
 };
 
-const slice_vtable = ByteSource.VTable{
+const SLICE_VTABLE = ByteSource.VTable{
     .read = sliceRead,
 };
 
@@ -45,13 +45,13 @@ pub const ReaderSource = struct {
 
     pub fn byteSource(self: *ReaderSource) ByteSource {
         return .{
-            .vtable = &reader_vtable,
+            .vtable = &READER_VTABLE,
             .ctx = self,
         };
     }
 };
 
-const reader_vtable = ByteSource.VTable{
+const READER_VTABLE = ByteSource.VTable{
     .read = readerRead,
 };
 
@@ -68,20 +68,18 @@ pub const FileSource = struct {
         file: std.Io.File,
         read_buf: []u8,
     ) FileSource {
-        var self: FileSource = undefined;
-        self.file_reader = file.reader(io, read_buf);
-        return self;
+        return .{ .file_reader = file.reader(io, read_buf) };
     }
 
     pub fn byteSource(self: *FileSource) ByteSource {
         return .{
-            .vtable = &file_source_vtable,
+            .vtable = &FILE_SOURCE_VTABLE,
             .ctx = self,
         };
     }
 };
 
-const file_source_vtable = ByteSource.VTable{
+const FILE_SOURCE_VTABLE = ByteSource.VTable{
     .read = fileSourceRead,
 };
 
@@ -104,22 +102,23 @@ pub const SliceSink = struct {
 
     pub fn byteSink(self: *SliceSink) ByteSink {
         return .{
-            .vtable = &slice_sink_vtable,
+            .vtable = &SLICE_SINK_VTABLE,
             .ctx = self,
         };
     }
 };
 
-const slice_sink_vtable = ByteSink.VTable{
+const SLICE_SINK_VTABLE = ByteSink.VTable{
     .write = sliceWrite,
     .flush = sliceFlush,
 };
 
 fn sliceWrite(ctx: *anyopaque, data: []const u8) WriteError!void {
     const self: *SliceSink = @ptrCast(@alignCast(ctx));
-    if (self.pos + data.len > self.buffer.len) return error.WriteFailed;
-    @memcpy(self.buffer[self.pos..][0..data.len], data);
-    self.pos += data.len;
+    const end = std.math.add(usize, self.pos, data.len) catch return error.WriteFailed;
+    if (end > self.buffer.len) return error.WriteFailed;
+    @memcpy(self.buffer[self.pos..end], data);
+    self.pos = end;
 }
 
 fn sliceFlush(ctx: *anyopaque) WriteError!void {
@@ -135,13 +134,13 @@ pub const WriterSink = struct {
 
     pub fn byteSink(self: *WriterSink) ByteSink {
         return .{
-            .vtable = &writer_sink_vtable,
+            .vtable = &WRITER_SINK_VTABLE,
             .ctx = self,
         };
     }
 };
 
-const writer_sink_vtable = ByteSink.VTable{
+const WRITER_SINK_VTABLE = ByteSink.VTable{
     .write = writerWrite,
     .flush = writerFlush,
 };
@@ -158,25 +157,34 @@ fn writerFlush(ctx: *anyopaque) WriteError!void {
 
 pub const FileSink = struct {
     file_writer: std.Io.File.Writer,
-    adapter: WriterSink,
 
     pub fn init(
         io: std.Io,
         file: std.Io.File,
         write_buf: []u8,
     ) FileSink {
-        var self: FileSink = undefined;
-        self.file_writer = file.writer(io, write_buf);
-        self.adapter = WriterSink.init(&self.file_writer.interface);
-        return self;
+        return .{ .file_writer = file.writer(io, write_buf) };
     }
 
     pub fn byteSink(self: *FileSink) ByteSink {
-        return self.adapter.byteSink();
-    }
-
-    pub fn flush(self: *FileSink, io: std.Io) WriteError!void {
-        _ = io;
-        return self.adapter.byteSink().flush();
+        return .{
+            .vtable = &FILE_SINK_VTABLE,
+            .ctx = self,
+        };
     }
 };
+
+const FILE_SINK_VTABLE = ByteSink.VTable{
+    .write = fileSinkWrite,
+    .flush = fileSinkFlush,
+};
+
+fn fileSinkWrite(ctx: *anyopaque, data: []const u8) WriteError!void {
+    const self: *FileSink = @ptrCast(@alignCast(ctx));
+    self.file_writer.interface.writeAll(data) catch return error.WriteFailed;
+}
+
+fn fileSinkFlush(ctx: *anyopaque) WriteError!void {
+    const self: *FileSink = @ptrCast(@alignCast(ctx));
+    self.file_writer.interface.flush() catch return error.WriteFailed;
+}

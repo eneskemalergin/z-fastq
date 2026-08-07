@@ -76,7 +76,6 @@ pub fn build(b: *std.Build) void {
     count_test_module.link_libc = true;
 
     const run_root_test = b.addRunArtifact(b.addTest(.{ .root_module = root_test_module }));
-    run_root_test.step.dependOn(b.getInstallStep());
 
     const run_reader_test = b.addRunArtifact(b.addTest(.{ .root_module = reader_test_module }));
     const run_writer_test = b.addRunArtifact(b.addTest(.{ .root_module = writer_test_module }));

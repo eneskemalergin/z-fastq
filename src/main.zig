@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const zfastq = @import("z-fastq");
-const cli = @import("cli/mod.zig");
+const count = @import("cli/count.zig");
 
 const USAGE =
     \\usage: z-fastq <command> [options] [args...]
@@ -11,8 +11,10 @@ const USAGE =
     \\  count    Count records in plain FASTQ files
     \\
     \\General options:
-    \\  -h, --help       Show this help message
-    \\  -V, --version    Print version
+    \\  -h, --help           Show this help message
+    \\  -V, --version        Print version
+    \\
+    \\Count options:
     \\  --max-line-bytes N   Override default line length limit
     \\
     \\Count usage:
@@ -42,22 +44,53 @@ pub fn main(init: std.process.Init) !void {
         printVersionAndExit(io);
     }
 
-    var max_line_bytes = zfastq.limits.default_max_line_bytes;
+    var max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES;
     var positional = std.ArrayList([]const u8).empty;
     defer positional.deinit(gpa);
 
     if (std.mem.eql(u8, cmd, "count")) {
         while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--")) {
+                while (args.next()) |path| {
+                    positional.append(gpa, path) catch {
+                        std.Io.File.writeStreamingAll(
+                            .stderr(),
+                            io,
+                            "error: out of memory\n",
+                        ) catch {};
+                        std.process.exit(3);
+                    };
+                }
+                break;
+            }
             if (std.mem.eql(u8, arg, "--max-line-bytes")) {
                 const value = args.next() orelse {
-                    std.Io.File.writeStreamingAll(.stderr(), io, "error: --max-line-bytes requires a value\n") catch {};
+                    std.Io.File.writeStreamingAll(
+                        .stderr(),
+                        io,
+                        "error: --max-line-bytes requires a value\n",
+                    ) catch {};
                     std.process.exit(2);
                 };
                 max_line_bytes = std.fmt.parseInt(usize, value, 10) catch {
-                    std.Io.File.writeStreamingAll(.stderr(), io, "error: invalid --max-line-bytes value\n") catch {};
+                    std.Io.File.writeStreamingAll(
+                        .stderr(),
+                        io,
+                        "error: invalid --max-line-bytes value\n",
+                    ) catch {};
                     std.process.exit(2);
                 };
                 continue;
+            }
+            if (std.mem.startsWith(u8, arg, "-")) {
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: unknown count option: ",
+                ) catch {};
+                std.Io.File.writeStreamingAll(.stderr(), io, arg) catch {};
+                std.Io.File.writeStreamingAll(.stderr(), io, "\n") catch {};
+                std.process.exit(2);
             }
             positional.append(gpa, arg) catch {
                 std.Io.File.writeStreamingAll(.stderr(), io, "error: out of memory\n") catch {};
@@ -65,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
             };
         }
 
-        const code = cli.count.run(io, positional.items, .{
+        const code = count.run(io, positional.items, .{
             .max_line_bytes = max_line_bytes,
         });
         std.process.exit(code);

@@ -11,18 +11,19 @@ pub const Record = struct {
 };
 
 pub const OwnedRecord = struct {
+    allocator: std.mem.Allocator,
     header: []u8,
     id: []u8,
     sequence: []u8,
     plus: []u8,
     quality: []u8,
 
-    pub fn deinit(self: *OwnedRecord, allocator: std.mem.Allocator) void {
-        allocator.free(self.header);
-        allocator.free(self.id);
-        allocator.free(self.sequence);
-        allocator.free(self.plus);
-        allocator.free(self.quality);
+    pub fn deinit(self: *OwnedRecord) void {
+        self.allocator.free(self.header);
+        self.allocator.free(self.id);
+        self.allocator.free(self.sequence);
+        self.allocator.free(self.plus);
+        self.allocator.free(self.quality);
         self.* = undefined;
     }
 };
@@ -32,7 +33,7 @@ pub fn firstToken(header: []const u8) []const u8 {
     return header[0..end];
 }
 
-pub fn toOwned(record: Record, allocator: std.mem.Allocator) !OwnedRecord {
+pub fn toOwned(allocator: std.mem.Allocator, record: Record) !OwnedRecord {
     const header = try allocator.dupe(u8, record.header);
     errdefer allocator.free(header);
     const id = try allocator.dupe(u8, record.id);
@@ -44,6 +45,7 @@ pub fn toOwned(record: Record, allocator: std.mem.Allocator) !OwnedRecord {
     const quality = try allocator.dupe(u8, record.quality);
     errdefer allocator.free(quality);
     return .{
+        .allocator = allocator,
         .header = header,
         .id = id,
         .sequence = sequence,
