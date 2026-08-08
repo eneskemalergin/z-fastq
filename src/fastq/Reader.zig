@@ -255,7 +255,9 @@ pub const Reader = struct {
             const got_data = try self.refill();
             if (!got_data) {
                 if (self.record_len > content_start) {
-                    self.stripLineCr(content_start);
+                    if (self.record_len - content_start > self.options.max_line_bytes) {
+                        return error.LineTooLong;
+                    }
                     return .{
                         .range = .{ .start = content_start, .end = self.record_len },
                         .start_offset = line_start_offset,

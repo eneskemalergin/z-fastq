@@ -243,3 +243,32 @@ test "count: accepts a line larger than the read buffer" {
         std.mem.indexOf(u8, limited.stderr, "line length limit exceeded") != null,
     );
 }
+
+test "count: treats a lone CR at EOF as quality data" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "lone-cr.fastq", .{});
+    defer file.close(io);
+    try file.writePositionalAll(io, "@r\nA\n+\n!\r", 0);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrint(
+        arena.allocator(),
+        ".zig-cache/tmp/{s}/lone-cr.fastq",
+        .{tmp.sub_path},
+    );
+
+    const result = try runCount(arena.allocator(), path);
+    const expected = try std.fmt.allocPrint(
+        arena.allocator(),
+        "error: {s}: S005: sequence and quality lengths differ " ++
+            "(record 0, line 4, offset 7)\n",
+        .{path},
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+    try std.testing.expectEqualStrings(expected, result.stderr);
+}

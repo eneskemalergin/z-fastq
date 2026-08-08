@@ -3,59 +3,87 @@
 const std = @import("std");
 const zfastq = @import("z-fastq");
 
-test "reader: parses basic four-line record" {
-    const data =
-        \\@read1
-        \\ACGT
-        \\+
-        \\!!!!
-        \\
-    ;
-    var source = zfastq.io.plain.SliceSource.init(data);
-    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
+test "reader: parses supported record forms" {
+    const cases = [_]struct {
+        data: []const u8,
+        header: []const u8,
+        id: []const u8,
+        sequence: []const u8,
+        plus: []const u8,
+        quality: []const u8,
+    }{
+        .{
+            .data = "@read1\nACGT\n+\n!!!!\n",
+            .header = "read1",
+            .id = "read1",
+            .sequence = "ACGT",
+            .plus = "",
+            .quality = "!!!!",
+        },
+        .{
+            .data = "@r1\r\nACGT\r\n+\r\n!!!!\r\n",
+            .header = "r1",
+            .id = "r1",
+            .sequence = "ACGT",
+            .plus = "",
+            .quality = "!!!!",
+        },
+        .{
+            .data = "@read3\nAAAA\n+repeat_id\n!!!!\n",
+            .header = "read3",
+            .id = "read3",
+            .sequence = "AAAA",
+            .plus = "repeat_id",
+            .quality = "!!!!",
+        },
+        .{
+            .data = "@final\nACGT\n+\nIIII",
+            .header = "final",
+            .id = "final",
+            .sequence = "ACGT",
+            .plus = "",
+            .quality = "IIII",
+        },
+        .{
+            .data = "@read1\tcomment\r\nACGT\n+name\r\n!!!!\n",
+            .header = "read1\tcomment",
+            .id = "read1",
+            .sequence = "ACGT",
+            .plus = "name",
+            .quality = "!!!!",
+        },
+        .{
+            .data = "@empty\n\n+description\n\n",
+            .header = "empty",
+            .id = "empty",
+            .sequence = "",
+            .plus = "description",
+            .quality = "",
+        },
+        .{
+            .data = "@r\rcomment\nA\rC\n+x\ry\n!\r!\n",
+            .header = "r\rcomment",
+            .id = "r\rcomment",
+            .sequence = "A\rC",
+            .plus = "x\ry",
+            .quality = "!\r!",
+        },
+    };
 
-    const record = (try reader.next()).?;
-    try std.testing.expectEqualStrings("read1", record.header);
-    try std.testing.expectEqualStrings("read1", record.id);
-    try std.testing.expectEqualStrings("ACGT", record.sequence);
-    try std.testing.expectEqualStrings("", record.plus);
-    try std.testing.expectEqualStrings("!!!!", record.quality);
-    try std.testing.expect((try reader.next()) == null);
-}
+    for (cases) |case| {
+        var source = zfastq.io.plain.SliceSource.init(case.data);
+        var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
 
-test "reader: accepts CRLF line endings" {
-    const data = "@r1\r\nACGT\r\n+\r\n!!!!\r\n";
-    var source = zfastq.io.plain.SliceSource.init(data);
-    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-    _ = try reader.next();
-    try std.testing.expect((try reader.next()) == null);
-}
+        const record = (try reader.next()).?;
 
-test "reader: accepts plus line description" {
-    const data =
-        \\@read3
-        \\AAAA
-        \\+repeat_id
-        \\!!!!
-        \\
-    ;
-    var source = zfastq.io.plain.SliceSource.init(data);
-    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-    const record = (try reader.next()).?;
-    try std.testing.expectEqualStrings("repeat_id", record.plus);
-    try std.testing.expectEqualStrings("!!!!", record.quality);
-}
-
-test "reader: accepts final quality line without trailing newline" {
-    const data = "@truncated\nACGT\n+\nIIII";
-    var source = zfastq.io.plain.SliceSource.init(data);
-    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-    _ = try reader.next();
-    try std.testing.expect((try reader.next()) == null);
+        try std.testing.expectEqualStrings(case.header, record.header);
+        try std.testing.expectEqualStrings(case.id, record.id);
+        try std.testing.expectEqualStrings(case.sequence, record.sequence);
+        try std.testing.expectEqualStrings(case.plus, record.plus);
+        try std.testing.expectEqualStrings(case.quality, record.quality);
+        try std.testing.expect((try reader.next()) == null);
+    }
 }
 
 test "reader: rejects S005 when sequence and quality lengths differ" {
@@ -275,18 +303,6 @@ test "reader: reports allocation failure while growing record storage" {
     try std.testing.expectError(zfastq.ReaderError.OutOfMemory, reader.next());
 }
 
-test "reader: handles mixed line endings and tab-delimited id" {
-    const data = "@read1\tcomment\r\nACGT\n+name\r\n!!!!\n";
-    var source = zfastq.io.plain.SliceSource.init(data);
-    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-
-    const parsed = (try reader.next()).?;
-    try std.testing.expectEqualStrings("read1", parsed.id);
-    try std.testing.expectEqualStrings("name", parsed.plus);
-    try std.testing.expectEqual(@as(u64, data.len), reader.byteOffset());
-}
-
 test "reader: enforces exact line limit" {
     const at_limit = "@r\nACGT\n+\n!!!!\n";
     var valid_source = zfastq.io.plain.SliceSource.init(at_limit);
@@ -307,6 +323,22 @@ test "reader: enforces exact line limit" {
     );
     defer invalid_reader.deinit();
     try std.testing.expectError(zfastq.ReaderError.LineTooLong, invalid_reader.next());
+
+    const lone_cr_at_eof = "@r\nA\n+\n!\r";
+    var eof_source = zfastq.io.plain.SliceSource.init(lone_cr_at_eof);
+    var eof_reader = try zfastq.Reader.init(
+        std.testing.allocator,
+        eof_source.byteSource(),
+        .{ .max_line_bytes = 1 },
+    );
+    defer eof_reader.deinit();
+    try std.testing.expectError(zfastq.ReaderError.LineTooLong, eof_reader.next());
+
+    var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 1 });
+    try std.testing.expectError(
+        zfastq.ReaderError.LineTooLong,
+        zfastq.count_scan.countSlice(lone_cr_at_eof, .{ .max_line_bytes = 1 }, &scan),
+    );
 }
 
 test "count_scan: matches reader advance on inline data" {
@@ -389,6 +421,61 @@ test "count_scan: result and details are chunk invariant" {
     }
 }
 
+test "reader and count_scan: generated mutations keep exact agreement" {
+    var prng = std.Random.DefaultPrng.init(0x6a09e667f3bcc909);
+    const random = prng.random();
+    const mutations = [_]u8{ '\n', '\r', '@', '+', 0, 'A', '!' };
+
+    for (0..96) |_| {
+        var storage: [8192]u8 = undefined;
+        var output = std.Io.Writer.fixed(&storage);
+        const record_count = random.intRangeAtMost(usize, 1, 16);
+        for (0..record_count) |record_index| {
+            try output.writeAll("@r");
+            const header_len = random.intRangeAtMost(usize, 1, 24);
+            for (0..header_len) |_| try output.writeByte(randomLetter(random));
+            try writeRandomLineEnding(&output, random);
+
+            const sequence_len = random.intRangeAtMost(usize, 0, 64);
+            for (0..sequence_len) |_| try output.writeByte(randomBase(random));
+            try writeRandomLineEnding(&output, random);
+
+            try output.writeByte('+');
+            const plus_len = random.intRangeAtMost(usize, 0, 16);
+            for (0..plus_len) |_| try output.writeByte(randomLetter(random));
+            try writeRandomLineEnding(&output, random);
+
+            for (0..sequence_len) |_| try output.writeByte(randomQuality(random));
+            if (record_index + 1 < record_count or sequence_len == 0 or random.boolean()) {
+                try writeRandomLineEnding(&output, random);
+            }
+        }
+        const data = output.buffered();
+        const reader_chunk = random.intRangeAtMost(usize, 1, 67);
+        const scanner_chunk = random.intRangeAtMost(usize, 1, 67);
+
+        const reader_valid = try readerOutcome(data, reader_chunk);
+        const scanner_valid = scannerOutcome(data, scanner_chunk);
+
+        try std.testing.expectEqual(@as(u64, @intCast(record_count)), reader_valid.count);
+        try std.testing.expectEqual(@as(?zfastq.ReaderError, null), reader_valid.err);
+        try expectSameOutcome(reader_valid, scanner_valid);
+
+        var mutated: [8192]u8 = undefined;
+        @memcpy(mutated[0..data.len], data);
+        const mutation_count = random.intRangeAtMost(usize, 1, 3);
+        for (0..mutation_count) |_| {
+            const index = random.uintLessThan(usize, data.len);
+            mutated[index] = mutations[random.uintLessThan(usize, mutations.len)];
+        }
+
+        const reader_mutated = try readerOutcome(mutated[0..data.len], reader_chunk);
+        const scanner_mutated = scannerOutcome(mutated[0..data.len], scanner_chunk);
+
+        try expectSameOutcome(reader_mutated, scanner_mutated);
+    }
+}
+
 test "reader and count_scan: structural error details agree across chunk sizes" {
     const cases = [_]struct {
         data: []const u8,
@@ -424,6 +511,13 @@ test "reader and count_scan: structural error details agree across chunk sizes" 
             .code = .s005_length_mismatch,
             .line = 4,
             .offset = 8,
+        },
+        .{
+            .data = "@r\nA\n+\n!\r",
+            .expected_error = error.S005LengthMismatch,
+            .code = .s005_length_mismatch,
+            .line = 4,
+            .offset = 7,
         },
     };
 
@@ -817,4 +911,92 @@ fn expectDetails(
     try std.testing.expectEqual(record_index, details.record_index);
     try std.testing.expectEqual(line, details.line_in_record);
     try std.testing.expectEqual(offset, details.byte_offset);
+}
+
+const ParseOutcome = struct {
+    count: u64,
+    err: ?zfastq.ReaderError = null,
+    details: ?zfastq.ParseError = null,
+};
+
+fn readerOutcome(data: []const u8, chunk_len: usize) !ParseOutcome {
+    var chunked = ChunkSource.init(data, chunk_len);
+    var reader = try zfastq.Reader.init(
+        std.testing.allocator,
+        chunked.byteSource(),
+        .{},
+    );
+    defer reader.deinit();
+
+    while (true) {
+        const has_record = reader.advance() catch |err| {
+            return .{
+                .count = reader.recordIndex(),
+                .err = err,
+                .details = reader.takeLastError(),
+            };
+        };
+        if (!has_record) return .{ .count = reader.recordIndex() };
+    }
+}
+
+fn scannerOutcome(data: []const u8, chunk_len: usize) ParseOutcome {
+    var scan = zfastq.count_scan.Scanner.init(.{});
+    var pos: usize = 0;
+    while (pos < data.len) {
+        const end = @min(data.len, pos + chunk_len);
+        _ = scan.feed(data[pos..end]) catch |err| {
+            return .{
+                .count = scan.record_index,
+                .err = err,
+                .details = scan.takeLastError(),
+            };
+        };
+        pos = end;
+    }
+    scan.finishEof() catch |err| {
+        return .{
+            .count = scan.record_index,
+            .err = err,
+            .details = scan.takeLastError(),
+        };
+    };
+    return .{ .count = scan.record_index };
+}
+
+fn expectSameOutcome(expected: ParseOutcome, actual: ParseOutcome) !void {
+    try std.testing.expectEqual(expected.count, actual.count);
+    try std.testing.expectEqual(expected.err, actual.err);
+    try std.testing.expectEqual(expected.details == null, actual.details == null);
+    if (expected.details) |expected_details| {
+        const actual_details = actual.details.?;
+        try expectDetails(
+            actual_details,
+            expected_details.code,
+            expected_details.record_index,
+            expected_details.line_in_record,
+            expected_details.byte_offset,
+        );
+        try std.testing.expectEqualStrings(expected_details.message, actual_details.message);
+    }
+}
+
+fn writeRandomLineEnding(output: *std.Io.Writer, random: std.Random) !void {
+    if (random.boolean()) {
+        try output.writeAll("\r\n");
+    } else {
+        try output.writeByte('\n');
+    }
+}
+
+fn randomBase(random: std.Random) u8 {
+    return "ACGTN"[random.uintLessThan(usize, 5)];
+}
+
+fn randomLetter(random: std.Random) u8 {
+    return 'a' + random.uintLessThan(u8, 26);
+}
+
+fn randomQuality(random: std.Random) u8 {
+    return '!' + random.uintLessThan(u8, 41);
 }

@@ -3,19 +3,52 @@
 const std = @import("std");
 const zfastq = @import("z-fastq");
 
-test "writer: emits LF FASTQ lines" {
-    var buf: [256]u8 = undefined;
-    var sink = zfastq.io.plain.SliceSink.init(&buf);
-    var writer = zfastq.Writer.init(sink.byteSink());
-    const record = zfastq.Record{
-        .header = "read1 run=1",
-        .id = "read1",
-        .sequence = "ACGT",
-        .plus = "",
-        .quality = "!!!!",
+test "writer: serializes supported records with LF endings" {
+    const cases = [_]struct {
+        record: zfastq.Record,
+        expected: []const u8,
+    }{
+        .{
+            .record = .{
+                .header = "read1 run=1",
+                .id = "read1",
+                .sequence = "ACGT",
+                .plus = "",
+                .quality = "!!!!",
+            },
+            .expected = "@read1 run=1\nACGT\n+\n!!!!\n",
+        },
+        .{
+            .record = .{
+                .header = "empty",
+                .id = "empty",
+                .sequence = "",
+                .plus = "description",
+                .quality = "",
+            },
+            .expected = "@empty\n\n+description\n\n",
+        },
+        .{
+            .record = .{
+                .header = "r\rcomment",
+                .id = "r\rcomment",
+                .sequence = "A\rC",
+                .plus = "x\ry",
+                .quality = "!\r!",
+            },
+            .expected = "@r\rcomment\nA\rC\n+x\ry\n!\r!\n",
+        },
     };
-    try writer.writeRecord(record);
-    try std.testing.expectEqualStrings("@read1 run=1\nACGT\n+\n!!!!\n", sink.written());
+
+    for (cases) |case| {
+        var buf: [256]u8 = undefined;
+        var sink = zfastq.io.plain.SliceSink.init(&buf);
+        var writer = zfastq.Writer.init(sink.byteSink());
+
+        try writer.writeRecord(case.record);
+
+        try std.testing.expectEqualStrings(case.expected, sink.written());
+    }
 }
 
 test "writer: rejects structurally invalid records before writing" {
@@ -25,6 +58,10 @@ test "writer: rejects structurally invalid records before writing" {
         .{ .header = "r", .id = "r", .sequence = "A\n", .plus = "", .quality = "!!" },
         .{ .header = "r", .id = "r", .sequence = "A", .plus = "x\n", .quality = "!" },
         .{ .header = "r", .id = "r", .sequence = "AA", .plus = "", .quality = "!\n" },
+        .{ .header = "r\r", .id = "r", .sequence = "A", .plus = "", .quality = "!" },
+        .{ .header = "r", .id = "r", .sequence = "A\r", .plus = "", .quality = "!x" },
+        .{ .header = "r", .id = "r", .sequence = "A", .plus = "x\r", .quality = "!" },
+        .{ .header = "r", .id = "r", .sequence = "Ax", .plus = "", .quality = "!\r" },
     };
 
     for (cases) |record| {
@@ -64,6 +101,75 @@ test "writer: round-trip preserves record fields" {
     try std.testing.expectEqualStrings(parsed.sequence, round.sequence);
     try std.testing.expectEqualStrings(parsed.plus, round.plus);
     try std.testing.expectEqualStrings(parsed.quality, round.quality);
+}
+
+test "writer: generated valid fields round-trip through Reader" {
+    var prng = std.Random.DefaultPrng.init(0xbb67ae8584caa73b);
+    const random = prng.random();
+
+    for (0..96) |_| {
+        var header_storage: [48]u8 = undefined;
+        const header_len = random.intRangeAtMost(usize, 1, header_storage.len);
+        for (header_storage[0..header_len]) |*byte| {
+            byte.* = 'a' + random.uintLessThan(u8, 26);
+        }
+        if (header_len > 2 and random.boolean()) {
+            header_storage[random.intRangeLessThan(usize, 1, header_len - 1)] = '\r';
+        }
+        const header = header_storage[0..header_len];
+
+        var sequence_storage: [96]u8 = undefined;
+        const sequence_len = random.intRangeAtMost(usize, 0, sequence_storage.len);
+        for (sequence_storage[0..sequence_len]) |*byte| {
+            byte.* = "ACGTN"[random.uintLessThan(usize, 5)];
+        }
+        if (sequence_len > 2 and random.boolean()) {
+            sequence_storage[random.intRangeLessThan(usize, 1, sequence_len - 1)] = '\r';
+        }
+        const sequence = sequence_storage[0..sequence_len];
+
+        var plus_storage: [32]u8 = undefined;
+        const plus_len = random.intRangeAtMost(usize, 0, plus_storage.len);
+        for (plus_storage[0..plus_len]) |*byte| {
+            byte.* = 'a' + random.uintLessThan(u8, 26);
+        }
+        if (plus_len > 2 and random.boolean()) {
+            plus_storage[random.intRangeLessThan(usize, 1, plus_len - 1)] = '\r';
+        }
+        const plus = plus_storage[0..plus_len];
+
+        var quality_storage: [96]u8 = undefined;
+        for (quality_storage[0..sequence_len]) |*byte| {
+            byte.* = '!' + random.uintLessThan(u8, 41);
+        }
+        if (sequence_len > 2 and random.boolean()) {
+            quality_storage[random.intRangeLessThan(usize, 1, sequence_len - 1)] = '\r';
+        }
+        const quality = quality_storage[0..sequence_len];
+
+        var output: [512]u8 = undefined;
+        var sink = zfastq.io.plain.SliceSink.init(&output);
+        var writer = zfastq.Writer.init(sink.byteSink());
+        try writer.writeRecord(.{
+            .header = header,
+            .id = header,
+            .sequence = sequence,
+            .plus = plus,
+            .quality = quality,
+        });
+        try writer.flush();
+
+        var source = zfastq.io.plain.SliceSource.init(sink.written());
+        var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
+        const round = (try reader.next()).?;
+
+        try std.testing.expectEqualStrings(header, round.header);
+        try std.testing.expectEqualStrings(sequence, round.sequence);
+        try std.testing.expectEqualStrings(plus, round.plus);
+        try std.testing.expectEqualStrings(quality, round.quality);
+        try std.testing.expect((try reader.next()) == null);
+    }
 }
 
 test "plain adapters: file sink writes and flushes after init return" {

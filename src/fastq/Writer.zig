@@ -17,10 +17,10 @@ pub const Writer = struct {
 
     pub fn writeRecord(self: *Writer, record: Record) WriterError!void {
         if (record.sequence.len != record.quality.len or
-            !isSingleLine(record.header) or
-            !isSingleLine(record.sequence) or
-            !isSingleLine(record.plus) or
-            !isSingleLine(record.quality))
+            !isWritableField(record.header) or
+            !isWritableField(record.sequence) or
+            !isWritableField(record.plus) or
+            !isWritableField(record.quality))
         {
             return error.InvalidRecord;
         }
@@ -41,6 +41,7 @@ pub const Writer = struct {
     }
 };
 
-fn isSingleLine(bytes: []const u8) bool {
-    return std.mem.indexOfScalar(u8, bytes, '\n') == null;
+fn isWritableField(bytes: []const u8) bool {
+    return std.mem.indexOfScalar(u8, bytes, '\n') == null and
+        (bytes.len == 0 or bytes[bytes.len - 1] != '\r');
 }

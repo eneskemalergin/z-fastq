@@ -133,7 +133,7 @@ pub const Scanner = struct {
     }
 
     pub fn finishEof(self: *Scanner) parse_error.ReaderError!void {
-        if (self.line_raw_len > 0) try self.finishLine();
+        if (self.line_raw_len > 0) try self.finishLine(false);
         const missing_line = self.machine.missingLine() orelse return;
         self.storeError(
             .s004_truncated_record,
@@ -338,7 +338,7 @@ pub const Scanner = struct {
             try self.consumeLineBytes(segment);
             self.byte_offset += @intCast(segment.len + 1);
             pos += segment.len + 1;
-            try self.finishLine();
+            try self.finishLine(true);
 
             if (self.fast_path_enabled and self.machine.expected == .header) {
                 return pos;
@@ -380,8 +380,10 @@ pub const Scanner = struct {
         }
     }
 
-    fn finishLine(self: *Scanner) parse_error.ReaderError!void {
-        const had_cr = self.line_raw_len > 0 and self.line_last_byte == '\r';
+    fn finishLine(self: *Scanner, terminated_by_lf: bool) parse_error.ReaderError!void {
+        const had_cr = terminated_by_lf and
+            self.line_raw_len > 0 and
+            self.line_last_byte == '\r';
         const content_len = self.line_raw_len - @intFromBool(had_cr);
         if (content_len > self.options.max_line_bytes) return error.LineTooLong;
 
