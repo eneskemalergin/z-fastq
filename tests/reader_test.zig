@@ -600,6 +600,43 @@ test "count_scan: alternates between sequence lengths with same header" {
     try std.testing.expectEqual(@as(u64, 2), n);
 }
 
+test "reader and count_scan: header lookup boundaries are chunk invariant" {
+    var data: [420]u8 = undefined;
+    var pos: usize = 0;
+    for ([_]usize{ 127, 128, 129 }) |header_line_bytes| {
+        data[pos] = '@';
+        @memset(data[pos + 1 .. pos + header_line_bytes - 1], 'H');
+        data[pos + header_line_bytes - 1] = '\n';
+        pos += header_line_bytes;
+        @memcpy(data[pos .. pos + 12], "AAAA\n+\nIIII\n");
+        pos += 12;
+    }
+
+    for (1..data.len + 1) |chunk_len| {
+        var scan = zfastq.count_scan.Scanner.init(.{});
+        var scan_pos: usize = 0;
+        while (scan_pos < data.len) {
+            const end = @min(data.len, scan_pos + chunk_len);
+            _ = try scan.feed(data[scan_pos..end]);
+            scan_pos = end;
+        }
+        try scan.finishEof();
+
+        var chunked = ChunkSource.init(&data, chunk_len);
+        var reader = try zfastq.Reader.init(
+            std.testing.allocator,
+            chunked.byteSource(),
+            .{},
+        );
+        defer reader.deinit();
+        var reader_count: u64 = 0;
+        while (try reader.advance()) reader_count += 1;
+
+        try std.testing.expectEqual(reader_count, scan.record_index);
+        try std.testing.expectEqual(@as(u64, 3), scan.record_index);
+    }
+}
+
 test "count_scan: retains fast path after non-minimal plus record" {
     const data =
         \\@read3

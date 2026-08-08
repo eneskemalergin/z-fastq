@@ -61,15 +61,15 @@ const DenseLayout = struct {
         const quality_len = lineContentLen(quality);
         return record[0] == '@' and
             record[layout.sequence_start - 1] == '\n' and
-            !containsNewline(header) and
+            !@call(.always_inline, containsNewline, .{header}) and
             lineContentLen(header) <= max_line_bytes and
             record[layout.sequence_end] == '\n' and
-            !containsNewline(sequence) and
+            !@call(.always_inline, containsNewline, .{sequence}) and
             sequence_len <= max_line_bytes and
             record[layout.plus_start] == '+' and
             record[layout.plus_start + 1] == '\n' and
             record[layout.quality_end] == '\n' and
-            !containsNewline(quality) and
+            !@call(.always_inline, containsNewline, .{quality}) and
             quality_len <= max_line_bytes and
             quality_len == sequence_len;
     }
@@ -148,14 +148,16 @@ pub const Scanner = struct {
         var cursor: usize = 0;
 
         while (cursor < data.len) {
-            const run = consumeWithKnownLayouts(self, data[cursor..]);
+            const remaining = data[cursor..];
+            const header_line_bytes = headerLineBytesAt(remaining);
+            const run = consumeWithKnownLayouts(self, remaining, header_line_bytes);
             if (run.count > 0) {
                 self.record_index += run.count;
                 cursor += run.count * run.stride;
                 continue;
             }
 
-            const consumed = try self.tryFastRecord(data[cursor..]);
+            const consumed = try self.tryFastRecord(remaining, header_line_bytes);
             if (consumed == 0) return cursor;
             self.record_index += 1;
             cursor += consumed;
@@ -182,15 +184,18 @@ pub const Scanner = struct {
         return .{};
     }
 
-    fn consumeWithKnownLayouts(self: *Scanner, data: []const u8) StrideRun {
+    fn consumeWithKnownLayouts(
+        self: *Scanner,
+        data: []const u8,
+        header_line_bytes: ?usize,
+    ) StrideRun {
         if (self.known_layout_count == 0) return .{};
         if (data.len < self.smallestKnownStride()) return .{};
         if (data[0] != '@') return .{};
 
-        const header_bytes = headerLineBytesAt(data);
         var tried_stride: ?usize = null;
 
-        if (header_bytes) |h| {
+        if (header_line_bytes) |h| {
             if (self.layoutByHeader(h)) |layout| {
                 tried_stride = layout.record_stride;
                 const run = self.tryStrideBlock(data, layout);
@@ -200,7 +205,7 @@ pub const Scanner = struct {
 
         if (self.layout) |active| {
             const already_tried = tried_stride != null and active.record_stride == tried_stride.?;
-            const header_ok = header_bytes == null or active.sequence_start == header_bytes.?;
+            const header_ok = header_line_bytes == null or active.sequence_start == header_line_bytes.?;
             if (!already_tried and header_ok) {
                 const run = self.tryStrideBlock(data, active);
                 if (run.count > 0) return run;
@@ -216,7 +221,7 @@ pub const Scanner = struct {
             if (self.layout) |active| {
                 if (layout.record_stride == active.record_stride) continue;
             }
-            if (header_bytes) |h| {
+            if (header_line_bytes) |h| {
                 if (layout.sequence_start != h) continue;
             }
             const run = self.tryStrideBlock(data, layout);
@@ -249,41 +254,18 @@ pub const Scanner = struct {
         return accepted;
     }
 
-    fn tryFastRecord(self: *Scanner, data: []const u8) parse_error.ReaderError!usize {
+    fn tryFastRecord(
+        self: *Scanner,
+        data: []const u8,
+        header_line_bytes: ?usize,
+    ) parse_error.ReaderError!usize {
         if (data.len == 0) return 0;
         if (data[0] != '@') {
             self.disableFast();
             return 0;
         }
 
-        if (headerLineBytesAt(data)) |h| {
-            if (self.layoutByHeader(h)) |layout| {
-                if (DenseLayout.validateRecordAt(data, 0, layout, self.options.max_line_bytes)) {
-                    self.layout = layout;
-                    return layout.record_stride;
-                }
-            }
-            var i: usize = 0;
-            while (i < self.known_layout_count) : (i += 1) {
-                const layout = self.known_layouts[i];
-                if (layout.sequence_start != h) continue;
-                if (DenseLayout.validateRecordAt(data, 0, layout, self.options.max_line_bytes)) {
-                    self.layout = layout;
-                    return layout.record_stride;
-                }
-            }
-        }
-
-        var i: usize = 0;
-        while (i < self.known_layout_count) : (i += 1) {
-            const layout = self.known_layouts[i];
-            if (DenseLayout.validateRecordAt(data, 0, layout, self.options.max_line_bytes)) {
-                self.layout = layout;
-                return layout.record_stride;
-            }
-        }
-
-        const nl1 = std.mem.findScalar(u8, data, '\n') orelse return 0;
+        const nl1 = if (header_line_bytes) |line_bytes| line_bytes - 1 else return 0;
         const hdr_len = lineContentLen(data[0..nl1]);
         if (hdr_len == 0) {
             self.disableFast();
@@ -498,8 +480,7 @@ fn containsNewline(bytes: []const u8) bool {
 
 fn headerLineBytesAt(data: []const u8) ?usize {
     if (data.len == 0 or data[0] != '@') return null;
-    const scan_limit = @min(data.len, MAX_HEADER_INDEX_BYTES);
-    const rel = std.mem.indexOfScalar(u8, data[0..scan_limit], '\n') orelse return null;
+    const rel = std.mem.indexOfScalar(u8, data, '\n') orelse return null;
     return rel + 1;
 }
 
@@ -531,4 +512,24 @@ test "DenseLayout construction: rejects impossible geometry" {
     try std.testing.expect(DenseLayout.fromRecordEnd(0, 0) == null);
     try std.testing.expect(DenseLayout.fromRecordEnd(8, 2) == null);
     try std.testing.expect(DenseLayout.fromRecordEnd(max, max) == null);
+}
+
+test "header scan: reports indexed boundaries and exceptional forms" {
+    var data: [130]u8 = undefined;
+    @memset(&data, 'H');
+    data[0] = '@';
+
+    data[126] = '\n';
+    try std.testing.expectEqual(@as(?usize, 127), headerLineBytesAt(data[0..127]));
+
+    data[126] = 'H';
+    data[127] = '\n';
+    try std.testing.expectEqual(@as(?usize, 128), headerLineBytesAt(data[0..128]));
+
+    data[127] = 'H';
+    data[128] = '\n';
+    try std.testing.expectEqual(@as(?usize, 129), headerLineBytesAt(data[0..129]));
+
+    try std.testing.expectEqual(@as(?usize, null), headerLineBytesAt(data[0..128]));
+    try std.testing.expectEqual(@as(?usize, 4), headerLineBytesAt("@h\r\n"));
 }
