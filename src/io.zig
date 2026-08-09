@@ -1,11 +1,50 @@
-//! Plain file and in-memory adapters for `ByteSource` and `ByteSink`.
+//! Byte interfaces, limits, and plain adapters for streaming FASTQ I/O.
 
 const std = @import("std");
-const ByteSource = @import("ByteSource.zig").ByteSource;
-const ReadError = @import("ByteSource.zig").ReadError;
-const ByteSink = @import("ByteSink.zig").ByteSink;
-const WriteError = @import("ByteSink.zig").WriteError;
 
+const ReadError = error{ReadFailed};
+pub const WriteError = error{WriteFailed};
+
+pub const DEFAULT_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_READER_BUFFER_BYTES: usize = 256 * 1024;
+pub const COUNT_READ_BUFFER_BYTES: usize = DEFAULT_READER_BUFFER_BYTES;
+
+/// Copied pull interface whose adapter must remain at a stable address and outlive it.
+/// A read initializes the returned prefix of the destination and returns zero only at EOF.
+pub const ByteSource = struct {
+    vtable: *const VTable,
+    ctx: *anyopaque,
+
+    pub const VTable = struct {
+        read: *const fn (ctx: *anyopaque, dest: []u8) ReadError!usize,
+    };
+
+    pub fn read(self: *const ByteSource, dest: []u8) ReadError!usize {
+        return self.vtable.read(self.ctx, dest);
+    }
+};
+
+/// Copied push interface whose adapter must remain at a stable address and outlive it.
+/// Writes consume the complete slice; a missing flush callback is a successful no-op.
+pub const ByteSink = struct {
+    vtable: *const VTable,
+    ctx: *anyopaque,
+
+    pub const VTable = struct {
+        write: *const fn (ctx: *anyopaque, data: []const u8) WriteError!void,
+        flush: ?*const fn (ctx: *anyopaque) WriteError!void = null,
+    };
+
+    pub fn write(self: *const ByteSink, data: []const u8) WriteError!void {
+        return self.vtable.write(self.ctx, data);
+    }
+
+    pub fn flush(self: *const ByteSink) WriteError!void {
+        if (self.vtable.flush) |flush_fn| return flush_fn(self.ctx);
+    }
+};
+
+/// In-memory source over borrowed data; wrappers also borrow this adapter's stable address.
 pub const SliceSource = struct {
     data: []const u8,
     pos: usize = 0,
@@ -36,6 +75,7 @@ fn sliceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return copy_len;
 }
 
+/// Source over a borrowed `std.Io.Reader`; wrappers also borrow this adapter's stable address.
 pub const ReaderSource = struct {
     reader: *std.Io.Reader,
 
@@ -60,6 +100,7 @@ fn readerRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return self.reader.readSliceShort(dest) catch error.ReadFailed;
 }
 
+/// Buffered source whose borrowed file, buffer, and stable address must outlive its wrappers.
 pub const FileSource = struct {
     file_reader: std.Io.File.Reader,
 
@@ -88,6 +129,7 @@ fn fileSourceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return self.file_reader.interface.readSliceShort(dest) catch error.ReadFailed;
 }
 
+/// Fixed-capacity sink over borrowed storage; wrappers borrow this adapter's stable address.
 pub const SliceSink = struct {
     buffer: []u8,
     pos: usize = 0,
@@ -125,6 +167,7 @@ fn sliceFlush(ctx: *anyopaque) WriteError!void {
     _ = ctx;
 }
 
+/// Sink over a borrowed `std.Io.Writer`; wrappers also borrow this adapter's stable address.
 pub const WriterSink = struct {
     writer: *std.Io.Writer,
 
@@ -155,6 +198,7 @@ fn writerFlush(ctx: *anyopaque) WriteError!void {
     self.writer.flush() catch return error.WriteFailed;
 }
 
+/// Buffered sink whose borrowed file, buffer, and stable address must outlive its wrappers.
 pub const FileSink = struct {
     file_writer: std.Io.File.Writer,
 

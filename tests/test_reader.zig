@@ -1,9 +1,33 @@
-//! Unit tests for `fastq.Reader`.
+//! Library root, reader, scanner, and structural-diagnostic contracts.
 
 const std = @import("std");
 const zfastq = @import("z-fastq");
 
-test "reader: parses supported record forms" {
+test "[unit] - [root]: every exported declaration is analyzable" {
+    std.testing.refAllDecls(zfastq);
+}
+
+test "[unit] - [root]: version exposes the current internal checkpoint" {
+    try std.testing.expectEqualStrings("0.0.2", zfastq.VERSION);
+}
+
+test "[unit] - [lint code]: every implemented code has its stable tag" {
+    const cases = [_]struct {
+        code: zfastq.LintCode,
+        tag: []const u8,
+    }{
+        .{ .code = .s001_invalid_plus_line, .tag = "S001" },
+        .{ .code = .s003_invalid_header, .tag = "S003" },
+        .{ .code = .s004_truncated_record, .tag = "S004" },
+        .{ .code = .s005_length_mismatch, .tag = "S005" },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.tag, zfastq.codeTag(case.code));
+    }
+}
+
+test "[unit] - [reader]: supported record forms parse exactly" {
     const cases = [_]struct {
         data: []const u8,
         header: []const u8,
@@ -86,7 +110,7 @@ test "reader: parses supported record forms" {
     }
 }
 
-test "reader: rejects S005 when sequence and quality lengths differ" {
+test "[failure] - [reader]: unequal sequence and quality lengths report S005" {
     const data =
         \\@bad
         \\ACGT
@@ -100,7 +124,7 @@ test "reader: rejects S005 when sequence and quality lengths differ" {
     try std.testing.expectError(zfastq.ReaderError.S005LengthMismatch, reader.next());
 }
 
-test "reader: rejects S003 when header does not start with @" {
+test "[failure] - [reader]: a header without at-sign reports S003" {
     const data = "not_a_header\nACGT\n+\n!!!!\n";
     var source = zfastq.io.plain.SliceSource.init(data);
     var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
@@ -108,7 +132,7 @@ test "reader: rejects S003 when header does not start with @" {
     try std.testing.expectError(zfastq.ReaderError.S003InvalidHeader, reader.next());
 }
 
-test "reader: rejects S004 on truncated record at EOF" {
+test "[failure] - [reader]: a truncated record at EOF reports S004" {
     const data = "@truncated\nACGT\n+";
     var source = zfastq.io.plain.SliceSource.init(data);
     var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
@@ -116,7 +140,7 @@ test "reader: rejects S004 on truncated record at EOF" {
     try std.testing.expectError(zfastq.ReaderError.S004TruncatedRecord, reader.next());
 }
 
-test "reader: rejects S001 with line-start details" {
+test "[failure] - [reader]: an invalid plus line reports S001 at its start" {
     const data = "@bad\nACGT\nnot-plus\n!!!!\n";
     var source = zfastq.io.plain.SliceSource.init(data);
     var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
@@ -130,7 +154,7 @@ test "reader: rejects S001 with line-start details" {
     try std.testing.expectEqual(@as(u64, 10), details.byte_offset);
 }
 
-test "reader: returned fields survive every fixed short-read size" {
+test "[property] - [reader]: borrowed fields survive every fixed short-read size" {
     const data = "@read1 comment\nACGT\n+repeat\n!!!!\n";
     for (1..data.len + 1) |chunk_len| {
         var chunked = ChunkSource.init(data, chunk_len);
@@ -148,7 +172,7 @@ test "reader: returned fields survive every fixed short-read size" {
     }
 }
 
-test "reader and count_scan: every partition preserves the format result" {
+test "[property] - [parser]: every input partition preserves the format result" {
     const valid = "@r\nA\n+\n!\n";
     const partition_count = @as(usize, 1) << (valid.len - 1);
     for (0..partition_count) |mask| {
@@ -199,7 +223,7 @@ test "reader and count_scan: every partition preserves the format result" {
     }
 }
 
-test "reader: fields survive record-buffer growth" {
+test "[edge] - [reader]: borrowed fields survive record-buffer growth" {
     const line_len = 1024 * 1024;
     const total_len = 3 + line_len + 3 + line_len;
     const data = try std.testing.allocator.alloc(u8, total_len);
@@ -225,7 +249,7 @@ test "reader: fields survive record-buffer growth" {
     try std.testing.expect(std.mem.allEqual(u8, parsed.quality, 'I'));
 }
 
-test "reader: common record performs no allocation after init" {
+test "[unit] - [reader]: a common record allocates only during initialization" {
     const data = "@r\nACGT\n+\n!!!!\n";
     var source = zfastq.io.plain.SliceSource.init(data);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
@@ -236,7 +260,7 @@ test "reader: common record performs no allocation after init" {
     try std.testing.expect(!failing.has_induced_failure);
 }
 
-test "reader: owned record remains stable after next" {
+test "[unit] - [owned record]: copied fields remain stable after Reader advances" {
     const data = "@one\nAAAA\n+\n!!!!\n@two\nCCCC\n+\n####\n";
     var source = zfastq.io.plain.SliceSource.init(data);
     var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
@@ -251,7 +275,7 @@ test "reader: owned record remains stable after next" {
     try std.testing.expectEqualStrings("!!!!", owned.quality);
 }
 
-test "reader: propagates source read failure" {
+test "[failure] - [reader]: source read failure propagates" {
     var failing_source = FailingSource{};
     const source = failing_source.byteSource();
     var reader = try zfastq.Reader.init(std.testing.allocator, source, .{});
@@ -260,7 +284,7 @@ test "reader: propagates source read failure" {
     try std.testing.expectError(zfastq.ReaderError.Io, reader.next());
 }
 
-test "reader: rejects an invalid source byte count" {
+test "[failure] - [reader]: a source count beyond its destination is rejected" {
     var invalid_source = InvalidCountSource{};
     var reader = try zfastq.Reader.init(
         std.testing.allocator,
@@ -272,7 +296,7 @@ test "reader: rejects an invalid source byte count" {
     try std.testing.expectError(zfastq.ReaderError.Io, reader.next());
 }
 
-test "reader: owns the ByteSource wrapper value" {
+test "[unit] - [reader]: the ByteSource wrapper is copied by value" {
     var original = zfastq.io.plain.SliceSource.init("@original\nA\n+\n!\n");
     var replacement = zfastq.io.plain.SliceSource.init("@replacement\nC\n+\n#\n");
     var source = original.byteSource();
@@ -285,7 +309,7 @@ test "reader: owns the ByteSource wrapper value" {
     try std.testing.expectEqualStrings("original", parsed.id);
 }
 
-test "reader: reports allocation failure while growing record storage" {
+test "[failure] - [reader]: allocation failure while growing storage propagates" {
     const line_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES + 1;
     const data = try std.testing.allocator.alloc(u8, line_len + 4);
     defer std.testing.allocator.free(data);
@@ -303,7 +327,7 @@ test "reader: reports allocation failure while growing record storage" {
     try std.testing.expectError(zfastq.ReaderError.OutOfMemory, reader.next());
 }
 
-test "reader: enforces exact line limit" {
+test "[edge] - [reader]: the configured line limit is exact" {
     const at_limit = "@r\nACGT\n+\n!!!!\n";
     var valid_source = zfastq.io.plain.SliceSource.init(at_limit);
     var valid_reader = try zfastq.Reader.init(
@@ -341,7 +365,7 @@ test "reader: enforces exact line limit" {
     );
 }
 
-test "count_scan: matches reader advance on inline data" {
+test "[property] - [count scanner]: inline counts match Reader advance" {
     const data =
         \\@read1
         \\ACGT
@@ -370,7 +394,7 @@ test "count_scan: matches reader advance on inline data" {
     try std.testing.expectEqual(scan.record_index, advance_count);
 }
 
-test "count_scan: rejects S005 on length mismatch" {
+test "[failure] - [count scanner]: a length mismatch reports S005" {
     const data =
         \\@bad
         \\ACGT
@@ -382,7 +406,7 @@ test "count_scan: rejects S005 on length mismatch" {
     try std.testing.expectError(zfastq.ReaderError.S005LengthMismatch, scan.feed(data));
 }
 
-test "count_scan: result and details are chunk invariant" {
+test "[property] - [count scanner]: result and details are chunk invariant" {
     const valid = "@r1\nAAAA\n+\n!!!!\n@r2\nCC\n+note\n##\n";
     for (1..valid.len + 1) |chunk_len| {
         var scan = zfastq.count_scan.Scanner.init(.{});
@@ -421,7 +445,7 @@ test "count_scan: result and details are chunk invariant" {
     }
 }
 
-test "reader and count_scan: generated mutations keep exact agreement" {
+test "[fuzz] - [parser]: generated mutations keep Reader and scanner in agreement" {
     var prng = std.Random.DefaultPrng.init(0x6a09e667f3bcc909);
     const random = prng.random();
     const mutations = [_]u8{ '\n', '\r', '@', '+', 0, 'A', '!' };
@@ -476,7 +500,7 @@ test "reader and count_scan: generated mutations keep exact agreement" {
     }
 }
 
-test "reader and count_scan: structural error details agree across chunk sizes" {
+test "[property] - [parser]: structural details agree across chunk sizes" {
     const cases = [_]struct {
         data: []const u8,
         expected_error: zfastq.ReaderError,
@@ -559,7 +583,7 @@ test "reader and count_scan: structural error details agree across chunk sizes" 
     }
 }
 
-test "count_scan: dense validation rejects embedded newlines in every field region" {
+test "[property] - [count scanner]: dense validation checks every field region" {
     const valid = "@r1\nAAAA\n+\n!!!!\n";
     const cases = [_]struct {
         malformed_record: []const u8,
@@ -616,7 +640,7 @@ test "count_scan: dense validation rejects embedded newlines in every field regi
     }
 }
 
-test "count_scan: carries lines across chunks and enforces limit" {
+test "[edge] - [count scanner]: lines span chunks while retaining the limit" {
     const data = "@r\nAAAAAAAA\n+\n!!!!!!!!";
     var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 8 });
     for (data) |byte| {
@@ -632,7 +656,7 @@ test "count_scan: carries lines across chunks and enforces limit" {
     );
 }
 
-test "count_scan: enforces line limit after dense layout learning" {
+test "[edge] - [count scanner]: dense layout learning retains the line limit" {
     const data = "@a\nAC\n+\n!!\n@b\nACGT\n+\n!!!!\n";
     var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 3 });
 
@@ -643,7 +667,7 @@ test "count_scan: enforces line limit after dense layout learning" {
     try std.testing.expectEqual(@as(u64, 1), scan.record_index);
 }
 
-test "count_scan: preserves length semantics after dense layout learning" {
+test "[property] - [count scanner]: dense layout learning preserves length semantics" {
     const data = "@a\nACGT\n+\n!!!!\n@b\nACG\r\n+\n!!!!\n";
     var scan = zfastq.count_scan.Scanner.init(.{});
 
@@ -660,14 +684,14 @@ test "count_scan: preserves length semantics after dense layout learning" {
     );
 }
 
-test "count_scan: dense stride block counts uniform records" {
+test "[unit] - [count scanner]: dense stride blocks count uniform records" {
     var buf: [243 * 3]u8 = undefined;
     const pos = appendUniformRecords(&buf, 3, "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/1\n", 100);
     var scan = zfastq.count_scan.Scanner.init(.{});
     const n = try zfastq.count_scan.countSlice(buf[0..pos], .{}, &scan);
     try std.testing.expectEqual(@as(u64, 3), n);
 }
-test "count_scan: alternates between known stride layouts" {
+test "[property] - [count scanner]: known stride layouts may alternate" {
     const hdr_a = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/1\n";
     const hdr_b = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/12\n";
 
@@ -681,7 +705,7 @@ test "count_scan: alternates between known stride layouts" {
     try std.testing.expectEqual(@as(u64, 2), n);
 }
 
-test "count_scan: alternates between sequence lengths with same header" {
+test "[property] - [count scanner]: sequence lengths may alternate under one header" {
     const hdr = "@ont_read\n";
 
     var buf: [128]u8 = undefined;
@@ -694,7 +718,7 @@ test "count_scan: alternates between sequence lengths with same header" {
     try std.testing.expectEqual(@as(u64, 2), n);
 }
 
-test "reader and count_scan: header lookup boundaries are chunk invariant" {
+test "[property] - [parser]: header lookup boundaries are chunk invariant" {
     var data: [420]u8 = undefined;
     var pos: usize = 0;
     for ([_]usize{ 127, 128, 129 }) |header_line_bytes| {
@@ -731,7 +755,7 @@ test "reader and count_scan: header lookup boundaries are chunk invariant" {
     }
 }
 
-test "count_scan: retains fast path after non-minimal plus record" {
+test "[edge] - [count scanner]: a non-minimal plus record does not disable fast scanning" {
     const data =
         \\@read3
         \\AAAA
@@ -748,7 +772,7 @@ test "count_scan: retains fast path after non-minimal plus record" {
     try std.testing.expectEqual(@as(u64, 2), n);
 }
 
-test "count_scan: falls back when plus line is not minimal" {
+test "[edge] - [count scanner]: a non-minimal plus line uses structural fallback" {
     const data =
         \\@read3
         \\AAAA
@@ -761,7 +785,7 @@ test "count_scan: falls back when plus line is not minimal" {
     try std.testing.expectEqual(@as(u64, 1), n);
 }
 
-test "reader: advance matches next record count" {
+test "[property] - [reader]: advance and next produce the same record count" {
     const data =
         \\@read1
         \\ACGT

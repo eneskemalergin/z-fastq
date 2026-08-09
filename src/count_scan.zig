@@ -3,12 +3,12 @@
 //! Zero heap allocations with incremental byte-slice input.
 
 const std = @import("std");
-const limits = @import("../io/limits.zig");
-const parse_error = @import("ParseError.zig");
-const structure = @import("structure.zig");
+const io_layer = @import("io.zig");
+const fastq = @import("fastq.zig");
 
 pub const Options = struct {
-    max_line_bytes: usize = limits.DEFAULT_MAX_LINE_BYTES,
+    /// Maximum content bytes in each logical FASTQ line, excluding CRLF or LF.
+    max_line_bytes: usize = io_layer.DEFAULT_MAX_LINE_BYTES,
 };
 
 const MAX_KNOWN_LAYOUTS = 8;
@@ -80,9 +80,10 @@ const StrideRun = struct {
     stride: usize = 0,
 };
 
+/// Allocation-free scanner; only `record_index` and `byte_offset` are caller-readable state.
 pub const Scanner = struct {
     options: Options,
-    machine: structure.Machine = .{},
+    machine: fastq.Machine = .{},
     fast_path_enabled: bool = false,
     layout: ?DenseLayout = null,
     known_layouts: [MAX_KNOWN_LAYOUTS]DenseLayout = undefined,
@@ -97,19 +98,24 @@ pub const Scanner = struct {
     line_start_offset: u64 = 0,
     record_index: u64 = 0,
     byte_offset: u64 = 0,
-    last_error: ?parse_error.ParseError = null,
+    last_error: ?fastq.ParseError = null,
 
     pub fn init(options: Options) Scanner {
         return .{ .options = options };
     }
 
-    pub fn takeLastError(self: *Scanner) ?parse_error.ParseError {
+    /// Returns and clears the structural diagnostic retained after a parse error.
+    pub fn takeLastError(self: *Scanner) ?fastq.ParseError {
         const err = self.last_error;
         self.last_error = null;
         return err;
     }
 
-    pub fn feed(self: *Scanner, data: []const u8) parse_error.ReaderError!usize {
+    /// Consumes as many bytes as possible from one input chunk.
+    ///
+    /// On success the returned count equals `data.len`. Structural failures leave
+    /// details for `takeLastError`.
+    pub fn feed(self: *Scanner, data: []const u8) fastq.ReaderError!usize {
         var pos: usize = 0;
         while (pos < data.len) {
             if (self.fast_path_enabled and
@@ -132,19 +138,20 @@ pub const Scanner = struct {
         return pos;
     }
 
-    pub fn finishEof(self: *Scanner) parse_error.ReaderError!void {
+    /// Finalizes an unterminated last line and rejects an incomplete record.
+    pub fn finishEof(self: *Scanner) fastq.ReaderError!void {
         if (self.line_raw_len > 0) try self.finishLine(false);
         const missing_line = self.machine.missingLine() orelse return;
         self.storeError(
             .s004_truncated_record,
-            structure.truncatedMessage(missing_line),
+            fastq.truncatedMessage(missing_line),
             missing_line,
             self.byte_offset,
         );
         return error.S004TruncatedRecord;
     }
 
-    fn feedFast(self: *Scanner, data: []const u8) parse_error.ReaderError!usize {
+    fn feedFast(self: *Scanner, data: []const u8) fastq.ReaderError!usize {
         var cursor: usize = 0;
 
         while (cursor < data.len) {
@@ -258,7 +265,7 @@ pub const Scanner = struct {
         self: *Scanner,
         data: []const u8,
         header_line_bytes: ?usize,
-    ) parse_error.ReaderError!usize {
+    ) fastq.ReaderError!usize {
         if (data.len == 0) return 0;
         if (data[0] != '@') {
             self.disableFast();
@@ -323,7 +330,7 @@ pub const Scanner = struct {
         }
     }
 
-    fn feedSlow(self: *Scanner, data: []const u8) parse_error.ReaderError!usize {
+    fn feedSlow(self: *Scanner, data: []const u8) fastq.ReaderError!usize {
         var pos: usize = 0;
 
         while (pos < data.len) {
@@ -368,7 +375,7 @@ pub const Scanner = struct {
         }
     }
 
-    fn consumeLineBytes(self: *Scanner, bytes: []const u8) parse_error.ReaderError!void {
+    fn consumeLineBytes(self: *Scanner, bytes: []const u8) fastq.ReaderError!void {
         if (bytes.len == 0) return;
         if (self.line_raw_len == 0) self.line_first_byte = bytes[0];
         self.line_raw_len = std.math.add(usize, self.line_raw_len, bytes.len) catch
@@ -380,7 +387,7 @@ pub const Scanner = struct {
         }
     }
 
-    fn finishLine(self: *Scanner, terminated_by_lf: bool) parse_error.ReaderError!void {
+    fn finishLine(self: *Scanner, terminated_by_lf: bool) fastq.ReaderError!void {
         const had_cr = terminated_by_lf and
             self.line_raw_len > 0 and
             self.line_last_byte == '\r';
@@ -425,17 +432,17 @@ pub const Scanner = struct {
 
     fn structuralError(
         self: *Scanner,
-        err: structure.Error,
+        err: fastq.Error,
         offset: u64,
-    ) parse_error.ReaderError {
-        const details = structure.diagnostic(err);
+    ) fastq.ReaderError {
+        const details = fastq.diagnostic(err);
         self.storeError(details.code, details.message, details.line, offset);
         return err;
     }
 
     fn storeError(
         self: *Scanner,
-        code: parse_error.LintCode,
+        code: fastq.LintCode,
         message: []const u8,
         line: u3,
         offset: u64,
@@ -486,18 +493,21 @@ fn headerLineBytesAt(data: []const u8) ?usize {
     return rel + 1;
 }
 
+/// Counts all records in one slice and replaces `scanner` with the final state.
+///
+/// Structural failures leave details in `scanner` for `takeLastError`.
 pub fn countSlice(
     data: []const u8,
     options: Options,
     scanner: *Scanner,
-) parse_error.ReaderError!u64 {
+) fastq.ReaderError!u64 {
     scanner.* = Scanner.init(options);
     _ = try scanner.feed(data);
     try scanner.finishEof();
     return scanner.record_index;
 }
 
-test "DenseLayout construction: precomputes complete record offsets" {
+test "[unit] - [dense layout]: construction derives complete record offsets" {
     const layout = DenseLayout.fromRecordEnd(11, 2).?;
 
     try std.testing.expect(layout.sequence_start == 3);
@@ -508,7 +518,7 @@ test "DenseLayout construction: precomputes complete record offsets" {
     try std.testing.expect(layout.record_stride == 11);
 }
 
-test "DenseLayout construction: rejects impossible geometry" {
+test "[failure] - [dense layout]: construction rejects impossible geometry" {
     const max = std.math.maxInt(usize);
 
     try std.testing.expect(DenseLayout.fromRecordEnd(0, 0) == null);
@@ -516,7 +526,7 @@ test "DenseLayout construction: rejects impossible geometry" {
     try std.testing.expect(DenseLayout.fromRecordEnd(max, max) == null);
 }
 
-test "header scan: reports indexed boundaries and exceptional forms" {
+test "[edge] - [header scan]: indexed boundaries and exceptional forms are exact" {
     var data: [130]u8 = undefined;
     @memset(&data, 'H');
     data[0] = '@';

@@ -1,4 +1,4 @@
-//! Product build: z-fastq exe (ReleaseFast + strip by default) and unit tests.
+//! Build graph for z-fastq.
 
 const std = @import("std");
 
@@ -47,35 +47,26 @@ pub fn build(b: *std.Build) void {
         .{ .name = "z-fastq", .module = lib_module },
     };
 
-    const root_test_module = b.createModule(.{
-        .root_source_file = b.path("tests/root_test.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &import_lib,
-    });
-
     const reader_test_module = b.createModule(.{
-        .root_source_file = b.path("tests/reader_test.zig"),
+        .root_source_file = b.path("tests/test_reader.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &import_lib,
     });
 
     const writer_test_module = b.createModule(.{
-        .root_source_file = b.path("tests/writer_test.zig"),
+        .root_source_file = b.path("tests/test_writer.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &import_lib,
     });
 
     const count_test_module = b.createModule(.{
-        .root_source_file = b.path("tests/count_test.zig"),
+        .root_source_file = b.path("tests/test_count.zig"),
         .target = target,
         .optimize = optimize,
     });
     count_test_module.link_libc = true;
-
-    const run_root_test = b.addRunArtifact(b.addTest(.{ .root_module = root_test_module }));
 
     const run_reader_test = b.addRunArtifact(b.addTest(.{ .root_module = reader_test_module }));
     const run_writer_test = b.addRunArtifact(b.addTest(.{ .root_module = writer_test_module }));
@@ -84,7 +75,6 @@ pub fn build(b: *std.Build) void {
     run_count_test.step.dependOn(b.getInstallStep());
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_root_test.step);
     test_step.dependOn(&run_reader_test.step);
     test_step.dependOn(&run_writer_test.step);
     test_step.dependOn(&run_count_test.step);

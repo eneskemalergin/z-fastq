@@ -1,9 +1,9 @@
-//! Unit tests for `fastq.Writer`.
+//! Writer and plain output-adapter contracts.
 
 const std = @import("std");
 const zfastq = @import("z-fastq");
 
-test "writer: serializes supported records with LF endings" {
+test "[unit] - [writer]: supported records use exact LF serialization" {
     const cases = [_]struct {
         record: zfastq.Record,
         expected: []const u8,
@@ -51,7 +51,7 @@ test "writer: serializes supported records with LF endings" {
     }
 }
 
-test "writer: rejects structurally invalid records before writing" {
+test "[failure] - [writer]: invalid fields are rejected before output" {
     const cases = [_]zfastq.Record{
         .{ .header = "r", .id = "r", .sequence = "AA", .plus = "", .quality = "!" },
         .{ .header = "r\nnext", .id = "r", .sequence = "A", .plus = "", .quality = "!" },
@@ -74,7 +74,7 @@ test "writer: rejects structurally invalid records before writing" {
     }
 }
 
-test "writer: round-trip preserves record fields" {
+test "[integration] - [writer]: serialized fields round-trip through Reader" {
     const input =
         \\@read3 lane=1
         \\AAAA
@@ -103,7 +103,7 @@ test "writer: round-trip preserves record fields" {
     try std.testing.expectEqualStrings(parsed.quality, round.quality);
 }
 
-test "writer: generated valid fields round-trip through Reader" {
+test "[property] - [writer]: generated valid fields round-trip through Reader" {
     var prng = std.Random.DefaultPrng.init(0xbb67ae8584caa73b);
     const random = prng.random();
 
@@ -172,7 +172,7 @@ test "writer: generated valid fields round-trip through Reader" {
     }
 }
 
-test "plain adapters: file sink writes and flushes after init return" {
+test "[integration] - [file sink]: writes and flushes after init returns" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -196,7 +196,7 @@ test "plain adapters: file sink writes and flushes after init return" {
     try std.testing.expectEqualStrings("@read1\nACGT\n+\n!!!!\n", actual[0..n]);
 }
 
-test "plain adapters: reader and writer wrappers preserve bytes" {
+test "[integration] - [plain adapters]: standard reader and writer preserve bytes" {
     const input = "@r\nA\n+\n!\n";
     var fixed_reader = std.Io.Reader.fixed(input);
     var reader_source = zfastq.io.plain.ReaderSource.init(&fixed_reader);
@@ -213,7 +213,7 @@ test "plain adapters: reader and writer wrappers preserve bytes" {
     try std.testing.expectEqualStrings(input, fixed_writer.buffered());
 }
 
-test "plain adapters: file source reads through Reader" {
+test "[integration] - [file source]: supplies records to Reader" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -230,7 +230,7 @@ test "plain adapters: file source reads through Reader" {
     try std.testing.expectEqualStrings("AC", parsed.sequence);
 }
 
-test "writer: propagates capacity and sink failures" {
+test "[failure] - [writer]: capacity and sink failures propagate" {
     var tiny: [3]u8 = undefined;
     var slice_sink = zfastq.io.plain.SliceSink.init(&tiny);
     var slice_writer = zfastq.Writer.init(slice_sink.byteSink());
@@ -249,7 +249,17 @@ test "writer: propagates capacity and sink failures" {
     try std.testing.expectError(error.WriteFailed, failing_writer.flush());
 }
 
-test "writer: owns the ByteSink wrapper value" {
+test "[unit] - [byte sink]: flush succeeds when the sink has no flush callback" {
+    var sink_state = NoFlushSink{};
+    const sink = sink_state.byteSink();
+
+    try sink.write("abc");
+    try sink.flush();
+
+    try std.testing.expectEqual(@as(usize, 3), sink_state.bytes_written);
+}
+
+test "[unit] - [writer]: the ByteSink wrapper is copied by value" {
     var original_buf: [32]u8 = undefined;
     var replacement_buf: [32]u8 = undefined;
     var original = zfastq.io.plain.SliceSink.init(&original_buf);
@@ -289,5 +299,20 @@ const FailingSink = struct {
     fn flush(ctx: *anyopaque) error{WriteFailed}!void {
         _ = ctx;
         return error.WriteFailed;
+    }
+};
+
+const NoFlushSink = struct {
+    bytes_written: usize = 0,
+
+    fn byteSink(self: *NoFlushSink) zfastq.io.ByteSink {
+        return .{ .vtable = &vtable, .ctx = self };
+    }
+
+    const vtable = zfastq.io.ByteSink.VTable{ .write = write };
+
+    fn write(ctx: *anyopaque, data: []const u8) error{WriteFailed}!void {
+        const self: *NoFlushSink = @ptrCast(@alignCast(ctx));
+        self.bytes_written += data.len;
     }
 };
