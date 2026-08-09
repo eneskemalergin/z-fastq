@@ -643,9 +643,9 @@ fn decodeDynamicFast(
     const input = d.input.buffered();
     if (input.len < DYNAMIC_FAST_INPUT_BYTES) return .input_boundary;
 
-    var input_pos: usize = @sizeOf(u64);
+    var input_pos: usize = @sizeOf(u64) - 1;
     var bit_buffer = std.mem.readInt(u64, input[0..@sizeOf(u64)], .little) >> d.consumed_bits;
-    var bit_count: u7 = @as(u7, 64) - d.consumed_bits;
+    var bit_count: u7 = @as(u7, 56) - d.consumed_bits;
     var output_pos = w.end;
     var output_remaining = remaining.*;
     const lit_dec = &d.lit_dec;
@@ -664,7 +664,7 @@ fn decodeDynamicFast(
         input.len - input_pos >= 8)
     {
         if (builtin.is_test) d.fast_iterations += 1;
-        refillDynamicBits(input, &input_pos, &bit_buffer, &bit_count, 15);
+        refillDynamicBits(input, &input_pos, &bit_buffer, &bit_count);
         const literal_token = try lit_dec.find(@truncate(bit_buffer));
         bit_buffer >>= @intCast(literal_token.code_bits);
         bit_count -= literal_token.code_bits;
@@ -678,21 +678,16 @@ fn decodeDynamicFast(
         if (literal_token.operation == .end) return .end_block;
 
         const length = literal_token.value + takeDynamicBits(
-            input,
-            &input_pos,
             &bit_buffer,
             &bit_count,
             literal_token.extraBits(),
         );
 
-        refillDynamicBits(input, &input_pos, &bit_buffer, &bit_count, 15);
         const distance_token = try dst_dec.find(@truncate(bit_buffer));
         bit_buffer >>= @intCast(distance_token.code_bits);
         bit_count -= distance_token.code_bits;
 
         const distance = distance_token.value + takeDynamicBits(
-            input,
-            &input_pos,
             &bit_buffer,
             &bit_count,
             distance_token.extra_bits,
@@ -716,24 +711,21 @@ inline fn refillDynamicBits(
     input_pos: *usize,
     bit_buffer: *u64,
     bit_count: *u7,
-    needed: u4,
 ) void {
-    if (bit_count.* >= needed) return;
-    assert(input.len - input_pos.* >= @sizeOf(u32));
-    const word = std.mem.readInt(u32, input[input_pos.*..][0..@sizeOf(u32)], .little);
-    bit_buffer.* |= @as(u64, word) << @intCast(bit_count.*);
-    bit_count.* += 32;
-    input_pos.* += @sizeOf(u32);
+    assert(bit_count.* < 64);
+    assert(input.len - input_pos.* >= @sizeOf(u64));
+    const word = std.mem.readInt(u64, input[input_pos.*..][0..@sizeOf(u64)], .little);
+    bit_buffer.* |= word << @intCast(bit_count.*);
+    const refill_bytes: u4 = @intCast((64 - bit_count.*) / 8);
+    input_pos.* += refill_bytes;
+    bit_count.* += @as(u7, refill_bytes) * 8;
 }
 
 inline fn takeDynamicBits(
-    input: []const u8,
-    input_pos: *usize,
     bit_buffer: *u64,
     bit_count: *u7,
     count: u4,
 ) u16 {
-    refillDynamicBits(input, input_pos, bit_buffer, bit_count, count);
     const mask = @shlExact(@as(u16, 1), count) - 1;
     const value: u16 = @intCast(bit_buffer.* & mask);
     bit_buffer.* >>= @intCast(count);
