@@ -1,7 +1,8 @@
 //! CLI entry and subcommand dispatcher for z-fastq.
 
 const std = @import("std");
-const zfastq = @import("z-fastq");
+const zfastq = @import("root.zig");
+const io_layer = @import("io.zig");
 
 const USAGE =
     \\usage: z-fastq <command> [options] [args...]
@@ -257,13 +258,41 @@ fn countInput(
             var gzip_reader = file.readerStreaming(io, &gzip_buffer);
             gzip_reader.pos = 2;
             gzip_reader.interface.end = 2;
-            var gzip_source = zfastq.io.gzip.ReaderSource.init(&gzip_reader.interface);
-            return countSource(io, label, gzip_source.byteSource(), options);
+            var gzip_source = io_layer.GzipSource.init(&gzip_reader.interface);
+            return countGzipSource(io, label, &gzip_source, options);
         }
     }
 
     var plain_source = zfastq.io.plain.ReaderSource.init(&sniff_reader.interface);
     return countSource(io, label, plain_source.byteSource(), options);
+}
+
+fn countGzipSource(
+    io: std.Io,
+    label: []const u8,
+    source: *io_layer.GzipSource,
+    options: CountOptions,
+) CountError!u64 {
+    const scan_options = zfastq.count_scan.Options{
+        .max_line_bytes = options.max_line_bytes,
+    };
+    var scanner = zfastq.count_scan.Scanner.init(scan_options);
+    var decompressor_buffer: [
+        std.compress.flate.history_len +
+            zfastq.limits.COUNT_READ_BUFFER_BYTES
+    ]u8 = undefined;
+    while (io_layer.readGzipChunk(source, &decompressor_buffer) catch {
+        printPathError(io, label, "I/O error");
+        return error.Io;
+    }) |decoded| {
+        _ = scanner.feed(decoded) catch |err| {
+            return mapScanError(io, label, &scanner, err);
+        };
+    }
+    scanner.finishEof() catch |err| {
+        return mapScanError(io, label, &scanner, err);
+    };
+    return scanner.record_index;
 }
 
 fn countSource(
