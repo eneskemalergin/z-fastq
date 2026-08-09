@@ -3,12 +3,63 @@
 const std = @import("std");
 const zfastq = @import("z-fastq");
 
+const GZIP_OPTIONAL_X = [_]u8{
+    0x1f, 0x8b, 0x08, 0x1e, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+    0x02, 0x00, 'x',  'y',  'n',  0x00, 'c',  0x00, 0xca, 0x4e,
+    0x01, 0x01, 0x00, 0xfe, 0xff, 'x',  0x83, 0x16, 0xdc, 0x8c,
+    0x01, 0x00, 0x00, 0x00,
+};
+
 test "[unit] - [root]: every exported declaration is analyzable" {
     std.testing.refAllDecls(zfastq);
 }
 
 test "[unit] - [root]: version exposes the current internal checkpoint" {
-    try std.testing.expectEqualStrings("0.0.3", zfastq.VERSION);
+    try std.testing.expectEqualStrings("0.0.4", zfastq.VERSION);
+}
+
+test "[property] - [gzip source]: optional member chains decode at every input chunk size" {
+    const gzip_xx = GZIP_OPTIONAL_X ++ GZIP_OPTIONAL_X;
+
+    for (1..gzip_xx.len + 1) |chunk_len| {
+        var input_buffer: [10]u8 = undefined;
+        var input = FragmentReader.init(&gzip_xx, chunk_len, &input_buffer);
+        try std.testing.expectEqualSlices(u8, gzip_xx[0..2], try input.interface.peek(2));
+        var gzip = zfastq.io.gzip.ReaderSource.init(&input.interface);
+        const source = gzip.byteSource();
+        var output: [2]u8 = undefined;
+
+        try std.testing.expectEqual(@as(usize, 2), try source.read(&output));
+        try std.testing.expectEqualStrings("xx", &output);
+        try std.testing.expectEqual(@as(usize, 0), try source.read(&output));
+    }
+}
+
+test "[failure] - [gzip source]: a read failure after decoded output propagates" {
+    var input_buffer: [10]u8 = undefined;
+    var input = FragmentReader.init(&GZIP_OPTIONAL_X, 1, &input_buffer);
+    input.fail_at = GZIP_OPTIONAL_X.len - 4;
+    var gzip = zfastq.io.gzip.ReaderSource.init(&input.interface);
+    const source = gzip.byteSource();
+    var output: [1]u8 = undefined;
+
+    try std.testing.expectEqual(@as(usize, 1), try source.read(&output));
+    try std.testing.expectEqualStrings("x", &output);
+    try std.testing.expectError(error.ReadFailed, source.read(&output));
+}
+
+test "[property] - [input detection]: a one-byte first read replays plain prefix bytes" {
+    const data = "@r\nA\n+\n!\n";
+    var input_buffer: [2]u8 = undefined;
+    var input = FragmentReader.init(data, 1, &input_buffer);
+
+    try std.testing.expectEqualSlices(u8, data[0..2], try input.interface.peek(2));
+    var plain = zfastq.io.plain.ReaderSource.init(&input.interface);
+    const source = plain.byteSource();
+    var output: [data.len]u8 = undefined;
+
+    try std.testing.expectEqual(data.len, try source.read(&output));
+    try std.testing.expectEqualStrings(data, &output);
 }
 
 test "[unit] - [lint code]: every implemented code has its stable tag" {
@@ -888,6 +939,51 @@ const ChunkSource = struct {
         @memcpy(dest[0..n], self.data[self.pos..][0..n]);
         self.pos += n;
         return n;
+    }
+};
+
+const FragmentReader = struct {
+    interface: std.Io.Reader,
+    data: []const u8,
+    pos: usize = 0,
+    chunk_len: usize,
+    fail_at: ?usize = null,
+
+    fn init(
+        data: []const u8,
+        chunk_len: usize,
+        buffer: []u8,
+    ) FragmentReader {
+        return .{
+            .interface = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .data = data,
+            .chunk_len = chunk_len,
+        };
+    }
+
+    fn stream(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const self: *FragmentReader = @alignCast(@fieldParentPtr("interface", reader));
+        if (self.pos == self.data.len) return error.EndOfStream;
+        const before_failure = if (self.fail_at) |fail_at| b: {
+            if (self.pos >= fail_at) return error.ReadFailed;
+            break :b fail_at - self.pos;
+        } else self.data.len - self.pos;
+        const n = @min(
+            @intFromEnum(limit),
+            @min(self.chunk_len, @min(before_failure, self.data.len - self.pos)),
+        );
+        const written = try writer.write(self.data[self.pos..][0..n]);
+        self.pos += written;
+        return written;
     }
 };
 

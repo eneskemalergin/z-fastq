@@ -1,8 +1,9 @@
-//! Byte interfaces, limits, and plain adapters for streaming FASTQ I/O.
+//! Byte interfaces, limits, and plain or gzip adapters for streaming FASTQ I/O.
 //!
 //! Adapters and borrowed backing state must stay alive and at stable addresses while wrapped.
 
 const std = @import("std");
+const flate = std.compress.flate;
 
 const ReadError = error{ReadFailed};
 pub const WriteError = error{WriteFailed};
@@ -10,6 +11,7 @@ pub const WriteError = error{WriteFailed};
 pub const DEFAULT_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_READER_BUFFER_BYTES: usize = 256 * 1024;
 pub const COUNT_READ_BUFFER_BYTES: usize = DEFAULT_READER_BUFFER_BYTES;
+const GZIP_OPTIONAL_HEADER_BYTES_MAX: usize = 64 * 1024;
 
 /// Copied pull interface whose adapter must remain at a stable address and outlive it.
 /// A read initializes the returned prefix of the destination and returns zero only at EOF.
@@ -126,6 +128,162 @@ const FILE_SOURCE_VTABLE = ByteSource.VTable{
 fn fileSourceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     const self: *FileSource = @ptrCast(@alignCast(ctx));
     return self.file_reader.interface.readSliceShort(dest) catch error.ReadFailed;
+}
+
+// --- gzip input ---
+
+/// Streams and validates complete RFC 1952 member sequences from a borrowed reader.
+/// The reader needs at least ten buffer bytes and must share this adapter's stable lifetime.
+pub const GzipSource = struct {
+    input: *std.Io.Reader,
+    decompressor: flate.Decompress = undefined,
+    decompressor_buffer: [flate.max_window_len]u8 = undefined,
+    crc: std.hash.Crc32 = .init(),
+    size: u32 = 0,
+    state: State = .between_members,
+    member_seen: bool = false,
+
+    const State = enum {
+        between_members,
+        payload,
+        eof,
+    };
+
+    pub fn init(input: *std.Io.Reader) GzipSource {
+        return .{ .input = input };
+    }
+
+    pub fn byteSource(self: *GzipSource) ByteSource {
+        return .{
+            .vtable = &GZIP_VTABLE,
+            .ctx = self,
+        };
+    }
+
+    fn read(self: *GzipSource, dest: []u8) ReadError!usize {
+        var written: usize = 0;
+        while (written < dest.len) {
+            switch (self.state) {
+                .eof => return written,
+                .between_members => {
+                    self.beginMember() catch |err| switch (err) {
+                        error.EndOfStream => {
+                            if (!self.member_seen) return error.ReadFailed;
+                            self.state = .eof;
+                            return written;
+                        },
+                        error.ReadFailed => return error.ReadFailed,
+                    };
+                },
+                .payload => {
+                    const n = self.decompressor.reader.readSliceShort(dest[written..]) catch
+                        return error.ReadFailed;
+                    const decoded = dest[written..][0..n];
+                    self.crc.update(decoded);
+                    self.size +%= @truncate(n);
+                    written += n;
+                    if (written == dest.len) return written;
+
+                    self.finishMember() catch return error.ReadFailed;
+                    self.state = .between_members;
+                },
+            }
+        }
+        return written;
+    }
+
+    fn beginMember(self: *GzipSource) std.Io.Reader.Error!void {
+        _ = self.input.peekByte() catch |err| return err;
+        self.parseHeader() catch return error.ReadFailed;
+
+        self.decompressor = .init(self.input, .raw, &self.decompressor_buffer);
+        self.crc = .init();
+        self.size = 0;
+        self.state = .payload;
+        self.member_seen = true;
+    }
+
+    fn parseHeader(self: *GzipSource) std.Io.Reader.Error!void {
+        const fixed = try self.input.takeArray(10);
+        var header_crc: std.hash.Crc32 = .init();
+        header_crc.update(fixed);
+        if (fixed[0] != 0x1f or fixed[1] != 0x8b or fixed[2] != 8) {
+            return error.ReadFailed;
+        }
+
+        const flags = fixed[3];
+        if (flags & 0xe0 != 0) return error.ReadFailed;
+        var optional_bytes: usize = 0;
+
+        if (flags & 0x04 != 0) {
+            try reserveOptionalBytes(&optional_bytes, 2);
+            const length_bytes = try self.input.takeArray(2);
+            header_crc.update(length_bytes);
+            const length = std.mem.readInt(u16, length_bytes, .little);
+            try self.consumeHeaderBytes(length, &optional_bytes, &header_crc);
+        }
+        if (flags & 0x08 != 0) {
+            try self.consumeHeaderString(&optional_bytes, &header_crc);
+        }
+        if (flags & 0x10 != 0) {
+            try self.consumeHeaderString(&optional_bytes, &header_crc);
+        }
+        if (flags & 0x02 != 0) {
+            try reserveOptionalBytes(&optional_bytes, 2);
+            const expected = try self.input.takeInt(u16, .little);
+            if (expected != @as(u16, @truncate(header_crc.final()))) {
+                return error.ReadFailed;
+            }
+        }
+    }
+
+    fn consumeHeaderBytes(
+        self: *GzipSource,
+        count: usize,
+        optional_bytes: *usize,
+        crc: *std.hash.Crc32,
+    ) std.Io.Reader.Error!void {
+        try reserveOptionalBytes(optional_bytes, count);
+        for (0..count) |_| {
+            const byte = try self.input.takeByte();
+            crc.update(&.{byte});
+        }
+    }
+
+    fn consumeHeaderString(
+        self: *GzipSource,
+        optional_bytes: *usize,
+        crc: *std.hash.Crc32,
+    ) std.Io.Reader.Error!void {
+        while (true) {
+            try reserveOptionalBytes(optional_bytes, 1);
+            const byte = try self.input.takeByte();
+            crc.update(&.{byte});
+            if (byte == 0) return;
+        }
+    }
+
+    fn finishMember(self: *GzipSource) std.Io.Reader.Error!void {
+        const expected_crc = try self.input.takeInt(u32, .little);
+        const expected_size = try self.input.takeInt(u32, .little);
+        if (expected_crc != self.crc.final() or expected_size != self.size) {
+            return error.ReadFailed;
+        }
+    }
+};
+
+const GZIP_VTABLE = ByteSource.VTable{
+    .read = gzipRead,
+};
+
+fn gzipRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
+    const self: *GzipSource = @ptrCast(@alignCast(ctx));
+    return self.read(dest);
+}
+
+fn reserveOptionalBytes(count: *usize, amount: usize) std.Io.Reader.Error!void {
+    if (amount > GZIP_OPTIONAL_HEADER_BYTES_MAX - count.*) return error.ReadFailed;
+    count.* += amount;
 }
 
 pub const SliceSink = struct {

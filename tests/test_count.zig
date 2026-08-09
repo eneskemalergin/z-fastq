@@ -12,7 +12,7 @@ const EXPECTED_USAGE =
     \\usage: z-fastq <command> [options] [args...]
     \\
     \\Commands:
-    \\  count    Count records in plain FASTQ inputs
+    \\  count    Count records in plain or gzip FASTQ inputs
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -74,6 +74,94 @@ const FIXTURES = [_]FixtureExpect{
 
 fn fixturePath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ FIXTURE_DIR, name });
+}
+
+const GzipOptions = struct {
+    extra: []const u8 = "",
+    name: ?[]const u8 = null,
+    comment: ?[]const u8 = null,
+    header_crc: bool = false,
+};
+
+fn appendInt(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    value: T,
+) !void {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, value, .little);
+    try output.appendSlice(allocator, &bytes);
+}
+
+fn appendGzipMember(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    payload: []const u8,
+    options: GzipOptions,
+) !void {
+    if (payload.len > std.math.maxInt(u16) or options.extra.len > std.math.maxInt(u16)) {
+        return error.TestFixtureTooLarge;
+    }
+
+    var flags: u8 = 0;
+    if (options.header_crc) flags |= 0x02;
+    if (options.extra.len != 0) flags |= 0x04;
+    if (options.name != null) flags |= 0x08;
+    if (options.comment != null) flags |= 0x10;
+
+    const header_start = output.items.len;
+    try output.appendSlice(allocator, &.{
+        0x1f, 0x8b, 0x08, flags, 0, 0, 0, 0, 0, 0xff,
+    });
+    if (options.extra.len != 0) {
+        try appendInt(u16, allocator, output, @intCast(options.extra.len));
+        try output.appendSlice(allocator, options.extra);
+    }
+    if (options.name) |name| {
+        try output.appendSlice(allocator, name);
+        try output.append(allocator, 0);
+    }
+    if (options.comment) |comment| {
+        try output.appendSlice(allocator, comment);
+        try output.append(allocator, 0);
+    }
+    if (options.header_crc) {
+        var crc: std.hash.Crc32 = .init();
+        crc.update(output.items[header_start..]);
+        try appendInt(u16, allocator, output, @truncate(crc.final()));
+    }
+
+    try output.append(allocator, 0x01);
+    try appendInt(u16, allocator, output, @intCast(payload.len));
+    try appendInt(u16, allocator, output, ~@as(u16, @intCast(payload.len)));
+    try output.appendSlice(allocator, payload);
+
+    var payload_crc: std.hash.Crc32 = .init();
+    payload_crc.update(payload);
+    try appendInt(u32, allocator, output, payload_crc.final());
+    try appendInt(u32, allocator, output, @truncate(payload.len));
+}
+
+fn runCountBytes(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    bytes: []const u8,
+) !CommandResult {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const file = try tmp.dir.createFile(io, name, .{});
+        defer file.close(io);
+        try std.Io.File.writeStreamingAll(file, io, bytes);
+    }
+    const path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/tmp/{s}/{s}",
+        .{ tmp.sub_path, name },
+    );
+    return runCount(allocator, path);
 }
 
 fn runCount(
@@ -248,6 +336,129 @@ test "[cli] - [count]: files and fragmented stdin produce exact fixture results"
     }
 }
 
+test "[cli] - [count]: bytes select plain or chained gzip independently of suffix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var gzip: std.ArrayList(u8) = .empty;
+
+    try appendGzipMember(allocator, &gzip, "", .{});
+    try appendGzipMember(allocator, &gzip, "@a\nA\n", .{
+        .extra = "xy",
+        .name = "reads.fastq",
+        .comment = "fixture",
+        .header_crc = true,
+    });
+    try appendGzipMember(allocator, &gzip, "+\n!\n@b\nTT\n+name\n##\n", .{});
+
+    const file_result = try runCountBytes(allocator, "reads.bin", gzip.items);
+    const plain_result = try runCountBytes(
+        allocator,
+        "plain.fastq.gz",
+        "@plain\nA\n+\n!\n",
+    );
+    const stdin_result = try runCliWithStdin(
+        allocator,
+        &.{ "count", "-" },
+        gzip.items,
+        1,
+    );
+
+    for ([_]CommandResult{ file_result, stdin_result }) |result| {
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expectEqualStrings("2\n", result.stdout);
+        try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
+    }
+    try std.testing.expectEqual(@as(u8, 0), plain_result.exit_code);
+    try std.testing.expectEqualStrings("1\n", plain_result.stdout);
+    try std.testing.expectEqual(@as(usize, 0), plain_result.stderr.len);
+}
+
+test "[cli] - [count]: damaged gzip framing and member data exit as I/O" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var valid: std.ArrayList(u8) = .empty;
+    try appendGzipMember(allocator, &valid, "@r\nA\n+\n!\n", .{});
+
+    const method = try allocator.dupe(u8, valid.items);
+    method[2] = 0;
+    const reserved = try allocator.dupe(u8, valid.items);
+    reserved[3] = 0x20;
+    const deflate = try allocator.dupe(u8, valid.items);
+    deflate[10] = 0x07;
+    const checksum = try allocator.dupe(u8, valid.items);
+    checksum[checksum.len - 8] ^= 1;
+    const size = try allocator.dupe(u8, valid.items);
+    size[size.len - 4] ^= 1;
+
+    var with_header_crc: std.ArrayList(u8) = .empty;
+    try appendGzipMember(allocator, &with_header_crc, "@r\nA\n+\n!\n", .{
+        .header_crc = true,
+    });
+    with_header_crc.items[10] ^= 1;
+
+    var damaged_later: std.ArrayList(u8) = .empty;
+    try damaged_later.appendSlice(allocator, valid.items);
+    try damaged_later.appendSlice(allocator, &.{ 0x1f, 0x8b, 0x08 });
+
+    const cases = [_][]const u8{
+        method,
+        reserved,
+        deflate,
+        checksum,
+        size,
+        with_header_crc.items,
+        valid.items[0..9],
+        valid.items[0..12],
+        valid.items[0 .. valid.items.len - 1],
+        damaged_later.items,
+    };
+    for (cases) |bytes| {
+        const result = try runCliWithStdin(allocator, &.{ "count", "-" }, bytes, 1);
+        try std.testing.expectEqual(@as(u8, 3), result.exit_code);
+        try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+        try std.testing.expectEqualStrings("error: -: I/O error\n", result.stderr);
+    }
+}
+
+test "[cli] - [count]: gzip optional headers enforce the documented byte limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const maximum_name = try allocator.alloc(u8, 64 * 1024 - 1);
+    @memset(maximum_name, 'a');
+    var maximum: std.ArrayList(u8) = .empty;
+    try appendGzipMember(allocator, &maximum, "@r\nA\n+\n!\n", .{
+        .name = maximum_name,
+    });
+    const accepted = try runCliWithStdin(
+        allocator,
+        &.{ "count", "-" },
+        maximum.items,
+        37,
+    );
+
+    var oversized: std.ArrayList(u8) = .empty;
+    try oversized.appendSlice(allocator, &.{
+        0x1f, 0x8b, 0x08, 0x08, 0, 0, 0, 0, 0, 0xff,
+    });
+    try oversized.appendNTimes(allocator, 'a', 64 * 1024 + 1);
+    const rejected = try runCliWithStdin(
+        allocator,
+        &.{ "count", "-" },
+        oversized.items,
+        37,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), accepted.exit_code);
+    try std.testing.expectEqualStrings("1\n", accepted.stdout);
+    try std.testing.expectEqual(@as(usize, 0), accepted.stderr.len);
+    try std.testing.expectEqual(@as(u8, 3), rejected.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), rejected.stdout.len);
+    try std.testing.expectEqualStrings("error: -: I/O error\n", rejected.stderr);
+}
+
 test "[cli] - [count]: empty and over-limit stdin preserve exit classes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -412,7 +623,7 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
 
     const version = try runCli(allocator, &.{"--version"});
     try std.testing.expectEqual(@as(u8, 0), version.exit_code);
-    try std.testing.expectEqualStrings("z-fastq 0.0.3\n", version.stdout);
+    try std.testing.expectEqualStrings("z-fastq 0.0.4\n", version.stdout);
     try std.testing.expectEqual(@as(usize, 0), version.stderr.len);
 
     const short_version = try runCli(allocator, &.{"-V"});

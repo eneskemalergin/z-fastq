@@ -26,6 +26,9 @@ pub const io = struct {
         pub const WriterSink = io_layer.WriterSink;
         pub const FileSink = io_layer.FileSink;
     };
+    pub const gzip = struct {
+        pub const ReaderSource = io_layer.GzipSource;
+    };
 };
 
 const Limits = struct {
@@ -37,4 +40,4 @@ const Limits = struct {
 pub const limits = Limits;
 pub const count_scan = @import("count_scan.zig");
 
-pub const VERSION = "0.0.3";
+pub const VERSION = "0.0.4";

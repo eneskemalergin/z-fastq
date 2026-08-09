@@ -7,7 +7,7 @@ const USAGE =
     \\usage: z-fastq <command> [options] [args...]
     \\
     \\Commands:
-    \\  count    Count records in plain FASTQ inputs
+    \\  count    Count records in plain or gzip FASTQ inputs
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -226,25 +226,52 @@ fn countFile(
     };
     defer file.close(io);
 
-    return countPlainInput(io, path, file, options);
+    return countInput(io, path, file, options);
 }
 
 fn countStdin(io: std.Io, options: CountOptions) CountError!u64 {
-    return countPlainInput(io, "-", std.Io.File.stdin(), options);
+    return countInput(io, "-", std.Io.File.stdin(), options);
 }
 
-fn countPlainInput(
+fn countInput(
     io: std.Io,
     label: []const u8,
     file: std.Io.File,
     options: CountOptions,
 ) CountError!u64 {
-    // A zero-byte reader buffer avoids duplicating the scanner's input buffer.
-    var reader_buffer: [0]u8 = .{};
-    var file_reader = file.readerStreaming(io, &reader_buffer);
-    var source_adapter = zfastq.io.plain.ReaderSource.init(&file_reader.interface);
-    const source = source_adapter.byteSource();
+    var sniff_buffer: [2]u8 = undefined;
+    var sniff_reader = file.readerStreaming(io, &sniff_buffer);
+    const prefix = sniff_reader.interface.peek(2) catch |err| switch (err) {
+        error.EndOfStream => null,
+        error.ReadFailed => {
+            printPathError(io, label, "I/O error");
+            return error.Io;
+        },
+    };
 
+    if (prefix) |bytes| {
+        if (std.mem.eql(u8, bytes, &.{ 0x1f, 0x8b })) {
+            var gzip_buffer: [64 * 1024]u8 = undefined;
+            // The gzip reader must replay the magic consumed by the sniff reader.
+            @memcpy(gzip_buffer[0..2], bytes);
+            var gzip_reader = file.readerStreaming(io, &gzip_buffer);
+            gzip_reader.pos = 2;
+            gzip_reader.interface.end = 2;
+            var gzip_source = zfastq.io.gzip.ReaderSource.init(&gzip_reader.interface);
+            return countSource(io, label, gzip_source.byteSource(), options);
+        }
+    }
+
+    var plain_source = zfastq.io.plain.ReaderSource.init(&sniff_reader.interface);
+    return countSource(io, label, plain_source.byteSource(), options);
+}
+
+fn countSource(
+    io: std.Io,
+    label: []const u8,
+    source: zfastq.io.ByteSource,
+    options: CountOptions,
+) CountError!u64 {
     const scan_options = zfastq.count_scan.Options{
         .max_line_bytes = options.max_line_bytes,
     };
