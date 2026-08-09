@@ -152,6 +152,7 @@ test "[failure] - [reader]: an invalid plus line reports S001 at its start" {
     try std.testing.expectEqual(@as(u64, 0), details.record_index);
     try std.testing.expectEqual(@as(u3, 3), details.line_in_record);
     try std.testing.expectEqual(@as(u64, 10), details.byte_offset);
+    try std.testing.expect(reader.takeLastError() == null);
 }
 
 test "[property] - [reader]: borrowed fields survive every fixed short-read size" {
@@ -273,6 +274,29 @@ test "[unit] - [owned record]: copied fields remain stable after Reader advances
     try std.testing.expectEqualStrings("one", owned.header);
     try std.testing.expectEqualStrings("AAAA", owned.sequence);
     try std.testing.expectEqualStrings("!!!!", owned.quality);
+}
+
+test "[failure] - [reader]: initialization releases partial allocations" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        initReaderForAllocationCheck,
+        .{"@r\nA\n+\n!\n"},
+    );
+}
+
+test "[failure] - [owned record]: conversion releases partial allocations" {
+    const record = zfastq.Record{
+        .header = "read comment",
+        .id = "read",
+        .sequence = "ACGT",
+        .plus = "read comment",
+        .quality = "!!!!",
+    };
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        ownRecordForAllocationCheck,
+        .{record},
+    );
 }
 
 test "[failure] - [reader]: source read failure propagates" {
@@ -558,6 +582,7 @@ test "[property] - [parser]: structural details agree across chunk sizes" {
             }
             const reader_details = reader.takeLastError().?;
             try expectDetails(reader_details, case.code, 0, case.line, case.offset);
+            try std.testing.expect(reader.takeLastError() == null);
 
             var scan = zfastq.count_scan.Scanner.init(.{});
             var pos: usize = 0;
@@ -579,6 +604,7 @@ test "[property] - [parser]: structural details agree across chunk sizes" {
             try std.testing.expectEqual(case.expected_error, scan_error.?);
             const scan_details = scan.takeLastError().?;
             try expectDetails(scan_details, case.code, 0, case.line, case.offset);
+            try std.testing.expect(scan.takeLastError() == null);
         }
     }
 }
@@ -935,6 +961,17 @@ fn expectDetails(
     try std.testing.expectEqual(record_index, details.record_index);
     try std.testing.expectEqual(line, details.line_in_record);
     try std.testing.expectEqual(offset, details.byte_offset);
+}
+
+fn initReaderForAllocationCheck(allocator: std.mem.Allocator, data: []const u8) !void {
+    var source = zfastq.io.plain.SliceSource.init(data);
+    var reader = try zfastq.Reader.init(allocator, source.byteSource(), .{});
+    defer reader.deinit();
+}
+
+fn ownRecordForAllocationCheck(allocator: std.mem.Allocator, record: zfastq.Record) !void {
+    var owned = try zfastq.toOwned(allocator, record);
+    defer owned.deinit();
 }
 
 const ParseOutcome = struct {

@@ -7,15 +7,12 @@ const ByteSource = io_layer.ByteSource;
 const ByteSink = io_layer.ByteSink;
 const WriteError = io_layer.WriteError;
 
-/// Stable identifiers for structural failures in the supported four-line grammar.
 pub const LintCode = enum {
     s001_invalid_plus_line,
     s003_invalid_header,
     s004_truncated_record,
     s005_length_mismatch,
 };
-
-/// Structural failure details with zero-based record and byte positions and a one-based line.
 pub const ParseError = struct {
     code: LintCode,
     message: []const u8,
@@ -24,7 +21,6 @@ pub const ParseError = struct {
     line_in_record: u3,
 };
 
-/// Returns the stable ASCII tag associated with `code`.
 pub fn codeTag(code: LintCode) []const u8 {
     return switch (code) {
         .s001_invalid_plus_line => "S001",
@@ -34,7 +30,6 @@ pub fn codeTag(code: LintCode) []const u8 {
     };
 }
 
-/// Errors returned by the general reader and specialized count scanner.
 pub const ReaderError = error{
     S001InvalidPlusLine,
     S003InvalidHeader,
@@ -175,12 +170,10 @@ pub const Reader = struct {
         self.* = undefined;
     }
 
-    /// Returns the number of complete records consumed.
     pub fn recordIndex(self: *const Reader) u64 {
         return self.record_index;
     }
 
-    /// Returns the number of input bytes consumed.
     pub fn byteOffset(self: *const Reader) u64 {
         return self.byte_offset;
     }
@@ -417,7 +410,7 @@ pub const Writer = struct {
         return .{ .sink = sink };
     }
 
-    /// Validates and writes one complete record using LF line endings.
+    /// Rejects invalid fields before output; accepted records use LF line endings.
     pub fn writeRecord(self: *Writer, record: Record) WriterError!void {
         if (record.sequence.len != record.quality.len or
             !isWritableField(record.header) or

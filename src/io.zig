@@ -1,4 +1,6 @@
 //! Byte interfaces, limits, and plain adapters for streaming FASTQ I/O.
+//!
+//! Adapters and borrowed backing state must stay alive and at stable addresses while wrapped.
 
 const std = @import("std");
 
@@ -44,7 +46,6 @@ pub const ByteSink = struct {
     }
 };
 
-/// In-memory source over borrowed data; wrappers also borrow this adapter's stable address.
 pub const SliceSource = struct {
     data: []const u8,
     pos: usize = 0,
@@ -75,7 +76,6 @@ fn sliceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return copy_len;
 }
 
-/// Source over a borrowed `std.Io.Reader`; wrappers also borrow this adapter's stable address.
 pub const ReaderSource = struct {
     reader: *std.Io.Reader,
 
@@ -100,7 +100,6 @@ fn readerRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return self.reader.readSliceShort(dest) catch error.ReadFailed;
 }
 
-/// Buffered source whose borrowed file, buffer, and stable address must outlive its wrappers.
 pub const FileSource = struct {
     file_reader: std.Io.File.Reader,
 
@@ -129,7 +128,6 @@ fn fileSourceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return self.file_reader.interface.readSliceShort(dest) catch error.ReadFailed;
 }
 
-/// Fixed-capacity sink over borrowed storage; wrappers borrow this adapter's stable address.
 pub const SliceSink = struct {
     buffer: []u8,
     pos: usize = 0,
@@ -167,7 +165,6 @@ fn sliceFlush(ctx: *anyopaque) WriteError!void {
     _ = ctx;
 }
 
-/// Sink over a borrowed `std.Io.Writer`; wrappers also borrow this adapter's stable address.
 pub const WriterSink = struct {
     writer: *std.Io.Writer,
 
@@ -198,7 +195,6 @@ fn writerFlush(ctx: *anyopaque) WriteError!void {
     self.writer.flush() catch return error.WriteFailed;
 }
 
-/// Buffered sink whose borrowed file, buffer, and stable address must outlive its wrappers.
 pub const FileSink = struct {
     file_writer: std.Io.File.Writer,
 

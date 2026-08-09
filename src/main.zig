@@ -17,7 +17,7 @@ const USAGE =
     \\  --max-line-bytes N   Override default line length limit
     \\
     \\Count usage:
-    \\  z-fastq count <file.fastq> [file2.fastq ...]
+    \\  z-fastq count [--max-line-bytes N] <file.fastq> [file2.fastq ...]
     \\
 ;
 

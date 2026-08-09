@@ -15,7 +15,7 @@ const MAX_KNOWN_LAYOUTS = 8;
 const MAX_HEADER_INDEX_BYTES = 128;
 const NO_LAYOUT_INDEX = 255;
 
-// Fixed tail geometry for `+\n` plus lines: `seq\n`, `+\n`, `qual\n`.
+// Bare plus lines let the fast path derive every tail offset from the sequence length.
 const DenseLayout = struct {
     sequence_start: usize,
     sequence_end: usize,

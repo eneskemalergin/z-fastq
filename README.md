@@ -15,7 +15,7 @@ Requires Zig 0.16.0 at `./zig-0.16.0/zig` (use the `./zig` wrapper).
 ## Usage
 
 ```bash
-./zig-out/bin/z-fastq count file.fastq [file2.fastq ...]
+./zig-out/bin/z-fastq count [--max-line-bytes N] file.fastq [file2.fastq ...]
 ```
 
 Each input file prints one record count on stdout (one decimal line per file). Non-zero exit status indicates an error; parse failures include record index, line number, and byte offset on stderr.

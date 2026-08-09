@@ -8,13 +8,29 @@ const ZFASTQ_BIN = if (builtin.os.tag == .windows)
 else
     "zig-out/bin/z-fastq";
 const FIXTURE_DIR = "tests/data/synthetic";
+const EXPECTED_USAGE =
+    \\usage: z-fastq <command> [options] [args...]
+    \\
+    \\Commands:
+    \\  count    Count records in plain FASTQ files
+    \\
+    \\General options:
+    \\  -h, --help           Show this help message
+    \\  -V, --version        Print version
+    \\
+    \\Count options:
+    \\  --max-line-bytes N   Override default line length limit
+    \\
+    \\Count usage:
+    \\  z-fastq count [--max-line-bytes N] <file.fastq> [file2.fastq ...]
+    \\
+;
 
 const FixtureExpect = struct {
     path: []const u8,
     exit_code: u8,
-    stdout: ?[]const u8 = null,
-    stderr_code: ?[]const u8 = null,
-    stderr: ?[]const u8 = null,
+    stdout: []const u8 = "",
+    stderr: []const u8 = "",
 };
 
 const FIXTURES = [_]FixtureExpect{
@@ -27,9 +43,24 @@ const FIXTURES = [_]FixtureExpect{
         .stderr = "error: tests/data/synthetic/bad_plus.fastq: S001: " ++
             "plus line must start with '+' (record 0, line 3, offset 15)\n",
     },
-    .{ .path = "bad_qual_length.fastq", .exit_code = 1, .stderr_code = "S005" },
-    .{ .path = "bad_header.fastq", .exit_code = 1, .stderr_code = "S003" },
-    .{ .path = "truncated_record.fastq", .exit_code = 1, .stderr_code = "S004" },
+    .{
+        .path = "bad_qual_length.fastq",
+        .exit_code = 1,
+        .stderr = "error: tests/data/synthetic/bad_qual_length.fastq: S005: " ++
+            "sequence and quality lengths differ (record 0, line 4, offset 19)\n",
+    },
+    .{
+        .path = "bad_header.fastq",
+        .exit_code = 1,
+        .stderr = "error: tests/data/synthetic/bad_header.fastq: S003: " ++
+            "header line must start with '@' (record 0, line 1, offset 0)\n",
+    },
+    .{
+        .path = "truncated_record.fastq",
+        .exit_code = 1,
+        .stderr = "error: tests/data/synthetic/truncated_record.fastq: S004: " ++
+            "unexpected end of file in quality line (record 0, line 4, offset 17)\n",
+    },
 };
 
 fn fixturePath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
@@ -118,7 +149,7 @@ fn runCliWithClosedStdout(
     return .{ .exit_code = exit_code, .stdout = try allocator.alloc(u8, 0), .stderr = stderr };
 }
 
-test "[cli] - [count]: valid fixture files produce expected counts" {
+test "[cli] - [count]: synthetic fixtures produce exact results" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -128,17 +159,11 @@ test "[cli] - [count]: valid fixture files produce expected counts" {
         const result = try runCount(allocator, path);
 
         try std.testing.expectEqual(fixture.exit_code, result.exit_code);
-        if (fixture.stdout) |want| {
-            try std.testing.expectEqualStrings(want, result.stdout);
-        }
-        if (fixture.stderr_code) |code| {
-            try std.testing.expect(std.mem.indexOf(u8, result.stderr, code) != null);
-        }
-        if (fixture.stderr) |want| {
-            try std.testing.expectEqualStrings(want, result.stderr);
-        }
+        try std.testing.expectEqualStrings(fixture.stdout, result.stdout);
+        try std.testing.expectEqualStrings(fixture.stderr, result.stderr);
     }
 }
+
 test "[cli] - [count]: a missing input exits with I/O status" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -146,6 +171,7 @@ test "[cli] - [count]: a missing input exits with I/O status" {
 
     const result = try runCount(allocator, "tests/data/synthetic/does_not_exist.fastq");
     try std.testing.expectEqual(@as(u8, 3), result.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
     try std.testing.expectEqualStrings(
         "error: tests/data/synthetic/does_not_exist.fastq: file not found\n",
         result.stderr,
@@ -160,10 +186,15 @@ test "[cli] - [count]: a long missing path is reported without truncation" {
     @memset(path, 'x');
 
     const result = try runCount(allocator, path);
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "error: {s}: failed to open file\n",
+        .{path},
+    );
 
     try std.testing.expectEqual(@as(u8, 3), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr, path) != null);
-    try std.testing.expect(std.mem.endsWith(u8, result.stderr, ": failed to open file\n"));
+    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+    try std.testing.expectEqualStrings(expected, result.stderr);
 }
 
 test "[cli] - [count]: all paths run and the highest exit class wins" {
@@ -179,8 +210,12 @@ test "[cli] - [count]: all paths run and the highest exit class wins" {
     });
     try std.testing.expectEqual(@as(u8, 3), result.exit_code);
     try std.testing.expectEqualStrings("1\n", result.stdout);
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "S003") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "file not found") != null);
+    try std.testing.expectEqualStrings(
+        "error: tests/data/synthetic/bad_header.fastq: S003: " ++
+            "header line must start with '@' (record 0, line 1, offset 0)\n" ++
+            "error: tests/data/synthetic/does_not_exist.fastq: file not found\n",
+        result.stderr,
+    );
 }
 
 test "[cli] - [root]: help, version, and usage failures are exact" {
@@ -190,12 +225,13 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
 
     const help = try runCli(allocator, &.{"--help"});
     try std.testing.expectEqual(@as(u8, 0), help.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, help.stdout, "usage: z-fastq") != null);
+    try std.testing.expectEqualStrings(EXPECTED_USAGE, help.stdout);
     try std.testing.expectEqual(@as(usize, 0), help.stderr.len);
 
     const short_help = try runCli(allocator, &.{"-h"});
     try std.testing.expectEqual(@as(u8, 0), short_help.exit_code);
     try std.testing.expectEqualStrings(help.stdout, short_help.stdout);
+    try std.testing.expectEqual(@as(usize, 0), short_help.stderr.len);
 
     const version = try runCli(allocator, &.{"--version"});
     try std.testing.expectEqual(@as(u8, 0), version.exit_code);
@@ -205,9 +241,11 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
     const short_version = try runCli(allocator, &.{"-V"});
     try std.testing.expectEqual(@as(u8, 0), short_version.exit_code);
     try std.testing.expectEqualStrings(version.stdout, short_version.stdout);
+    try std.testing.expectEqual(@as(usize, 0), short_version.stderr.len);
 
     const invalid = try runCli(allocator, &.{ "count", "--max-line-bytes", "nope" });
     try std.testing.expectEqual(@as(u8, 2), invalid.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), invalid.stdout.len);
     try std.testing.expectEqualStrings(
         "error: invalid --max-line-bytes value\n",
         invalid.stderr,
@@ -215,18 +253,20 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
 
     const missing_command = try runCli(allocator, &.{});
     try std.testing.expectEqual(@as(u8, 2), missing_command.exit_code);
-    try std.testing.expect(std.mem.startsWith(u8, missing_command.stderr, "usage: z-fastq"));
+    try std.testing.expectEqual(@as(usize, 0), missing_command.stdout.len);
+    try std.testing.expectEqualStrings(EXPECTED_USAGE, missing_command.stderr);
 
     const unknown_command = try runCli(allocator, &.{"unknown"});
     try std.testing.expectEqual(@as(u8, 2), unknown_command.exit_code);
-    try std.testing.expect(std.mem.startsWith(
-        u8,
+    try std.testing.expectEqual(@as(usize, 0), unknown_command.stdout.len);
+    try std.testing.expectEqualStrings(
+        "error: unknown command: unknown\n" ++ EXPECTED_USAGE,
         unknown_command.stderr,
-        "error: unknown command: unknown\nusage: z-fastq",
-    ));
+    );
 
     const missing_path = try runCli(allocator, &.{"count"});
     try std.testing.expectEqual(@as(u8, 2), missing_path.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), missing_path.stdout.len);
     try std.testing.expectEqualStrings(
         "error: count requires at least one file path\n",
         missing_path.stderr,
@@ -234,6 +274,7 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
 
     const missing_limit = try runCli(allocator, &.{ "count", "--max-line-bytes" });
     try std.testing.expectEqual(@as(u8, 2), missing_limit.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), missing_limit.stdout.len);
     try std.testing.expectEqualStrings(
         "error: --max-line-bytes requires a value\n",
         missing_limit.stderr,
@@ -245,6 +286,7 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
         "340282366920938463463374607431768211456",
     });
     try std.testing.expectEqual(@as(u8, 4), overflow.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), overflow.stdout.len);
     try std.testing.expectEqualStrings(
         "error: --max-line-bytes exceeds supported limit\n",
         overflow.stderr,
@@ -274,14 +316,15 @@ test "[cli] - [diagnostics]: untrusted command, option, and path bytes use escap
 
     const command = try runCli(allocator, &.{"bad\n\\\x1b"});
     try std.testing.expectEqual(@as(u8, 2), command.exit_code);
-    try std.testing.expect(std.mem.startsWith(
-        u8,
+    try std.testing.expectEqual(@as(usize, 0), command.stdout.len);
+    try std.testing.expectEqualStrings(
+        "error: unknown command: bad\\x0A\\\\\\x1B\n" ++ EXPECTED_USAGE,
         command.stderr,
-        "error: unknown command: bad\\x0A\\\\\\x1B\nusage: z-fastq",
-    ));
+    );
 
     const option = try runCli(allocator, &.{ "count", "-bad\t\\\x1b" });
     try std.testing.expectEqual(@as(u8, 2), option.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), option.stdout.len);
     try std.testing.expectEqualStrings(
         "error: unknown count option: -bad\\x09\\\\\\x1B\n",
         option.stderr,
@@ -289,6 +332,7 @@ test "[cli] - [diagnostics]: untrusted command, option, and path bytes use escap
 
     const path = try runCount(allocator, "unsafe\n\x1b.fastq");
     try std.testing.expectEqual(@as(u8, 3), path.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), path.stdout.len);
     try std.testing.expectEqualStrings(
         "error: unsafe\\x0A\\x1B.fastq: file not found\n",
         path.stderr,
@@ -302,6 +346,7 @@ test "[cli] - [count]: an unknown option exits with usage status" {
     const result = try runCli(arena.allocator(), &.{ "count", "--bogus" });
 
     try std.testing.expectEqual(@as(u8, 2), result.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
     try std.testing.expectEqualStrings("error: unknown count option: --bogus\n", result.stderr);
 }
 
@@ -309,14 +354,19 @@ test "[cli] - [count]: double dash treats a leading-hyphen argument as a path" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
+    const path = "-z-fastq-v002-missing/record.fastq";
     const result = try runCli(arena.allocator(), &.{
         "count",
         "--",
-        "tests/data/synthetic/basic_valid.fastq",
+        path,
     });
 
-    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expectEqualStrings("5\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 3), result.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+    try std.testing.expectEqualStrings(
+        "error: " ++ path ++ ": file not found\n",
+        result.stderr,
+    );
 }
 
 test "[cli] - [count]: a line may exceed the read buffer within its limit" {
@@ -358,6 +408,7 @@ test "[cli] - [count]: a line may exceed the read buffer within its limit" {
     const result = try runCount(arena.allocator(), path);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
     try std.testing.expectEqualStrings("1\n", result.stdout);
+    try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
 
     const limited = try runCli(arena.allocator(), &.{
         "count",
@@ -365,10 +416,14 @@ test "[cli] - [count]: a line may exceed the read buffer within its limit" {
         "262144",
         path,
     });
-    try std.testing.expectEqual(@as(u8, 4), limited.exit_code);
-    try std.testing.expect(
-        std.mem.indexOf(u8, limited.stderr, "line length limit exceeded") != null,
+    const limited_expected = try std.fmt.allocPrint(
+        arena.allocator(),
+        "error: {s}: line length limit exceeded\n",
+        .{path},
     );
+    try std.testing.expectEqual(@as(u8, 4), limited.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), limited.stdout.len);
+    try std.testing.expectEqualStrings(limited_expected, limited.stderr);
 }
 
 test "[cli] - [count]: a lone CR at EOF remains quality content" {
