@@ -8,7 +8,7 @@ test "[unit] - [root]: every exported declaration is analyzable" {
 }
 
 test "[unit] - [root]: version exposes the current internal checkpoint" {
-    try std.testing.expectEqualStrings("0.0.2", zfastq.VERSION);
+    try std.testing.expectEqualStrings("0.0.3", zfastq.VERSION);
 }
 
 test "[unit] - [lint code]: every implemented code has its stable tag" {

@@ -7,7 +7,7 @@ const USAGE =
     \\usage: z-fastq <command> [options] [args...]
     \\
     \\Commands:
-    \\  count    Count records in plain FASTQ files
+    \\  count    Count records in plain FASTQ inputs
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -17,7 +17,7 @@ const USAGE =
     \\  --max-line-bytes N   Override default line length limit
     \\
     \\Count usage:
-    \\  z-fastq count [--max-line-bytes N] <file.fastq> [file2.fastq ...]
+    \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
     \\
 ;
 
@@ -91,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
                 };
                 continue;
             }
-            if (std.mem.startsWith(u8, arg, "-")) {
+            if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
                 std.Io.File.writeStreamingAll(
                     .stderr(),
                     io,
@@ -144,21 +144,39 @@ const CountOptions = struct {
 
 fn runCount(
     io: std.Io,
-    paths: []const []const u8,
+    inputs: []const []const u8,
     options: CountOptions,
 ) u8 {
-    if (paths.len == 0) {
+    if (inputs.len == 0) {
         std.Io.File.writeStreamingAll(
             .stderr(),
             io,
-            "error: count requires at least one file path\n",
+            "error: count requires at least one input\n",
         ) catch {};
         return 2;
     }
 
+    var has_stdin = false;
+    for (inputs) |input| {
+        if (!std.mem.eql(u8, input, "-")) continue;
+        if (has_stdin) {
+            std.Io.File.writeStreamingAll(
+                .stderr(),
+                io,
+                "error: standard input may appear at most once\n",
+            ) catch {};
+            return 2;
+        }
+        has_stdin = true;
+    }
+
     var exit_code: u8 = 0;
-    for (paths) |path| {
-        const count_result = countFile(io, path, options) catch |err| switch (err) {
+    for (inputs) |input| {
+        const count_result = if (std.mem.eql(u8, input, "-"))
+            countStdin(io, options)
+        else
+            countFile(io, input, options);
+        const count = count_result catch |err| switch (err) {
             error.Io => {
                 exit_code = @max(exit_code, 3);
                 continue;
@@ -168,7 +186,7 @@ fn runCount(
                 continue;
             },
             error.Limit => {
-                printPathError(io, path, "line length limit exceeded");
+                printPathError(io, input, "line length limit exceeded");
                 exit_code = @max(exit_code, 4);
                 continue;
             },
@@ -178,7 +196,7 @@ fn runCount(
             },
         };
 
-        printCount(io, count_result) catch return 3;
+        printCount(io, count) catch return @max(exit_code, 3);
     }
 
     return exit_code;
@@ -208,26 +226,42 @@ fn countFile(
     };
     defer file.close(io);
 
+    return countPlainInput(io, path, file, options);
+}
+
+fn countStdin(io: std.Io, options: CountOptions) CountError!u64 {
+    return countPlainInput(io, "-", std.Io.File.stdin(), options);
+}
+
+fn countPlainInput(
+    io: std.Io,
+    label: []const u8,
+    file: std.Io.File,
+    options: CountOptions,
+) CountError!u64 {
+    // A zero-byte reader buffer avoids duplicating the scanner's input buffer.
+    var reader_buffer: [0]u8 = .{};
+    var file_reader = file.readerStreaming(io, &reader_buffer);
+    var source_adapter = zfastq.io.plain.ReaderSource.init(&file_reader.interface);
+    const source = source_adapter.byteSource();
+
     const scan_options = zfastq.count_scan.Options{
         .max_line_bytes = options.max_line_bytes,
     };
     var scanner = zfastq.count_scan.Scanner.init(scan_options);
     var buf: [zfastq.limits.COUNT_READ_BUFFER_BYTES]u8 = undefined;
     while (true) {
-        const n = file.readStreaming(io, &.{&buf}) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => {
-                printPathError(io, path, "I/O error");
-                return error.Io;
-            },
+        const n = source.read(&buf) catch {
+            printPathError(io, label, "I/O error");
+            return error.Io;
         };
         if (n == 0) break;
         _ = scanner.feed(buf[0..n]) catch |err| {
-            return mapScanError(io, path, &scanner, err);
+            return mapScanError(io, label, &scanner, err);
         };
     }
     scanner.finishEof() catch |err| {
-        return mapScanError(io, path, &scanner, err);
+        return mapScanError(io, label, &scanner, err);
     };
     return scanner.record_index;
 }

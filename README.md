@@ -15,10 +15,10 @@ Requires Zig 0.16.0 at `./zig-0.16.0/zig` (use the `./zig` wrapper).
 ## Usage
 
 ```bash
-./zig-out/bin/z-fastq count [--max-line-bytes N] file.fastq [file2.fastq ...]
+./zig-out/bin/z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
 ```
 
-Each input file prints one record count on stdout (one decimal line per file). Non-zero exit status indicates an error; parse failures include record index, line number, and byte offset on stderr.
+Each successfully parsed path or explicit `-` for standard input prints one record count on stdout. Standard input may appear once and is never selected implicitly. Non-zero exit status indicates an error; parse failures include record index, line number, and byte offset on stderr.
 
 Exit status 1 reports invalid FASTQ, 2 reports command-line usage, 3 reports I/O or unexpected allocation failure, and 4 reports configured or arithmetic limits. Untrusted command, option, and path bytes are displayed using printable ASCII, doubled backslashes, and uppercase `\xHH` escapes for all other bytes.
 

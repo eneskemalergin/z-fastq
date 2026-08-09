@@ -37,4 +37,4 @@ const Limits = struct {
 pub const limits = Limits;
 pub const count_scan = @import("count_scan.zig");
 
-pub const VERSION = "0.0.2";
+pub const VERSION = "0.0.3";
