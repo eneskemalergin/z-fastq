@@ -8,6 +8,7 @@
         "build.zig.zon",
         "src",
         "tests",
+        "vendor",
         "README.md",
     },
 }

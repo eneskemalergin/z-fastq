@@ -277,10 +277,7 @@ fn countGzipSource(
         .max_line_bytes = options.max_line_bytes,
     };
     var scanner = zfastq.count_scan.Scanner.init(scan_options);
-    var decompressor_buffer: [
-        std.compress.flate.history_len +
-            zfastq.limits.COUNT_READ_BUFFER_BYTES
-    ]u8 = undefined;
+    var decompressor_buffer: [io_layer.COUNT_DECOMPRESS_BUFFER_BYTES]u8 = undefined;
     while (io_layer.readGzipChunk(source, &decompressor_buffer) catch {
         printPathError(io, label, "I/O error");
         return error.Io;
