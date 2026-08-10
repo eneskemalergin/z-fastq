@@ -1,28 +1,32 @@
 //! Installed CLI contracts for `z-fastq count`.
 
 const std = @import("std");
-const builtin = @import("builtin");
-
-const ZFASTQ_BIN = if (builtin.os.tag == .windows)
-    "zig-out\\bin\\z-fastq.exe"
-else
-    "zig-out/bin/z-fastq";
+const cli = @import("utilities.zig");
+const CommandResult = cli.CommandResult;
+const runCli = cli.run;
+const runCliWithStdin = cli.runWithStdin;
+const runCliWithClosedStdout = cli.runWithClosedStdout;
+const runCliWithClosedStdin = cli.runWithClosedStdin;
 const FIXTURE_DIR = "tests/data/synthetic";
 const EXPECTED_USAGE =
     \\usage: z-fastq <command> [options] [args...]
     \\
     \\Commands:
     \\  count    Count records in plain or gzip FASTQ inputs
+    \\  stats    Report aggregate FASTQ statistics
     \\
     \\General options:
     \\  -h, --help           Show this help message
     \\  -V, --version        Print version
     \\
-    \\Count options:
+    \\Input options:
     \\  --max-line-bytes N   Override default line length limit
     \\
     \\Count usage:
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
+    \\
+    \\Stats usage:
+    \\  z-fastq stats [--max-line-bytes N] <path|-> [<path|-> ...]
     \\
 ;
 
@@ -169,146 +173,6 @@ fn runCount(
     path: []const u8,
 ) !CommandResult {
     return runCli(allocator, &.{ "count", path });
-}
-
-const CommandResult = struct {
-    exit_code: u8,
-    stdout: []u8,
-    stderr: []u8,
-};
-
-fn runCli(
-    allocator: std.mem.Allocator,
-    command_args: []const []const u8,
-) !CommandResult {
-    return runCliWithStdin(allocator, command_args, "", 1);
-}
-
-fn runCliWithStdin(
-    allocator: std.mem.Allocator,
-    command_args: []const []const u8,
-    stdin_data: []const u8,
-    chunk_len: usize,
-) !CommandResult {
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, ZFASTQ_BIN);
-    try argv.appendSlice(allocator, command_args);
-
-    var proc = try std.process.spawn(io, .{
-        .argv = argv.items,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
-    defer proc.kill(io);
-
-    try writeAndCloseStdin(io, &proc, stdin_data, chunk_len);
-    return collectCommandResult(allocator, io, &proc);
-}
-
-fn collectCommandResult(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    proc: *std.process.Child,
-) !CommandResult {
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_reader = proc.stdout.?.reader(io, &stdout_buf);
-    const stdout = try stdout_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
-    errdefer allocator.free(stdout);
-    var stderr_buf: [4096]u8 = undefined;
-    var stderr_reader = proc.stderr.?.reader(io, &stderr_buf);
-    const stderr = try stderr_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
-    errdefer allocator.free(stderr);
-
-    const wait = try proc.wait(io);
-    const exit_code: u8 = switch (wait) {
-        .exited => |code| @intCast(code),
-        else => return error.ChildProcessFailed,
-    };
-
-    return .{ .exit_code = exit_code, .stdout = stdout, .stderr = stderr };
-}
-
-fn runCliWithClosedStdout(
-    allocator: std.mem.Allocator,
-    command_args: []const []const u8,
-    stdin_data: []const u8,
-) !CommandResult {
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, ZFASTQ_BIN);
-    try argv.appendSlice(allocator, command_args);
-
-    var proc = try std.process.spawn(io, .{
-        .argv = argv.items,
-        .stdin = .pipe,
-        .stdout = .close,
-        .stderr = .pipe,
-    });
-    defer proc.kill(io);
-
-    try writeAndCloseStdin(io, &proc, stdin_data, @max(stdin_data.len, 1));
-    var stderr_buf: [4096]u8 = undefined;
-    var stderr_reader = proc.stderr.?.reader(io, &stderr_buf);
-    const stderr = try stderr_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
-
-    const wait = try proc.wait(io);
-    const exit_code: u8 = switch (wait) {
-        .exited => |code| @intCast(code),
-        else => return error.ChildProcessFailed,
-    };
-
-    return .{ .exit_code = exit_code, .stdout = try allocator.alloc(u8, 0), .stderr = stderr };
-}
-
-fn runCliWithClosedStdin(
-    allocator: std.mem.Allocator,
-    command_args: []const []const u8,
-) !CommandResult {
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, ZFASTQ_BIN);
-    try argv.appendSlice(allocator, command_args);
-
-    var proc = try std.process.spawn(io, .{
-        .argv = argv.items,
-        .stdin = .close,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
-    defer proc.kill(io);
-
-    return collectCommandResult(allocator, io, &proc);
-}
-
-fn writeAndCloseStdin(
-    io: std.Io,
-    proc: *std.process.Child,
-    data: []const u8,
-    chunk_len: usize,
-) !void {
-    std.debug.assert(chunk_len > 0);
-    var pos: usize = 0;
-    while (pos < data.len) {
-        const end = pos + @min(chunk_len, data.len - pos);
-        try std.Io.File.writeStreamingAll(proc.stdin.?, io, data[pos..end]);
-        pos = end;
-    }
-    proc.stdin.?.close(io);
-    proc.stdin = null;
 }
 
 test "[cli] - [count]: files and fragmented stdin produce exact fixture results" {
@@ -621,9 +485,22 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
     try std.testing.expectEqualStrings(help.stdout, short_help.stdout);
     try std.testing.expectEqual(@as(usize, 0), short_help.stderr.len);
 
+    const command_help_cases = [_][2][]const u8{
+        .{ "count", "--help" },
+        .{ "count", "-h" },
+        .{ "stats", "--help" },
+        .{ "stats", "-h" },
+    };
+    for (command_help_cases) |args| {
+        const result = try runCli(allocator, &args);
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expectEqualStrings(EXPECTED_USAGE, result.stdout);
+        try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
+    }
+
     const version = try runCli(allocator, &.{"--version"});
     try std.testing.expectEqual(@as(u8, 0), version.exit_code);
-    try std.testing.expectEqualStrings("z-fastq 0.0.4\n", version.stdout);
+    try std.testing.expectEqualStrings("z-fastq 0.0.5\n", version.stdout);
     try std.testing.expectEqual(@as(usize, 0), version.stderr.len);
 
     const short_version = try runCli(allocator, &.{"-V"});

@@ -12,6 +12,7 @@ pub const LintCode = enum {
     s003_invalid_header,
     s004_truncated_record,
     s005_length_mismatch,
+    s006_invalid_quality_range,
 };
 pub const ParseError = struct {
     code: LintCode,
@@ -27,6 +28,7 @@ pub fn codeTag(code: LintCode) []const u8 {
         .s003_invalid_header => "S003",
         .s004_truncated_record => "S004",
         .s005_length_mismatch => "S005",
+        .s006_invalid_quality_range => "S006",
     };
 }
 
@@ -120,6 +122,13 @@ const Line = struct {
     start_offset: u64,
 };
 
+pub const RecordOffsets = struct {
+    header: u64,
+    sequence: u64,
+    plus: u64,
+    quality: u64,
+};
+
 /// Streaming parser constructed with `init`; fields are implementation state.
 /// The copied source wrapper's referenced adapter must outlive the reader.
 pub const Reader = struct {
@@ -135,6 +144,8 @@ pub const Reader = struct {
     options: Options,
     machine: Machine,
     last_error: ?ParseError,
+    record_offsets: RecordOffsets = undefined,
+    current_record_offsets: ?RecordOffsets = null,
     header_range: Range = undefined,
     sequence_range: Range = undefined,
     plus_range: Range = undefined,
@@ -178,6 +189,11 @@ pub const Reader = struct {
         return self.byte_offset;
     }
 
+    /// Returns decoded-stream line-start offsets for the current borrowed record.
+    pub fn currentRecordOffsets(self: *const Reader) ?RecordOffsets {
+        return self.current_record_offsets;
+    }
+
     /// Returns and clears structural details retained after a parse error.
     pub fn takeLastError(self: *Reader) ?ParseError {
         const err = self.last_error;
@@ -194,6 +210,7 @@ pub const Reader = struct {
                 .eof => return null,
                 .continue_ => {},
                 .record_ready => {
+                    self.current_record_offsets = self.record_offsets;
                     const bytes = self.record_buf[0..self.record_len];
                     const header = self.header_range.slice(bytes);
                     return .{
@@ -228,7 +245,10 @@ pub const Reader = struct {
     };
 
     fn beginRecord(self: *Reader) void {
-        if (self.machine.expected == .header) self.record_len = 0;
+        if (self.machine.expected == .header) {
+            self.record_len = 0;
+            self.current_record_offsets = null;
+        }
     }
 
     fn ingestLine(self: *Reader, line: ?Line) ReaderError!IngestResult {
@@ -251,21 +271,25 @@ pub const Reader = struct {
 
         switch (line_kind) {
             .header => {
+                self.record_offsets.header = actual_line.start_offset;
                 self.header_range = .{
                     .start = actual_line.range.start + 1,
                     .end = actual_line.range.end,
                 };
             },
             .sequence => {
+                self.record_offsets.sequence = actual_line.start_offset;
                 self.sequence_range = actual_line.range;
             },
             .plus => {
+                self.record_offsets.plus = actual_line.start_offset;
                 self.plus_range = .{
                     .start = actual_line.range.start + 1,
                     .end = actual_line.range.end,
                 };
             },
             .quality => {
+                self.record_offsets.quality = actual_line.start_offset;
                 self.quality_range = actual_line.range;
             },
         }

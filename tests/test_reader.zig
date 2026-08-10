@@ -15,7 +15,7 @@ test "[unit] - [root]: every exported declaration is analyzable" {
 }
 
 test "[unit] - [root]: version exposes the current internal checkpoint" {
-    try std.testing.expectEqualStrings("0.0.4", zfastq.VERSION);
+    try std.testing.expectEqualStrings("0.0.5", zfastq.VERSION);
 }
 
 test "[property] - [gzip source]: optional member chains decode at every input chunk size" {
@@ -71,11 +71,48 @@ test "[unit] - [lint code]: every implemented code has its stable tag" {
         .{ .code = .s003_invalid_header, .tag = "S003" },
         .{ .code = .s004_truncated_record, .tag = "S004" },
         .{ .code = .s005_length_mismatch, .tag = "S005" },
+        .{ .code = .s006_invalid_quality_range, .tag = "S006" },
     };
 
     for (cases) |case| {
         try std.testing.expectEqualStrings(case.tag, zfastq.codeTag(case.code));
     }
+}
+
+test "[unit] - [reader]: current record offsets identify every line start" {
+    const data = "@one\r\nA\r\n+\r\n!\r\n@two\nCC\n+x\n##";
+    var source = zfastq.io.plain.SliceSource.init(data);
+    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
+    defer reader.deinit();
+
+    try std.testing.expect(reader.currentRecordOffsets() == null);
+
+    const first = (try reader.next()).?;
+    try std.testing.expectEqualStrings("one", first.id);
+    try std.testing.expectEqual(
+        zfastq.RecordOffsets{ .header = 0, .sequence = 6, .plus = 9, .quality = 12 },
+        reader.currentRecordOffsets().?,
+    );
+
+    const second = (try reader.next()).?;
+    try std.testing.expectEqualStrings("two", second.id);
+    try std.testing.expectEqual(
+        zfastq.RecordOffsets{ .header = 15, .sequence = 20, .plus = 23, .quality = 26 },
+        reader.currentRecordOffsets().?,
+    );
+
+    try std.testing.expect((try reader.next()) == null);
+    try std.testing.expect(reader.currentRecordOffsets() == null);
+
+    var advance_source = zfastq.io.plain.SliceSource.init("@r\nA\n+\n!\n");
+    var advance_reader = try zfastq.Reader.init(
+        std.testing.allocator,
+        advance_source.byteSource(),
+        .{},
+    );
+    defer advance_reader.deinit();
+    try std.testing.expect(try advance_reader.advance());
+    try std.testing.expect(advance_reader.currentRecordOffsets() == null);
 }
 
 test "[unit] - [reader]: supported record forms parse exactly" {
