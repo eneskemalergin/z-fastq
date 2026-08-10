@@ -12,6 +12,18 @@ Requires Zig 0.16.0 at `./zig-0.16.0/zig` (use the `./zig` wrapper).
 ./zig build -Doptimize=ReleaseFast
 ```
 
+Linux x86-64 glibc and musl builds use the vendored ISA-L 2.32.1 stateful inflate and CRC path by default. Building this path from source requires NASM 2.14.01 or newer. Use `-Disa-l=false` to exclude ISA-L and NASM from the build; other targets select the Zig path automatically. The Zig path runtime-selects PCLMUL CRC-32 on supported x86-64 processors and retains a portable fallback. Both paths stream through bounded storage and validate the same project-owned gzip framing, CRC-32, ISIZE, and concatenated-member behavior.
+
+Use the static musl target for the Linux x86-64 release artifact and performance measurements:
+
+```bash
+./zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+```
+
+### Dependency and portability boundary
+
+The project as a whole is not dependency-free. The accelerated build compiles vendored BSD-licensed ISA-L C and x86-64 assembly, supports only Linux x86-64 glibc and musl in the current build graph, and needs NASM when built from source. Static musl release binaries require no separately installed ISA-L or C runtime, but static linking does not remove the source dependency or its license notice. The ISA-L-disabled path needs no external compression library or assembler beyond the Zig toolchain, but its PCLMUL CRC schedule retains MIT-licensed `crc32fast` provenance. No equivalent ISA-L acceleration is currently integrated or verified for AArch64, RISC-V, Windows, or macOS.
+
 ## Usage
 
 ```bash
@@ -30,4 +42,4 @@ Records returned by `Reader.next()` borrow reader storage until the next reader 
 
 ## License
 
-TBD
+The project license is not yet selected. The vendored ISA-L subset retains its [BSD-3-Clause license](vendor/ISA-L/LICENSE.md). The native PCLMUL CRC schedule is adapted from `crc32fast` 1.5.0 and retains its [MIT license](vendor/CRC32FAST-LICENSE-MIT). Both notices must accompany binary distributions that contain the corresponding code.
