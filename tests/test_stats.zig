@@ -125,14 +125,14 @@ test "[failure] - [statistics]: invalid quality rejects the entire record" {
     }, stats.result());
 }
 
-test "[failure] - [statistics]: mismatched direct records reject the entire record" {
+test "[failure] - [statistics]: length mismatch precedes quality validation" {
     var stats: zfastq.Stats = .{};
     try stats.addRecord(record("A", "!"));
     const before = stats.result();
 
     try std.testing.expectError(
         error.S005LengthMismatch,
-        stats.addRecord(record("AC", "!")),
+        stats.addRecord(record("AC", " ")),
     );
     try std.testing.expectEqualDeep(before, stats.result());
 }
