@@ -122,6 +122,12 @@ const Line = struct {
     start_offset: u64,
 };
 
+const BufferedRecordResult = union(enum) {
+    incomplete,
+    eof,
+    ranges: [4]Range,
+};
+
 pub const RecordOffsets = struct {
     header: u64,
     sequence: u64,
@@ -204,6 +210,21 @@ pub const Reader = struct {
     /// Returns the next borrowed record, or null at a clean EOF boundary.
     pub fn next(self: *Reader) ReaderError!?Record {
         self.beginRecord();
+        switch (try self.readBufferedRecord()) {
+            .incomplete => {},
+            .eof => return null,
+            .ranges => |ranges| {
+                self.current_record_offsets = self.record_offsets;
+                const header = self.buf[ranges[0].start + 1 .. ranges[0].end];
+                return .{
+                    .header = header,
+                    .id = firstToken(header),
+                    .sequence = ranges[1].slice(self.buf),
+                    .plus = self.buf[ranges[2].start + 1 .. ranges[2].end],
+                    .quality = ranges[3].slice(self.buf),
+                };
+            },
+        }
         while (true) {
             const line = try self.readLine();
             switch (try self.ingestLine(line)) {
@@ -228,6 +249,11 @@ pub const Reader = struct {
     /// Consumes one record without returning its fields, or returns false at clean EOF.
     pub fn advance(self: *Reader) ReaderError!bool {
         self.beginRecord();
+        switch (try self.readBufferedRecord()) {
+            .incomplete => {},
+            .eof => return false,
+            .ranges => return true,
+        }
         while (true) {
             const line = try self.readLine();
             switch (try self.ingestLine(line)) {
@@ -249,6 +275,58 @@ pub const Reader = struct {
             self.record_len = 0;
             self.current_record_offsets = null;
         }
+    }
+
+    fn readBufferedRecord(self: *Reader) ReaderError!BufferedRecordResult {
+        if (self.machine.expected != .header) return .incomplete;
+        if (self.cursor == self.fill_end and !try self.refill()) return .eof;
+
+        var starts: [4]usize = undefined;
+        var ends: [4]usize = undefined;
+        var search_start = self.cursor;
+        for (0..4) |line_index| {
+            const rel = std.mem.indexOfScalar(
+                u8,
+                self.buf[search_start..self.fill_end],
+                '\n',
+            ) orelse return .incomplete;
+            starts[line_index] = search_start;
+            ends[line_index] = search_start + rel;
+            search_start = ends[line_index] + 1;
+        }
+
+        var ranges: [4]Range = undefined;
+        for (0..4) |line_index| {
+            const start = starts[line_index];
+            const raw_end = ends[line_index];
+            const end = if (raw_end > start and self.buf[raw_end - 1] == '\r')
+                raw_end - 1
+            else
+                raw_end;
+            if (end - start > self.options.max_line_bytes) return error.LineTooLong;
+
+            const start_offset = self.byte_offset;
+            self.cursor = raw_end + 1;
+            self.byte_offset += @intCast(raw_end + 1 - start);
+
+            const line_kind = self.machine.expected;
+            const content = self.buf[start..end];
+            const first_byte = if (content.len == 0) null else content[0];
+            const record_ready = self.machine.push(content.len, first_byte) catch |err| {
+                return self.structuralError(err, start_offset);
+            };
+            ranges[line_index] = .{ .start = start, .end = end };
+            switch (line_kind) {
+                .header => self.record_offsets.header = start_offset,
+                .sequence => self.record_offsets.sequence = start_offset,
+                .plus => self.record_offsets.plus = start_offset,
+                .quality => self.record_offsets.quality = start_offset,
+            }
+            std.debug.assert(record_ready == (line_index == 3));
+        }
+
+        self.record_index += 1;
+        return .{ .ranges = ranges };
     }
 
     fn ingestLine(self: *Reader, line: ?Line) ReaderError!IngestResult {

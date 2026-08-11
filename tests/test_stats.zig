@@ -293,6 +293,19 @@ test "[cli] - [stats]: S006 reports the exact decompressed quality-byte offset" 
     defer arena.deinit();
     const allocator = arena.allocator();
     const invalid = "@bad\r\nAC\r\n+\r\n!\x7f\r\n";
+    const invalid_lf = try runCli(
+        allocator,
+        &.{ "stats", "-" },
+        "@bad\nAC\n+\n!\x7f\n",
+        1,
+    );
+    try std.testing.expectEqual(@as(u8, 1), invalid_lf.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), invalid_lf.stdout.len);
+    try std.testing.expectEqualStrings(
+        "error: -: S006: quality byte must be ASCII 33 through 126 " ++
+            "(record 0, line 4, offset 11)\n",
+        invalid_lf.stderr,
+    );
 
     for ([_][]const u8{ invalid, &INVALID_QUALITY_GZIP }) |input| {
         const result = try runCli(allocator, &.{ "stats", "-" }, input, 1);
@@ -419,6 +432,20 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
     const structural = try runCli(allocator, &.{ "stats", "-" }, "@r\nAA\n+\n!\n", 1);
     try expectCommand(
         structural,
+        1,
+        "",
+        "error: -: S005: sequence and quality lengths differ " ++
+            "(record 0, line 4, offset 8)\n",
+    );
+
+    const mismatch_and_invalid = try runCli(
+        allocator,
+        &.{ "stats", "-" },
+        "@r\nAA\n+\n \n",
+        1,
+    );
+    try expectCommand(
+        mismatch_and_invalid,
         1,
         "",
         "error: -: S005: sequence and quality lengths differ " ++

@@ -261,6 +261,79 @@ test "[property] - [reader]: borrowed fields survive every fixed short-read size
     }
 }
 
+test "[property] - [reader]: complete and refill-spanning records are identical" {
+    const data =
+        "@one comment\r\nACGT\r\n+same\r\n!!!!\r\n" ++
+        "@empty\n\n+description\n\n" ++
+        "@final\nNN\n+\n##";
+    const cases = [_]struct {
+        header: []const u8,
+        id: []const u8,
+        sequence: []const u8,
+        plus: []const u8,
+        quality: []const u8,
+        offsets: zfastq.RecordOffsets,
+    }{
+        .{
+            .header = "one comment",
+            .id = "one",
+            .sequence = "ACGT",
+            .plus = "same",
+            .quality = "!!!!",
+            .offsets = .{ .header = 0, .sequence = 14, .plus = 20, .quality = 27 },
+        },
+        .{
+            .header = "empty",
+            .id = "empty",
+            .sequence = "",
+            .plus = "description",
+            .quality = "",
+            .offsets = .{ .header = 33, .sequence = 40, .plus = 41, .quality = 54 },
+        },
+        .{
+            .header = "final",
+            .id = "final",
+            .sequence = "NN",
+            .plus = "",
+            .quality = "##",
+            .offsets = .{ .header = 55, .sequence = 62, .plus = 65, .quality = 67 },
+        },
+    };
+    const vector_len = @max(std.simd.suggestVectorLength(u8) orelse 16, 2);
+    const chunk_sizes = [_]usize{
+        1,
+        2,
+        3,
+        vector_len - 1,
+        vector_len,
+        vector_len + 1,
+        4 * 1024,
+        zfastq.limits.DEFAULT_READER_BUFFER_BYTES,
+    };
+
+    for (chunk_sizes) |chunk_len| {
+        var chunked = ChunkSource.init(data, chunk_len);
+        var reader = try zfastq.Reader.init(
+            std.testing.allocator,
+            chunked.byteSource(),
+            .{},
+        );
+        defer reader.deinit();
+
+        for (cases) |case| {
+            const parsed = (try reader.next()).?;
+            try std.testing.expectEqualStrings(case.header, parsed.header);
+            try std.testing.expectEqualStrings(case.id, parsed.id);
+            try std.testing.expectEqualStrings(case.sequence, parsed.sequence);
+            try std.testing.expectEqualStrings(case.plus, parsed.plus);
+            try std.testing.expectEqualStrings(case.quality, parsed.quality);
+            try std.testing.expectEqual(case.offsets, reader.currentRecordOffsets().?);
+        }
+        try std.testing.expect((try reader.next()) == null);
+        try std.testing.expectEqual(@as(u64, data.len), reader.byteOffset());
+    }
+}
+
 test "[property] - [parser]: every input partition preserves the format result" {
     const valid = "@r\nA\n+\n!\n";
     const partition_count = @as(usize, 1) << (valid.len - 1);
