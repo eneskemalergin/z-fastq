@@ -182,7 +182,11 @@ fn payloadTotals(
 ) StatsError!PayloadTotals {
     if (sum_type == u64) {
         if (std.simd.suggestVectorLength(u8)) |vector_len| {
-            if (vector_len >= 2 and vector_len % 2 == 0 and quality.len >= vector_len) {
+            if (vector_len >= 2 and
+                vector_len % 2 == 0 and
+                vector_len <= std.math.maxInt(u16) / std.math.maxInt(u8) and
+                quality.len >= vector_len)
+            {
                 return payloadTotalsVector(vector_len, sequence, quality, quality_error);
             }
         }
@@ -242,6 +246,12 @@ fn payloadTotalsVector(
     const maximum: Bytes = @splat(126);
     const q20_minimum: Bytes = @splat(53);
     const q30_minimum: Bytes = @splat(63);
+    const case_mask: Bytes = @splat(0xdf);
+    const a_base: Bytes = @splat('A');
+    const c_base: Bytes = @splat('C');
+    const g_base: Bytes = @splat('G');
+    const t_base: Bytes = @splat('T');
+    const n_base: Bytes = @splat('N');
     const ones: Bytes = @splat(1);
     const zeros: Bytes = @splat(0);
 
@@ -286,17 +296,36 @@ fn payloadTotalsVector(
     }
 
     var base_counts = [_]usize{0} ** 6;
-    for (sequence[0..byte_index]) |base| {
-        const index: usize = switch (base) {
-            'A', 'a' => 0,
-            'C', 'c' => 1,
-            'G', 'g' => 2,
-            'T', 't' => 3,
-            'N', 'n' => 4,
-            else => 5,
-        };
-        base_counts[index] += 1;
+    var base_index: usize = 0;
+    while (byte_index - base_index >= vector_len) {
+        const remaining_vectors = (byte_index - base_index) / vector_len;
+        const block_vectors = @min(remaining_vectors, std.math.maxInt(u8));
+        var a_lanes: Bytes = @splat(0);
+        var c_lanes: Bytes = @splat(0);
+        var g_lanes: Bytes = @splat(0);
+        var t_lanes: Bytes = @splat(0);
+        var n_lanes: Bytes = @splat(0);
+
+        var vector_index: usize = 0;
+        while (vector_index < block_vectors) : (vector_index += 1) {
+            const bases: Bytes = sequence[base_index..][0..vector_len].*;
+            const normalized = bases & case_mask;
+            a_lanes += @select(u8, normalized == a_base, ones, zeros);
+            c_lanes += @select(u8, normalized == c_base, ones, zeros);
+            g_lanes += @select(u8, normalized == g_base, ones, zeros);
+            t_lanes += @select(u8, normalized == t_base, ones, zeros);
+            n_lanes += @select(u8, normalized == n_base, ones, zeros);
+            base_index += vector_len;
+        }
+
+        base_counts[0] += sumBaseLanes(vector_len, a_lanes);
+        base_counts[1] += sumBaseLanes(vector_len, c_lanes);
+        base_counts[2] += sumBaseLanes(vector_len, g_lanes);
+        base_counts[3] += sumBaseLanes(vector_len, t_lanes);
+        base_counts[4] += sumBaseLanes(vector_len, n_lanes);
     }
+    base_counts[5] = byte_index -
+        (base_counts[0] + base_counts[1] + base_counts[2] + base_counts[3] + base_counts[4]);
 
     for (
         sequence[byte_index..],
@@ -329,6 +358,14 @@ fn payloadTotalsVector(
     };
 }
 
+fn sumBaseLanes(
+    comptime vector_len: comptime_int,
+    lanes: @Vector(vector_len, u8),
+) usize {
+    const WideLanes = @Vector(vector_len, u16);
+    return @reduce(.Add, @as(WideLanes, @intCast(lanes)));
+}
+
 fn add(left: u64, right: u64) error{Overflow}!u64 {
     return std.math.add(u64, left, right);
 }
@@ -354,12 +391,15 @@ test "[unit] - [statistics]: quality accumulator width uses the checked bound" {
     }
 }
 
-test "[property] - [statistics]: vector quality kernel matches the scalar path" {
+test "[property] - [statistics]: vector payload kernels match the scalar path" {
     const vector_len = std.simd.suggestVectorLength(u8) orelse return;
-    if (vector_len < 2 or vector_len % 2 != 0) return;
+    if (vector_len < 2 or
+        vector_len % 2 != 0 or
+        vector_len > std.math.maxInt(u16) / std.math.maxInt(u8)) return;
 
-    const block_len = vector_len * (std.math.maxInt(u16) / (2 * 93));
-    const max_len = block_len + vector_len + 1;
+    const quality_block_len = vector_len * (std.math.maxInt(u16) / (2 * 93));
+    const base_block_len = vector_len * std.math.maxInt(u8);
+    const max_len = @max(quality_block_len, base_block_len) + vector_len + 1;
     const lengths = [_]usize{
         0,
         1,
@@ -369,18 +409,20 @@ test "[property] - [statistics]: vector quality kernel matches the scalar path" 
         2 * vector_len - 1,
         2 * vector_len,
         2 * vector_len + 1,
-        block_len - 1,
-        block_len,
-        block_len + 1,
+        base_block_len - 1,
+        base_block_len,
+        base_block_len + 1,
+        quality_block_len - 1,
+        quality_block_len,
+        quality_block_len + 1,
     };
-    const bases = "AaCcGgTtNnX\x00\xff";
     const qualities = [_]u8{ 33, 52, 53, 62, 63, 126 };
     const sequence = try std.testing.allocator.alloc(u8, max_len);
     defer std.testing.allocator.free(sequence);
     const quality = try std.testing.allocator.alloc(u8, max_len);
     defer std.testing.allocator.free(quality);
     for (sequence, quality, 0..) |*base, *quality_byte, index| {
-        base.* = bases[index % bases.len];
+        base.* = @intCast(index % 256);
         quality_byte.* = qualities[index % qualities.len];
     }
 
