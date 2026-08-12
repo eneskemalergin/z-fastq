@@ -25,6 +25,9 @@ const EXPECTED_USAGE =
     \\Input options:
     \\  --max-line-bytes N   Override default line length limit
     \\
+    \\Machine output:
+    \\  --json               Emit versioned JSON (stats and check only)
+    \\
     \\Check options:
     \\  --alphabet POLICY    Select iupac (default) or acgtn sequence symbols
     \\
@@ -32,10 +35,10 @@ const EXPECTED_USAGE =
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
     \\
     \\Stats usage:
-    \\  z-fastq stats [--max-line-bytes N] <path|-> [<path|-> ...]
+    \\  z-fastq stats [--json] [--max-line-bytes N] <path|-> [<path|-> ...]
     \\
     \\Check usage:
-    \\  z-fastq check [--alphabet iupac|acgtn] [--max-line-bytes N] <path|-> [<path|-> ...]
+    \\  z-fastq check [--json] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|-> [<path|-> ...]
     \\
 ;
 
@@ -320,6 +323,14 @@ test "[cli] - [count]: stdin is explicit and duplicate use fails before input pr
         duplicate.stderr,
     );
 
+    const json = try runCliWithStdin(allocator, &.{ "count", "--json", "-" }, "", 1);
+    try std.testing.expectEqual(@as(u8, 2), json.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), json.stdout.len);
+    try std.testing.expectEqualStrings(
+        "error: unknown count option: --json\n",
+        json.stderr,
+    );
+
     const after_double_dash = try runCliWithStdin(
         allocator,
         &.{ "count", "--", "-" },
@@ -444,7 +455,7 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
 
     const version = try runCli(allocator, &.{"--version"});
     try std.testing.expectEqual(@as(u8, 0), version.exit_code);
-    try std.testing.expectEqualStrings("z-fastq 0.0.6\n", version.stdout);
+    try std.testing.expectEqualStrings("z-fastq 0.0.7\n", version.stdout);
     try std.testing.expectEqual(@as(usize, 0), version.stderr.len);
 
     const short_version = try runCli(allocator, &.{"-V"});

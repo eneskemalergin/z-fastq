@@ -21,6 +21,105 @@ pub const GzipOptions = struct {
     header_crc: bool = false,
 };
 
+pub fn expectJsonObjectKeys(
+    object: std.json.ObjectMap,
+    expected: []const []const u8,
+) !void {
+    try std.testing.expectEqual(expected.len, object.count());
+    var iterator = object.iterator();
+    var index: usize = 0;
+    while (iterator.next()) |entry| : (index += 1) {
+        try std.testing.expectEqualStrings(expected[index], entry.key_ptr.*);
+    }
+}
+
+pub fn expectJsonDocument(
+    value: *const std.json.Value,
+    schema: []const u8,
+) ![]const std.json.Value {
+    const object = switch (value.*) {
+        .object => |object| object,
+        else => return error.UnexpectedJsonShape,
+    };
+    try expectJsonObjectKeys(object, &.{ "schema", "tool", "byte_strings", "results" });
+    try expectJsonString(object.get("schema"), schema);
+    try expectJsonString(object.get("byte_strings"), "escaped-bytes-v1");
+
+    const tool_value = object.get("tool") orelse return error.UnexpectedJsonShape;
+    const tool = switch (tool_value) {
+        .object => |tool| tool,
+        else => return error.UnexpectedJsonShape,
+    };
+    try expectJsonObjectKeys(tool, &.{ "name", "version" });
+    try expectJsonString(tool.get("name"), "z-fastq");
+    try expectJsonString(tool.get("version"), "0.0.7");
+
+    const results_value = object.get("results") orelse return error.UnexpectedJsonShape;
+    return switch (results_value) {
+        .array => |results| results.items,
+        else => error.UnexpectedJsonShape,
+    };
+}
+
+pub fn expectJsonString(value: ?std.json.Value, expected: []const u8) !void {
+    const actual = switch (value orelse return error.UnexpectedJsonShape) {
+        .string => |string| string,
+        else => return error.UnexpectedJsonShape,
+    };
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+pub fn expectJsonInteger(value: ?std.json.Value, expected: u64) !void {
+    const integer = switch (value orelse return error.UnexpectedJsonShape) {
+        .integer => |integer| integer,
+        else => return error.UnexpectedJsonShape,
+    };
+    try std.testing.expectEqual(@as(i64, @intCast(expected)), integer);
+}
+
+pub fn expectJsonError(
+    value: std.json.Value,
+    input: []const u8,
+    code: []const u8,
+) !std.json.ObjectMap {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.UnexpectedJsonShape,
+    };
+    try expectJsonObjectKeys(object, &.{ "input", "status", "error" });
+    try expectJsonString(object.get("input"), input);
+    try expectJsonString(object.get("status"), "error");
+    const error_value = object.get("error") orelse return error.UnexpectedJsonShape;
+    const error_object = switch (error_value) {
+        .object => |error_object| error_object,
+        else => return error.UnexpectedJsonShape,
+    };
+    try expectJsonObjectKeys(
+        error_object,
+        &.{ "code", "message", "record_index", "byte_offset", "line_in_record" },
+    );
+    try expectJsonString(error_object.get("code"), code);
+    return error_object;
+}
+
+pub fn expectJsonErrorLocation(
+    object: std.json.ObjectMap,
+    record_index: u64,
+    byte_offset: u64,
+    line_in_record: u64,
+) !void {
+    try expectJsonInteger(object.get("record_index"), record_index);
+    try expectJsonInteger(object.get("byte_offset"), byte_offset);
+    try expectJsonInteger(object.get("line_in_record"), line_in_record);
+}
+
+pub fn expectJsonNullErrorLocation(object: std.json.ObjectMap) !void {
+    inline for (&.{ "record_index", "byte_offset", "line_in_record" }) |field| {
+        const value = object.get(field) orelse return error.UnexpectedJsonShape;
+        try std.testing.expect(value == .null);
+    }
+}
+
 pub fn appendGzipMember(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),

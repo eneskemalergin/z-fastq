@@ -230,6 +230,53 @@ test "[cli] - [stats]: plain, gzip, and fragmented stdin print identical fields"
     }
 }
 
+test "[cli] - [stats-json]: success and empty results have exact parsed shapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const samples = [_]CommandResult{
+        try runCli(
+            allocator,
+            &.{ "stats", "--json", "--max-line-bytes", "64", "-" },
+            SAMPLE_FASTQ,
+            1,
+        ),
+        try runCli(allocator, &.{ "stats", "--json", "-" }, &SAMPLE_GZIP, 1),
+    };
+    for (samples) |sample| {
+        try std.testing.expectEqual(@as(u8, 0), sample.exit_code);
+        try std.testing.expectEqual(@as(usize, 0), sample.stderr.len);
+        var sample_json = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            sample.stdout,
+            .{},
+        );
+        defer sample_json.deinit();
+        const sample_results = try cli.expectJsonDocument(
+            &sample_json.value,
+            "z-fastq/stats-v1",
+        );
+        try std.testing.expectEqual(@as(usize, 1), sample_results.len);
+        try expectSampleJsonStats(sample_results[0], "-");
+    }
+
+    const empty = try runCli(allocator, &.{ "stats", "--json", "-" }, "", 1);
+    try std.testing.expectEqual(@as(u8, 0), empty.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), empty.stderr.len);
+    var empty_json = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        empty.stdout,
+        .{},
+    );
+    defer empty_json.deinit();
+    const empty_results = try cli.expectJsonDocument(&empty_json.value, "z-fastq/stats-v1");
+    try std.testing.expectEqual(@as(usize, 1), empty_results.len);
+    try expectEmptyJsonStats(empty_results[0], "-");
+}
+
 test "[cli] - [stats]: empty input and a zero-length record remain distinct" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -400,6 +447,21 @@ test "[cli] - [stats]: input labels use escaped ASCII" {
         result.stdout,
     );
     try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
+
+    const json_result = try runCli(allocator, &.{ "stats", "--json", path }, "", 1);
+    try std.testing.expectEqual(@as(u8, 0), json_result.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), json_result.stderr.len);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        json_result.stdout,
+        .{},
+    );
+    defer parsed.deinit();
+    const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    const object = results[0].object;
+    try cli.expectJsonString(object.get("input"), escaped_path);
 }
 
 test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are explicit" {
@@ -418,8 +480,26 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
         "error: standard input may appear at most once\n",
     );
 
-    const unknown = try runCli(allocator, &.{ "stats", "--json" }, "", 1);
-    try expectCommand(unknown, 2, "", "error: unknown stats option: --json\n");
+    const json_duplicate_stdin = try runCli(
+        allocator,
+        &.{ "stats", "--json", "-", "-" },
+        "",
+        1,
+    );
+    try expectCommand(
+        json_duplicate_stdin,
+        2,
+        "",
+        "error: standard input may appear at most once\n",
+    );
+
+    const json_without_input = try runCli(allocator, &.{ "stats", "--json" }, "", 1);
+    try expectCommand(
+        json_without_input,
+        2,
+        "",
+        "error: stats requires at least one input\n",
+    );
 
     const line_limit = try runCli(
         allocator,
@@ -466,6 +546,28 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
     const corrupt = try runCli(allocator, &.{ "stats", "-" }, &damaged, 1);
     try expectCommand(corrupt, 3, "", "error: -: I/O error\n");
 
+    const corrupt_json = try runCli(allocator, &.{ "stats", "--json", "-" }, &damaged, 1);
+    try std.testing.expectEqual(@as(u8, 3), corrupt_json.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), corrupt_json.stderr.len);
+    var parsed_corrupt = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        corrupt_json.stdout,
+        .{},
+    );
+    defer parsed_corrupt.deinit();
+    const corrupt_results = try cli.expectJsonDocument(
+        &parsed_corrupt.value,
+        "z-fastq/stats-v1",
+    );
+    try std.testing.expectEqual(@as(usize, 1), corrupt_results.len);
+    try expectJsonFailureWithoutLocation(
+        corrupt_results[0],
+        "-",
+        "io_error",
+        "I/O error",
+    );
+
     const closed = try runCliWithClosedStdout(
         allocator,
         &.{ "stats", "-" },
@@ -474,8 +576,66 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
     try std.testing.expectEqual(@as(u8, 3), closed.exit_code);
     try std.testing.expectEqual(@as(usize, 0), closed.stderr.len);
 
+    const json_closed = try runCliWithClosedStdout(
+        allocator,
+        &.{ "stats", "--json", "-" },
+        SAMPLE_FASTQ,
+    );
+    try std.testing.expectEqual(@as(u8, 3), json_closed.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), json_closed.stderr.len);
+
     const closed_stdin = try runCliWithClosedStdin(allocator, &.{ "stats", "-" });
     try expectCommand(closed_stdin, 3, "", "error: -: I/O error\n");
+}
+
+test "[cli] - [stats-json]: mixed results preserve order, variants, and stream separation" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "valid.fastq", .data = SAMPLE_FASTQ });
+    try tmp.dir.writeFile(io, .{ .sub_path = "invalid.fastq", .data = "@bad\nA\n+\n \n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "long.fastq", .data = "@r\nAAAAAAA\n+\n!!!!!!!\n" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const valid = try tempPath(allocator, &tmp, "valid.fastq");
+    const invalid = try tempPath(allocator, &tmp, "invalid.fastq");
+    const long = try tempPath(allocator, &tmp, "long.fastq");
+    const missing = try tempPath(allocator, &tmp, "missing.fastq");
+
+    const result = try runCli(
+        allocator,
+        &.{
+            "stats",
+            "--json",
+            "--max-line-bytes",
+            "6",
+            valid,
+            invalid,
+            missing,
+            long,
+            valid,
+        },
+        "",
+        1,
+    );
+    try std.testing.expectEqual(@as(u8, 4), result.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
+    try std.testing.expectEqual(@as(usize, 5), results.len);
+    try expectSampleJsonStats(results[0], valid);
+    try expectJsonFailure(results[1], invalid, "S006", 0, 9, 4);
+    try expectJsonFailureWithoutLocation(results[2], missing, "io_error", "file not found");
+    try expectJsonFailureWithoutLocation(
+        results[3],
+        long,
+        "line_limit",
+        "line length limit exceeded",
+    );
+    try expectSampleJsonStats(results[4], valid);
 }
 
 fn record(sequence: []const u8, quality: []const u8) zfastq.Record {
@@ -528,4 +688,126 @@ fn expectCommand(
     try std.testing.expectEqual(exit_code, result.exit_code);
     try std.testing.expectEqualStrings(stdout, result.stdout);
     try std.testing.expectEqualStrings(stderr, result.stderr);
+}
+
+const STATS_RESULT_KEYS = [_][]const u8{
+    "input",
+    "status",
+    "reads",
+    "bases",
+    "min_length",
+    "max_length",
+    "mean_length",
+    "a",
+    "c",
+    "g",
+    "t",
+    "n",
+    "other_bases",
+    "gc_fraction",
+    "quality_sum",
+    "mean_quality",
+    "q20_bases",
+    "q20_fraction",
+    "q30_bases",
+    "q30_fraction",
+};
+
+fn expectSampleJsonStats(value: std.json.Value, input: []const u8) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.UnexpectedJsonShape,
+    };
+    try cli.expectJsonObjectKeys(object, &STATS_RESULT_KEYS);
+    try cli.expectJsonString(object.get("input"), input);
+    try cli.expectJsonString(object.get("status"), "ok");
+    try cli.expectJsonInteger(object.get("reads"), 1);
+    try cli.expectJsonInteger(object.get("bases"), 6);
+    try cli.expectJsonInteger(object.get("min_length"), 6);
+    try cli.expectJsonInteger(object.get("max_length"), 6);
+    try expectJsonNumber(object.get("mean_length"), 6.0);
+    inline for (&.{ "a", "c", "g", "t", "n", "other_bases" }) |field| {
+        try cli.expectJsonInteger(object.get(field), 1);
+    }
+    try expectJsonNumber(object.get("gc_fraction"), 0.5);
+    try cli.expectJsonInteger(object.get("quality_sum"), 183);
+    try expectJsonNumber(object.get("mean_quality"), 30.5);
+    try cli.expectJsonInteger(object.get("q20_bases"), 4);
+    try expectJsonNumber(object.get("q20_fraction"), 2.0 / 3.0);
+    try cli.expectJsonInteger(object.get("q30_bases"), 3);
+    try expectJsonNumber(object.get("q30_fraction"), 0.5);
+}
+
+fn expectEmptyJsonStats(value: std.json.Value, input: []const u8) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.UnexpectedJsonShape,
+    };
+    try cli.expectJsonObjectKeys(object, &STATS_RESULT_KEYS);
+    try cli.expectJsonString(object.get("input"), input);
+    try cli.expectJsonString(object.get("status"), "ok");
+    inline for (&.{
+        "reads",
+        "bases",
+        "a",
+        "c",
+        "g",
+        "t",
+        "n",
+        "other_bases",
+        "quality_sum",
+        "q20_bases",
+        "q30_bases",
+    }) |field| {
+        try cli.expectJsonInteger(object.get(field), 0);
+    }
+    inline for (&.{
+        "min_length",
+        "max_length",
+        "mean_length",
+        "gc_fraction",
+        "mean_quality",
+        "q20_fraction",
+        "q30_fraction",
+    }) |field| {
+        const field_value = object.get(field) orelse return error.UnexpectedJsonShape;
+        try std.testing.expect(field_value == .null);
+    }
+}
+
+fn expectJsonFailure(
+    value: std.json.Value,
+    input: []const u8,
+    code: []const u8,
+    record_index: u64,
+    byte_offset: u64,
+    line_in_record: u64,
+) !void {
+    const error_object = try cli.expectJsonError(value, input, code);
+    try cli.expectJsonErrorLocation(
+        error_object,
+        record_index,
+        byte_offset,
+        line_in_record,
+    );
+}
+
+fn expectJsonFailureWithoutLocation(
+    value: std.json.Value,
+    input: []const u8,
+    code: []const u8,
+    message: []const u8,
+) !void {
+    const error_object = try cli.expectJsonError(value, input, code);
+    try cli.expectJsonString(error_object.get("message"), message);
+    try cli.expectJsonNullErrorLocation(error_object);
+}
+
+fn expectJsonNumber(value: ?std.json.Value, expected: f64) !void {
+    const number = switch (value orelse return error.UnexpectedJsonShape) {
+        .float => |number| number,
+        .integer => |number| @as(f64, @floatFromInt(number)),
+        else => return error.UnexpectedJsonShape,
+    };
+    try std.testing.expectApproxEqAbs(expected, number, 1e-12);
 }

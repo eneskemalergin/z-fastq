@@ -3,7 +3,20 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const requested_target = b.standardTargetOptions(.{});
+    const static_release = b.option(
+        bool,
+        "static",
+        "Build the static Linux x86-64 release artifact",
+    ) orelse false;
+    const target = if (static_release)
+        b.resolveTargetQuery(.{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .abi = .musl,
+        })
+    else
+        requested_target;
     const optimize = b.standardOptimizeOption(.{});
     if (optimize == .ReleaseSmall) {
         std.debug.print(
@@ -25,7 +38,7 @@ pub fn build(b: *std.Build) void {
         "Use the vendored ISA-L gzip engine",
     ) orelse isa_l_supported;
     if (use_isa_l and !isa_l_supported) {
-        std.debug.print("error: ISA-L requires Linux x86-64 glibc or musl\n", .{});
+        std.debug.print("error: ISA-L requires a supported Linux x86-64 target\n", .{});
         std.process.exit(1);
     }
     const build_options = b.addOptions();
@@ -118,6 +131,7 @@ pub fn build(b: *std.Build) void {
     check_test_module.link_libc = true;
 
     const run_fastq_test = b.addRunArtifact(b.addTest(.{ .root_module = fastq_test_module }));
+    const run_main_test = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
     const run_reader_test = b.addRunArtifact(b.addTest(.{ .root_module = reader_test_module }));
     const run_writer_test = b.addRunArtifact(b.addTest(.{ .root_module = writer_test_module }));
 
@@ -130,6 +144,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_fastq_test.step);
+    test_step.dependOn(&run_main_test.step);
     test_step.dependOn(&run_reader_test.step);
     test_step.dependOn(&run_writer_test.step);
     test_step.dependOn(&run_count_test.step);

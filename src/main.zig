@@ -22,6 +22,9 @@ const USAGE =
     \\Input options:
     \\  --max-line-bytes N   Override default line length limit
     \\
+    \\Machine output:
+    \\  --json               Emit versioned JSON (stats and check only)
+    \\
     \\Check options:
     \\  --alphabet POLICY    Select iupac (default) or acgtn sequence symbols
     \\
@@ -29,10 +32,10 @@ const USAGE =
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
     \\
     \\Stats usage:
-    \\  z-fastq stats [--max-line-bytes N] <path|-> [<path|-> ...]
+    \\  z-fastq stats [--json] [--max-line-bytes N] <path|-> [<path|-> ...]
     \\
     \\Check usage:
-    \\  z-fastq check [--alphabet iupac|acgtn] [--max-line-bytes N] <path|-> [<path|-> ...]
+    \\  z-fastq check [--json] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|-> [<path|-> ...]
     \\
 ;
 
@@ -73,6 +76,7 @@ pub fn main(init: std.process.Init) !void {
 
     var max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES;
     var alphabet: zfastq.Alphabet = .iupac;
+    var json_output = false;
     var positional = std.ArrayList([]const u8).empty;
     defer positional.deinit(gpa);
 
@@ -122,6 +126,10 @@ pub fn main(init: std.process.Init) !void {
             };
             continue;
         }
+        if (command != .count and std.mem.eql(u8, arg, "--json")) {
+            json_output = true;
+            continue;
+        }
         if (command == .check and std.mem.eql(u8, arg, "--alphabet")) {
             const value = args.next() orelse {
                 std.Io.File.writeStreamingAll(
@@ -162,11 +170,11 @@ pub fn main(init: std.process.Init) !void {
     const options = InputOptions{ .max_line_bytes = max_line_bytes };
     const code = switch (command) {
         .count => runCount(io, positional.items, options),
-        .stats => runStats(io, gpa, positional.items, options),
+        .stats => runStats(io, gpa, positional.items, options, json_output),
         .check => runCheck(io, positional.items, .{
             .max_line_bytes = max_line_bytes,
             .alphabet = alphabet,
-        }),
+        }, json_output),
     };
     std.process.exit(code);
 }
@@ -401,20 +409,62 @@ fn printCount(io: std.Io, n: u64) !void {
     try std.Io.File.writeStreamingAll(.stdout(), io, text);
 }
 
-const RecordCommandError = error{
-    Io,
-    Format,
-    LineLimit,
-    ArithmeticLimit,
-    OutOfMemory,
+const CommandFailure = struct {
+    code: []const u8,
+    message: []const u8,
+    exit_code: u8,
+    record_index: ?u64 = null,
+    byte_offset: ?u64 = null,
+    line_in_record: ?u3 = null,
+
+    fn lint(details: zfastq.ParseError) CommandFailure {
+        return .{
+            .code = zfastq.codeTag(details.code),
+            .message = details.message,
+            .exit_code = 1,
+            .record_index = details.record_index,
+            .byte_offset = details.byte_offset,
+            .line_in_record = details.line_in_record,
+        };
+    }
+
+    fn plain(code: []const u8, message: []const u8, exit_code: u8) CommandFailure {
+        return .{ .code = code, .message = message, .exit_code = exit_code };
+    }
 };
 
-const CheckCommandError = error{
-    Io,
-    Format,
-    LineLimit,
-    ArithmeticLimit,
+const StatsOutcome = union(enum) {
+    success: zfastq.Stats,
+    failure: CommandFailure,
 };
+
+fn validateRecordCommandInputs(
+    io: std.Io,
+    command: Command,
+    inputs: []const []const u8,
+) ?u8 {
+    if (inputs.len == 0) {
+        std.Io.File.writeStreamingAll(.stderr(), io, "error: ") catch {};
+        std.Io.File.writeStreamingAll(.stderr(), io, @tagName(command)) catch {};
+        std.Io.File.writeStreamingAll(.stderr(), io, " requires at least one input\n") catch {};
+        return 2;
+    }
+
+    var has_stdin = false;
+    for (inputs) |input| {
+        if (!std.mem.eql(u8, input, "-")) continue;
+        if (has_stdin) {
+            std.Io.File.writeStreamingAll(
+                .stderr(),
+                io,
+                "error: standard input may appear at most once\n",
+            ) catch {};
+            return 2;
+        }
+        has_stdin = true;
+    }
+    return null;
+}
 
 // --- Check command ---
 
@@ -428,49 +478,42 @@ noinline fn runCheck(
     io: std.Io,
     inputs: []const []const u8,
     options: CheckOptions,
+    json_output: bool,
 ) u8 {
-    if (inputs.len == 0) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: check requires at least one input\n",
-        ) catch {};
-        return 2;
-    }
-
-    var has_stdin = false;
-    for (inputs) |input| {
-        if (!std.mem.eql(u8, input, "-")) continue;
-        if (has_stdin) {
-            std.Io.File.writeStreamingAll(
-                .stderr(),
-                io,
-                "error: standard input may appear at most once\n",
-            ) catch {};
-            return 2;
-        }
-        has_stdin = true;
-    }
+    if (validateRecordCommandInputs(io, .check, inputs)) |exit_code| return exit_code;
+    if (json_output) return runCheckJson(io, inputs, options);
 
     var exit_code: u8 = 0;
     for (inputs) |input| {
-        const result = if (std.mem.eql(u8, input, "-"))
+        const failure = if (std.mem.eql(u8, input, "-"))
             checkStdin(io, options)
         else
             checkFile(io, input, options);
-        result catch |err| switch (err) {
-            error.Io => exit_code = @max(exit_code, 3),
-            error.Format => exit_code = @max(exit_code, 1),
-            error.LineLimit => {
-                printPathError(io, input, "line length limit exceeded");
-                exit_code = @max(exit_code, 4);
-            },
-            error.ArithmeticLimit => {
-                printPathError(io, input, "input location exceeds supported limit");
-                exit_code = @max(exit_code, 4);
-            },
-        };
+        if (failure) |details| {
+            printCommandFailure(io, input, details);
+            exit_code = @max(exit_code, details.exit_code);
+        }
     }
+    return exit_code;
+}
+
+fn runCheckJson(io: std.Io, inputs: []const []const u8, options: CheckOptions) u8 {
+    var stdout_buffer: [16 * 1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    var json: std.json.Stringify = .{ .writer = &stdout_writer.interface };
+
+    beginJsonDocument(&json, "z-fastq/check-v1") catch return 3;
+    var exit_code: u8 = 0;
+    for (inputs) |input| {
+        const failure = if (std.mem.eql(u8, input, "-"))
+            checkStdin(io, options)
+        else
+            checkFile(io, input, options);
+        writeCheckJsonResult(&json, input, failure) catch return 3;
+        if (failure) |details| exit_code = @max(exit_code, details.exit_code);
+    }
+    finishJsonDocument(&json) catch return 3;
+    stdout_writer.interface.flush() catch return 3;
     return exit_code;
 }
 
@@ -478,47 +521,37 @@ fn checkFile(
     io: std.Io,
     path: []const u8,
     options: CheckOptions,
-) CheckCommandError!void {
+) ?CommandFailure {
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            printPathError(io, path, "file not found");
-            return error.Io;
-        },
-        else => {
-            printPathError(io, path, "failed to open file");
-            return error.Io;
-        },
+        error.FileNotFound => return CommandFailure.plain("io_error", "file not found", 3),
+        else => return CommandFailure.plain("io_error", "failed to open file", 3),
     };
 
     var input: RecordInput = undefined;
     input.init(io, file, true) catch {
         file.close(io);
-        printPathError(io, path, "I/O error");
-        return error.Io;
+        return CommandFailure.plain("io_error", "I/O error", 3);
     };
     defer input.deinit(io);
-    return checkSource(io, path, input.byteSource(), options);
+    return checkSource(input.byteSource(), options);
 }
 
 fn checkStdin(
     io: std.Io,
     options: CheckOptions,
-) CheckCommandError!void {
+) ?CommandFailure {
     var input: RecordInput = undefined;
     input.init(io, .stdin(), false) catch {
-        printPathError(io, "-", "I/O error");
-        return error.Io;
+        return CommandFailure.plain("io_error", "I/O error", 3);
     };
     defer input.deinit(io);
-    return checkSource(io, "-", input.byteSource(), options);
+    return checkSource(input.byteSource(), options);
 }
 
 fn checkSource(
-    io: std.Io,
-    label: []const u8,
     source: zfastq.io.ByteSource,
     options: CheckOptions,
-) CheckCommandError!void {
+) ?CommandFailure {
     var scanner = fastq.CheckScanner.init(
         .{ .max_line_bytes = options.max_line_bytes },
         .{ .alphabet = options.alphabet },
@@ -526,32 +559,38 @@ fn checkSource(
     var buf: [zfastq.limits.COUNT_READ_BUFFER_BYTES]u8 = undefined;
     while (true) {
         const n = source.read(&buf) catch {
-            printPathError(io, label, "I/O error");
-            return error.Io;
+            return CommandFailure.plain("io_error", "I/O error", 3);
         };
         if (n == 0) break;
         _ = scanner.feed(buf[0..n]) catch |err| {
-            return mapCheckScannerError(io, label, &scanner, err);
+            return mapCheckScannerFailure(&scanner, err);
         };
     }
     scanner.finishEof() catch |err| {
-        return mapCheckScannerError(io, label, &scanner, err);
+        return mapCheckScannerFailure(&scanner, err);
     };
+    return null;
 }
 
-fn mapCheckScannerError(
-    io: std.Io,
-    path: []const u8,
+fn mapCheckScannerFailure(
     scanner: *fastq.CheckScanner,
     err: fastq.CheckScannerError,
-) CheckCommandError {
+) CommandFailure {
     return switch (err) {
-        error.Format => {
-            if (scanner.takeLastError()) |details| printParseError(io, path, details);
-            return error.Format;
-        },
-        error.LineTooLong => error.LineLimit,
-        error.ArithmeticLimit => error.ArithmeticLimit,
+        error.Format => if (scanner.takeLastError()) |details|
+            CommandFailure.lint(details)
+        else
+            CommandFailure.plain("io_error", "validation failed without details", 3),
+        error.LineTooLong => CommandFailure.plain(
+            "line_limit",
+            "line length limit exceeded",
+            4,
+        ),
+        error.ArithmeticLimit => CommandFailure.plain(
+            "arithmetic_limit",
+            "input location exceeds supported limit",
+            4,
+        ),
     };
 }
 
@@ -563,59 +602,32 @@ noinline fn runStats(
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
     options: InputOptions,
+    json_output: bool,
 ) u8 {
-    if (inputs.len == 0) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: stats requires at least one input\n",
-        ) catch {};
-        return 2;
-    }
-
-    var has_stdin = false;
-    for (inputs) |input| {
-        if (!std.mem.eql(u8, input, "-")) continue;
-        if (has_stdin) {
-            std.Io.File.writeStreamingAll(
-                .stderr(),
-                io,
-                "error: standard input may appear at most once\n",
-            ) catch {};
-            return 2;
-        }
-        has_stdin = true;
-    }
+    if (validateRecordCommandInputs(io, .stats, inputs)) |exit_code| return exit_code;
+    if (json_output) return runStatsJson(io, allocator, inputs, options);
 
     var exit_code: u8 = 0;
     var printed_block = false;
     for (inputs) |input| {
-        const stats_result = if (std.mem.eql(u8, input, "-"))
+        const outcome = if (std.mem.eql(u8, input, "-"))
             statsStdin(io, allocator, options)
         else
             statsFile(io, allocator, input, options);
-        const stats = stats_result catch |err| switch (err) {
-            error.Io => {
-                exit_code = @max(exit_code, 3);
+        const stats = switch (outcome) {
+            .success => |stats| stats,
+            .failure => |failure| {
+                if (std.mem.eql(u8, failure.code, "out_of_memory")) {
+                    std.Io.File.writeStreamingAll(
+                        .stderr(),
+                        io,
+                        "error: out of memory\n",
+                    ) catch {};
+                    return 3;
+                }
+                printCommandFailure(io, input, failure);
+                exit_code = @max(exit_code, failure.exit_code);
                 continue;
-            },
-            error.Format => {
-                exit_code = @max(exit_code, 1);
-                continue;
-            },
-            error.LineLimit => {
-                printPathError(io, input, "line length limit exceeded");
-                exit_code = @max(exit_code, 4);
-                continue;
-            },
-            error.ArithmeticLimit => {
-                printPathError(io, input, "statistics arithmetic limit exceeded");
-                exit_code = @max(exit_code, 4);
-                continue;
-            },
-            error.OutOfMemory => {
-                std.Io.File.writeStreamingAll(.stderr(), io, "error: out of memory\n") catch {};
-                return 3;
             },
         };
 
@@ -626,45 +638,73 @@ noinline fn runStats(
     return exit_code;
 }
 
+fn runStatsJson(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    options: InputOptions,
+) u8 {
+    var stdout_buffer: [16 * 1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    var json: std.json.Stringify = .{ .writer = &stdout_writer.interface };
+
+    beginJsonDocument(&json, "z-fastq/stats-v1") catch return 3;
+    var exit_code: u8 = 0;
+    for (inputs) |input| {
+        const outcome = if (std.mem.eql(u8, input, "-"))
+            statsStdin(io, allocator, options)
+        else
+            statsFile(io, allocator, input, options);
+        writeStatsJsonResult(&json, input, outcome) catch return 3;
+        switch (outcome) {
+            .success => {},
+            .failure => |failure| exit_code = @max(exit_code, failure.exit_code),
+        }
+    }
+    finishJsonDocument(&json) catch return 3;
+    stdout_writer.interface.flush() catch return 3;
+    return exit_code;
+}
+
 fn statsFile(
     io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     options: InputOptions,
-) RecordCommandError!zfastq.Stats {
+) StatsOutcome {
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            printPathError(io, path, "file not found");
-            return error.Io;
-        },
-        else => {
-            printPathError(io, path, "failed to open file");
-            return error.Io;
-        },
+        error.FileNotFound => return .{ .failure = CommandFailure.plain(
+            "io_error",
+            "file not found",
+            3,
+        ) },
+        else => return .{ .failure = CommandFailure.plain(
+            "io_error",
+            "failed to open file",
+            3,
+        ) },
     };
 
     var input: RecordInput = undefined;
     input.init(io, file, true) catch {
         file.close(io);
-        printPathError(io, path, "I/O error");
-        return error.Io;
+        return .{ .failure = CommandFailure.plain("io_error", "I/O error", 3) };
     };
     defer input.deinit(io);
-    return collectStats(io, allocator, path, input.byteSource(), options);
+    return collectStats(allocator, input.byteSource(), options);
 }
 
 fn statsStdin(
     io: std.Io,
     allocator: std.mem.Allocator,
     options: InputOptions,
-) RecordCommandError!zfastq.Stats {
+) StatsOutcome {
     var input: RecordInput = undefined;
     input.init(io, .stdin(), false) catch {
-        printPathError(io, "-", "I/O error");
-        return error.Io;
+        return .{ .failure = CommandFailure.plain("io_error", "I/O error", 3) };
     };
     defer input.deinit(io);
-    return collectStats(io, allocator, "-", input.byteSource(), options);
+    return collectStats(allocator, input.byteSource(), options);
 }
 
 const RecordInput = struct {
@@ -713,93 +753,250 @@ const RecordInput = struct {
 };
 
 fn collectStats(
-    io: std.Io,
     allocator: std.mem.Allocator,
-    label: []const u8,
     source: zfastq.io.ByteSource,
     options: InputOptions,
-) RecordCommandError!zfastq.Stats {
+) StatsOutcome {
     var reader = zfastq.Reader.init(
         allocator,
         source,
         .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return error.OutOfMemory;
+    ) catch return .{ .failure = CommandFailure.plain(
+        "out_of_memory",
+        "out of memory",
+        3,
+    ) };
     defer reader.deinit();
 
     var stats: zfastq.Stats = .{};
     while (reader.next() catch |err| {
-        return mapReaderError(io, label, &reader, err);
+        return .{ .failure = mapReaderFailure(&reader, err) };
     }) |record| {
         stats.addRecord(record) catch |err| switch (err) {
             error.S006InvalidQuality => {
                 const quality_error = stats.takeLastQualityError() orelse {
-                    printPathError(io, label, "quality validation failed without details");
-                    return error.Io;
+                    return .{ .failure = CommandFailure.plain(
+                        "io_error",
+                        "quality validation failed without details",
+                        3,
+                    ) };
                 };
                 const offsets = reader.currentRecordOffsets() orelse {
-                    printPathError(io, label, "record location is unavailable");
-                    return error.Io;
+                    return .{ .failure = CommandFailure.plain(
+                        "io_error",
+                        "record location is unavailable",
+                        3,
+                    ) };
                 };
                 const relative_offset = std.math.cast(u64, quality_error.byte_index) orelse
-                    return error.ArithmeticLimit;
+                    return .{ .failure = CommandFailure.plain(
+                        "arithmetic_limit",
+                        "statistics arithmetic limit exceeded",
+                        4,
+                    ) };
                 const byte_offset = std.math.add(
                     u64,
                     offsets.quality,
                     relative_offset,
-                ) catch return error.ArithmeticLimit;
-                printParseError(io, label, .{
+                ) catch return .{ .failure = CommandFailure.plain(
+                    "arithmetic_limit",
+                    "statistics arithmetic limit exceeded",
+                    4,
+                ) };
+                return .{ .failure = CommandFailure.lint(.{
                     .code = .s006_invalid_quality_range,
                     .message = INVALID_QUALITY_MESSAGE,
                     .record_index = reader.recordIndex() - 1,
                     .byte_offset = byte_offset,
                     .line_in_record = 4,
-                });
-                return error.Format;
+                }) };
             },
             error.S005LengthMismatch => {
                 const offsets = reader.currentRecordOffsets() orelse {
-                    printPathError(io, label, "record location is unavailable");
-                    return error.Io;
+                    return .{ .failure = CommandFailure.plain(
+                        "io_error",
+                        "record location is unavailable",
+                        3,
+                    ) };
                 };
-                printParseError(io, label, .{
+                return .{ .failure = CommandFailure.lint(.{
                     .code = .s005_length_mismatch,
                     .message = "sequence and quality lengths differ",
                     .record_index = reader.recordIndex() - 1,
                     .byte_offset = offsets.quality,
                     .line_in_record = 4,
-                });
-                return error.Format;
+                }) };
             },
-            error.Overflow => return error.ArithmeticLimit,
+            error.Overflow => return .{ .failure = CommandFailure.plain(
+                "arithmetic_limit",
+                "statistics arithmetic limit exceeded",
+                4,
+            ) },
         };
     }
-    return stats;
+    return .{ .success = stats };
 }
 
-fn mapReaderError(
-    io: std.Io,
-    path: []const u8,
+fn mapReaderFailure(
     reader: *zfastq.Reader,
     err: zfastq.ReaderError,
-) RecordCommandError {
+) CommandFailure {
     return switch (err) {
         error.S001InvalidPlusLine,
         error.S003InvalidHeader,
         error.S004TruncatedRecord,
         error.S005LengthMismatch,
-        => {
-            if (reader.takeLastError()) |details| {
-                printParseError(io, path, details);
-            }
-            return error.Format;
-        },
-        error.LineTooLong => error.LineLimit,
-        error.OutOfMemory => error.OutOfMemory,
-        error.Io => {
-            printPathError(io, path, "I/O error");
-            return error.Io;
-        },
+        => if (reader.takeLastError()) |details|
+            CommandFailure.lint(details)
+        else
+            CommandFailure.plain("io_error", "validation failed without details", 3),
+        error.LineTooLong => CommandFailure.plain(
+            "line_limit",
+            "line length limit exceeded",
+            4,
+        ),
+        error.OutOfMemory => CommandFailure.plain("out_of_memory", "out of memory", 3),
+        error.Io => CommandFailure.plain("io_error", "I/O error", 3),
     };
+}
+
+// --- Machine output ---
+
+fn beginJsonDocument(json: *std.json.Stringify, schema: []const u8) !void {
+    try json.beginObject();
+    try json.objectField("schema");
+    try json.write(schema);
+    try json.objectField("tool");
+    try json.beginObject();
+    try json.objectField("name");
+    try json.write("z-fastq");
+    try json.objectField("version");
+    try json.write(zfastq.VERSION);
+    try json.endObject();
+    try json.objectField("byte_strings");
+    try json.write("escaped-bytes-v1");
+    try json.objectField("results");
+    try json.beginArray();
+}
+
+fn finishJsonDocument(json: *std.json.Stringify) !void {
+    try json.endArray();
+    try json.endObject();
+    try json.writer.writeByte('\n');
+}
+
+fn writeCheckJsonResult(
+    json: *std.json.Stringify,
+    input: []const u8,
+    failure: ?CommandFailure,
+) !void {
+    try json.beginObject();
+    try json.objectField("input");
+    try writeEscapedJsonString(json, input);
+    try json.objectField("status");
+    try json.write(if (failure == null) "ok" else "error");
+    if (failure) |details| try writeJsonFailure(json, details);
+    try json.endObject();
+}
+
+fn writeStatsJsonResult(
+    json: *std.json.Stringify,
+    input: []const u8,
+    outcome: StatsOutcome,
+) !void {
+    try json.beginObject();
+    try json.objectField("input");
+    try writeEscapedJsonString(json, input);
+    switch (outcome) {
+        .failure => |failure| {
+            try json.objectField("status");
+            try json.write("error");
+            try writeJsonFailure(json, failure);
+        },
+        .success => |stats| {
+            const result = stats.result();
+            try json.objectField("status");
+            try json.write("ok");
+            try json.objectField("reads");
+            try json.write(result.reads);
+            try json.objectField("bases");
+            try json.write(result.bases);
+            try json.objectField("min_length");
+            try json.write(result.min_length);
+            try json.objectField("max_length");
+            try json.write(result.max_length);
+            try json.objectField("mean_length");
+            try json.write(result.mean_length);
+            try json.objectField("a");
+            try json.write(result.a);
+            try json.objectField("c");
+            try json.write(result.c);
+            try json.objectField("g");
+            try json.write(result.g);
+            try json.objectField("t");
+            try json.write(result.t);
+            try json.objectField("n");
+            try json.write(result.n);
+            try json.objectField("other_bases");
+            try json.write(result.other_bases);
+            try json.objectField("gc_fraction");
+            try json.write(result.gc_fraction);
+            try json.objectField("quality_sum");
+            try json.write(result.quality_sum);
+            try json.objectField("mean_quality");
+            try json.write(result.mean_quality);
+            try json.objectField("q20_bases");
+            try json.write(result.q20_bases);
+            try json.objectField("q20_fraction");
+            try json.write(result.q20_fraction);
+            try json.objectField("q30_bases");
+            try json.write(result.q30_bases);
+            try json.objectField("q30_fraction");
+            try json.write(result.q30_fraction);
+        },
+    }
+    try json.endObject();
+}
+
+fn writeJsonFailure(json: *std.json.Stringify, failure: CommandFailure) !void {
+    try json.objectField("error");
+    try json.beginObject();
+    try json.objectField("code");
+    try json.write(failure.code);
+    try json.objectField("message");
+    try json.write(failure.message);
+    try json.objectField("record_index");
+    try json.write(failure.record_index);
+    try json.objectField("byte_offset");
+    try json.write(failure.byte_offset);
+    try json.objectField("line_in_record");
+    try json.write(failure.line_in_record);
+    try json.endObject();
+}
+
+fn writeEscapedJsonString(json: *std.json.Stringify, bytes: []const u8) !void {
+    try json.beginWriteRaw();
+    try json.writer.writeByte('"');
+    var run_start: usize = 0;
+    for (bytes, 0..) |byte, index| {
+        if (byte >= 0x20 and byte <= 0x7e and byte != '\\') continue;
+
+        try std.json.Stringify.encodeJsonStringChars(
+            bytes[run_start..index],
+            .{},
+            json.writer,
+        );
+        if (byte == '\\') {
+            try std.json.Stringify.encodeJsonStringChars("\\\\", .{}, json.writer);
+        } else {
+            const escaped = [4]u8{ '\\', 'x', HEX[byte >> 4], HEX[byte & 0x0f] };
+            try std.json.Stringify.encodeJsonStringChars(&escaped, .{}, json.writer);
+        }
+        run_start = index + 1;
+    }
+    try std.json.Stringify.encodeJsonStringChars(bytes[run_start..], .{}, json.writer);
+    try json.writer.writeByte('"');
+    json.endWriteRaw();
 }
 
 fn printStats(
@@ -879,6 +1076,34 @@ fn printPathError(io: std.Io, path: []const u8, message: []const u8) void {
     std.Io.File.writeStreamingAll(.stderr(), io, "\n") catch {};
 }
 
+fn printCommandFailure(io: std.Io, path: []const u8, failure: CommandFailure) void {
+    if (failure.record_index == null or
+        failure.byte_offset == null or
+        failure.line_in_record == null)
+    {
+        return printPathError(io, path, failure.message);
+    }
+
+    std.Io.File.writeStreamingAll(.stderr(), io, "error: ") catch {};
+    writeEscaped(.stderr(), io, path);
+    std.Io.File.writeStreamingAll(.stderr(), io, ": ") catch {};
+    std.Io.File.writeStreamingAll(.stderr(), io, failure.code) catch {};
+    std.Io.File.writeStreamingAll(.stderr(), io, ": ") catch {};
+    std.Io.File.writeStreamingAll(.stderr(), io, failure.message) catch {};
+
+    var buf: [96]u8 = undefined;
+    const suffix = std.fmt.bufPrint(
+        &buf,
+        " (record {d}, line {d}, offset {d})\n",
+        .{
+            failure.record_index.?,
+            failure.line_in_record.?,
+            failure.byte_offset.?,
+        },
+    ) catch return;
+    std.Io.File.writeStreamingAll(.stderr(), io, suffix) catch {};
+}
+
 fn printParseError(io: std.Io, path: []const u8, details: zfastq.ParseError) void {
     std.Io.File.writeStreamingAll(.stderr(), io, "error: ") catch {};
     writeEscaped(.stderr(), io, path);
@@ -921,4 +1146,85 @@ fn writeEscapedAll(file: std.Io.File, io: std.Io, bytes: []const u8) !void {
         run_start = index + 1;
     }
     try std.Io.File.writeStreamingAll(file, io, bytes[run_start..]);
+}
+
+test "[unit] - [machine output]: handled non-lint errors share one exact shape" {
+    const cases = [_]struct {
+        code: []const u8,
+        message: []const u8,
+        exit_code: u8,
+    }{
+        .{ .code = "io_error", .message = "I/O error", .exit_code = 3 },
+        .{ .code = "line_limit", .message = "line length limit exceeded", .exit_code = 4 },
+        .{ .code = "arithmetic_limit", .message = "arithmetic limit exceeded", .exit_code = 4 },
+        .{ .code = "out_of_memory", .message = "out of memory", .exit_code = 3 },
+    };
+
+    for (cases) |case| {
+        var storage: [256]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&storage);
+        var json: std.json.Stringify = .{ .writer = &writer };
+        try json.beginObject();
+        try writeJsonFailure(
+            &json,
+            CommandFailure.plain(case.code, case.message, case.exit_code),
+        );
+        try json.endObject();
+
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            writer.buffered(),
+            .{},
+        );
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        try std.testing.expectEqual(@as(usize, 1), object.count());
+        const failure = object.get("error").?.object;
+        try std.testing.expectEqual(@as(usize, 5), failure.count());
+        try std.testing.expectEqualStrings(case.code, failure.get("code").?.string);
+        try std.testing.expectEqualStrings(case.message, failure.get("message").?.string);
+        try std.testing.expect(failure.get("record_index").? == .null);
+        try std.testing.expect(failure.get("byte_offset").? == .null);
+        try std.testing.expect(failure.get("line_in_record").? == .null);
+    }
+}
+
+test "[edge] - [stats-json]: preserves the maximum u64 counter" {
+    var storage: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    var json: std.json.Stringify = .{ .writer = &writer };
+    try writeStatsJsonResult(&json, "-", .{ .success = .{
+        .reads = std.math.maxInt(u64),
+    } });
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        writer.buffered(),
+        .{ .parse_numbers = false },
+    );
+    defer parsed.deinit();
+    const result = parsed.value.object.get("reads").?;
+    try std.testing.expectEqualStrings("18446744073709551615", result.number_string);
+}
+
+test "[failure] - [stats command]: reader allocation failure becomes a handled result" {
+    var source = zfastq.io.plain.SliceSource.init("");
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+
+    const outcome = collectStats(failing.allocator(), source.byteSource(), .{});
+    const failure = switch (outcome) {
+        .success => return error.ExpectedFailure,
+        .failure => |failure| failure,
+    };
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqualStrings("out_of_memory", failure.code);
+    try std.testing.expectEqualStrings("out of memory", failure.message);
+    try std.testing.expectEqual(@as(u8, 3), failure.exit_code);
+    try std.testing.expect(failure.record_index == null);
+    try std.testing.expect(failure.byte_offset == null);
+    try std.testing.expect(failure.line_in_record == null);
 }
