@@ -29,17 +29,20 @@ The project as a whole is not dependency-free. The accelerated build compiles ve
 ```bash
 ./zig-out/bin/z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
 ./zig-out/bin/z-fastq stats [--max-line-bytes N] <path|-> [<path|-> ...]
+./zig-out/bin/z-fastq check [--alphabet iupac|acgtn] [--max-line-bytes N] <path|-> [<path|-> ...]
 ```
 
 `count` prints one record count for each successfully parsed plain or gzip path, or explicit `-` for standard input. Input bytes select gzip independently of the path suffix. Standard input may appear once and is never selected implicitly. Non-zero exit status indicates an error; parse failures include record index, line number, and byte offset on stderr.
 
 `stats` reports aggregate read lengths, case-insensitive base composition, GC fraction, and Phred+33 mean, Q20, and Q30 metrics. Undefined values print as `-`. Quality bytes outside ASCII 33 through 126 fail with S006 rather than entering the result.
 
+`check` validates FASTQ structure, sequence symbols, and Phred+33 byte range. Its default alphabet accepts upper- and lowercase IUPAC nucleotide symbols; `--alphabet acgtn` selects the narrower A, C, G, T, and N policy. Successful validation is silent. The first failure in each input reports an S001 through S006 code with its zero-based record index and byte offset plus its one-based record line.
+
 Exit status 1 reports invalid FASTQ, 2 reports command-line usage, 3 reports I/O or unexpected allocation failure, and 4 reports configured or arithmetic limits. Untrusted command, option, and path bytes are displayed using printable ASCII, doubled backslashes, and uppercase `\xHH` escapes for all other bytes.
 
 ## Library
 
-Import the `z-fastq` module from `src/root.zig`. The current surface provides `Reader`, `Writer`, borrowed `Record`, `OwnedRecord`, structural diagnostics, `count_scan`, the checked allocation-free `Stats` accumulator, plain and gzip `io` adapters, shared `limits`, and `VERSION`.
+Import the `z-fastq` module from `src/root.zig`. The current surface provides `Reader`, `Writer`, borrowed `Record`, `OwnedRecord`, structural and semantic diagnostics, allocation-free record validation with `validateRecord()`, `count_scan`, the checked allocation-free `Stats` accumulator, plain and gzip `io` adapters, shared `limits`, and `VERSION`.
 
 Records returned by `Reader.next()` borrow reader storage until the next reader advance or deinitialization. Use `toOwned()` and later `OwnedRecord.deinit()` when a record must outlive that boundary. Byte-source and byte-sink wrappers are copied, but their referenced adapters must outlive the reader or writer. `io.gzip.ReaderSource` validates RFC 1952 headers, DEFLATE payloads, trailers, and concatenated members while borrowing a `std.Io.Reader` with at least ten buffer bytes.
 

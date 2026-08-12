@@ -1,4 +1,4 @@
-//! Four-line FASTQ records, streaming reader and writer, and structural errors.
+//! Four-line FASTQ records, streaming reader and writer, and record validation.
 
 const std = @import("std");
 const io_layer = @import("io.zig");
@@ -9,6 +9,7 @@ const WriteError = io_layer.WriteError;
 
 pub const LintCode = enum {
     s001_invalid_plus_line,
+    s002_invalid_sequence_alphabet,
     s003_invalid_header,
     s004_truncated_record,
     s005_length_mismatch,
@@ -25,6 +26,7 @@ pub const ParseError = struct {
 pub fn codeTag(code: LintCode) []const u8 {
     return switch (code) {
         .s001_invalid_plus_line => "S001",
+        .s002_invalid_sequence_alphabet => "S002",
         .s003_invalid_header => "S003",
         .s004_truncated_record => "S004",
         .s005_length_mismatch => "S005",
@@ -54,6 +56,105 @@ pub const Record = struct {
     plus: []const u8,
     quality: []const u8,
 };
+
+pub const Alphabet = enum {
+    iupac,
+    acgtn,
+};
+
+pub const ValidationOptions = struct {
+    alphabet: Alphabet = .iupac,
+};
+
+pub const SemanticField = enum {
+    sequence,
+    quality,
+};
+
+/// Describes the first semantic failure at a zero-based field-relative byte index.
+pub const SemanticError = struct {
+    code: LintCode,
+    message: []const u8,
+    field: SemanticField,
+    byte_index: usize,
+};
+
+/// Checks only sequence alphabet and Phred+33 bytes without allocating.
+/// Structural prefixes, completeness, and equal field lengths remain caller-owned.
+pub fn validateRecord(record: Record, options: ValidationOptions) ?SemanticError {
+    for (record.sequence, 0..) |byte, byte_index| {
+        if (!alphabetAccepts(options.alphabet, byte)) {
+            return .{
+                .code = .s002_invalid_sequence_alphabet,
+                .message = "sequence byte is outside the selected alphabet",
+                .field = .sequence,
+                .byte_index = byte_index,
+            };
+        }
+    }
+    for (record.quality, 0..) |byte, byte_index| {
+        _ = decodePhred33(byte) catch {
+            return .{
+                .code = .s006_invalid_quality_range,
+                .message = "quality byte must be ASCII 33 through 126",
+                .field = .quality,
+                .byte_index = byte_index,
+            };
+        };
+    }
+    return null;
+}
+
+/// Decodes one Phred+33 byte and rejects values outside ASCII 33 through 126.
+pub fn decodePhred33(quality_byte: u8) error{InvalidQuality}!u8 {
+    if (quality_byte < 33 or quality_byte > 126) return error.InvalidQuality;
+    return quality_byte - 33;
+}
+
+fn alphabetAccepts(alphabet: Alphabet, byte: u8) bool {
+    return switch (alphabet) {
+        .iupac => switch (byte) {
+            'A',
+            'C',
+            'G',
+            'T',
+            'U',
+            'R',
+            'Y',
+            'S',
+            'W',
+            'K',
+            'M',
+            'B',
+            'D',
+            'H',
+            'V',
+            'N',
+            'a',
+            'c',
+            'g',
+            't',
+            'u',
+            'r',
+            'y',
+            's',
+            'w',
+            'k',
+            'm',
+            'b',
+            'd',
+            'h',
+            'v',
+            'n',
+            => true,
+            else => false,
+        },
+        .acgtn => switch (byte) {
+            'A', 'C', 'G', 'T', 'N', 'a', 'c', 'g', 't', 'n' => true,
+            else => false,
+        },
+    };
+}
 
 /// Independently allocated fields released together by `deinit`.
 pub const OwnedRecord = struct {

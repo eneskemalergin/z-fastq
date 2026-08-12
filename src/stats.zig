@@ -14,12 +14,6 @@ pub const QualityError = struct {
     byte: u8,
 };
 
-/// Decodes one Phred+33 byte and rejects values outside ASCII 33 through 126.
-pub fn decodePhred33(quality_byte: u8) error{InvalidQuality}!u8 {
-    if (quality_byte < 33 or quality_byte > 126) return error.InvalidQuality;
-    return quality_byte - 33;
-}
-
 /// Materialized counters and ratios; optional values are null for an empty population.
 pub const StatsResult = struct {
     reads: u64,
@@ -205,7 +199,7 @@ fn payloadTotalsScalar(
     var q20_bases: usize = 0;
     var q30_bases: usize = 0;
     for (sequence, quality, 0..) |base, quality_byte, byte_index| {
-        const score = decodePhred33(quality_byte) catch {
+        const score = fastq.decodePhred33(quality_byte) catch {
             quality_error.* = .{ .byte_index = byte_index, .byte = quality_byte };
             return error.S006InvalidQuality;
         };
@@ -332,7 +326,7 @@ fn payloadTotalsVector(
         quality[byte_index..],
         byte_index..,
     ) |base, quality_byte, tail_index| {
-        const score = decodePhred33(quality_byte) catch {
+        const score = fastq.decodePhred33(quality_byte) catch {
             quality_error.* = .{ .byte_index = tail_index, .byte = quality_byte };
             return error.S006InvalidQuality;
         };

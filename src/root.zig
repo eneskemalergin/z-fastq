@@ -15,12 +15,17 @@ pub const ParseError = fastq.ParseError;
 pub const LintCode = fastq.LintCode;
 pub const ReaderError = fastq.ReaderError;
 pub const codeTag = fastq.codeTag;
+pub const Alphabet = fastq.Alphabet;
+pub const ValidationOptions = fastq.ValidationOptions;
+pub const SemanticField = fastq.SemanticField;
+pub const SemanticError = fastq.SemanticError;
+pub const validateRecord = fastq.validateRecord;
 
 pub const Stats = statistics.Stats;
 pub const StatsResult = statistics.StatsResult;
 pub const StatsError = statistics.StatsError;
 pub const QualityError = statistics.QualityError;
-pub const decodePhred33 = statistics.decodePhred33;
+pub const decodePhred33 = fastq.decodePhred33;
 
 pub const io = struct {
     pub const ByteSource = io_layer.ByteSource;
@@ -48,4 +53,4 @@ const Limits = struct {
 pub const limits = Limits;
 pub const count_scan = @import("count_scan.zig");
 
-pub const VERSION = "0.0.5";
+pub const VERSION = "0.0.6";

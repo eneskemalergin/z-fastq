@@ -12,6 +12,7 @@ const USAGE =
     \\Commands:
     \\  count    Count records in plain or gzip FASTQ inputs
     \\  stats    Report aggregate FASTQ statistics
+    \\  check    Validate FASTQ structure, sequence alphabet, and quality range
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -20,11 +21,17 @@ const USAGE =
     \\Input options:
     \\  --max-line-bytes N   Override default line length limit
     \\
+    \\Check options:
+    \\  --alphabet POLICY    Select iupac (default) or acgtn sequence symbols
+    \\
     \\Count usage:
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
     \\
     \\Stats usage:
     \\  z-fastq stats [--max-line-bytes N] <path|-> [<path|-> ...]
+    \\
+    \\Check usage:
+    \\  z-fastq check [--alphabet iupac|acgtn] [--max-line-bytes N] <path|-> [<path|-> ...]
     \\
 ;
 
@@ -54,6 +61,8 @@ pub fn main(init: std.process.Init) !void {
         .count
     else if (std.mem.eql(u8, cmd, "stats"))
         .stats
+    else if (std.mem.eql(u8, cmd, "check"))
+        .check
     else {
         std.Io.File.writeStreamingAll(.stderr(), io, "error: unknown command: ") catch {};
         writeEscaped(.stderr(), io, cmd);
@@ -62,6 +71,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES;
+    var alphabet: zfastq.Alphabet = .iupac;
     var positional = std.ArrayList([]const u8).empty;
     defer positional.deinit(gpa);
 
@@ -111,6 +121,29 @@ pub fn main(init: std.process.Init) !void {
             };
             continue;
         }
+        if (command == .check and std.mem.eql(u8, arg, "--alphabet")) {
+            const value = args.next() orelse {
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: --alphabet requires a value\n",
+                ) catch {};
+                std.process.exit(2);
+            };
+            alphabet = if (std.mem.eql(u8, value, "iupac"))
+                .iupac
+            else if (std.mem.eql(u8, value, "acgtn"))
+                .acgtn
+            else {
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: --alphabet must be iupac or acgtn\n",
+                ) catch {};
+                std.process.exit(2);
+            };
+            continue;
+        }
         if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
             std.Io.File.writeStreamingAll(.stderr(), io, "error: unknown ") catch {};
             std.Io.File.writeStreamingAll(.stderr(), io, @tagName(command)) catch {};
@@ -129,11 +162,15 @@ pub fn main(init: std.process.Init) !void {
     const code = switch (command) {
         .count => runCount(io, positional.items, options),
         .stats => runStats(io, gpa, positional.items, options),
+        .check => runCheck(io, gpa, positional.items, .{
+            .max_line_bytes = max_line_bytes,
+            .alphabet = alphabet,
+        }),
     };
     std.process.exit(code);
 }
 
-const Command = enum { count, stats };
+const Command = enum { count, stats, check };
 
 fn printUsageAndExit(io: std.Io) noreturn {
     std.Io.File.writeStreamingAll(.stderr(), io, USAGE) catch {};
@@ -363,15 +400,167 @@ fn printCount(io: std.Io, n: u64) !void {
     try std.Io.File.writeStreamingAll(.stdout(), io, text);
 }
 
-// --- Stats command ---
-
-const StatsCommandError = error{
+const RecordCommandError = error{
     Io,
     Format,
     LineLimit,
     ArithmeticLimit,
     OutOfMemory,
 };
+
+// --- Check command ---
+
+const CheckOptions = struct {
+    max_line_bytes: usize = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+    alphabet: zfastq.Alphabet = .iupac,
+};
+
+// Keep check code generation out of the measured count dispatch path.
+noinline fn runCheck(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    options: CheckOptions,
+) u8 {
+    if (inputs.len == 0) {
+        std.Io.File.writeStreamingAll(
+            .stderr(),
+            io,
+            "error: check requires at least one input\n",
+        ) catch {};
+        return 2;
+    }
+
+    var has_stdin = false;
+    for (inputs) |input| {
+        if (!std.mem.eql(u8, input, "-")) continue;
+        if (has_stdin) {
+            std.Io.File.writeStreamingAll(
+                .stderr(),
+                io,
+                "error: standard input may appear at most once\n",
+            ) catch {};
+            return 2;
+        }
+        has_stdin = true;
+    }
+
+    var exit_code: u8 = 0;
+    for (inputs) |input| {
+        const result = if (std.mem.eql(u8, input, "-"))
+            checkStdin(io, allocator, options)
+        else
+            checkFile(io, allocator, input, options);
+        result catch |err| switch (err) {
+            error.Io => exit_code = @max(exit_code, 3),
+            error.Format => exit_code = @max(exit_code, 1),
+            error.LineLimit => {
+                printPathError(io, input, "line length limit exceeded");
+                exit_code = @max(exit_code, 4);
+            },
+            error.ArithmeticLimit => {
+                printPathError(io, input, "input location exceeds supported limit");
+                exit_code = @max(exit_code, 4);
+            },
+            error.OutOfMemory => {
+                std.Io.File.writeStreamingAll(.stderr(), io, "error: out of memory\n") catch {};
+                return 3;
+            },
+        };
+    }
+    return exit_code;
+}
+
+fn checkFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: CheckOptions,
+) RecordCommandError!void {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            printPathError(io, path, "file not found");
+            return error.Io;
+        },
+        else => {
+            printPathError(io, path, "failed to open file");
+            return error.Io;
+        },
+    };
+
+    var input: RecordInput = undefined;
+    input.init(io, file, true) catch {
+        file.close(io);
+        printPathError(io, path, "I/O error");
+        return error.Io;
+    };
+    defer input.deinit(io);
+    return checkSource(io, allocator, path, input.byteSource(), options);
+}
+
+fn checkStdin(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    options: CheckOptions,
+) RecordCommandError!void {
+    var input: RecordInput = undefined;
+    input.init(io, .stdin(), false) catch {
+        printPathError(io, "-", "I/O error");
+        return error.Io;
+    };
+    defer input.deinit(io);
+    return checkSource(io, allocator, "-", input.byteSource(), options);
+}
+
+fn checkSource(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    source: zfastq.io.ByteSource,
+    options: CheckOptions,
+) RecordCommandError!void {
+    var reader = zfastq.Reader.init(
+        allocator,
+        source,
+        .{ .max_line_bytes = options.max_line_bytes },
+    ) catch return error.OutOfMemory;
+    defer reader.deinit();
+
+    while (reader.next() catch |err| {
+        return mapReaderError(io, label, &reader, err);
+    }) |record| {
+        const semantic_error = zfastq.validateRecord(
+            record,
+            .{ .alphabet = options.alphabet },
+        ) orelse continue;
+        const offsets = reader.currentRecordOffsets() orelse {
+            printPathError(io, label, "record location is unavailable");
+            return error.Io;
+        };
+        const field_offset = switch (semantic_error.field) {
+            .sequence => offsets.sequence,
+            .quality => offsets.quality,
+        };
+        const line_in_record: u3 = switch (semantic_error.field) {
+            .sequence => 2,
+            .quality => 4,
+        };
+        const relative_offset = std.math.cast(u64, semantic_error.byte_index) orelse
+            return error.ArithmeticLimit;
+        const byte_offset = std.math.add(u64, field_offset, relative_offset) catch
+            return error.ArithmeticLimit;
+        printParseError(io, label, .{
+            .code = semantic_error.code,
+            .message = semantic_error.message,
+            .record_index = reader.recordIndex() - 1,
+            .byte_offset = byte_offset,
+            .line_in_record = line_in_record,
+        });
+        return error.Format;
+    }
+}
+
+// --- Stats command ---
 
 // Keep stats code generation out of the measured count dispatch path.
 noinline fn runStats(
@@ -447,7 +636,7 @@ fn statsFile(
     allocator: std.mem.Allocator,
     path: []const u8,
     options: InputOptions,
-) StatsCommandError!zfastq.Stats {
+) RecordCommandError!zfastq.Stats {
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             printPathError(io, path, "file not found");
@@ -473,7 +662,7 @@ fn statsStdin(
     io: std.Io,
     allocator: std.mem.Allocator,
     options: InputOptions,
-) StatsCommandError!zfastq.Stats {
+) RecordCommandError!zfastq.Stats {
     var input: RecordInput = undefined;
     input.init(io, .stdin(), false) catch {
         printPathError(io, "-", "I/O error");
@@ -534,7 +723,7 @@ fn collectStats(
     label: []const u8,
     source: zfastq.io.ByteSource,
     options: InputOptions,
-) StatsCommandError!zfastq.Stats {
+) RecordCommandError!zfastq.Stats {
     var reader = zfastq.Reader.init(
         allocator,
         source,
@@ -597,7 +786,7 @@ fn mapReaderError(
     path: []const u8,
     reader: *zfastq.Reader,
     err: zfastq.ReaderError,
-) StatsCommandError {
+) RecordCommandError {
     return switch (err) {
         error.S001InvalidPlusLine,
         error.S003InvalidHeader,

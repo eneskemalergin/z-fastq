@@ -7,6 +7,8 @@ const runCli = cli.run;
 const runCliWithStdin = cli.runWithStdin;
 const runCliWithClosedStdout = cli.runWithClosedStdout;
 const runCliWithClosedStdin = cli.runWithClosedStdin;
+const GzipOptions = cli.GzipOptions;
+const appendGzipMember = cli.appendGzipMember;
 const FIXTURE_DIR = "tests/data/synthetic";
 const EXPECTED_USAGE =
     \\usage: z-fastq <command> [options] [args...]
@@ -14,6 +16,7 @@ const EXPECTED_USAGE =
     \\Commands:
     \\  count    Count records in plain or gzip FASTQ inputs
     \\  stats    Report aggregate FASTQ statistics
+    \\  check    Validate FASTQ structure, sequence alphabet, and quality range
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -22,11 +25,17 @@ const EXPECTED_USAGE =
     \\Input options:
     \\  --max-line-bytes N   Override default line length limit
     \\
+    \\Check options:
+    \\  --alphabet POLICY    Select iupac (default) or acgtn sequence symbols
+    \\
     \\Count usage:
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
     \\
     \\Stats usage:
     \\  z-fastq stats [--max-line-bytes N] <path|-> [<path|-> ...]
+    \\
+    \\Check usage:
+    \\  z-fastq check [--alphabet iupac|acgtn] [--max-line-bytes N] <path|-> [<path|-> ...]
     \\
 ;
 
@@ -78,73 +87,6 @@ const FIXTURES = [_]FixtureExpect{
 
 fn fixturePath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ FIXTURE_DIR, name });
-}
-
-const GzipOptions = struct {
-    extra: []const u8 = "",
-    name: ?[]const u8 = null,
-    comment: ?[]const u8 = null,
-    header_crc: bool = false,
-};
-
-fn appendInt(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    output: *std.ArrayList(u8),
-    value: T,
-) !void {
-    var bytes: [@sizeOf(T)]u8 = undefined;
-    std.mem.writeInt(T, &bytes, value, .little);
-    try output.appendSlice(allocator, &bytes);
-}
-
-fn appendGzipMember(
-    allocator: std.mem.Allocator,
-    output: *std.ArrayList(u8),
-    payload: []const u8,
-    options: GzipOptions,
-) !void {
-    if (payload.len > std.math.maxInt(u16) or options.extra.len > std.math.maxInt(u16)) {
-        return error.TestFixtureTooLarge;
-    }
-
-    var flags: u8 = 0;
-    if (options.header_crc) flags |= 0x02;
-    if (options.extra.len != 0) flags |= 0x04;
-    if (options.name != null) flags |= 0x08;
-    if (options.comment != null) flags |= 0x10;
-
-    const header_start = output.items.len;
-    try output.appendSlice(allocator, &.{
-        0x1f, 0x8b, 0x08, flags, 0, 0, 0, 0, 0, 0xff,
-    });
-    if (options.extra.len != 0) {
-        try appendInt(u16, allocator, output, @intCast(options.extra.len));
-        try output.appendSlice(allocator, options.extra);
-    }
-    if (options.name) |name| {
-        try output.appendSlice(allocator, name);
-        try output.append(allocator, 0);
-    }
-    if (options.comment) |comment| {
-        try output.appendSlice(allocator, comment);
-        try output.append(allocator, 0);
-    }
-    if (options.header_crc) {
-        var crc: std.hash.Crc32 = .init();
-        crc.update(output.items[header_start..]);
-        try appendInt(u16, allocator, output, @truncate(crc.final()));
-    }
-
-    try output.append(allocator, 0x01);
-    try appendInt(u16, allocator, output, @intCast(payload.len));
-    try appendInt(u16, allocator, output, ~@as(u16, @intCast(payload.len)));
-    try output.appendSlice(allocator, payload);
-
-    var payload_crc: std.hash.Crc32 = .init();
-    payload_crc.update(payload);
-    try appendInt(u32, allocator, output, payload_crc.final());
-    try appendInt(u32, allocator, output, @truncate(payload.len));
 }
 
 fn runCountBytes(
@@ -490,6 +432,8 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
         .{ "count", "-h" },
         .{ "stats", "--help" },
         .{ "stats", "-h" },
+        .{ "check", "--help" },
+        .{ "check", "-h" },
     };
     for (command_help_cases) |args| {
         const result = try runCli(allocator, &args);
@@ -500,7 +444,7 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
 
     const version = try runCli(allocator, &.{"--version"});
     try std.testing.expectEqual(@as(u8, 0), version.exit_code);
-    try std.testing.expectEqualStrings("z-fastq 0.0.5\n", version.stdout);
+    try std.testing.expectEqualStrings("z-fastq 0.0.6\n", version.stdout);
     try std.testing.expectEqual(@as(usize, 0), version.stderr.len);
 
     const short_version = try runCli(allocator, &.{"-V"});

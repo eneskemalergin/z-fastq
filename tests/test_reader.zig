@@ -1,4 +1,4 @@
-//! Library root, reader, scanner, and structural-diagnostic contracts.
+//! Library root, reader, scanner, and validation contracts.
 
 const std = @import("std");
 const zfastq = @import("z-fastq");
@@ -15,7 +15,7 @@ test "[unit] - [root]: every exported declaration is analyzable" {
 }
 
 test "[unit] - [root]: version exposes the current internal checkpoint" {
-    try std.testing.expectEqualStrings("0.0.5", zfastq.VERSION);
+    try std.testing.expectEqualStrings("0.0.6", zfastq.VERSION);
 }
 
 test "[property] - [gzip source]: optional member chains decode at every input chunk size" {
@@ -68,6 +68,7 @@ test "[unit] - [lint code]: every implemented code has its stable tag" {
         tag: []const u8,
     }{
         .{ .code = .s001_invalid_plus_line, .tag = "S001" },
+        .{ .code = .s002_invalid_sequence_alphabet, .tag = "S002" },
         .{ .code = .s003_invalid_header, .tag = "S003" },
         .{ .code = .s004_truncated_record, .tag = "S004" },
         .{ .code = .s005_length_mismatch, .tag = "S005" },
@@ -76,6 +77,178 @@ test "[unit] - [lint code]: every implemented code has its stable tag" {
 
     for (cases) |case| {
         try std.testing.expectEqualStrings(case.tag, zfastq.codeTag(case.code));
+    }
+}
+
+test "[unit] - [record validation]: both alphabets accept their complete symbol sets" {
+    const cases = [_]struct {
+        options: zfastq.ValidationOptions,
+        sequence: []const u8,
+    }{
+        .{
+            .options = .{},
+            .sequence = "ACGTURYSWKMBDHVNacgturyswkmbdhvn",
+        },
+        .{
+            .options = .{ .alphabet = .acgtn },
+            .sequence = "ACGTNacgtn",
+        },
+        .{ .options = .{ .alphabet = .iupac }, .sequence = "" },
+        .{ .options = .{ .alphabet = .acgtn }, .sequence = "" },
+    };
+
+    for (cases) |case| {
+        var quality_buffer: [32]u8 = undefined;
+        const quality = quality_buffer[0..case.sequence.len];
+        @memset(quality, '!');
+        const record = zfastq.Record{
+            .header = "r",
+            .id = "r",
+            .sequence = case.sequence,
+            .plus = "",
+            .quality = quality,
+        };
+
+        try std.testing.expect(zfastq.validateRecord(record, case.options) == null);
+    }
+}
+
+test "[property] - [record validation]: ACGTN rejects every wider IUPAC symbol" {
+    for ("URYSWKMBDHVuryswkmbdhv") |byte| {
+        const sequence = [1]u8{byte};
+        const details = zfastq.validateRecord(.{
+            .header = "r",
+            .id = "r",
+            .sequence = &sequence,
+            .plus = "",
+            .quality = "!",
+        }, .{ .alphabet = .acgtn }).?;
+
+        try std.testing.expectEqual(zfastq.LintCode.s002_invalid_sequence_alphabet, details.code);
+        try std.testing.expectEqual(zfastq.SemanticField.sequence, details.field);
+        try std.testing.expectEqual(@as(usize, 0), details.byte_index);
+        try std.testing.expectEqualStrings(
+            "sequence byte is outside the selected alphabet",
+            details.message,
+        );
+    }
+}
+
+test "[property] - [record validation]: alphabet policies classify every byte" {
+    const policies = [_]struct {
+        alphabet: zfastq.Alphabet,
+        accepted: []const u8,
+    }{
+        .{
+            .alphabet = .iupac,
+            .accepted = "ACGTURYSWKMBDHVNacgturyswkmbdhvn",
+        },
+        .{
+            .alphabet = .acgtn,
+            .accepted = "ACGTNacgtn",
+        },
+    };
+
+    for (policies) |policy| {
+        for (0..256) |value| {
+            const sequence = [1]u8{@intCast(value)};
+            const details = zfastq.validateRecord(.{
+                .header = "r",
+                .id = "r",
+                .sequence = &sequence,
+                .plus = "",
+                .quality = "!",
+            }, .{ .alphabet = policy.alphabet });
+            const accepted = std.mem.indexOfScalar(u8, policy.accepted, sequence[0]) != null;
+            try std.testing.expectEqual(accepted, details == null);
+            if (details) |semantic_error| {
+                try std.testing.expectEqual(
+                    zfastq.LintCode.s002_invalid_sequence_alphabet,
+                    semantic_error.code,
+                );
+                try std.testing.expectEqual(@as(usize, 0), semantic_error.byte_index);
+            }
+        }
+    }
+}
+
+test "[property] - [record validation]: every semantic byte position reports exactly" {
+    var sequence = [_]u8{ 'A', 'C', 'G', 'T' };
+    const quality = [_]u8{ '!', '!', '!', '!' };
+    for (sequence, 0..) |original, invalid_index| {
+        sequence[invalid_index] = '.';
+        const details = zfastq.validateRecord(.{
+            .header = "r",
+            .id = "r",
+            .sequence = &sequence,
+            .plus = "",
+            .quality = &quality,
+        }, .{}).?;
+        try std.testing.expectEqual(zfastq.LintCode.s002_invalid_sequence_alphabet, details.code);
+        try std.testing.expectEqual(zfastq.SemanticField.sequence, details.field);
+        try std.testing.expectEqual(invalid_index, details.byte_index);
+        sequence[invalid_index] = original;
+    }
+
+    var mutable_quality = quality;
+    for (mutable_quality, 0..) |original, invalid_index| {
+        mutable_quality[invalid_index] = if (invalid_index % 2 == 0) 32 else 127;
+        const details = zfastq.validateRecord(.{
+            .header = "r",
+            .id = "r",
+            .sequence = &sequence,
+            .plus = "",
+            .quality = &mutable_quality,
+        }, .{}).?;
+        try std.testing.expectEqual(zfastq.LintCode.s006_invalid_quality_range, details.code);
+        try std.testing.expectEqual(zfastq.SemanticField.quality, details.field);
+        try std.testing.expectEqual(invalid_index, details.byte_index);
+        try std.testing.expectEqualStrings(
+            "quality byte must be ASCII 33 through 126",
+            details.message,
+        );
+        mutable_quality[invalid_index] = original;
+    }
+}
+
+test "[unit] - [record validation]: sequence errors precede quality errors" {
+    const details = zfastq.validateRecord(.{
+        .header = "r",
+        .id = "r",
+        .sequence = ".",
+        .plus = "",
+        .quality = "\x7f",
+    }, .{}).?;
+
+    try std.testing.expectEqual(zfastq.LintCode.s002_invalid_sequence_alphabet, details.code);
+}
+
+test "[property] - [record validation]: quality range classifies every byte" {
+    try std.testing.expect(zfastq.validateRecord(.{
+        .header = "r",
+        .id = "r",
+        .sequence = "AC",
+        .plus = "",
+        .quality = "!~",
+    }, .{}) == null);
+
+    for (0..256) |value| {
+        const quality = [1]u8{@intCast(value)};
+        const details = zfastq.validateRecord(.{
+            .header = "r",
+            .id = "r",
+            .sequence = "A",
+            .plus = "",
+            .quality = &quality,
+        }, .{});
+        try std.testing.expectEqual(value >= 33 and value <= 126, details == null);
+        if (details) |semantic_error| {
+            try std.testing.expectEqual(
+                zfastq.LintCode.s006_invalid_quality_range,
+                semantic_error.code,
+            );
+            try std.testing.expectEqual(@as(usize, 0), semantic_error.byte_index);
+        }
     }
 }
 

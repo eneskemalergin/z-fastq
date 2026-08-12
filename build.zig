@@ -101,6 +101,13 @@ pub fn build(b: *std.Build) void {
     });
     stats_test_module.link_libc = true;
 
+    const check_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/test_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    check_test_module.link_libc = true;
+
     const run_reader_test = b.addRunArtifact(b.addTest(.{ .root_module = reader_test_module }));
     const run_writer_test = b.addRunArtifact(b.addTest(.{ .root_module = writer_test_module }));
 
@@ -108,12 +115,15 @@ pub fn build(b: *std.Build) void {
     run_count_test.step.dependOn(b.getInstallStep());
     const run_stats_test = b.addRunArtifact(b.addTest(.{ .root_module = stats_test_module }));
     run_stats_test.step.dependOn(b.getInstallStep());
+    const run_check_test = b.addRunArtifact(b.addTest(.{ .root_module = check_test_module }));
+    run_check_test.step.dependOn(b.getInstallStep());
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_reader_test.step);
     test_step.dependOn(&run_writer_test.step);
     test_step.dependOn(&run_count_test.step);
     test_step.dependOn(&run_stats_test.step);
+    test_step.dependOn(&run_check_test.step);
 }
 
 fn addIsaL(
