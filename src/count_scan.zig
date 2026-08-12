@@ -111,11 +111,12 @@ pub const Scanner = struct {
         return err;
     }
 
+    // Keep this hot function cache-line aligned; half-line placement raised cycles.
     /// Consumes as many bytes as possible from one input chunk.
     ///
     /// On success the returned count equals `data.len`. Structural failures leave
     /// details for `takeLastError`.
-    pub fn feed(self: *Scanner, data: []const u8) fastq.ReaderError!usize {
+    pub fn feed(self: *Scanner, data: []const u8) align(64) fastq.ReaderError!usize {
         var pos: usize = 0;
         while (pos < data.len) {
             if (self.fast_path_enabled and

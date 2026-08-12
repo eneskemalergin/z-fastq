@@ -72,6 +72,15 @@ pub fn build(b: *std.Build) void {
         .{ .name = "z-fastq", .module = lib_module },
     };
 
+    const fastq_test_module = b.createModule(.{
+        .root_source_file = b.path("src/fastq.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const fastq_test_options = b.addOptions();
+    fastq_test_options.addOption(bool, "use_isa_l", false);
+    fastq_test_module.addOptions("build_options", fastq_test_options);
+
     const reader_test_module = b.createModule(.{
         .root_source_file = b.path("tests/test_reader.zig"),
         .target = target,
@@ -108,6 +117,7 @@ pub fn build(b: *std.Build) void {
     });
     check_test_module.link_libc = true;
 
+    const run_fastq_test = b.addRunArtifact(b.addTest(.{ .root_module = fastq_test_module }));
     const run_reader_test = b.addRunArtifact(b.addTest(.{ .root_module = reader_test_module }));
     const run_writer_test = b.addRunArtifact(b.addTest(.{ .root_module = writer_test_module }));
 
@@ -119,6 +129,7 @@ pub fn build(b: *std.Build) void {
     run_check_test.step.dependOn(b.getInstallStep());
 
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_fastq_test.step);
     test_step.dependOn(&run_reader_test.step);
     test_step.dependOn(&run_writer_test.step);
     test_step.dependOn(&run_count_test.step);

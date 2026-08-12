@@ -178,6 +178,34 @@ test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
         "error: -: S002: sequence byte is outside the selected alphabet " ++
             "(record 0, line 2, offset 3)\n",
     );
+
+    const truncated = try cli.runWithStdin(
+        allocator,
+        &.{ "check", "-" },
+        "@r\n.\n+\n",
+        1,
+    );
+    try expectResult(
+        truncated,
+        1,
+        "",
+        "error: -: S004: unexpected end of file in quality line " ++
+            "(record 0, line 4, offset 7)\n",
+    );
+
+    const mismatch = try cli.runWithStdin(
+        allocator,
+        &.{ "check", "-" },
+        "@r\n.\n+\n!!\n",
+        1,
+    );
+    try expectResult(
+        mismatch,
+        1,
+        "",
+        "error: -: S005: sequence and quality lengths differ " ++
+            "(record 0, line 4, offset 7)\n",
+    );
 }
 
 test "[cli] - [check]: semantic locations survive every field position and line ending" {
