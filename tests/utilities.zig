@@ -52,7 +52,7 @@ pub fn expectJsonDocument(
     };
     try expectJsonObjectKeys(tool, &.{ "name", "version" });
     try expectJsonString(tool.get("name"), "z-fastq");
-    try expectJsonString(tool.get("version"), "0.0.7");
+    try expectJsonString(tool.get("version"), "0.0.8");
 
     const results_value = object.get("results") orelse return error.UnexpectedJsonShape;
     return switch (results_value) {
@@ -315,9 +315,13 @@ fn writeAndCloseStdin(
 ) !void {
     std.debug.assert(chunk_len > 0);
     var pos: usize = 0;
-    while (pos < data.len) {
+    write_stdin: while (pos < data.len) {
         const end = pos + @min(chunk_len, data.len - pos);
-        try std.Io.File.writeStreamingAll(proc.stdin.?, io, data[pos..end]);
+        std.Io.File.writeStreamingAll(proc.stdin.?, io, data[pos..end]) catch |err| switch (err) {
+            // Usage failures may close stdin before the test finishes feeding it.
+            error.BrokenPipe => break :write_stdin,
+            else => return err,
+        };
         pos = end;
     }
     proc.stdin.?.close(io);

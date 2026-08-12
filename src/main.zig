@@ -6,6 +6,7 @@ const fastq = @import("fastq.zig");
 const io_layer = @import("io.zig");
 
 const INVALID_QUALITY_MESSAGE = "quality byte must be ASCII 33 through 126";
+const PAIR_DIAGNOSTIC_PREFIX_BYTES = 128;
 
 const USAGE =
     \\usage: z-fastq <command> [options] [args...]
@@ -27,6 +28,9 @@ const USAGE =
     \\
     \\Check options:
     \\  --alphabet POLICY    Select iupac (default) or acgtn sequence symbols
+    \\  --paired             Validate two inputs as paired reads
+    \\  --interleaved        Validate consecutive records as paired reads
+    \\  --pair-names POLICY  Select illumina (default) or exact pair names
     \\
     \\Count usage:
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
@@ -36,6 +40,8 @@ const USAGE =
     \\
     \\Check usage:
     \\  z-fastq check [--json] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|-> [<path|-> ...]
+    \\  z-fastq check --paired [--json] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
+    \\  z-fastq check --interleaved [--json] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
     \\
 ;
 
@@ -76,6 +82,9 @@ pub fn main(init: std.process.Init) !void {
 
     var max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES;
     var alphabet: zfastq.Alphabet = .iupac;
+    var pair_mode: PairMode = .none;
+    var pair_name_policy: PairNamePolicy = .illumina;
+    var pair_names_set = false;
     var json_output = false;
     var positional = std.ArrayList([]const u8).empty;
     defer positional.deinit(gpa);
@@ -153,6 +162,54 @@ pub fn main(init: std.process.Init) !void {
             };
             continue;
         }
+        if (command == .check and std.mem.eql(u8, arg, "--paired")) {
+            if (pair_mode == .interleaved) {
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: --paired and --interleaved are mutually exclusive\n",
+                ) catch {};
+                std.process.exit(2);
+            }
+            pair_mode = .paired;
+            continue;
+        }
+        if (command == .check and std.mem.eql(u8, arg, "--interleaved")) {
+            if (pair_mode == .paired) {
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: --paired and --interleaved are mutually exclusive\n",
+                ) catch {};
+                std.process.exit(2);
+            }
+            pair_mode = .interleaved;
+            continue;
+        }
+        if (command == .check and std.mem.eql(u8, arg, "--pair-names")) {
+            const value = args.next() orelse {
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: --pair-names requires a value\n",
+                ) catch {};
+                std.process.exit(2);
+            };
+            pair_name_policy = if (std.mem.eql(u8, value, "illumina"))
+                .illumina
+            else if (std.mem.eql(u8, value, "exact"))
+                .exact
+            else {
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: --pair-names must be illumina or exact\n",
+                ) catch {};
+                std.process.exit(2);
+            };
+            pair_names_set = true;
+            continue;
+        }
         if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
             std.Io.File.writeStreamingAll(.stderr(), io, "error: unknown ") catch {};
             std.Io.File.writeStreamingAll(.stderr(), io, @tagName(command)) catch {};
@@ -171,10 +228,18 @@ pub fn main(init: std.process.Init) !void {
     const code = switch (command) {
         .count => runCount(io, positional.items, options),
         .stats => runStats(io, gpa, positional.items, options, json_output),
-        .check => runCheck(io, positional.items, .{
-            .max_line_bytes = max_line_bytes,
-            .alphabet = alphabet,
-        }, json_output),
+        .check => if (pair_mode == .none)
+            runSingleCheckCommand(io, positional.items, .{
+                .max_line_bytes = max_line_bytes,
+                .alphabet = alphabet,
+            }, json_output, pair_names_set)
+        else
+            runPairedCheckCommand(io, gpa, positional.items, .{
+                .max_line_bytes = max_line_bytes,
+                .alphabet = alphabet,
+                .pair_mode = pair_mode,
+                .pair_name_policy = pair_name_policy,
+            }, json_output),
     };
     std.process.exit(code);
 }
@@ -468,10 +533,155 @@ fn validateRecordCommandInputs(
 
 // --- Check command ---
 
+const PairMode = enum {
+    none,
+    paired,
+    interleaved,
+};
+
+const PairNamePolicy = enum {
+    illumina,
+    exact,
+};
+
 const CheckOptions = struct {
     max_line_bytes: usize = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
     alphabet: zfastq.Alphabet = .iupac,
 };
+
+const PairedCheckOptions = struct {
+    max_line_bytes: usize = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+    alphabet: zfastq.Alphabet = .iupac,
+    pair_mode: PairMode = .none,
+    pair_name_policy: PairNamePolicy = .illumina,
+};
+
+const BoundedBytes = struct {
+    prefix: [PAIR_DIAGNOSTIC_PREFIX_BYTES]u8 = undefined,
+    prefix_len: u8,
+    full_len: usize,
+
+    fn init(value: []const u8) BoundedBytes {
+        const prefix_len = @min(value.len, PAIR_DIAGNOSTIC_PREFIX_BYTES);
+        var display: BoundedBytes = .{
+            .prefix_len = @intCast(prefix_len),
+            .full_len = value.len,
+        };
+        @memcpy(display.prefix[0..prefix_len], value[0..prefix_len]);
+        return display;
+    }
+
+    fn bytes(self: *const BoundedBytes) []const u8 {
+        return self.prefix[0..self.prefix_len];
+    }
+
+    fn truncated(self: *const BoundedBytes) bool {
+        return self.full_len > @as(usize, self.prefix_len);
+    }
+};
+
+const PairName = struct {
+    first_token: []const u8,
+    normalized_id: []const u8,
+    mate_markers: u2,
+    first_mate_marker: ?u2,
+};
+
+const PairRecordDiagnostic = struct {
+    record_index: u64,
+    byte_offset: u64,
+    first_token: BoundedBytes,
+    normalized_id: BoundedBytes,
+    mate_markers: u2,
+
+    fn init(name: PairName, record_index: u64, byte_offset: u64) PairRecordDiagnostic {
+        return .{
+            .record_index = record_index,
+            .byte_offset = byte_offset,
+            .first_token = .init(name.first_token),
+            .normalized_id = .init(name.normalized_id),
+            .mate_markers = name.mate_markers,
+        };
+    }
+
+    fn initStored(
+        normalized_id: []const u8,
+        first_token_len: usize,
+        first_mate_marker: ?u2,
+        mate_markers: u2,
+        record_index: u64,
+        byte_offset: u64,
+    ) PairRecordDiagnostic {
+        var first_token = BoundedBytes.init(normalized_id);
+        first_token.full_len = first_token_len;
+        if (first_mate_marker) |marker| {
+            if (first_token.prefix_len < PAIR_DIAGNOSTIC_PREFIX_BYTES) {
+                first_token.prefix[first_token.prefix_len] = '/';
+                first_token.prefix_len += 1;
+            }
+            if (first_token.prefix_len < PAIR_DIAGNOSTIC_PREFIX_BYTES) {
+                first_token.prefix[first_token.prefix_len] = '0' + @as(u8, marker);
+                first_token.prefix_len += 1;
+            }
+        }
+        return .{
+            .record_index = record_index,
+            .byte_offset = byte_offset,
+            .first_token = first_token,
+            .normalized_id = .init(normalized_id),
+            .mate_markers = mate_markers,
+        };
+    }
+};
+
+const PairNameFailure = struct {
+    pair_index: u64,
+    records: [2]PairRecordDiagnostic,
+};
+
+const PairCountFailure = struct {
+    pair_index: u64,
+    remaining_side: u1,
+    record_indexes: [2]?u64,
+};
+
+const PairFailure = union(enum) {
+    name_mismatch: PairNameFailure,
+    count_mismatch: PairCountFailure,
+};
+
+const CheckFailure = union(enum) {
+    command: struct {
+        input_index: u1,
+        details: CommandFailure,
+    },
+    pair: PairFailure,
+
+    fn exitCode(self: CheckFailure) u8 {
+        return switch (self) {
+            .command => |failure| failure.details.exit_code,
+            .pair => 1,
+        };
+    }
+};
+
+fn runSingleCheckCommand(
+    io: std.Io,
+    inputs: []const []const u8,
+    options: CheckOptions,
+    json_output: bool,
+    pair_names_set: bool,
+) u8 {
+    if (pair_names_set) {
+        std.Io.File.writeStreamingAll(
+            .stderr(),
+            io,
+            "error: --pair-names requires --paired or --interleaved\n",
+        ) catch {};
+        return 2;
+    }
+    return runCheck(io, inputs, options, json_output);
+}
 
 // Keep check code generation out of the measured count dispatch path.
 noinline fn runCheck(
@@ -497,7 +707,57 @@ noinline fn runCheck(
     return exit_code;
 }
 
-fn runCheckJson(io: std.Io, inputs: []const []const u8, options: CheckOptions) u8 {
+// Keep paired check code generation out of the measured single-input path.
+noinline fn runPairedCheckCommand(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    options: PairedCheckOptions,
+    json_output: bool,
+) u8 {
+    if (validatePairedCheckInputs(io, inputs, options.pair_mode)) |exit_code| {
+        return exit_code;
+    }
+    if (json_output) return runPairedCheckJson(io, allocator, inputs, options);
+
+    const failure = checkPairMode(io, allocator, inputs, options);
+    if (failure) |details| printCheckFailure(io, inputs, options.pair_mode, details);
+    return if (failure) |details| details.exitCode() else 0;
+}
+
+fn validatePairedCheckInputs(
+    io: std.Io,
+    inputs: []const []const u8,
+    pair_mode: PairMode,
+) ?u8 {
+    const expected_inputs: usize = if (pair_mode == .paired) 2 else 1;
+    if (inputs.len != expected_inputs) {
+        const message = if (pair_mode == .paired)
+            "error: check --paired requires exactly two inputs\n"
+        else
+            "error: check --interleaved requires exactly one input\n";
+        std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
+        return 2;
+    }
+    if (pair_mode == .paired and
+        std.mem.eql(u8, inputs[0], "-") and
+        std.mem.eql(u8, inputs[1], "-"))
+    {
+        std.Io.File.writeStreamingAll(
+            .stderr(),
+            io,
+            "error: paired inputs may contain standard input at most once\n",
+        ) catch {};
+        return 2;
+    }
+    return null;
+}
+
+fn runCheckJson(
+    io: std.Io,
+    inputs: []const []const u8,
+    options: CheckOptions,
+) u8 {
     var stdout_buffer: [16 * 1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     var json: std.json.Stringify = .{ .writer = &stdout_writer.interface };
@@ -515,6 +775,373 @@ fn runCheckJson(io: std.Io, inputs: []const []const u8, options: CheckOptions) u
     finishJsonDocument(&json) catch return 3;
     stdout_writer.interface.flush() catch return 3;
     return exit_code;
+}
+
+fn runPairedCheckJson(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    options: PairedCheckOptions,
+) u8 {
+    var stdout_buffer: [16 * 1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    var json: std.json.Stringify = .{ .writer = &stdout_writer.interface };
+
+    beginJsonDocument(&json, "z-fastq/check-v1") catch return 3;
+    const failure = checkPairMode(io, allocator, inputs, options);
+    writePairedCheckJsonResult(&json, inputs, options.pair_mode, failure) catch return 3;
+    finishJsonDocument(&json) catch return 3;
+    stdout_writer.interface.flush() catch return 3;
+    return if (failure) |details| details.exitCode() else 0;
+}
+
+fn checkPairMode(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    options: PairedCheckOptions,
+) ?CheckFailure {
+    return switch (options.pair_mode) {
+        .none => unreachable,
+        .paired => checkPaired(io, allocator, inputs, options),
+        .interleaved => checkInterleaved(io, allocator, inputs[0], options),
+    };
+}
+
+fn checkPaired(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    options: PairedCheckOptions,
+) ?CheckFailure {
+    var input1: RecordInput = undefined;
+    if (initCheckInput(&input1, io, inputs[0])) |failure| {
+        return .{ .command = .{ .input_index = 0, .details = failure } };
+    }
+    defer input1.deinit(io);
+
+    var input2: RecordInput = undefined;
+    if (initCheckInput(&input2, io, inputs[1])) |failure| {
+        return .{ .command = .{ .input_index = 1, .details = failure } };
+    }
+    defer input2.deinit(io);
+
+    var reader1 = zfastq.Reader.init(
+        allocator,
+        input1.byteSource(),
+        .{ .max_line_bytes = options.max_line_bytes },
+    ) catch return commandCheckFailure(0, "out_of_memory", "out of memory", 3);
+    defer reader1.deinit();
+    var reader2 = zfastq.Reader.init(
+        allocator,
+        input2.byteSource(),
+        .{ .max_line_bytes = options.max_line_bytes },
+    ) catch return commandCheckFailure(1, "out_of_memory", "out of memory", 3);
+    defer reader2.deinit();
+
+    while (true) {
+        const record1 = reader1.next() catch |err| {
+            return .{ .command = .{
+                .input_index = 0,
+                .details = mapReaderFailure(&reader1, err),
+            } };
+        };
+        const record2 = reader2.next() catch |err| {
+            return .{ .command = .{
+                .input_index = 1,
+                .details = mapReaderFailure(&reader2, err),
+            } };
+        };
+
+        if (record1 == null and record2 == null) return null;
+        if (record1 == null or record2 == null) {
+            const remaining_side: u1 = if (record1 != null) 0 else 1;
+            const pair_index = if (record1 != null)
+                reader1.recordIndex() - 1
+            else
+                reader2.recordIndex() - 1;
+            return .{ .pair = .{ .count_mismatch = .{
+                .pair_index = pair_index,
+                .remaining_side = remaining_side,
+                .record_indexes = .{
+                    lastRecordIndex(&reader1),
+                    lastRecordIndex(&reader2),
+                },
+            } } };
+        }
+
+        const record_index1 = reader1.recordIndex() - 1;
+        const record_index2 = reader2.recordIndex() - 1;
+        const offsets1 = reader1.currentRecordOffsets().?;
+        const offsets2 = reader2.currentRecordOffsets().?;
+        if (validatePairRecord(record1.?, offsets1, record_index1, options)) |failure| {
+            return .{ .command = .{ .input_index = 0, .details = failure } };
+        }
+        if (validatePairRecord(record2.?, offsets2, record_index2, options)) |failure| {
+            return .{ .command = .{ .input_index = 1, .details = failure } };
+        }
+
+        const name1 = parsePairName(record1.?.header, options.pair_name_policy);
+        const name2 = parsePairName(record2.?.header, options.pair_name_policy);
+        if (!pairNamesMatch(name1, name2)) {
+            return .{ .pair = .{ .name_mismatch = .{
+                .pair_index = record_index1,
+                .records = .{
+                    .init(name1, record_index1, offsets1.header),
+                    .init(name2, record_index2, offsets2.header),
+                },
+            } } };
+        }
+    }
+}
+
+fn checkInterleaved(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    input_label: []const u8,
+    options: PairedCheckOptions,
+) ?CheckFailure {
+    var input: RecordInput = undefined;
+    if (initCheckInput(&input, io, input_label)) |failure| {
+        return .{ .command = .{ .input_index = 0, .details = failure } };
+    }
+    defer input.deinit(io);
+
+    var reader = zfastq.Reader.init(
+        allocator,
+        input.byteSource(),
+        .{ .max_line_bytes = options.max_line_bytes },
+    ) catch return commandCheckFailure(0, "out_of_memory", "out of memory", 3);
+    defer reader.deinit();
+    var normalized_id: std.ArrayList(u8) = .empty;
+    defer normalized_id.deinit(allocator);
+
+    while (true) {
+        const record1 = reader.next() catch |err| {
+            return .{ .command = .{
+                .input_index = 0,
+                .details = mapReaderFailure(&reader, err),
+            } };
+        } orelse return null;
+        const record_index1 = reader.recordIndex() - 1;
+        const offsets1 = reader.currentRecordOffsets().?;
+        const semantic1 = validatePairRecord(record1, offsets1, record_index1, options);
+
+        var first_token_len: usize = 0;
+        var first_mate_marker: ?u2 = null;
+        var mate1_markers: u2 = 0;
+        if (semantic1 == null) {
+            const name1 = parsePairName(record1.header, options.pair_name_policy);
+            normalized_id.clearRetainingCapacity();
+            normalized_id.ensureTotalCapacityPrecise(allocator, name1.normalized_id.len) catch {
+                return commandCheckFailure(0, "out_of_memory", "out of memory", 3);
+            };
+            normalized_id.appendSliceAssumeCapacity(name1.normalized_id);
+            first_token_len = name1.first_token.len;
+            first_mate_marker = name1.first_mate_marker;
+            mate1_markers = name1.mate_markers;
+        }
+
+        const record2 = reader.next() catch |err| {
+            return .{ .command = .{
+                .input_index = 0,
+                .details = mapReaderFailure(&reader, err),
+            } };
+        } orelse return .{ .pair = .{ .count_mismatch = .{
+            .pair_index = record_index1 / 2,
+            .remaining_side = 0,
+            .record_indexes = .{
+                record_index1,
+                if (record_index1 == 0) null else record_index1 - 1,
+            },
+        } } };
+
+        if (semantic1) |failure| {
+            return .{ .command = .{ .input_index = 0, .details = failure } };
+        }
+
+        const record_index2 = reader.recordIndex() - 1;
+        const offsets2 = reader.currentRecordOffsets().?;
+        if (validatePairRecord(record2, offsets2, record_index2, options)) |failure| {
+            return .{ .command = .{ .input_index = 0, .details = failure } };
+        }
+
+        const name1: PairName = .{
+            .first_token = normalized_id.items,
+            .normalized_id = normalized_id.items,
+            .mate_markers = mate1_markers,
+            .first_mate_marker = first_mate_marker,
+        };
+        const name2 = parsePairName(record2.header, options.pair_name_policy);
+        if (!pairNamesMatch(name1, name2)) {
+            return .{ .pair = .{ .name_mismatch = .{
+                .pair_index = record_index1 / 2,
+                .records = .{
+                    .initStored(
+                        normalized_id.items,
+                        first_token_len,
+                        first_mate_marker,
+                        mate1_markers,
+                        record_index1,
+                        offsets1.header,
+                    ),
+                    .init(name2, record_index2, offsets2.header),
+                },
+            } } };
+        }
+    }
+}
+
+fn initCheckInput(
+    input: *RecordInput,
+    io: std.Io,
+    label: []const u8,
+) ?CommandFailure {
+    if (std.mem.eql(u8, label, "-")) {
+        input.init(io, .stdin(), false) catch {
+            return CommandFailure.plain("io_error", "I/O error", 3);
+        };
+        return null;
+    }
+
+    const file = std.Io.Dir.cwd().openFile(io, label, .{}) catch |err| switch (err) {
+        error.FileNotFound => return CommandFailure.plain("io_error", "file not found", 3),
+        else => return CommandFailure.plain("io_error", "failed to open file", 3),
+    };
+    input.init(io, file, true) catch {
+        file.close(io);
+        return CommandFailure.plain("io_error", "I/O error", 3);
+    };
+    return null;
+}
+
+fn commandCheckFailure(
+    input_index: u1,
+    code: []const u8,
+    message: []const u8,
+    exit_code: u8,
+) CheckFailure {
+    return .{ .command = .{
+        .input_index = input_index,
+        .details = CommandFailure.plain(code, message, exit_code),
+    } };
+}
+
+fn validatePairRecord(
+    record: zfastq.Record,
+    offsets: zfastq.RecordOffsets,
+    record_index: u64,
+    options: PairedCheckOptions,
+) ?CommandFailure {
+    const semantic_error = zfastq.validateRecord(
+        record,
+        .{ .alphabet = options.alphabet },
+    ) orelse return null;
+    const field_offset = switch (semantic_error.field) {
+        .sequence => offsets.sequence,
+        .quality => offsets.quality,
+    };
+    const relative_offset = std.math.cast(u64, semantic_error.byte_index) orelse {
+        return CommandFailure.plain(
+            "arithmetic_limit",
+            "input location exceeds supported limit",
+            4,
+        );
+    };
+    const byte_offset = std.math.add(u64, field_offset, relative_offset) catch {
+        return CommandFailure.plain(
+            "arithmetic_limit",
+            "input location exceeds supported limit",
+            4,
+        );
+    };
+    return CommandFailure.lint(.{
+        .code = semantic_error.code,
+        .message = semantic_error.message,
+        .record_index = record_index,
+        .byte_offset = byte_offset,
+        .line_in_record = switch (semantic_error.field) {
+            .sequence => 2,
+            .quality => 4,
+        },
+    });
+}
+
+fn lastRecordIndex(reader: *const zfastq.Reader) ?u64 {
+    return if (reader.recordIndex() == 0) null else reader.recordIndex() - 1;
+}
+
+fn parsePairName(header: []const u8, policy: PairNamePolicy) PairName {
+    var first_end: usize = 0;
+    while (first_end < header.len and header[first_end] != ' ' and header[first_end] != '\t') {
+        first_end += 1;
+    }
+    const first_token = header[0..first_end];
+    if (policy == .exact) {
+        return .{
+            .first_token = first_token,
+            .normalized_id = first_token,
+            .mate_markers = 0,
+            .first_mate_marker = null,
+        };
+    }
+
+    var normalized_id = first_token;
+    var mate_markers: u2 = 0;
+    const first_mate_marker = terminalMateMarker(first_token);
+    if (first_mate_marker) |mate| {
+        mate_markers |= mateMask(mate);
+        normalized_id = first_token[0 .. first_token.len - 2];
+    }
+
+    var second_start = first_end;
+    while (second_start < header.len and
+        (header[second_start] == ' ' or header[second_start] == '\t'))
+    {
+        second_start += 1;
+    }
+    var second_end = second_start;
+    while (second_end < header.len and header[second_end] != ' ' and
+        header[second_end] != '\t')
+    {
+        second_end += 1;
+    }
+    const second_token = header[second_start..second_end];
+    if (second_token.len >= 2 and second_token[1] == ':' and
+        (second_token[0] == '1' or second_token[0] == '2'))
+    {
+        mate_markers |= mateMask(@intCast(second_token[0] - '0'));
+    }
+    if (terminalMateMarker(second_token)) |mate| {
+        mate_markers |= mateMask(mate);
+    }
+    return .{
+        .first_token = first_token,
+        .normalized_id = normalized_id,
+        .mate_markers = mate_markers,
+        .first_mate_marker = first_mate_marker,
+    };
+}
+
+fn terminalMateMarker(token: []const u8) ?u2 {
+    if (token.len < 2 or token[token.len - 2] != '/') return null;
+    return switch (token[token.len - 1]) {
+        '1' => 1,
+        '2' => 2,
+        else => null,
+    };
+}
+
+fn mateMask(mate: u2) u2 {
+    return if (mate == 1) 0b01 else 0b10;
+}
+
+fn pairNamesMatch(name1: PairName, name2: PairName) bool {
+    if (!std.mem.eql(u8, name1.normalized_id, name2.normalized_id)) return false;
+    if (name1.mate_markers == 0b11 or name2.mate_markers == 0b11) return false;
+    if ((name1.mate_markers == 0) != (name2.mate_markers == 0)) return false;
+    if (name1.mate_markers == 0) return true;
+    return name1.mate_markers == 0b01 and name2.mate_markers == 0b10;
 }
 
 fn checkFile(
@@ -899,6 +1526,105 @@ fn writeCheckJsonResult(
     try json.endObject();
 }
 
+fn writePairedCheckJsonResult(
+    json: *std.json.Stringify,
+    inputs: []const []const u8,
+    pair_mode: PairMode,
+    failure: ?CheckFailure,
+) !void {
+    try json.beginObject();
+    if (pair_mode == .paired) {
+        try json.objectField("inputs");
+        try json.beginArray();
+        for (inputs) |input| try writeEscapedJsonString(json, input);
+        try json.endArray();
+    } else {
+        try json.objectField("input");
+        try writeEscapedJsonString(json, inputs[0]);
+    }
+    try json.objectField("status");
+    try json.write(if (failure == null) "ok" else "error");
+    if (failure) |details| switch (details) {
+        .command => |command_failure| {
+            if (pair_mode == .paired) {
+                try json.objectField("failed_input");
+                try writeEscapedJsonString(json, inputs[command_failure.input_index]);
+            }
+            try writeJsonFailure(json, command_failure.details);
+        },
+        .pair => |pair_failure| try writePairJsonFailure(json, pair_failure),
+    };
+    try json.endObject();
+}
+
+fn writePairJsonFailure(json: *std.json.Stringify, failure: PairFailure) !void {
+    try json.objectField("error");
+    try json.beginObject();
+    switch (failure) {
+        .name_mismatch => |details| {
+            try json.objectField("code");
+            try json.write("P001");
+            try json.objectField("message");
+            try json.write("paired identifiers or mate markers do not match");
+            try json.objectField("pair_index");
+            try json.write(details.pair_index);
+            try json.objectField("record_indexes");
+            try json.beginArray();
+            for (details.records) |record| try json.write(record.record_index);
+            try json.endArray();
+            try json.objectField("byte_offsets");
+            try json.beginArray();
+            for (details.records) |record| try json.write(record.byte_offset);
+            try json.endArray();
+            try json.objectField("first_tokens");
+            try json.beginArray();
+            for (details.records) |record| try writeBoundedJsonBytes(json, &record.first_token);
+            try json.endArray();
+            try json.objectField("normalized_ids");
+            try json.beginArray();
+            for (details.records) |record| try writeBoundedJsonBytes(json, &record.normalized_id);
+            try json.endArray();
+            try json.objectField("mate_markers");
+            try json.beginArray();
+            for (details.records) |record| try writeMateMarkersJson(json, record.mate_markers);
+            try json.endArray();
+        },
+        .count_mismatch => |details| {
+            try json.objectField("code");
+            try json.write("P002");
+            try json.objectField("message");
+            try json.write("paired input is missing a mate");
+            try json.objectField("pair_index");
+            try json.write(details.pair_index);
+            try json.objectField("remaining_side");
+            try json.write(if (details.remaining_side == 0) "R1" else "R2");
+            try json.objectField("record_indexes");
+            try json.beginArray();
+            for (details.record_indexes) |record_index| try json.write(record_index);
+            try json.endArray();
+        },
+    }
+    try json.endObject();
+}
+
+fn writeBoundedJsonBytes(json: *std.json.Stringify, display: *const BoundedBytes) !void {
+    try json.beginObject();
+    try json.objectField("prefix");
+    try writeEscapedJsonString(json, display.bytes());
+    try json.objectField("length");
+    try json.write(display.full_len);
+    try json.objectField("truncated");
+    try json.write(display.truncated());
+    try json.endObject();
+}
+
+fn writeMateMarkersJson(json: *std.json.Stringify, markers: u2) !void {
+    try json.beginArray();
+    if (markers & 0b01 != 0) try json.write(@as(u8, 1));
+    if (markers & 0b10 != 0) try json.write(@as(u8, 2));
+    try json.endArray();
+}
+
 fn writeStatsJsonResult(
     json: *std.json.Stringify,
     input: []const u8,
@@ -1102,6 +1828,140 @@ fn printCommandFailure(io: std.Io, path: []const u8, failure: CommandFailure) vo
         },
     ) catch return;
     std.Io.File.writeStreamingAll(.stderr(), io, suffix) catch {};
+}
+
+fn printCheckFailure(
+    io: std.Io,
+    inputs: []const []const u8,
+    pair_mode: PairMode,
+    failure: CheckFailure,
+) void {
+    switch (failure) {
+        .command => |details| printCommandFailure(
+            io,
+            inputs[details.input_index],
+            details.details,
+        ),
+        .pair => |details| printPairFailure(io, inputs, pair_mode, details),
+    }
+}
+
+fn printPairFailure(
+    io: std.Io,
+    inputs: []const []const u8,
+    pair_mode: PairMode,
+    failure: PairFailure,
+) void {
+    std.Io.File.writeStreamingAll(.stderr(), io, "error: ") catch {};
+    writeEscaped(.stderr(), io, inputs[0]);
+    if (pair_mode == .paired) {
+        std.Io.File.writeStreamingAll(.stderr(), io, " + ") catch {};
+        writeEscaped(.stderr(), io, inputs[1]);
+    }
+    switch (failure) {
+        .name_mismatch => |details| {
+            std.Io.File.writeStreamingAll(
+                .stderr(),
+                io,
+                ": P001: paired identifiers or mate markers do not match",
+            ) catch {};
+            var buf: [64]u8 = undefined;
+            const pair = std.fmt.bufPrint(&buf, " (pair {d})\n", .{details.pair_index}) catch
+                return;
+            std.Io.File.writeStreamingAll(.stderr(), io, pair) catch {};
+            for (details.records, 0..) |record, index| {
+                writePairRecordDiagnostic(
+                    io,
+                    inputs[if (pair_mode == .paired) index else 0],
+                    index,
+                    &record,
+                );
+            }
+        },
+        .count_mismatch => |details| {
+            std.Io.File.writeStreamingAll(
+                .stderr(),
+                io,
+                ": P002: paired input is missing a mate",
+            ) catch {};
+            var buf: [96]u8 = undefined;
+            const prefix = std.fmt.bufPrint(
+                &buf,
+                " (pair {d}, remaining R{d}, last R1 record ",
+                .{ details.pair_index, @as(u8, details.remaining_side) + 1 },
+            ) catch return;
+            std.Io.File.writeStreamingAll(.stderr(), io, prefix) catch {};
+            writeOptionalIndex(io, details.record_indexes[0]);
+            std.Io.File.writeStreamingAll(.stderr(), io, ", last R2 record ") catch {};
+            writeOptionalIndex(io, details.record_indexes[1]);
+            std.Io.File.writeStreamingAll(.stderr(), io, ")\n") catch {};
+        },
+    }
+}
+
+fn writePairRecordDiagnostic(
+    io: std.Io,
+    input: []const u8,
+    side_index: usize,
+    record: *const PairRecordDiagnostic,
+) void {
+    var buf: [96]u8 = undefined;
+    const prefix = std.fmt.bufPrint(
+        &buf,
+        "  R{d}: input=",
+        .{side_index + 1},
+    ) catch return;
+    std.Io.File.writeStreamingAll(.stderr(), io, prefix) catch {};
+    writeEscaped(.stderr(), io, input);
+    const location = std.fmt.bufPrint(
+        &buf,
+        ", record={d}, offset={d}, first_token=",
+        .{ record.record_index, record.byte_offset },
+    ) catch return;
+    std.Io.File.writeStreamingAll(.stderr(), io, location) catch {};
+    writeBoundedHuman(io, &record.first_token);
+    std.Io.File.writeStreamingAll(.stderr(), io, ", normalized_id=") catch {};
+    writeBoundedHuman(io, &record.normalized_id);
+    std.Io.File.writeStreamingAll(.stderr(), io, ", mate_markers=") catch {};
+    writeMateMarkersHuman(io, record.mate_markers);
+    std.Io.File.writeStreamingAll(.stderr(), io, "\n") catch {};
+}
+
+fn writeBoundedHuman(io: std.Io, display: *const BoundedBytes) void {
+    writeEscaped(.stderr(), io, display.bytes());
+    var buf: [64]u8 = undefined;
+    const suffix = std.fmt.bufPrint(
+        &buf,
+        " [length={d}, truncated={s}]",
+        .{ display.full_len, if (display.truncated()) "true" else "false" },
+    ) catch return;
+    std.Io.File.writeStreamingAll(.stderr(), io, suffix) catch {};
+}
+
+fn writeMateMarkersHuman(io: std.Io, markers: u2) void {
+    if (markers == 0) {
+        std.Io.File.writeStreamingAll(.stderr(), io, "none") catch {};
+        return;
+    }
+    if (markers & 0b01 != 0) {
+        std.Io.File.writeStreamingAll(.stderr(), io, "1") catch {};
+    }
+    if (markers == 0b11) {
+        std.Io.File.writeStreamingAll(.stderr(), io, ",") catch {};
+    }
+    if (markers & 0b10 != 0) {
+        std.Io.File.writeStreamingAll(.stderr(), io, "2") catch {};
+    }
+}
+
+fn writeOptionalIndex(io: std.Io, record_index: ?u64) void {
+    if (record_index) |value| {
+        var buf: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return;
+        std.Io.File.writeStreamingAll(.stderr(), io, text) catch {};
+    } else {
+        std.Io.File.writeStreamingAll(.stderr(), io, "none") catch {};
+    }
 }
 
 fn printParseError(io: std.Io, path: []const u8, details: zfastq.ParseError) void {

@@ -30,6 +30,9 @@ const EXPECTED_USAGE =
     \\
     \\Check options:
     \\  --alphabet POLICY    Select iupac (default) or acgtn sequence symbols
+    \\  --paired             Validate two inputs as paired reads
+    \\  --interleaved        Validate consecutive records as paired reads
+    \\  --pair-names POLICY  Select illumina (default) or exact pair names
     \\
     \\Count usage:
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
@@ -39,6 +42,8 @@ const EXPECTED_USAGE =
     \\
     \\Check usage:
     \\  z-fastq check [--json] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|-> [<path|-> ...]
+    \\  z-fastq check --paired [--json] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
+    \\  z-fastq check --interleaved [--json] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
     \\
 ;
 
@@ -455,7 +460,7 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
 
     const version = try runCli(allocator, &.{"--version"});
     try std.testing.expectEqual(@as(u8, 0), version.exit_code);
-    try std.testing.expectEqualStrings("z-fastq 0.0.7\n", version.stdout);
+    try std.testing.expectEqualStrings("z-fastq 0.0.8\n", version.stdout);
     try std.testing.expectEqual(@as(usize, 0), version.stderr.len);
 
     const short_version = try runCli(allocator, &.{"-V"});
