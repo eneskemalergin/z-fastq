@@ -5,6 +5,9 @@ const builtin = @import("builtin");
 
 const POLYNOMIAL: u32 = 0xedb8_8320;
 const FOLD_MIN_BYTES = 128;
+// Zig's self-hosted x86 backend only encodes PCLMUL when the target enables it.
+const CAN_COMPILE_PCLMUL = builtin.cpu.arch == .x86_64 and
+    (builtin.zig_backend != .stage2_x86_64 or builtin.cpu.has(.x86, .pclmul));
 
 pub const Crc32 = struct {
     value: u32 = 0,
@@ -45,7 +48,7 @@ pub const Crc32 = struct {
     }
 
     fn initWithPclmul(has_pclmul: bool) Crc32 {
-        if (comptime builtin.cpu.arch == .x86_64) {
+        if (comptime CAN_COMPILE_PCLMUL) {
             return .{ .bulk_update = if (has_pclmul) X86Crc32.update else null };
         }
         return .{};
@@ -74,7 +77,7 @@ pub const Crc32 = struct {
 };
 
 fn runtimeHasPclmul() bool {
-    if (comptime builtin.cpu.arch != .x86_64) return false;
+    if (comptime !CAN_COMPILE_PCLMUL) return false;
     return X86Crc32.isSupported();
 }
 
@@ -258,7 +261,7 @@ test "[unit] - [CRC-32 dispatch]: selects safely and permits portable use" {
     try std.testing.expectEqual(expected.final(), portable.final());
 
     const selected = Crc32.init();
-    if (comptime builtin.cpu.arch == .x86_64) {
+    if (comptime CAN_COMPILE_PCLMUL) {
         try std.testing.expectEqual(X86Crc32.isSupported(), selected.usesPclmul());
     } else {
         try std.testing.expect(!selected.usesPclmul());
@@ -276,7 +279,7 @@ test "[unit] - [CRC-32 reset]: preserves the selected implementation" {
 }
 
 test "[property] - [CRC-32 PCLMUL]: matches portable folding boundaries" {
-    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    if (comptime !CAN_COMPILE_PCLMUL) return error.SkipZigTest;
     if (!X86Crc32.isSupported()) return error.SkipZigTest;
 
     var storage: [545]u8 = undefined;
