@@ -4,6 +4,7 @@ const std = @import("std");
 const zfastq = @import("root.zig");
 const fastq = @import("fastq.zig");
 const io_layer = @import("io.zig");
+const sampling = @import("sample.zig");
 
 const INVALID_QUALITY_MESSAGE = "quality byte must be ASCII 33 through 126";
 const PAIR_DIAGNOSTIC_PREFIX_BYTES = 128;
@@ -15,6 +16,7 @@ const USAGE =
     \\  count    Count records in plain or gzip FASTQ inputs
     \\  stats    Report aggregate FASTQ statistics
     \\  check    Validate FASTQ structure, sequence alphabet, and quality range
+    \\  sample   Select records with a deterministic probability
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -23,14 +25,20 @@ const USAGE =
     \\Input options:
     \\  --max-line-bytes N   Override default line length limit
     \\
+    \\Validation options:
+    \\  --alphabet POLICY    Select iupac (default) or acgtn sequence symbols
+    \\
     \\Machine output:
     \\  --json               Emit versioned JSON (stats and check only)
     \\
     \\Check options:
-    \\  --alphabet POLICY    Select iupac (default) or acgtn sequence symbols
     \\  --paired             Validate two inputs as paired reads
     \\  --interleaved        Validate consecutive records as paired reads
     \\  --pair-names POLICY  Select illumina (default) or exact pair names
+    \\
+    \\Sample options:
+    \\  --fraction P         Use 0, 1, 0.DIGITS, or 1.ZEROES
+    \\  --seed S             Use an unsigned decimal u64 seed (default 11)
     \\
     \\Count usage:
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
@@ -42,6 +50,9 @@ const USAGE =
     \\  z-fastq check [--json] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|-> [<path|-> ...]
     \\  z-fastq check --paired [--json] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
     \\  z-fastq check --interleaved [--json] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
+    \\
+    \\Sample usage:
+    \\  z-fastq sample --fraction P [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
     \\
 ;
 
@@ -73,6 +84,8 @@ pub fn main(init: std.process.Init) !void {
         .stats
     else if (std.mem.eql(u8, cmd, "check"))
         .check
+    else if (std.mem.eql(u8, cmd, "sample"))
+        .sample
     else {
         std.Io.File.writeStreamingAll(.stderr(), io, "error: unknown command: ") catch {};
         writeEscaped(.stderr(), io, cmd);
@@ -86,6 +99,8 @@ pub fn main(init: std.process.Init) !void {
     var pair_name_policy: PairNamePolicy = .illumina;
     var pair_names_set = false;
     var json_output = false;
+    var fraction: ?sampling.Fraction = null;
+    var sample_seed: u64 = 11;
     var positional = std.ArrayList([]const u8).empty;
     defer positional.deinit(gpa);
 
@@ -135,11 +150,13 @@ pub fn main(init: std.process.Init) !void {
             };
             continue;
         }
-        if (command != .count and std.mem.eql(u8, arg, "--json")) {
+        if ((command == .stats or command == .check) and std.mem.eql(u8, arg, "--json")) {
             json_output = true;
             continue;
         }
-        if (command == .check and std.mem.eql(u8, arg, "--alphabet")) {
+        if ((command == .check or command == .sample) and
+            std.mem.eql(u8, arg, "--alphabet"))
+        {
             const value = args.next() orelse {
                 std.Io.File.writeStreamingAll(
                     .stderr(),
@@ -159,6 +176,54 @@ pub fn main(init: std.process.Init) !void {
                     "error: --alphabet must be iupac or acgtn\n",
                 ) catch {};
                 std.process.exit(2);
+            };
+            continue;
+        }
+        if (command == .sample and std.mem.eql(u8, arg, "--fraction")) {
+            const value = args.next() orelse {
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: --fraction requires a value\n",
+                ) catch {};
+                std.process.exit(2);
+            };
+            fraction = sampling.Fraction.parse(value) catch {
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: invalid --fraction value\n",
+                ) catch {};
+                std.process.exit(2);
+            };
+            continue;
+        }
+        if (command == .sample and std.mem.eql(u8, arg, "--seed")) {
+            const value = args.next() orelse {
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: --seed requires a value\n",
+                ) catch {};
+                std.process.exit(2);
+            };
+            sample_seed = sampling.parseSeed(value) catch |err| switch (err) {
+                error.InvalidSeed => {
+                    std.Io.File.writeStreamingAll(
+                        .stderr(),
+                        io,
+                        "error: invalid --seed value\n",
+                    ) catch {};
+                    std.process.exit(2);
+                },
+                error.Overflow => {
+                    std.Io.File.writeStreamingAll(
+                        .stderr(),
+                        io,
+                        "error: --seed exceeds supported limit\n",
+                    ) catch {};
+                    std.process.exit(4);
+                },
             };
             continue;
         }
@@ -240,11 +305,22 @@ pub fn main(init: std.process.Init) !void {
                 .pair_mode = pair_mode,
                 .pair_name_policy = pair_name_policy,
             }, json_output),
+        .sample => runSample(
+            io,
+            gpa,
+            positional.items,
+            .{
+                .max_line_bytes = max_line_bytes,
+                .alphabet = alphabet,
+                .fraction = fraction,
+                .seed = sample_seed,
+            },
+        ),
     };
     std.process.exit(code);
 }
 
-const Command = enum { count, stats, check };
+const Command = enum { count, stats, check, sample };
 
 fn printUsageAndExit(io: std.Io) noreturn {
     std.Io.File.writeStreamingAll(.stderr(), io, USAGE) catch {};
@@ -497,6 +573,46 @@ const CommandFailure = struct {
         return .{ .code = code, .message = message, .exit_code = exit_code };
     }
 };
+
+fn validateCommandRecord(
+    record: zfastq.Record,
+    offsets: zfastq.RecordOffsets,
+    record_index: u64,
+    alphabet: zfastq.Alphabet,
+) ?CommandFailure {
+    const semantic_error = zfastq.validateRecord(
+        record,
+        .{ .alphabet = alphabet },
+    ) orelse return null;
+    const field_offset = switch (semantic_error.field) {
+        .sequence => offsets.sequence,
+        .quality => offsets.quality,
+    };
+    const relative_offset = std.math.cast(u64, semantic_error.byte_index) orelse {
+        return CommandFailure.plain(
+            "arithmetic_limit",
+            "input location exceeds supported limit",
+            4,
+        );
+    };
+    const byte_offset = std.math.add(u64, field_offset, relative_offset) catch {
+        return CommandFailure.plain(
+            "arithmetic_limit",
+            "input location exceeds supported limit",
+            4,
+        );
+    };
+    return CommandFailure.lint(.{
+        .code = semantic_error.code,
+        .message = semantic_error.message,
+        .record_index = record_index,
+        .byte_offset = byte_offset,
+        .line_in_record = switch (semantic_error.field) {
+            .sequence => 2,
+            .quality => 4,
+        },
+    });
+}
 
 const StatsOutcome = union(enum) {
     success: zfastq.Stats,
@@ -1033,38 +1149,7 @@ fn validatePairRecord(
     record_index: u64,
     options: PairedCheckOptions,
 ) ?CommandFailure {
-    const semantic_error = zfastq.validateRecord(
-        record,
-        .{ .alphabet = options.alphabet },
-    ) orelse return null;
-    const field_offset = switch (semantic_error.field) {
-        .sequence => offsets.sequence,
-        .quality => offsets.quality,
-    };
-    const relative_offset = std.math.cast(u64, semantic_error.byte_index) orelse {
-        return CommandFailure.plain(
-            "arithmetic_limit",
-            "input location exceeds supported limit",
-            4,
-        );
-    };
-    const byte_offset = std.math.add(u64, field_offset, relative_offset) catch {
-        return CommandFailure.plain(
-            "arithmetic_limit",
-            "input location exceeds supported limit",
-            4,
-        );
-    };
-    return CommandFailure.lint(.{
-        .code = semantic_error.code,
-        .message = semantic_error.message,
-        .record_index = record_index,
-        .byte_offset = byte_offset,
-        .line_in_record = switch (semantic_error.field) {
-            .sequence => 2,
-            .quality => 4,
-        },
-    });
+    return validateCommandRecord(record, offsets, record_index, options.alphabet);
 }
 
 fn lastRecordIndex(reader: *const zfastq.Reader) ?u64 {
@@ -1485,6 +1570,127 @@ fn mapReaderFailure(
         error.OutOfMemory => CommandFailure.plain("out_of_memory", "out of memory", 3),
         error.Io => CommandFailure.plain("io_error", "I/O error", 3),
     };
+}
+
+// --- Sample command ---
+
+const SampleOptions = struct {
+    max_line_bytes: usize,
+    alphabet: zfastq.Alphabet,
+    fraction: ?sampling.Fraction,
+    seed: u64,
+};
+
+noinline fn runSample(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    options: SampleOptions,
+) u8 {
+    const fraction = options.fraction orelse {
+        std.Io.File.writeStreamingAll(
+            .stderr(),
+            io,
+            "error: sample requires --fraction P\n",
+        ) catch {};
+        return 2;
+    };
+    if (inputs.len != 1) {
+        std.Io.File.writeStreamingAll(
+            .stderr(),
+            io,
+            "error: sample requires exactly one input\n",
+        ) catch {};
+        return 2;
+    }
+
+    var stdout_buffer: [64 * 1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    var sink_adapter = io_layer.WriterSink.init(&stdout_writer.interface);
+    var writer = zfastq.Writer.init(sink_adapter.byteSink());
+    var selector = sampling.Selector.init(fraction, options.seed);
+    const input = inputs[0];
+    const failure = (if (std.mem.eql(u8, input, "-"))
+        sampleStdin(io, allocator, &writer, &selector, options)
+    else
+        sampleFile(io, allocator, input, &writer, &selector, options)) catch {
+        writer.flush() catch {};
+        return 3;
+    };
+
+    var output_exit: u8 = 0;
+    writer.flush() catch {
+        output_exit = 3;
+    };
+    if (failure) |details| {
+        printCommandFailure(io, input, details);
+        return @max(output_exit, details.exit_code);
+    }
+    return output_exit;
+}
+
+fn sampleFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    writer: *zfastq.Writer,
+    selector: *sampling.Selector,
+    options: SampleOptions,
+) error{WriteFailed}!?CommandFailure {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return CommandFailure.plain("io_error", "file not found", 3),
+        else => return CommandFailure.plain("io_error", "failed to open file", 3),
+    };
+
+    var input: RecordInput = undefined;
+    input.init(io, file, true) catch {
+        file.close(io);
+        return CommandFailure.plain("io_error", "I/O error", 3);
+    };
+    defer input.deinit(io);
+    return sampleSource(allocator, input.byteSource(), writer, selector, options);
+}
+
+fn sampleStdin(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    writer: *zfastq.Writer,
+    selector: *sampling.Selector,
+    options: SampleOptions,
+) error{WriteFailed}!?CommandFailure {
+    var input: RecordInput = undefined;
+    input.init(io, .stdin(), false) catch {
+        return CommandFailure.plain("io_error", "I/O error", 3);
+    };
+    defer input.deinit(io);
+    return sampleSource(allocator, input.byteSource(), writer, selector, options);
+}
+
+fn sampleSource(
+    allocator: std.mem.Allocator,
+    source: zfastq.io.ByteSource,
+    writer: *zfastq.Writer,
+    selector: *sampling.Selector,
+    options: SampleOptions,
+) error{WriteFailed}!?CommandFailure {
+    var reader = zfastq.Reader.init(
+        allocator,
+        source,
+        .{ .max_line_bytes = options.max_line_bytes },
+    ) catch return CommandFailure.plain("out_of_memory", "out of memory", 3);
+    defer reader.deinit();
+
+    while (reader.next() catch |err| return mapReaderFailure(&reader, err)) |record| {
+        const record_index = reader.recordIndex() - 1;
+        const offsets = reader.currentRecordOffsets().?;
+        if (validateCommandRecord(record, offsets, record_index, options.alphabet)) |failure| {
+            return failure;
+        }
+        if (selector.selectRecord()) {
+            writer.writeRecord(record) catch return error.WriteFailed;
+        }
+    }
+    return null;
 }
 
 // --- Machine output ---
