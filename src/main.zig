@@ -1680,14 +1680,21 @@ fn sampleSource(
     ) catch return CommandFailure.plain("out_of_memory", "out of memory", 3);
     defer reader.deinit();
 
-    while (reader.next() catch |err| return mapReaderFailure(&reader, err)) |record| {
+    var canonical_span: ?[]const u8 = null;
+    while (fastq.nextWithCanonicalSpan(&reader, &canonical_span) catch |err|
+        return mapReaderFailure(&reader, err)) |record|
+    {
         const record_index = reader.recordIndex() - 1;
         const offsets = reader.currentRecordOffsets().?;
         if (validateCommandRecord(record, offsets, record_index, options.alphabet)) |failure| {
             return failure;
         }
         if (selector.selectRecord()) {
-            writer.writeRecord(record) catch return error.WriteFailed;
+            if (canonical_span) |span| {
+                fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
+            } else {
+                fastq.writeValidatedRecord(writer, record) catch return error.WriteFailed;
+            }
         }
     }
     return null;

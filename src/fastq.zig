@@ -305,10 +305,15 @@ const Line = struct {
     start_offset: u64,
 };
 
+const BufferedRecord = struct {
+    ranges: [4]Range,
+    canonical_range: ?Range,
+};
+
 const BufferedRecordResult = union(enum) {
     incomplete,
     eof,
-    ranges: [4]Range,
+    record: BufferedRecord,
 };
 
 pub const RecordOffsets = struct {
@@ -392,13 +397,27 @@ pub const Reader = struct {
 
     /// Returns the next borrowed record, or null at a clean EOF boundary.
     pub fn next(self: *Reader) ReaderError!?Record {
+        var canonical_span: ?[]const u8 = null;
+        return self.nextWithCanonicalSpan(&canonical_span);
+    }
+
+    fn nextWithCanonicalSpan(
+        self: *Reader,
+        canonical_span: *?[]const u8,
+    ) ReaderError!?Record {
+        canonical_span.* = null;
         self.beginRecord();
         switch (try self.readBufferedRecord()) {
             .incomplete => {},
             .eof => return null,
-            .ranges => |ranges| {
+            .record => |buffered| {
                 self.current_record_offsets = self.record_offsets;
+                const ranges = buffered.ranges;
                 const header = self.buf[ranges[0].start + 1 .. ranges[0].end];
+                canonical_span.* = if (buffered.canonical_range) |range|
+                    range.slice(self.buf)
+                else
+                    null;
                 return .{
                     .header = header,
                     .id = firstToken(header),
@@ -435,7 +454,7 @@ pub const Reader = struct {
         switch (try self.readBufferedRecord()) {
             .incomplete => {},
             .eof => return false,
-            .ranges => return true,
+            .record => return true,
         }
         while (true) {
             const line = try self.readLine();
@@ -479,6 +498,7 @@ pub const Reader = struct {
         }
 
         var ranges: [4]Range = undefined;
+        var canonical = true;
         for (0..4) |line_index| {
             const start = starts[line_index];
             const raw_end = ends[line_index];
@@ -486,6 +506,7 @@ pub const Reader = struct {
                 raw_end - 1
             else
                 raw_end;
+            canonical = canonical and end == raw_end;
             if (end - start > self.options.max_line_bytes) return error.LineTooLong;
 
             const start_offset = self.byte_offset;
@@ -509,7 +530,13 @@ pub const Reader = struct {
         }
 
         self.record_index += 1;
-        return .{ .ranges = ranges };
+        return .{ .record = .{
+            .ranges = ranges,
+            .canonical_range = if (canonical)
+                .{ .start = starts[0], .end = search_start }
+            else
+                null,
+        } };
     }
 
     fn ingestLine(self: *Reader, line: ?Line) ReaderError!IngestResult {
@@ -683,6 +710,15 @@ pub const Reader = struct {
     }
 };
 
+/// Returns the next borrowed record and its complete span when its framing is already canonical.
+/// Both borrows expire when the reader advances again.
+pub fn nextWithCanonicalSpan(
+    reader: *Reader,
+    canonical_span: *?[]const u8,
+) ReaderError!?Record {
+    return reader.nextWithCanonicalSpan(canonical_span);
+}
+
 // --- Writer ---
 
 pub const WriterError = WriteError || error{InvalidRecord};
@@ -706,15 +742,7 @@ pub const Writer = struct {
             return error.InvalidRecord;
         }
 
-        try self.sink.write("@");
-        try self.sink.write(record.header);
-        try self.sink.write("\n");
-        try self.sink.write(record.sequence);
-        try self.sink.write("\n+");
-        try self.sink.write(record.plus);
-        try self.sink.write("\n");
-        try self.sink.write(record.quality);
-        try self.sink.write("\n");
+        return writeRecordFields(self, record);
     }
 
     /// Flushes the underlying sink when it provides a flush callback.
@@ -722,6 +750,28 @@ pub const Writer = struct {
         return self.sink.flush();
     }
 };
+
+/// Writes a Reader record whose structure and command semantics were already validated.
+pub fn writeValidatedRecord(writer: *Writer, record: Record) WriteError!void {
+    return writeRecordFields(writer, record);
+}
+
+/// Writes one borrowed record span already proven to have canonical LF framing.
+pub fn writeCanonicalRecordSpan(writer: *Writer, span: []const u8) WriteError!void {
+    return writer.sink.write(span);
+}
+
+fn writeRecordFields(writer: *Writer, record: Record) WriteError!void {
+    try writer.sink.write("@");
+    try writer.sink.write(record.header);
+    try writer.sink.write("\n");
+    try writer.sink.write(record.sequence);
+    try writer.sink.write("\n+");
+    try writer.sink.write(record.plus);
+    try writer.sink.write("\n");
+    try writer.sink.write(record.quality);
+    try writer.sink.write("\n");
+}
 
 fn isWritableField(bytes: []const u8) bool {
     return std.mem.indexOfScalar(u8, bytes, '\n') == null and
@@ -1063,6 +1113,96 @@ const CheckTestOutcome = union(enum) {
     parse_error: ParseError,
     line_too_long,
 };
+
+test "[property] - [record delivery]: canonical spans use only complete buffered LF records" {
+    const cases = [_]struct {
+        input: []const u8,
+        expected_output: []const u8,
+        has_span: bool,
+    }{
+        .{
+            .input = "@r\rdesc\nACGT\n+note\rx\n!#$%\n",
+            .expected_output = "@r\rdesc\nACGT\n+note\rx\n!#$%\n",
+            .has_span = true,
+        },
+        .{
+            .input = "@crlf\r\nACGT\r\n+\r\n!!!!\r\n",
+            .expected_output = "@crlf\nACGT\n+\n!!!!\n",
+            .has_span = false,
+        },
+        .{
+            .input = "@eof\nA\n+\n!",
+            .expected_output = "@eof\nA\n+\n!\n",
+            .has_span = false,
+        },
+    };
+
+    for (cases) |case| {
+        var source = io_layer.SliceSource.init(case.input);
+        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
+        var canonical_span: ?[]const u8 = null;
+        const record = (try nextWithCanonicalSpan(&reader, &canonical_span)).?;
+        try std.testing.expect(validateRecord(record, .{}) == null);
+        try std.testing.expectEqual(case.has_span, canonical_span != null);
+
+        var output: [64]u8 = undefined;
+        var sink = io_layer.SliceSink.init(&output);
+        var writer = Writer.init(sink.byteSink());
+        if (canonical_span) |span| {
+            try writeCanonicalRecordSpan(&writer, span);
+        } else {
+            try writeValidatedRecord(&writer, record);
+        }
+        try std.testing.expectEqualStrings(case.expected_output, sink.written());
+        try std.testing.expect((try nextWithCanonicalSpan(&reader, &canonical_span)) == null);
+        try std.testing.expect(canonical_span == null);
+    }
+
+    const header_len = io_layer.DEFAULT_READER_BUFFER_BYTES;
+    const input = try std.testing.allocator.alloc(u8, header_len + 8);
+    defer std.testing.allocator.free(input);
+    @memset(input, 'h');
+    input[0] = '@';
+    input[header_len + 1] = '\n';
+    input[header_len + 2] = 'A';
+    input[header_len + 3] = '\n';
+    input[header_len + 4] = '+';
+    input[header_len + 5] = '\n';
+    input[header_len + 6] = '!';
+    input[header_len + 7] = '\n';
+
+    var source = io_layer.SliceSource.init(input);
+    var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+    defer reader.deinit();
+    var canonical_span: ?[]const u8 = null;
+    const record = (try nextWithCanonicalSpan(&reader, &canonical_span)).?;
+    try std.testing.expectEqual(header_len, record.header.len);
+    try std.testing.expect(canonical_span == null);
+}
+
+test "[integration] - [writer]: trusted Reader records match checked serialization" {
+    const input = "@r\rdesc\r\nACGT\r\n+note\rx\r\n!#$%\r\n";
+    const expected = "@r\rdesc\nACGT\n+note\rx\n!#$%\n";
+    var source = io_layer.SliceSource.init(input);
+    var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+    defer reader.deinit();
+    const record = (try reader.next()).?;
+    try std.testing.expect(validateRecord(record, .{}) == null);
+
+    var checked_bytes: [64]u8 = undefined;
+    var checked_sink = io_layer.SliceSink.init(&checked_bytes);
+    var checked_writer = Writer.init(checked_sink.byteSink());
+    try checked_writer.writeRecord(record);
+
+    var trusted_bytes: [64]u8 = undefined;
+    var trusted_sink = io_layer.SliceSink.init(&trusted_bytes);
+    var trusted_writer = Writer.init(trusted_sink.byteSink());
+    try writeValidatedRecord(&trusted_writer, record);
+
+    try std.testing.expectEqualStrings(expected, checked_sink.written());
+    try std.testing.expectEqualStrings(checked_sink.written(), trusted_sink.written());
+}
 
 test "[unit] - [check scanner]: state remains fixed-size" {
     try std.testing.expect(@sizeOf(CheckScanner) <= 160);
