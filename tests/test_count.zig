@@ -17,7 +17,7 @@ const EXPECTED_USAGE =
     \\  count    Count records in plain or gzip FASTQ inputs
     \\  stats    Report aggregate FASTQ statistics
     \\  check    Validate FASTQ structure, sequence alphabet, and quality range
-    \\  sample   Select records with a deterministic probability
+    \\  sample   Select records by deterministic probability or exact count
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -39,6 +39,7 @@ const EXPECTED_USAGE =
     \\
     \\Sample options:
     \\  --fraction P         Use 0, 1, 0.DIGITS, or 1.ZEROES
+    \\  --count K            Select exactly min(K, records) from a file
     \\  --seed S             Use an unsigned decimal u64 seed (default 11)
     \\
     \\Count usage:
@@ -54,6 +55,7 @@ const EXPECTED_USAGE =
     \\
     \\Sample usage:
     \\  z-fastq sample --fraction P [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
+    \\  z-fastq sample --count K [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] path
     \\
 ;
 
@@ -472,7 +474,7 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
 
     const version = try runCli(allocator, &.{"--version"});
     try std.testing.expectEqual(@as(u8, 0), version.exit_code);
-    try std.testing.expectEqualStrings("z-fastq 0.0.9\n", version.stdout);
+    try std.testing.expectEqualStrings("z-fastq 0.0.10\n", version.stdout);
     try std.testing.expectEqual(@as(usize, 0), version.stderr.len);
 
     const short_version = try runCli(allocator, &.{"-V"});

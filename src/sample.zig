@@ -1,9 +1,11 @@
-//! Deterministic fraction parsing and record selection for the private sample command.
+//! Deterministic numeric parsing and record selection for the private sample command.
 
 const std = @import("std");
 
 pub const FractionError = error{InvalidFraction};
+pub const CountError = error{ InvalidCount, Overflow };
 pub const SeedError = error{ InvalidSeed, Overflow };
+pub const ReservoirError = std.mem.Allocator.Error || error{Overflow};
 
 pub const Fraction = union(enum) {
     none,
@@ -47,6 +49,13 @@ pub fn parseSeed(text: []const u8) SeedError!u64 {
     };
 }
 
+pub fn parseCount(text: []const u8) CountError!u64 {
+    return parseSeed(text) catch |err| switch (err) {
+        error.InvalidSeed => error.InvalidCount,
+        error.Overflow => error.Overflow,
+    };
+}
+
 pub const Selector = union(enum) {
     none,
     all,
@@ -74,6 +83,72 @@ pub const Selector = union(enum) {
             .all => true,
             .probability => |*state| state.generator.nextUnitFloat() < state.fraction,
         };
+    }
+};
+
+pub const ExactSelector = struct {
+    target: u64,
+    generator: Mt19937_64,
+    indexes: std.ArrayList(u64) = .empty,
+    unordered: bool = false,
+
+    pub fn init(target: u64, seed: u64) ExactSelector {
+        return .{
+            .target = target,
+            .generator = Mt19937_64.init(seed),
+        };
+    }
+
+    pub fn deinit(self: *ExactSelector, allocator: std.mem.Allocator) void {
+        self.indexes.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn considerRecord(
+        self: *ExactSelector,
+        allocator: std.mem.Allocator,
+        record_number: u64,
+    ) ReservoirError!void {
+        std.debug.assert(record_number != 0);
+        if (self.target == 0) return;
+
+        const draw = self.generator.nextUnitFloat();
+        if (record_number <= self.target) {
+            const new_len = std.math.add(usize, self.indexes.items.len, 1) catch
+                return error.Overflow;
+            _ = std.math.mul(usize, new_len, @sizeOf(u64)) catch
+                return error.Overflow;
+            try self.indexes.append(allocator, record_number);
+            return;
+        }
+
+        const candidate_float = draw * @as(f64, @floatFromInt(record_number));
+        const candidate = if (candidate_float >= @as(f64, @floatFromInt(record_number)))
+            record_number - 1
+        else
+            @as(u64, @intFromFloat(candidate_float));
+        if (candidate >= self.target) return;
+
+        const slot = std.math.cast(usize, candidate) orelse return error.Overflow;
+        self.indexes.items[slot] = record_number;
+        self.unordered = self.unordered or slot + 1 != self.indexes.items.len;
+    }
+
+    pub fn finish(
+        self: *ExactSelector,
+        allocator: std.mem.Allocator,
+    ) std.mem.Allocator.Error!void {
+        if (self.unordered) {
+            std.mem.sortUnstable(
+                u64,
+                self.indexes.items,
+                {},
+                std.sort.asc(u64),
+            );
+        }
+        if (self.indexes.capacity != self.indexes.items.len) {
+            try self.indexes.shrinkToLen(allocator);
+        }
     }
 };
 

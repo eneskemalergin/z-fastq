@@ -6,11 +6,30 @@ const cli = @import("utilities.zig");
 
 const BASIC_PATH = "tests/data/synthetic/basic_valid.fastq";
 const EMPTY_PATH = "tests/data/synthetic/empty_valid.fastq";
+const EMPTY_RECORD = "@empty\n\n+\n\n";
 const BASIC_SELECTED_HALF =
     \\@read1 run=1 lane=1
     \\ACGTACGTACGT
     \\+
     \\IIIIIIIIIIII
+    \\@read3_with_plus_header
+    \\AAAA
+    \\+read3_with_plus_header
+    \\!!!!
+    \\@read5_phred_zero
+    \\A
+    \\+
+    \\!
+    \\
+;
+const BASIC_EXACT_ONE =
+    \\@read5_phred_zero
+    \\A
+    \\+
+    \\!
+    \\
+;
+const BASIC_EXACT_TWO =
     \\@read3_with_plus_header
     \\AAAA
     \\+read3_with_plus_header
@@ -138,6 +157,68 @@ test "[unit] - [sample numbers]: fraction and seed grammars are exact" {
         error.Overflow,
         sampling.parseSeed("18446744073709551616"),
     );
+
+    try std.testing.expectEqual(@as(u64, 0), try sampling.parseCount("0"));
+    try std.testing.expectEqual(@as(u64, 11), try sampling.parseCount("00011"));
+    try std.testing.expectEqual(std.math.maxInt(u64), try sampling.parseCount(
+        "18446744073709551615",
+    ));
+    for ([_][]const u8{ "", "+1", "-1", "1.0", "1e2", " 1", "1 " }) |text| {
+        try std.testing.expectError(error.InvalidCount, sampling.parseCount(text));
+    }
+    try std.testing.expectError(
+        error.Overflow,
+        sampling.parseCount("18446744073709551616"),
+    );
+}
+
+test "[unit] - [exact selector]: seed 11 matches frozen seqtk indexes" {
+    var zero = sampling.ExactSelector.init(0, 11);
+    defer zero.deinit(std.testing.allocator);
+    var untouched = sampling.Mt19937_64.init(11);
+    try zero.considerRecord(std.testing.allocator, 1);
+    try std.testing.expectEqual(untouched.nextU64(), zero.generator.nextU64());
+
+    const cases = [_]struct {
+        target: u64,
+        expected: []const u64,
+    }{
+        .{ .target = 0, .expected = &.{} },
+        .{ .target = 1, .expected = &.{5} },
+        .{ .target = 2, .expected = &.{ 3, 5 } },
+        .{ .target = 3, .expected = &.{ 2, 4, 5 } },
+        .{ .target = 5, .expected = &.{ 1, 2, 3, 4, 5 } },
+        .{ .target = 8, .expected = &.{ 1, 2, 3, 4, 5 } },
+    };
+
+    for (cases) |case| {
+        var selector = sampling.ExactSelector.init(case.target, 11);
+        defer selector.deinit(std.testing.allocator);
+        for (1..6) |record_number| {
+            try selector.considerRecord(std.testing.allocator, record_number);
+        }
+        try selector.finish(std.testing.allocator);
+        try std.testing.expectEqualSlices(u64, case.expected, selector.indexes.items);
+        try std.testing.expectEqual(selector.indexes.items.len, selector.indexes.capacity);
+    }
+}
+
+fn exerciseExactSelectorAllocations(allocator: std.mem.Allocator) !void {
+    var selector = sampling.ExactSelector.init(37, 11);
+    defer selector.deinit(allocator);
+    for (1..101) |record_number| {
+        try selector.considerRecord(allocator, record_number);
+    }
+    try selector.finish(allocator);
+    try std.testing.expectEqual(@as(usize, 37), selector.indexes.items.len);
+}
+
+test "[failure] - [exact selector]: every growth allocation is released" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseExactSelectorAllocations,
+        .{},
+    );
 }
 
 test "[cli] - [sample]: boundary fractions preserve fields and canonicalize LF" {
@@ -181,6 +262,49 @@ test "[cli] - [sample]: boundary fractions preserve fields and canonicalize LF" 
         "",
         "",
     );
+}
+
+test "[cli] - [exact sample]: count boundaries preserve records in input order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const basic = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        BASIC_PATH,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const empty_file = try tmp.dir.createFile(std.testing.io, "empty.fastq", .{});
+    empty_file.close(std.testing.io);
+    const empty_path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/tmp/{s}/empty.fastq",
+        .{tmp.sub_path},
+    );
+
+    const cases = [_]struct {
+        count: []const u8,
+        path: []const u8,
+        expected: []const u8,
+    }{
+        .{ .count = "0", .path = BASIC_PATH, .expected = "" },
+        .{ .count = "1", .path = BASIC_PATH, .expected = BASIC_EXACT_ONE },
+        .{ .count = "2", .path = BASIC_PATH, .expected = BASIC_EXACT_TWO },
+        .{ .count = "5", .path = BASIC_PATH, .expected = basic },
+        .{ .count = "8", .path = BASIC_PATH, .expected = basic },
+        .{ .count = "18446744073709551615", .path = EMPTY_PATH, .expected = EMPTY_RECORD },
+        .{ .count = "18446744073709551615", .path = empty_path, .expected = "" },
+    };
+    for (cases) |case| {
+        try expectResult(
+            try cli.run(allocator, &.{ "sample", "--count", case.count, case.path }),
+            0,
+            case.expected,
+            "",
+        );
+    }
 }
 
 test "[integration] - [sample]: plain and gzip file and stdin select identical records" {
@@ -234,6 +358,25 @@ test "[integration] - [sample]: plain and gzip file and stdin select identical r
     for ([_]cli.CommandResult{ file_plain, file_gzip, stdin_plain, stdin_gzip }) |result| {
         try expectResult(result, 0, BASIC_SELECTED_HALF, "");
     }
+
+    try expectResult(
+        try cli.run(
+            allocator,
+            &.{ "sample", "--count", "2", "--seed", "11", BASIC_PATH },
+        ),
+        0,
+        BASIC_EXACT_TWO,
+        "",
+    );
+    try expectResult(
+        try cli.run(
+            allocator,
+            &.{ "sample", "--count", "2", "--seed", "11", gzip_path },
+        ),
+        0,
+        BASIC_EXACT_TWO,
+        "",
+    );
 }
 
 test "[cli] - [sample]: every record is validated before selection" {
@@ -245,6 +388,18 @@ test "[cli] - [sample]: every record is validated before selection" {
         try cli.run(allocator, &.{
             "sample",
             "--fraction",
+            "0",
+            "tests/data/synthetic/bad_alphabet.fastq",
+        }),
+        1,
+        "",
+        "error: tests/data/synthetic/bad_alphabet.fastq: S002: " ++
+            "sequence byte is outside the selected alphabet (record 0, line 2, offset 16)\n",
+    );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--count",
             "0",
             "tests/data/synthetic/bad_alphabet.fastq",
         }),
@@ -375,6 +530,35 @@ test "[cli] - [sample]: numeric grammar maps to exact exit classes" {
         "",
         "",
     );
+
+    for ([_][]const u8{ "0", "1", "00011", "18446744073709551615" }) |value| {
+        const expected = if ((try sampling.parseCount(value)) == 0) "" else EMPTY_RECORD;
+        try expectResult(
+            try cli.run(allocator, &.{ "sample", "--count", value, EMPTY_PATH }),
+            0,
+            expected,
+            "",
+        );
+    }
+    for ([_][]const u8{ "", "+1", "-1", "1.0", "1e2", " 1", "1 " }) |value| {
+        try expectResult(
+            try cli.run(allocator, &.{ "sample", "--count", value, EMPTY_PATH }),
+            2,
+            "",
+            "error: invalid --count value\n",
+        );
+    }
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--count",
+            "18446744073709551616",
+            EMPTY_PATH,
+        }),
+        4,
+        "",
+        "error: --count exceeds supported limit\n",
+    );
 }
 
 test "[cli] - [sample]: invocation shape is validated before input" {
@@ -386,10 +570,20 @@ test "[cli] - [sample]: invocation shape is validated before input" {
         args: []const []const u8,
         stderr: []const u8,
     }{
-        .{ .args = &.{ "sample", EMPTY_PATH }, .stderr = "error: sample requires --fraction P\n" },
+        .{ .args = &.{ "sample", EMPTY_PATH }, .stderr = "error: sample requires --fraction P or --count K\n" },
         .{ .args = &.{ "sample", "--fraction", "0" }, .stderr = "error: sample requires exactly one input\n" },
+        .{ .args = &.{ "sample", "--count", "1" }, .stderr = "error: sample requires exactly one input\n" },
         .{ .args = &.{ "sample", "--fraction", "0", EMPTY_PATH, BASIC_PATH }, .stderr = "error: sample requires exactly one input\n" },
         .{ .args = &.{ "sample", "--fraction" }, .stderr = "error: --fraction requires a value\n" },
+        .{ .args = &.{ "sample", "--count" }, .stderr = "error: --count requires a value\n" },
+        .{
+            .args = &.{ "sample", "--fraction", "0.5", "--count", "1", BASIC_PATH },
+            .stderr = "error: --fraction and --count are mutually exclusive\n",
+        },
+        .{
+            .args = &.{ "sample", "--count", "1", "-" },
+            .stderr = "error: exact-count sampling requires a file path\n",
+        },
         .{ .args = &.{ "sample", "--seed" }, .stderr = "error: --seed requires a value\n" },
         .{ .args = &.{ "sample", "--json", EMPTY_PATH }, .stderr = "error: unknown sample option: --json\n" },
         .{ .args = &.{ "sample", "--bogus", EMPTY_PATH }, .stderr = "error: unknown sample option: --bogus\n" },
@@ -459,6 +653,25 @@ test "[cli] - [sample]: line, input, and output failures retain their classes" {
         3,
         "",
         "error: -: I/O error\n",
+    );
+    try expectResult(
+        try cli.runWithClosedStdin(
+            allocator,
+            &.{ "sample", "--count", "1", "-" },
+        ),
+        2,
+        "",
+        "error: exact-count sampling requires a file path\n",
+    );
+    try expectResult(
+        try cli.runWithClosedStdout(
+            allocator,
+            &.{ "sample", "--count", "1", BASIC_PATH },
+            "",
+        ),
+        3,
+        "",
+        "",
     );
 }
 
