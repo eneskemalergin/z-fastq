@@ -398,12 +398,13 @@ pub const Reader = struct {
     /// Returns the next borrowed record, or null at a clean EOF boundary.
     pub fn next(self: *Reader) ReaderError!?Record {
         var canonical_span: ?[]const u8 = null;
-        return self.nextWithCanonicalSpan(&canonical_span);
+        return self.nextWithCanonicalSpan(&canonical_span, true);
     }
 
     fn nextWithCanonicalSpan(
         self: *Reader,
         canonical_span: *?[]const u8,
+        comptime derive_id: bool,
     ) ReaderError!?Record {
         canonical_span.* = null;
         self.beginRecord();
@@ -420,7 +421,7 @@ pub const Reader = struct {
                     null;
                 return .{
                     .header = header,
-                    .id = firstToken(header),
+                    .id = if (derive_id) firstToken(header) else header[0..0],
                     .sequence = ranges[1].slice(self.buf),
                     .plus = self.buf[ranges[2].start + 1 .. ranges[2].end],
                     .quality = ranges[3].slice(self.buf),
@@ -438,7 +439,7 @@ pub const Reader = struct {
                     const header = self.header_range.slice(bytes);
                     return .{
                         .header = header,
-                        .id = firstToken(header),
+                        .id = if (derive_id) firstToken(header) else header[0..0],
                         .sequence = self.sequence_range.slice(bytes),
                         .plus = self.plus_range.slice(bytes),
                         .quality = self.quality_range.slice(bytes),
@@ -710,13 +711,13 @@ pub const Reader = struct {
     }
 };
 
-/// Returns the next borrowed record and its complete span when its framing is already canonical.
-/// Both borrows expire when the reader advances again.
-pub fn nextWithCanonicalSpan(
+/// Returns the next borrowed record with an empty identifier and its canonical span when available.
+/// The record and span expire when the reader advances again.
+pub fn nextWithoutId(
     reader: *Reader,
     canonical_span: *?[]const u8,
 ) ReaderError!?Record {
-    return reader.nextWithCanonicalSpan(canonical_span);
+    return reader.nextWithCanonicalSpan(canonical_span, false);
 }
 
 // --- Writer ---
@@ -1114,7 +1115,7 @@ const CheckTestOutcome = union(enum) {
     line_too_long,
 };
 
-test "[property] - [record delivery]: canonical spans use only complete buffered LF records" {
+test "[property] - [record delivery]: sampling omits identifiers and spans only buffered LF records" {
     const cases = [_]struct {
         input: []const u8,
         expected_output: []const u8,
@@ -1142,8 +1143,9 @@ test "[property] - [record delivery]: canonical spans use only complete buffered
         var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
         defer reader.deinit();
         var canonical_span: ?[]const u8 = null;
-        const record = (try nextWithCanonicalSpan(&reader, &canonical_span)).?;
+        const record = (try nextWithoutId(&reader, &canonical_span)).?;
         try std.testing.expect(validateRecord(record, .{}) == null);
+        try std.testing.expectEqual(@as(usize, 0), record.id.len);
         try std.testing.expectEqual(case.has_span, canonical_span != null);
 
         var output: [64]u8 = undefined;
@@ -1155,7 +1157,7 @@ test "[property] - [record delivery]: canonical spans use only complete buffered
             try writeValidatedRecord(&writer, record);
         }
         try std.testing.expectEqualStrings(case.expected_output, sink.written());
-        try std.testing.expect((try nextWithCanonicalSpan(&reader, &canonical_span)) == null);
+        try std.testing.expect((try nextWithoutId(&reader, &canonical_span)) == null);
         try std.testing.expect(canonical_span == null);
     }
 
@@ -1176,8 +1178,9 @@ test "[property] - [record delivery]: canonical spans use only complete buffered
     var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
     defer reader.deinit();
     var canonical_span: ?[]const u8 = null;
-    const record = (try nextWithCanonicalSpan(&reader, &canonical_span)).?;
+    const record = (try nextWithoutId(&reader, &canonical_span)).?;
     try std.testing.expectEqual(header_len, record.header.len);
+    try std.testing.expectEqual(@as(usize, 0), record.id.len);
     try std.testing.expect(canonical_span == null);
 }
 

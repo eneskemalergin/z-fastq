@@ -1681,7 +1681,7 @@ fn sampleSource(
     defer reader.deinit();
 
     var canonical_span: ?[]const u8 = null;
-    while (fastq.nextWithCanonicalSpan(&reader, &canonical_span) catch |err|
+    while (fastq.nextWithoutId(&reader, &canonical_span) catch |err|
         return mapReaderFailure(&reader, err)) |record|
     {
         const record_index = reader.recordIndex() - 1;
