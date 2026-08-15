@@ -1607,6 +1607,8 @@ fn mapReaderFailure(
 
 // --- Sample command ---
 
+const SAMPLE_SCAN_BUFFER_BYTES = 64 * 1024;
+
 const SampleOptions = struct {
     max_line_bytes: usize,
     alphabet: zfastq.Alphabet,
@@ -1830,21 +1832,31 @@ fn sampleExactFile(
         .failure => |failure| return failure,
         .success => |success| success,
     };
-    selector.finish(allocator) catch {
-        return CommandFailure.plain("out_of_memory", "out of memory", 3);
+    return switch (selector.finish()) {
+        .none => null,
+        .all => sampleExactSecondPass(
+            true,
+            io,
+            allocator,
+            path,
+            writer,
+            &.{},
+            completed.snapshot,
+            completed.record_count,
+            options,
+        ),
+        .indexes => |indexes| sampleExactSecondPass(
+            false,
+            io,
+            allocator,
+            path,
+            writer,
+            indexes,
+            completed.snapshot,
+            completed.record_count,
+            options,
+        ),
     };
-    if (selector.indexes.items.len == 0) return null;
-
-    return sampleExactSecondPass(
-        io,
-        allocator,
-        path,
-        writer,
-        selector.indexes.items,
-        completed.snapshot,
-        completed.record_count,
-        options,
-    );
 }
 
 fn sampleExactFirstPass(
@@ -1885,26 +1897,101 @@ fn sampleExactFirstPass(
     };
     defer input.deinit(io);
 
-    var reader = zfastq.Reader.init(
-        allocator,
-        input.byteSource(),
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return .{ .failure = CommandFailure.plain(
-        "out_of_memory",
-        "out of memory",
-        3,
-    ) };
-    defer reader.deinit();
-
+    var considered_records: u64 = 0;
     var failure: ?CommandFailure = null;
-    while (true) switch (nextValidatedSampleRecord(&reader, options.alphabet)) {
-        .done => break,
-        .failure => |details| {
-            failure = details;
-            break;
+    var record_count: u64 = 0;
+    switch (input.source) {
+        .plain => {
+            var scanner = fastq.CheckScanner.init(
+                .{ .max_line_bytes = options.max_line_bytes },
+                .{ .alphabet = options.alphabet },
+            );
+            const source = input.byteSource();
+            var buf: [SAMPLE_SCAN_BUFFER_BYTES]u8 = undefined;
+            while (true) {
+                const n = source.read(&buf) catch {
+                    failure = CommandFailure.plain("io_error", "I/O error", 3);
+                    break;
+                };
+                if (n == 0) break;
+                _ = scanner.feed(buf[0..n]) catch |err| {
+                    failure = mapCheckScannerFailure(&scanner, err);
+                    break;
+                };
+                failure = considerExactRecords(
+                    allocator,
+                    selector,
+                    &considered_records,
+                    scanner.record_index,
+                );
+                if (failure != null) break;
+            }
+            if (failure == null) {
+                scanner.finishEof() catch |err| {
+                    failure = mapCheckScannerFailure(&scanner, err);
+                };
+                if (failure == null) {
+                    failure = considerExactRecords(
+                        allocator,
+                        selector,
+                        &considered_records,
+                        scanner.record_index,
+                    );
+                }
+            }
+            record_count = scanner.record_index;
         },
-        .record => selector.considerRecord(allocator, reader.recordIndex()) catch |err| {
-            failure = switch (err) {
+        .gzip => {
+            var reader = zfastq.Reader.init(
+                allocator,
+                input.byteSource(),
+                .{ .max_line_bytes = options.max_line_bytes },
+            ) catch return .{ .failure = CommandFailure.plain(
+                "out_of_memory",
+                "out of memory",
+                3,
+            ) };
+            defer reader.deinit();
+
+            while (true) switch (nextValidatedSampleRecord(&reader, options.alphabet)) {
+                .done => break,
+                .failure => |details| {
+                    failure = details;
+                    break;
+                },
+                .record => {
+                    failure = considerExactRecords(
+                        allocator,
+                        selector,
+                        &considered_records,
+                        reader.recordIndex(),
+                    );
+                    if (failure != null) break;
+                },
+            };
+            record_count = reader.recordIndex();
+        },
+    }
+
+    const final = fileSnapshot(input.file, io) catch return .{ .failure = CommandFailure.plain("io_error", "failed to inspect file", 3) };
+    if (!sameFileSnapshot(initial, final)) return .{ .failure = inputChangedFailure() };
+    if (failure) |details| return .{ .failure = details };
+    return .{ .success = .{
+        .snapshot = initial,
+        .record_count = record_count,
+    } };
+}
+
+fn considerExactRecords(
+    allocator: std.mem.Allocator,
+    selector: *sampling.ExactSelector,
+    considered_records: *u64,
+    completed_records: u64,
+) ?CommandFailure {
+    while (considered_records.* < completed_records) {
+        considered_records.* += 1;
+        selector.considerRecord(allocator, considered_records.*) catch |err| {
+            return switch (err) {
                 error.OutOfMemory => CommandFailure.plain("out_of_memory", "out of memory", 3),
                 error.Overflow => CommandFailure.plain(
                     "arithmetic_limit",
@@ -1912,20 +1999,13 @@ fn sampleExactFirstPass(
                     4,
                 ),
             };
-            break;
-        },
-    };
-
-    const final = fileSnapshot(input.file, io) catch return .{ .failure = CommandFailure.plain("io_error", "failed to inspect file", 3) };
-    if (!sameFileSnapshot(initial, final)) return .{ .failure = inputChangedFailure() };
-    if (failure) |details| return .{ .failure = details };
-    return .{ .success = .{
-        .snapshot = initial,
-        .record_count = reader.recordIndex(),
-    } };
+        };
+    }
+    return null;
 }
 
 fn sampleExactSecondPass(
+    comptime select_all: bool,
     io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -1974,15 +2054,15 @@ fn sampleExactSecondPass(
             break;
         },
         .record => |validated| {
-            if (selected_cursor == selected.len or
-                reader.recordIndex() != selected[selected_cursor]) continue;
+            if (!select_all and (selected_cursor == selected.len or
+                reader.recordIndex() != selected[selected_cursor])) continue;
             if (validated.canonical_span) |span| {
                 fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
             } else {
                 fastq.writeValidatedRecord(writer, validated.record) catch
                     return error.WriteFailed;
             }
-            selected_cursor += 1;
+            if (!select_all) selected_cursor += 1;
         },
     };
 
@@ -1990,7 +2070,9 @@ fn sampleExactSecondPass(
         return CommandFailure.plain("io_error", "failed to inspect file", 3);
     if (!sameFileSnapshot(expected_snapshot, final)) return inputChangedFailure();
     if (failure) |details| return details;
-    if (reader.recordIndex() != expected_count or selected_cursor != selected.len) {
+    if (reader.recordIndex() != expected_count or
+        (!select_all and selected_cursor != selected.len))
+    {
         return inputChangedFailure();
     }
     return null;
@@ -2668,6 +2750,7 @@ test "[failure] - [exact sample]: final record-count change keeps a valid prefix
     var sink = io_layer.SliceSink.init(&output);
     var writer = zfastq.Writer.init(sink.byteSink());
     const failure = (try sampleExactSecondPass(
+        false,
         io,
         std.testing.allocator,
         path,
@@ -2701,6 +2784,7 @@ test "[failure] - [exact sample]: changed metadata stops the second pass before 
     var sink = io_layer.SliceSink.init(&output);
     var writer = zfastq.Writer.init(sink.byteSink());
     const failure = (try sampleExactSecondPass(
+        false,
         io,
         std.testing.allocator,
         path,
@@ -2733,6 +2817,7 @@ test "[failure] - [exact sample]: the second pass repeats semantic validation" {
     var sink = io_layer.SliceSink.init(&output);
     var writer = zfastq.Writer.init(sink.byteSink());
     const failure = (try sampleExactSecondPass(
+        false,
         io,
         std.testing.allocator,
         path,

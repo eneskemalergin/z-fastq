@@ -91,6 +91,7 @@ pub const ExactSelector = struct {
     generator: Mt19937_64,
     indexes: std.ArrayList(u64) = .empty,
     unordered: bool = false,
+    record_count: u64 = 0,
 
     pub fn init(target: u64, seed: u64) ExactSelector {
         return .{
@@ -110,16 +111,23 @@ pub const ExactSelector = struct {
         record_number: u64,
     ) ReservoirError!void {
         std.debug.assert(record_number != 0);
+        std.debug.assert(record_number - 1 == self.record_count);
+        self.record_count = record_number;
         if (self.target == 0) return;
 
         const draw = self.generator.nextUnitFloat();
-        if (record_number <= self.target) {
-            const new_len = std.math.add(usize, self.indexes.items.len, 1) catch
+        if (record_number <= self.target) return;
+
+        if (self.indexes.items.len == 0) {
+            const target_len = std.math.cast(usize, self.target) orelse
                 return error.Overflow;
-            _ = std.math.mul(usize, new_len, @sizeOf(u64)) catch
+            _ = std.math.mul(usize, target_len, @sizeOf(u64)) catch
                 return error.Overflow;
-            try self.indexes.append(allocator, record_number);
-            return;
+            try self.indexes.ensureTotalCapacityPrecise(allocator, target_len);
+            self.indexes.expandToCapacity();
+            for (self.indexes.items, 1..) |*index, initial_record| {
+                index.* = @intCast(initial_record);
+            }
         }
 
         const candidate_float = draw * @as(f64, @floatFromInt(record_number));
@@ -134,10 +142,9 @@ pub const ExactSelector = struct {
         self.unordered = self.unordered or slot + 1 != self.indexes.items.len;
     }
 
-    pub fn finish(
-        self: *ExactSelector,
-        allocator: std.mem.Allocator,
-    ) std.mem.Allocator.Error!void {
+    pub fn finish(self: *ExactSelector) ExactSelection {
+        if (self.target == 0 or self.record_count == 0) return .none;
+        if (self.indexes.items.len == 0) return .all;
         if (self.unordered) {
             std.mem.sortUnstable(
                 u64,
@@ -146,10 +153,14 @@ pub const ExactSelector = struct {
                 std.sort.asc(u64),
             );
         }
-        if (self.indexes.capacity != self.indexes.items.len) {
-            try self.indexes.shrinkToLen(allocator);
-        }
+        return .{ .indexes = self.indexes.items };
     }
+};
+
+pub const ExactSelection = union(enum) {
+    none,
+    all,
+    indexes: []const u64,
 };
 
 pub const Mt19937_64 = struct {

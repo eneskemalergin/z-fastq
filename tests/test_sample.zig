@@ -179,16 +179,21 @@ test "[unit] - [exact selector]: seed 11 matches frozen seqtk indexes" {
     try zero.considerRecord(std.testing.allocator, 1);
     try std.testing.expectEqual(untouched.nextU64(), zero.generator.nextU64());
 
+    const Expected = union(enum) {
+        none,
+        all,
+        indexes: []const u64,
+    };
     const cases = [_]struct {
         target: u64,
-        expected: []const u64,
+        expected: Expected,
     }{
-        .{ .target = 0, .expected = &.{} },
-        .{ .target = 1, .expected = &.{5} },
-        .{ .target = 2, .expected = &.{ 3, 5 } },
-        .{ .target = 3, .expected = &.{ 2, 4, 5 } },
-        .{ .target = 5, .expected = &.{ 1, 2, 3, 4, 5 } },
-        .{ .target = 8, .expected = &.{ 1, 2, 3, 4, 5 } },
+        .{ .target = 0, .expected = .none },
+        .{ .target = 1, .expected = .{ .indexes = &.{5} } },
+        .{ .target = 2, .expected = .{ .indexes = &.{ 3, 5 } } },
+        .{ .target = 3, .expected = .{ .indexes = &.{ 2, 4, 5 } } },
+        .{ .target = 5, .expected = .all },
+        .{ .target = 8, .expected = .all },
     };
 
     for (cases) |case| {
@@ -197,10 +202,43 @@ test "[unit] - [exact selector]: seed 11 matches frozen seqtk indexes" {
         for (1..6) |record_number| {
             try selector.considerRecord(std.testing.allocator, record_number);
         }
-        try selector.finish(std.testing.allocator);
-        try std.testing.expectEqualSlices(u64, case.expected, selector.indexes.items);
-        try std.testing.expectEqual(selector.indexes.items.len, selector.indexes.capacity);
+        const actual = selector.finish();
+        switch (case.expected) {
+            .indexes => |expected| {
+                const indexes = switch (actual) {
+                    .indexes => |indexes| indexes,
+                    else => return error.TestExpectedEqual,
+                };
+                try std.testing.expectEqualSlices(u64, expected, indexes);
+                try std.testing.expectEqual(
+                    selector.indexes.items.len,
+                    selector.indexes.capacity,
+                );
+            },
+            .none => {
+                try std.testing.expect(actual == .none);
+                try std.testing.expectEqual(@as(usize, 0), selector.indexes.capacity);
+            },
+            .all => {
+                try std.testing.expect(actual == .all);
+                try std.testing.expectEqual(@as(usize, 0), selector.indexes.capacity);
+            },
+        }
     }
+}
+
+test "[unit] - [exact selector]: indexes materialize only after the target is exceeded" {
+    var selector = sampling.ExactSelector.init(5, 11);
+    defer selector.deinit(std.testing.allocator);
+
+    for (1..6) |record_number| {
+        try selector.considerRecord(std.testing.allocator, record_number);
+        try std.testing.expectEqual(@as(usize, 0), selector.indexes.capacity);
+    }
+    try selector.considerRecord(std.testing.allocator, 6);
+    try std.testing.expectEqual(@as(usize, 5), selector.indexes.items.len);
+    try std.testing.expectEqual(@as(usize, 5), selector.indexes.capacity);
+    try std.testing.expect(selector.finish() == .indexes);
 }
 
 fn exerciseExactSelectorAllocations(allocator: std.mem.Allocator) !void {
@@ -209,11 +247,12 @@ fn exerciseExactSelectorAllocations(allocator: std.mem.Allocator) !void {
     for (1..101) |record_number| {
         try selector.considerRecord(allocator, record_number);
     }
-    try selector.finish(allocator);
-    try std.testing.expectEqual(@as(usize, 37), selector.indexes.items.len);
+    const selection = selector.finish();
+    try std.testing.expect(selection == .indexes);
+    try std.testing.expectEqual(@as(usize, 37), selection.indexes.len);
 }
 
-test "[failure] - [exact selector]: every growth allocation is released" {
+test "[failure] - [exact selector]: materialized index allocation is released" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         exerciseExactSelectorAllocations,
@@ -396,18 +435,49 @@ test "[cli] - [sample]: every record is validated before selection" {
         "error: tests/data/synthetic/bad_alphabet.fastq: S002: " ++
             "sequence byte is outside the selected alphabet (record 0, line 2, offset 16)\n",
     );
-    try expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--count",
-            "0",
-            "tests/data/synthetic/bad_alphabet.fastq",
-        }),
-        1,
-        "",
-        "error: tests/data/synthetic/bad_alphabet.fastq: S002: " ++
-            "sequence byte is outside the selected alphabet (record 0, line 2, offset 16)\n",
-    );
+    const exact_cases = [_]struct {
+        path: []const u8,
+        stderr: []const u8,
+    }{
+        .{
+            .path = "tests/data/synthetic/bad_plus.fastq",
+            .stderr = "error: tests/data/synthetic/bad_plus.fastq: S001: " ++
+                "plus line must start with '+' (record 0, line 3, offset 15)\n",
+        },
+        .{
+            .path = "tests/data/synthetic/bad_alphabet.fastq",
+            .stderr = "error: tests/data/synthetic/bad_alphabet.fastq: S002: " ++
+                "sequence byte is outside the selected alphabet (record 0, line 2, offset 16)\n",
+        },
+        .{
+            .path = "tests/data/synthetic/bad_header.fastq",
+            .stderr = "error: tests/data/synthetic/bad_header.fastq: S003: " ++
+                "header line must start with '@' (record 0, line 1, offset 0)\n",
+        },
+        .{
+            .path = "tests/data/synthetic/truncated_record.fastq",
+            .stderr = "error: tests/data/synthetic/truncated_record.fastq: S004: " ++
+                "unexpected end of file in quality line (record 0, line 4, offset 17)\n",
+        },
+        .{
+            .path = "tests/data/synthetic/bad_qual_length.fastq",
+            .stderr = "error: tests/data/synthetic/bad_qual_length.fastq: S005: " ++
+                "sequence and quality lengths differ (record 0, line 4, offset 19)\n",
+        },
+        .{
+            .path = "tests/data/synthetic/bad_quality_range.fastq",
+            .stderr = "error: tests/data/synthetic/bad_quality_range.fastq: S006: " ++
+                "quality byte must be ASCII 33 through 126 (record 0, line 4, offset 22)\n",
+        },
+    };
+    for (exact_cases) |case| {
+        try expectResult(
+            try cli.run(allocator, &.{ "sample", "--count", "0", case.path }),
+            1,
+            "",
+            case.stderr,
+        );
+    }
     try expectResult(
         try cli.run(allocator, &.{
             "sample",
