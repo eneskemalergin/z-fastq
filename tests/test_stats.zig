@@ -1,7 +1,6 @@
 //! Public aggregate-statistics contracts.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const zfastq = @import("z-fastq");
 const cli = @import("utilities.zig");
 const CommandResult = cli.CommandResult;
@@ -420,8 +419,6 @@ test "[cli] - [stats]: successful blocks survive independent higher-class failur
 }
 
 test "[cli] - [stats]: input labels use escaped ASCII" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();

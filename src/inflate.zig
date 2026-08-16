@@ -27,8 +27,8 @@ const CODEGEN_ORDER: [19]u8 = .{
     15,
 };
 
-const LenCode = if (builtin.mode != .ReleaseSmall) LookupLenCode else ShortLenCode;
-const DistCode = if (builtin.mode != .ReleaseSmall) LookupDistCode else ShortDistCode;
+const LenCode = LookupLenCode;
+const DistCode = LookupDistCode;
 const ShortLenCode = ShortCode(u8, u2, u3, true);
 const ShortDistCode = ShortCode(u15, u1, u4, false);
 

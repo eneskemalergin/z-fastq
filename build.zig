@@ -4,11 +4,36 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const requested_target = b.standardTargetOptions(.{});
-    const static_release = b.option(
-        bool,
-        "static",
-        "Build the static Linux x86-64 release artifact",
-    ) orelse false;
+    const optimize = b.standardOptimizeOption(.{});
+    switch (optimize) {
+        .Debug, .ReleaseFast => {},
+        else => {
+            std.debug.print(
+                "error: z-fastq builds only in Debug or ReleaseFast\n",
+                .{},
+            );
+            std.process.exit(1);
+        },
+    }
+    if (requested_target.result.cpu.arch != .x86_64 or
+        requested_target.result.os.tag != .linux)
+    {
+        std.debug.print(
+            "error: z-fastq currently supports Linux x86-64 builds only\n",
+            .{},
+        );
+        std.process.exit(1);
+    }
+    const static_release = optimize == .ReleaseFast;
+    if (b.option(bool, "static", "Confirm the static ReleaseFast build")) |requested_static| {
+        if (requested_static != static_release) {
+            std.debug.print(
+                "error: Debug is the development build and ReleaseFast is always static\n",
+                .{},
+            );
+            std.process.exit(1);
+        }
+    }
     const target = if (static_release)
         b.resolveTargetQuery(.{
             .cpu_arch = .x86_64,
@@ -17,15 +42,7 @@ pub fn build(b: *std.Build) void {
         })
     else
         requested_target;
-    const optimize = b.standardOptimizeOption(.{});
-    if (optimize == .ReleaseSmall) {
-        std.debug.print(
-            "error: ReleaseSmall is unsupported; use -Doptimize=ReleaseFast (strips by default)\n",
-            .{},
-        );
-        std.process.exit(1);
-    }
-    const strip = b.option(bool, "strip", "Strip debug info") orelse (optimize != .Debug);
+    const strip = optimize == .ReleaseFast;
     const isa_l_supported = target.result.cpu.arch == .x86_64 and
         target.result.os.tag == .linux and
         switch (target.result.abi) {

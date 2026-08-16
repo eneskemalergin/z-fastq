@@ -1,12 +1,8 @@
 //! Shared utilities for installed CLI tests.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
-const ZFASTQ_BIN = if (builtin.os.tag == .windows)
-    "zig-out\\bin\\z-fastq.exe"
-else
-    "zig-out/bin/z-fastq";
+const ZFASTQ_BIN = "zig-out/bin/z-fastq";
 
 pub const CommandResult = struct {
     exit_code: u8,
