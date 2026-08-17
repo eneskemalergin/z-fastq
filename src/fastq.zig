@@ -777,12 +777,20 @@ pub const Reader = struct {
 
     fn ensureRecordCapacity(self: *Reader, needed: usize) ReaderError!void {
         if (needed <= self.record_buf.len) return;
+        const storage_limit = recordStorageLimit(self.options.max_line_bytes);
+        if (needed > storage_limit) return error.LineTooLong;
         const doubled = std.math.add(usize, self.record_buf.len, self.record_buf.len) catch needed;
-        const grown_len = @max(doubled, needed);
+        const grown_len = @min(@max(doubled, needed), storage_limit);
         self.record_buf = self.allocator.realloc(self.record_buf, grown_len) catch
             return error.OutOfMemory;
     }
 };
+
+fn recordStorageLimit(max_line_bytes: usize) usize {
+    const content_bytes = std.math.mul(usize, max_line_bytes, 4) catch
+        return std.math.maxInt(usize);
+    return std.math.add(usize, content_bytes, 1) catch std.math.maxInt(usize);
+}
 
 /// Returns the next borrowed record with an empty identifier and its canonical span when available.
 /// The record and span expire when the reader advances again.
@@ -1187,6 +1195,91 @@ const CheckTestOutcome = union(enum) {
     parse_error: ParseError,
     line_too_long,
 };
+
+test "[edge] - [reader]: spill capacity stops at the complete-record limit" {
+    const max_line_bytes = 80 * 1024;
+    const storage_limit = recordStorageLimit(max_line_bytes);
+    const fill_bytes = [_]u8{ 'h', 'A', 'p', 'I' };
+    const prefix_bytes = [_]?u8{ '@', null, '+', null };
+
+    for ([_]bool{ false, true }) |crlf| {
+        const ending_bytes: usize = if (crlf) 2 else 1;
+        const input = try std.testing.allocator.alloc(
+            u8,
+            4 * (max_line_bytes + ending_bytes),
+        );
+        defer std.testing.allocator.free(input);
+
+        var offset: usize = 0;
+        for (fill_bytes, prefix_bytes) |fill, prefix| {
+            @memset(input[offset..][0..max_line_bytes], fill);
+            if (prefix) |byte| input[offset] = byte;
+            offset += max_line_bytes;
+            if (crlf) {
+                input[offset] = '\r';
+                offset += 1;
+            }
+            input[offset] = '\n';
+            offset += 1;
+        }
+        try std.testing.expectEqual(input.len, offset);
+
+        var source = io_layer.SliceSource.init(input);
+        var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var reader = try Reader.init(
+            tracking.allocator(),
+            source.byteSource(),
+            .{ .max_line_bytes = max_line_bytes },
+        );
+        defer reader.deinit();
+
+        const record = (try reader.next()).?;
+        try std.testing.expectEqual(max_line_bytes - 1, record.header.len);
+        try std.testing.expectEqual(max_line_bytes, record.sequence.len);
+        try std.testing.expectEqual(max_line_bytes - 1, record.plus.len);
+        try std.testing.expectEqual(max_line_bytes, record.quality.len);
+        try std.testing.expect(std.mem.allEqual(u8, record.sequence, 'A'));
+        try std.testing.expect(std.mem.allEqual(u8, record.quality, 'I'));
+        try std.testing.expectEqual(storage_limit, reader.record_buf.len);
+        try std.testing.expectEqual(4 * max_line_bytes, reader.record_len);
+        try std.testing.expectEqual(1, tracking.resize_index + tracking.allocations - 2);
+        try std.testing.expectError(
+            ReaderError.LineTooLong,
+            reader.ensureRecordCapacity(storage_limit + 1),
+        );
+        try std.testing.expectEqual(storage_limit, reader.record_buf.len);
+    }
+}
+
+test "[edge] - [reader]: record storage limit saturates after checked overflow" {
+    const max = std.math.maxInt(usize);
+    const largest_exact = (max - 1) / 4;
+
+    try std.testing.expectEqual(4 * 1024 * 1024 + 1, recordStorageLimit(1024 * 1024));
+    try std.testing.expectEqual(4 * largest_exact + 1, recordStorageLimit(largest_exact));
+    try std.testing.expectEqual(max, recordStorageLimit(largest_exact + 1));
+    try std.testing.expectEqual(max, recordStorageLimit(max));
+}
+
+test "[failure] - [reader]: failed spill growth preserves owned storage" {
+    var source = io_layer.SliceSource.init("");
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 2,
+        .resize_fail_index = 0,
+    });
+    var reader = try Reader.init(
+        failing.allocator(),
+        source.byteSource(),
+        .{ .max_line_bytes = 80 * 1024 },
+    );
+    defer reader.deinit();
+
+    try std.testing.expectError(
+        ReaderError.OutOfMemory,
+        reader.ensureRecordCapacity(reader.record_buf.len + 1),
+    );
+    try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.record_buf.len);
+}
 
 test "[property] - [record delivery]: sampling omits identifiers and spans only buffered LF records" {
     const cases = [_]struct {

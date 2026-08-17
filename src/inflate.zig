@@ -553,7 +553,7 @@ fn streamInner(d: *Decompress, w: *Writer, limit: std.Io.Limit) (Error || Reader
                 return @intFromEnum(limit) - remaining;
             }
         },
-        // Corpus profiling found only dynamic blocks, so this path owns the bounded fast loop.
+        // Fixed and stored blocks use dedicated state loops; keep the hot dynamic path bounded here.
         .dynamic_block => {
             const fast_result = try decodeDynamicFast(d, w, &remaining);
             if (fast_result == .end_block) {
