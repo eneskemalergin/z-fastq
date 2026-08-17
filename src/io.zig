@@ -151,7 +151,7 @@ const IsalInflate = struct {
     fn init(self: *IsalInflate) void {
         self.* = .{};
         isal.isal_inflate_init(&self.state);
-        self.state.crc_flag = isal.ISAL_GZIP_NO_HDR;
+        self.state.crc_flag = isal.ISAL_GZIP_NO_HDR_VER;
     }
 
     fn read(
@@ -185,10 +185,6 @@ const IsalInflate = struct {
             if (consumed == 0 and produced == 0) return error.ReadFailed;
             if (produced != 0) return output[0..produced];
         }
-    }
-
-    fn checksum(self: *const IsalInflate) u32 {
-        return self.state.crc;
     }
 };
 
@@ -355,13 +351,10 @@ pub const GzipSource = struct {
     }
 
     fn finishMember(self: *GzipSource) std.Io.Reader.Error!void {
+        if (use_isa_l) return;
         const expected_crc = try self.input.takeInt(u32, .little);
         const expected_size = try self.input.takeInt(u32, .little);
-        const actual_crc = if (use_isa_l)
-            self.decompressor.checksum()
-        else
-            self.payload_crc.final();
-        if (expected_crc != actual_crc or expected_size != self.size) {
+        if (expected_crc != self.payload_crc.final() or expected_size != self.size) {
             return error.ReadFailed;
         }
     }
@@ -549,4 +542,25 @@ test "[property] - [gzip direct delivery]: preserves bytes across members" {
 
     try std.testing.expectEqual(output.len, output_len);
     try std.testing.expectEqualStrings("xx", &output);
+}
+
+test "[property] - [gzip input]: compressed output may span many reads" {
+    const compressed = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff,
+        0x73, 0x74, 0x1c, 0x05, 0xa3, 0x60, 0x14, 0x8c, 0x54, 0x00,
+        0x00, 0x1a, 0xfb, 0x37, 0xb7, 0x00, 0x04, 0x00, 0x00,
+    };
+    var input = std.Io.Reader.fixed(&compressed);
+    var source = GzipSource.init(&input);
+    var output: [1024]u8 = undefined;
+    var written: usize = 0;
+    while (written < output.len) {
+        const end = @min(written + 17, output.len);
+        const n = try source.read(output[written..end]);
+        try std.testing.expect(n > 0);
+        written += n;
+    }
+
+    try std.testing.expect(std.mem.allEqual(u8, &output, 'A'));
+    try std.testing.expectEqual(@as(usize, 0), try source.read(output[0..17]));
 }

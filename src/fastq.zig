@@ -780,7 +780,15 @@ pub const Reader = struct {
         const storage_limit = recordStorageLimit(self.options.max_line_bytes);
         if (needed > storage_limit) return error.LineTooLong;
         const doubled = std.math.add(usize, self.record_buf.len, self.record_buf.len) catch needed;
-        const grown_len = @min(@max(doubled, needed), storage_limit);
+        var grown_len = @min(@max(doubled, needed), storage_limit);
+        if (self.machine.expected == .quality) {
+            const sequence_len = self.sequence_range.end - self.sequence_range.start;
+            const quality_end = std.math.add(usize, self.plus_range.end, sequence_len) catch
+                return error.LineTooLong;
+            const quality_capacity = std.math.add(usize, quality_end, 1) catch
+                return error.LineTooLong;
+            if (quality_capacity >= needed) grown_len = quality_capacity;
+        }
         self.record_buf = self.allocator.realloc(self.record_buf, grown_len) catch
             return error.OutOfMemory;
     }
@@ -1196,6 +1204,41 @@ const CheckTestOutcome = union(enum) {
     line_too_long,
 };
 
+const ReaderSpillFixture = struct {
+    fn init(
+        allocator: std.mem.Allocator,
+        sequence_len: usize,
+        quality_len: usize,
+        ending: []const u8,
+        final_ending: bool,
+    ) ![]u8 {
+        const ending_count: usize = if (final_ending) 4 else 3;
+        const total_len = 4 + sequence_len + 1 + quality_len + ending_count * ending.len;
+        const input = try allocator.alloc(u8, total_len);
+        var offset: usize = 0;
+        @memcpy(input[offset..][0..4], "@abc");
+        offset += 4;
+        @memcpy(input[offset..][0..ending.len], ending);
+        offset += ending.len;
+        @memset(input[offset..][0..sequence_len], 'A');
+        offset += sequence_len;
+        @memcpy(input[offset..][0..ending.len], ending);
+        offset += ending.len;
+        input[offset] = '+';
+        offset += 1;
+        @memcpy(input[offset..][0..ending.len], ending);
+        offset += ending.len;
+        @memset(input[offset..][0..quality_len], 'I');
+        offset += quality_len;
+        if (final_ending) {
+            @memcpy(input[offset..][0..ending.len], ending);
+            offset += ending.len;
+        }
+        std.debug.assert(offset == input.len);
+        return input;
+    }
+};
+
 test "[edge] - [reader]: spill capacity stops at the complete-record limit" {
     const max_line_bytes = 80 * 1024;
     const storage_limit = recordStorageLimit(max_line_bytes);
@@ -1279,6 +1322,130 @@ test "[failure] - [reader]: failed spill growth preserves owned storage" {
         reader.ensureRecordCapacity(reader.record_buf.len + 1),
     );
     try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.record_buf.len);
+}
+
+test "[edge] - [reader]: quality spill reserves only its valid tail" {
+    const sequence_len = 131_070;
+    const exact_capacity = io_layer.DEFAULT_READER_BUFFER_BYTES + 2;
+    const Case = struct {
+        quality_len: usize,
+        ending: []const u8,
+        final_ending: bool,
+        expected_error: ?ReaderError,
+        expected_capacity: usize,
+    };
+    const cases = [_]Case{
+        .{
+            .quality_len = sequence_len,
+            .ending = "\n",
+            .final_ending = true,
+            .expected_error = null,
+            .expected_capacity = exact_capacity,
+        },
+        .{
+            .quality_len = sequence_len,
+            .ending = "\r\n",
+            .final_ending = true,
+            .expected_error = null,
+            .expected_capacity = exact_capacity,
+        },
+        .{
+            .quality_len = sequence_len,
+            .ending = "\n",
+            .final_ending = false,
+            .expected_error = null,
+            .expected_capacity = exact_capacity,
+        },
+        .{
+            .quality_len = sequence_len - 1,
+            .ending = "\n",
+            .final_ending = true,
+            .expected_error = error.S005LengthMismatch,
+            .expected_capacity = io_layer.DEFAULT_READER_BUFFER_BYTES,
+        },
+        .{
+            .quality_len = sequence_len + 1,
+            .ending = "\n",
+            .final_ending = true,
+            .expected_error = error.S005LengthMismatch,
+            .expected_capacity = exact_capacity,
+        },
+        .{
+            .quality_len = sequence_len + 2,
+            .ending = "\n",
+            .final_ending = true,
+            .expected_error = error.S005LengthMismatch,
+            .expected_capacity = 2 * io_layer.DEFAULT_READER_BUFFER_BYTES,
+        },
+    };
+
+    for (cases) |case| {
+        const input = try ReaderSpillFixture.init(
+            std.testing.allocator,
+            sequence_len,
+            case.quality_len,
+            case.ending,
+            case.final_ending,
+        );
+        defer std.testing.allocator.free(input);
+        var source = io_layer.SliceSource.init(input);
+        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
+
+        if (case.expected_error) |expected_error| {
+            try std.testing.expectError(expected_error, reader.next());
+        } else {
+            const record = (try reader.next()).?;
+            try std.testing.expectEqual(sequence_len, record.sequence.len);
+            try std.testing.expectEqual(sequence_len, record.quality.len);
+        }
+        try std.testing.expectEqual(case.expected_capacity, reader.record_buf.len);
+    }
+
+    for ([_]usize{ 512 * 1024, 1024 * 1024 }) |long_sequence_len| {
+        const input = try ReaderSpillFixture.init(
+            std.testing.allocator,
+            long_sequence_len,
+            long_sequence_len,
+            "\n",
+            true,
+        );
+        defer std.testing.allocator.free(input);
+        var source = io_layer.SliceSource.init(input);
+        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
+
+        const record = (try reader.next()).?;
+        try std.testing.expectEqual(long_sequence_len, record.sequence.len);
+        try std.testing.expectEqual(long_sequence_len, record.quality.len);
+        try std.testing.expectEqual(2 * long_sequence_len + 6, reader.record_buf.len);
+    }
+}
+
+test "[failure] - [reader]: failed quality-tail reserve preserves owned storage" {
+    const sequence_len = 131_070;
+    const input = try ReaderSpillFixture.init(
+        std.testing.allocator,
+        sequence_len,
+        sequence_len,
+        "\n",
+        true,
+    );
+    defer std.testing.allocator.free(input);
+
+    var source = io_layer.SliceSource.init(input);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 2,
+        .resize_fail_index = 0,
+    });
+    var reader = try Reader.init(failing.allocator(), source.byteSource(), .{});
+    defer reader.deinit();
+    const old_pointer = reader.record_buf.ptr;
+
+    try std.testing.expectError(ReaderError.OutOfMemory, reader.next());
+    try std.testing.expectEqual(old_pointer, reader.record_buf.ptr);
+    try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.record_buf.len);
+    try std.testing.expect(failing.has_induced_failure);
 }
 
 test "[property] - [record delivery]: sampling omits identifiers and spans only buffered LF records" {
