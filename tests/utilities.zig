@@ -48,7 +48,7 @@ pub fn expectJsonDocument(
     };
     try expectJsonObjectKeys(tool, &.{ "name", "version" });
     try expectJsonString(tool.get("name"), "z-fastq");
-    try expectJsonString(tool.get("version"), "0.0.10");
+    try expectJsonString(tool.get("version"), "0.0.11");
 
     const results_value = object.get("results") orelse return error.UnexpectedJsonShape;
     return switch (results_value) {

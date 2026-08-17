@@ -14,10 +14,11 @@ const EXPECTED_USAGE =
     \\usage: z-fastq <command> [options] [args...]
     \\
     \\Commands:
-    \\  count    Count records in plain or gzip FASTQ inputs
-    \\  stats    Report aggregate FASTQ statistics
-    \\  check    Validate FASTQ structure, sequence alphabet, and quality range
-    \\  sample   Select records by deterministic probability or exact count
+    \\  count       Count records in plain or gzip FASTQ inputs
+    \\  stats       Report aggregate FASTQ statistics
+    \\  check       Validate FASTQ structure, sequence alphabet, and quality range
+    \\  sample      Select records by deterministic probability or exact count
+    \\  interleave  Validate and interleave paired FASTQ inputs
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -32,7 +33,7 @@ const EXPECTED_USAGE =
     \\Machine output:
     \\  --json               Emit versioned JSON (stats and check only)
     \\
-    \\Check options:
+    \\Pair options:
     \\  --paired             Validate two inputs as paired reads
     \\  --interleaved        Validate consecutive records as paired reads
     \\  --pair-names POLICY  Select illumina (default) or exact pair names
@@ -56,6 +57,9 @@ const EXPECTED_USAGE =
     \\Sample usage:
     \\  z-fastq sample --fraction P [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
     \\  z-fastq sample --count K [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] path
+    \\
+    \\Interleave usage:
+    \\  z-fastq interleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
     \\
 ;
 
@@ -474,7 +478,7 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
 
     const version = try runCli(allocator, &.{"--version"});
     try std.testing.expectEqual(@as(u8, 0), version.exit_code);
-    try std.testing.expectEqualStrings("z-fastq 0.0.10\n", version.stdout);
+    try std.testing.expectEqualStrings("z-fastq 0.0.11\n", version.stdout);
     try std.testing.expectEqual(@as(usize, 0), version.stderr.len);
 
     const short_version = try runCli(allocator, &.{"-V"});
