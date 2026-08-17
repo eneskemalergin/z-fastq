@@ -2126,13 +2126,15 @@ fn interleaveInputs(
     defer reader2.deinit();
 
     while (true) {
-        const record1 = reader1.next() catch |err| {
+        var canonical_span1: ?[]const u8 = null;
+        const record1 = fastq.nextWithoutId(&reader1, &canonical_span1) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader1, err),
             } };
         };
-        const record2 = reader2.next() catch |err| {
+        var canonical_span2: ?[]const u8 = null;
+        const record2 = fastq.nextWithoutId(&reader2, &canonical_span2) catch |err| {
             return .{ .command = .{
                 .input_index = 1,
                 .details = mapReaderFailure(&reader2, err),
