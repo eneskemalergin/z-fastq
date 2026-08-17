@@ -63,6 +63,32 @@ test "[cli] - [interleave]: fields, order, line endings, and name policies are e
     );
 }
 
+test "[cli] - [interleave]: canonical and refill-spanning mates preserve exact output" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const r1_path = try tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const r2_path = try tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    const r1 = "@refill/1\nA\n+left\n!\n";
+
+    var r2: std.ArrayList(u8) = .empty;
+    try r2.appendSlice(allocator, "@refill/2 ");
+    try r2.appendNTimes(allocator, 'x', 256 * 1024);
+    try r2.appendSlice(allocator, "\nT\n+right\n#\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = r1 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = r2.items });
+
+    const result = try cli.run(allocator, &.{ "interleave", r1_path, r2_path });
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqual(r1.len + r2.items.len, result.stdout.len);
+    try std.testing.expectEqualStrings(r1, result.stdout[0..r1.len]);
+    try std.testing.expectEqualSlices(u8, r2.items, result.stdout[r1.len..]);
+    try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
+}
+
 test "[cli] - [interleave]: stdin and mixed plain or gzip inputs preserve output" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

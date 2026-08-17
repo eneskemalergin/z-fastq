@@ -2191,8 +2191,16 @@ fn interleaveInputs(
             } } };
         }
 
-        fastq.writeValidatedRecord(writer, record1.?) catch return error.WriteFailed;
-        fastq.writeValidatedRecord(writer, record2.?) catch return error.WriteFailed;
+        if (canonical_span1) |span| {
+            fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
+        } else {
+            fastq.writeValidatedRecord(writer, record1.?) catch return error.WriteFailed;
+        }
+        if (canonical_span2) |span| {
+            fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
+        } else {
+            fastq.writeValidatedRecord(writer, record2.?) catch return error.WriteFailed;
+        }
     }
 }
 
