@@ -394,6 +394,52 @@ const BufferedRecordResult = union(enum) {
     record: BufferedRecord,
 };
 
+fn findLineEnds(bytes: []const u8, ends: *[4]usize) bool {
+    if (std.simd.suggestVectorLength(u8)) |vector_len| {
+        return findLineEndsVector(vector_len, bytes, ends);
+    }
+    return findLineEndsScalar(bytes, 0, ends, 0);
+}
+
+fn findLineEndsVector(
+    comptime vector_len: comptime_int,
+    bytes: []const u8,
+    ends: *[4]usize,
+) bool {
+    const Bytes = @Vector(vector_len, u8);
+    const Mask = @Int(.unsigned, vector_len);
+
+    var found: usize = 0;
+    var block_start: usize = 0;
+    while (bytes.len - block_start >= vector_len) : (block_start += vector_len) {
+        const block: Bytes = bytes[block_start..][0..vector_len].*;
+        var line_feeds: Mask = @bitCast(block == @as(Bytes, @splat('\n')));
+        while (line_feeds != 0) {
+            ends[found] = block_start + @as(usize, @intCast(@ctz(line_feeds)));
+            found += 1;
+            if (found == ends.len) return true;
+            line_feeds &= line_feeds - 1;
+        }
+    }
+    return findLineEndsScalar(bytes[block_start..], block_start, ends, found);
+}
+
+fn findLineEndsScalar(
+    bytes: []const u8,
+    base: usize,
+    ends: *[4]usize,
+    initial_found: usize,
+) bool {
+    var found = initial_found;
+    for (bytes, 0..) |byte, index| {
+        if (byte != '\n') continue;
+        ends[found] = base + index;
+        found += 1;
+        if (found == ends.len) return true;
+    }
+    return false;
+}
+
 pub const RecordOffsets = struct {
     header: u64,
     sequence: u64,
@@ -589,25 +635,20 @@ pub const Reader = struct {
         if (self.machine.expected != .header) return .incomplete;
         if (self.cursor == self.fill_end and !try self.refill()) return .eof;
 
-        var starts: [4]usize = undefined;
-        var ends: [4]usize = undefined;
-        var search_start = self.cursor;
-        for (0..4) |line_index| {
-            const rel = std.mem.indexOfScalar(
-                u8,
-                self.buf[search_start..self.fill_end],
-                '\n',
-            ) orelse return .incomplete;
-            starts[line_index] = search_start;
-            ends[line_index] = search_start + rel;
-            search_start = ends[line_index] + 1;
+        var relative_ends: [4]usize = undefined;
+        if (!findLineEnds(self.buf[self.cursor..self.fill_end], &relative_ends)) {
+            return .incomplete;
         }
 
         var ranges: [4]Range = undefined;
         var canonical = true;
+        const record_start = self.cursor;
         for (0..4) |line_index| {
-            const start = starts[line_index];
-            const raw_end = ends[line_index];
+            const start = if (line_index == 0)
+                record_start
+            else
+                record_start + relative_ends[line_index - 1] + 1;
+            const raw_end = record_start + relative_ends[line_index];
             const end = if (raw_end > start and self.buf[raw_end - 1] == '\r')
                 raw_end - 1
             else
@@ -639,7 +680,7 @@ pub const Reader = struct {
         return .{ .record = .{
             .ranges = ranges,
             .canonical_range = if (canonical)
-                .{ .start = starts[0], .end = search_start }
+                .{ .start = record_start, .end = record_start + relative_ends[3] + 1 }
             else
                 null,
         } };
@@ -1295,6 +1336,45 @@ fn readSpillForAllocationCheck(allocator: std.mem.Allocator, input: []const u8) 
     var reader = try Reader.init(allocator, source.byteSource(), .{});
     defer reader.deinit();
     _ = try reader.next();
+}
+
+test "[property] - [reader]: structural masks match scalar line boundaries" {
+    const vector_len = std.simd.suggestVectorLength(u8) orelse 1;
+    var storage: [5 * vector_len + 8]u8 = undefined;
+
+    for (0..vector_len) |alignment| {
+        for (0..vector_len) |first_len| {
+            @memset(&storage, 'x');
+            const bytes = storage[alignment..];
+            const line_lengths = [4]usize{ first_len, 0, vector_len - 1, vector_len };
+            var input_len: usize = 0;
+            for (line_lengths) |line_len| {
+                input_len += line_len;
+                bytes[input_len] = '\n';
+                input_len += 1;
+            }
+            const input = bytes[0..input_len];
+
+            var expected: [4]usize = undefined;
+            var search_start: usize = 0;
+            for (&expected) |*line_end| {
+                const relative = std.mem.indexOfScalar(
+                    u8,
+                    input[search_start..],
+                    '\n',
+                ).?;
+                line_end.* = search_start + relative;
+                search_start = line_end.* + 1;
+            }
+
+            var actual: [4]usize = undefined;
+            try std.testing.expect(findLineEnds(input, &actual));
+            try std.testing.expectEqual(expected, actual);
+        }
+    }
+
+    var incomplete_ends: [4]usize = undefined;
+    try std.testing.expect(!findLineEnds("a\nb\nc\n", &incomplete_ends));
 }
 
 test "[failure] - [reader]: partial fallback ownership is released after allocation failure" {
