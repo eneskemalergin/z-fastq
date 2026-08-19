@@ -1069,9 +1069,13 @@ fn checkPaired(
             return .{ .command = .{ .input_index = 1, .details = failure } };
         }
 
-        const name1 = pairing.parseName(record1.?.header, options.pair_name_policy);
-        const name2 = pairing.parseName(record2.?.header, options.pair_name_policy);
-        if (!pairing.namesMatch(name1, name2)) {
+        if (!pairing.headersMatch(
+            record1.?.header,
+            record2.?.header,
+            options.pair_name_policy,
+        )) {
+            const name1 = pairing.parseName(record1.?.header, options.pair_name_policy);
+            const name2 = pairing.parseName(record2.?.header, options.pair_name_policy);
             return .{ .pair = .{ .name_mismatch = .{
                 .pair_index = record_index1,
                 .records = .{
@@ -2216,9 +2220,13 @@ fn interleaveInputs(
             return .{ .command = .{ .input_index = 1, .details = failure } };
         }
 
-        const name1 = pairing.parseName(record1.?.header, options.pair_name_policy);
-        const name2 = pairing.parseName(record2.?.header, options.pair_name_policy);
-        if (!pairing.namesMatch(name1, name2)) {
+        if (!pairing.headersMatch(
+            record1.?.header,
+            record2.?.header,
+            options.pair_name_policy,
+        )) {
+            const name1 = pairing.parseName(record1.?.header, options.pair_name_policy);
+            const name2 = pairing.parseName(record2.?.header, options.pair_name_policy);
             return .{ .pair = .{ .name_mismatch = .{
                 .pair_index = record_index1,
                 .records = .{
@@ -2593,9 +2601,9 @@ fn deinterleaveSource(
             record1.header
         else
             staged_record.items[1 .. 1 + header1_len];
-        const name1 = pairing.parseName(header1, options.pair_name_policy);
-        const name2 = pairing.parseName(record2.header, options.pair_name_policy);
-        if (!pairing.namesMatch(name1, name2)) {
+        if (!pairing.headersMatch(header1, record2.header, options.pair_name_policy)) {
+            const name1 = pairing.parseName(header1, options.pair_name_policy);
+            const name2 = pairing.parseName(record2.header, options.pair_name_policy);
             return .{ .pair = .{ .name_mismatch = .{
                 .pair_index = record_index1 / 2,
                 .records = .{

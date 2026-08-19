@@ -15,11 +15,7 @@ pub const Name = struct {
 };
 
 pub fn parseName(header: []const u8, policy: NamePolicy) Name {
-    var first_end: usize = 0;
-    while (first_end < header.len and header[first_end] != ' ' and header[first_end] != '\t') {
-        first_end += 1;
-    }
-    const first_token = header[0..first_end];
+    const first_token = header[0..firstTokenEnd(header)];
     if (policy == .exact) {
         return .{
             .first_token = first_token,
@@ -37,23 +33,9 @@ pub fn parseName(header: []const u8, policy: NamePolicy) Name {
         normalized_id = first_token[0 .. first_token.len - 2];
     }
 
-    var second_start = first_end;
-    while (second_start < header.len and
-        (header[second_start] == ' ' or header[second_start] == '\t'))
-    {
-        second_start += 1;
-    }
-    var second_end = second_start;
-    while (second_end < header.len and header[second_end] != ' ' and
-        header[second_end] != '\t')
-    {
-        second_end += 1;
-    }
-    const second_token = header[second_start..second_end];
-    if (second_token.len >= 2 and second_token[1] == ':' and
-        (second_token[0] == '1' or second_token[0] == '2'))
-    {
-        mate_markers |= mateMask(@intCast(second_token[0] - '0'));
+    const second_token = nextToken(header, first_token.len).bytes;
+    if (leadingMateMarker(second_token)) |mate| {
+        mate_markers |= mateMask(mate);
     }
     if (terminalMateMarker(second_token)) |mate| {
         mate_markers |= mateMask(mate);
@@ -66,12 +48,74 @@ pub fn parseName(header: []const u8, policy: NamePolicy) Name {
     };
 }
 
+pub fn headersMatch(header1: []const u8, header2: []const u8, policy: NamePolicy) bool {
+    return switch (policy) {
+        .exact => namesMatch(parseName(header1, policy), parseName(header2, policy)),
+        .illumina => illuminaHeadersMatch(header1, header2),
+    };
+}
+
 pub fn namesMatch(name1: Name, name2: Name) bool {
     if (!std.mem.eql(u8, name1.normalized_id, name2.normalized_id)) return false;
     if (name1.mate_markers == 0b11 or name2.mate_markers == 0b11) return false;
     if ((name1.mate_markers == 0) != (name2.mate_markers == 0)) return false;
     if (name1.mate_markers == 0) return true;
     return name1.mate_markers == 0b01 and name2.mate_markers == 0b10;
+}
+
+const HeaderToken = struct {
+    bytes: []const u8,
+    ends_header: bool,
+};
+
+fn firstTokenEnd(header: []const u8) usize {
+    var end: usize = 0;
+    while (end < header.len and header[end] != ' ' and header[end] != '\t') {
+        end += 1;
+    }
+    return end;
+}
+
+fn nextToken(header: []const u8, previous_end: usize) HeaderToken {
+    var start = previous_end;
+    while (start < header.len and (header[start] == ' ' or header[start] == '\t')) {
+        start += 1;
+    }
+    var end = start;
+    while (end < header.len and header[end] != ' ' and header[end] != '\t') {
+        end += 1;
+    }
+    return .{ .bytes = header[start..end], .ends_header = end == header.len };
+}
+
+noinline fn illuminaHeadersMatch(header1: []const u8, header2: []const u8) bool {
+    return terminalPairHeadersMatch(header1, header2) or
+        namesMatch(parseName(header1, .illumina), parseName(header2, .illumina));
+}
+
+fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
+    if (header1.len < 2 or header1.len != header2.len) return false;
+    if (header1[header1.len - 2] != '/' or header2[header2.len - 2] != '/') return false;
+    if (header1[header1.len - 1] != '1' or header2[header2.len - 1] != '2') return false;
+    if (!std.mem.eql(u8, header1[0 .. header1.len - 1], header2[0 .. header2.len - 1])) {
+        return false;
+    }
+
+    const first_token = header1[0..firstTokenEnd(header1)];
+    if (first_token.len == header1.len) return true;
+    if (terminalMateMarker(first_token) != null) return false;
+
+    const second_token = nextToken(header1, first_token.len);
+    return second_token.ends_header and leadingMateMarker(second_token.bytes) == null;
+}
+
+fn leadingMateMarker(token: []const u8) ?u2 {
+    if (token.len < 2 or token[1] != ':') return null;
+    return switch (token[0]) {
+        '1' => 1,
+        '2' => 2,
+        else => null,
+    };
 }
 
 fn terminalMateMarker(token: []const u8) ?u2 {
@@ -85,4 +129,43 @@ fn terminalMateMarker(token: []const u8) ?u2 {
 
 fn mateMask(mate: u2) u2 {
     return if (mate == 1) 0b01 else 0b10;
+}
+
+test "[property] - [paired names]: success-first matching preserves established policies" {
+    const headers = [_][]const u8{
+        "cluster",
+        "cluster/1",
+        "cluster/2",
+        "cluster description/1",
+        "cluster description/2",
+        "cluster\tdescription/1",
+        "cluster\tdescription/2",
+        "cluster  1:N:0:1",
+        "cluster  2:N:0:1",
+        "cluster 1:/1",
+        "cluster 1:/2",
+        "cluster/1 description/1",
+        "cluster/1 description/2",
+        "cluster description note/1",
+        "cluster description note/2",
+        "other/1",
+        "other/2",
+        "",
+    };
+    const policies = [_]NamePolicy{ .illumina, .exact };
+
+    for (policies) |policy| {
+        for (headers) |header1| {
+            for (headers) |header2| {
+                const expected = namesMatch(
+                    parseName(header1, policy),
+                    parseName(header2, policy),
+                );
+                try std.testing.expectEqual(
+                    expected,
+                    headersMatch(header1, header2, policy),
+                );
+            }
+        }
+    }
 }
