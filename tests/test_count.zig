@@ -14,11 +14,12 @@ const EXPECTED_USAGE =
     \\usage: z-fastq <command> [options] [args...]
     \\
     \\Commands:
-    \\  count       Count records in plain or gzip FASTQ inputs
-    \\  stats       Report aggregate FASTQ statistics
-    \\  check       Validate FASTQ structure, sequence alphabet, and quality range
-    \\  sample      Select records by deterministic probability or exact count
-    \\  interleave  Validate and interleave paired FASTQ inputs
+    \\  count         Count records in plain or gzip FASTQ inputs
+    \\  stats         Report aggregate FASTQ statistics
+    \\  check         Validate FASTQ structure, sequence alphabet, and quality range
+    \\  sample        Select records by deterministic probability or exact count
+    \\  interleave    Validate and interleave paired FASTQ inputs
+    \\  deinterleave  Validate and separate interleaved paired FASTQ input
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -60,6 +61,9 @@ const EXPECTED_USAGE =
     \\
     \\Interleave usage:
     \\  z-fastq interleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
+    \\
+    \\Deinterleave usage:
+    \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
 ;
 
@@ -478,7 +482,7 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
 
     const version = try runCli(allocator, &.{"--version"});
     try std.testing.expectEqual(@as(u8, 0), version.exit_code);
-    try std.testing.expectEqualStrings("z-fastq 0.0.11\n", version.stdout);
+    try std.testing.expectEqualStrings("z-fastq 0.0.12\n", version.stdout);
     try std.testing.expectEqual(@as(usize, 0), version.stderr.len);
 
     const short_version = try runCli(allocator, &.{"-V"});

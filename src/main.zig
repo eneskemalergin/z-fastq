@@ -14,11 +14,12 @@ const USAGE =
     \\usage: z-fastq <command> [options] [args...]
     \\
     \\Commands:
-    \\  count       Count records in plain or gzip FASTQ inputs
-    \\  stats       Report aggregate FASTQ statistics
-    \\  check       Validate FASTQ structure, sequence alphabet, and quality range
-    \\  sample      Select records by deterministic probability or exact count
-    \\  interleave  Validate and interleave paired FASTQ inputs
+    \\  count         Count records in plain or gzip FASTQ inputs
+    \\  stats         Report aggregate FASTQ statistics
+    \\  check         Validate FASTQ structure, sequence alphabet, and quality range
+    \\  sample        Select records by deterministic probability or exact count
+    \\  interleave    Validate and interleave paired FASTQ inputs
+    \\  deinterleave  Validate and separate interleaved paired FASTQ input
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -61,6 +62,9 @@ const USAGE =
     \\Interleave usage:
     \\  z-fastq interleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
     \\
+    \\Deinterleave usage:
+    \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
+    \\
 ;
 
 pub fn main(init: std.process.Init) !void {
@@ -95,6 +99,8 @@ pub fn main(init: std.process.Init) !void {
         .sample
     else if (std.mem.eql(u8, cmd, "interleave"))
         .interleave
+    else if (std.mem.eql(u8, cmd, "deinterleave"))
+        .deinterleave
     else {
         std.Io.File.writeStreamingAll(.stderr(), io, "error: unknown command: ") catch {};
         writeEscaped(.stderr(), io, cmd);
@@ -111,6 +117,8 @@ pub fn main(init: std.process.Init) !void {
     var fraction: ?sampling.Fraction = null;
     var sample_count: ?u64 = null;
     var sample_seed: u64 = 11;
+    var output1: ?[]const u8 = null;
+    var output2: ?[]const u8 = null;
     var positional = std.ArrayList([]const u8).empty;
     defer positional.deinit(gpa);
 
@@ -164,7 +172,8 @@ pub fn main(init: std.process.Init) !void {
             json_output = true;
             continue;
         }
-        if ((command == .check or command == .sample or command == .interleave) and
+        if ((command == .check or command == .sample or command == .interleave or
+            command == .deinterleave) and
             std.mem.eql(u8, arg, "--alphabet"))
         {
             const value = args.next() orelse {
@@ -290,7 +299,7 @@ pub fn main(init: std.process.Init) !void {
             pair_mode = .interleaved;
             continue;
         }
-        if ((command == .check or command == .interleave) and
+        if ((command == .check or command == .interleave or command == .deinterleave) and
             std.mem.eql(u8, arg, "--pair-names"))
         {
             const value = args.next() orelse {
@@ -314,6 +323,29 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(2);
             };
             pair_names_set = true;
+            continue;
+        }
+        if (command == .deinterleave and
+            (std.mem.eql(u8, arg, "--out1") or std.mem.eql(u8, arg, "--out2")))
+        {
+            const value = args.next() orelse {
+                const message = if (std.mem.eql(u8, arg, "--out1"))
+                    "error: --out1 requires a value\n"
+                else
+                    "error: --out2 requires a value\n";
+                std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
+                std.process.exit(2);
+            };
+            const destination = if (std.mem.eql(u8, arg, "--out1")) &output1 else &output2;
+            if (destination.* != null) {
+                const message = if (std.mem.eql(u8, arg, "--out1"))
+                    "error: --out1 may appear only once\n"
+                else
+                    "error: --out2 may appear only once\n";
+                std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
+                std.process.exit(2);
+            }
+            destination.* = value;
             continue;
         }
         if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
@@ -363,11 +395,16 @@ pub fn main(init: std.process.Init) !void {
             .alphabet = alphabet,
             .pair_name_policy = pair_name_policy,
         }),
+        .deinterleave => runDeinterleave(io, gpa, positional.items, output1, output2, .{
+            .max_line_bytes = max_line_bytes,
+            .alphabet = alphabet,
+            .pair_name_policy = pair_name_policy,
+        }),
     };
     std.process.exit(code);
 }
 
-const Command = enum { count, stats, check, sample, interleave };
+const Command = enum { count, stats, check, sample, interleave, deinterleave };
 
 fn printUsageAndExit(io: std.Io) noreturn {
     std.Io.File.writeStreamingAll(.stderr(), io, USAGE) catch {};
@@ -2212,6 +2249,439 @@ fn printOutputFailure(io: std.Io) void {
     ) catch {};
 }
 
+// --- Deinterleave command ---
+
+const DeinterleaveOptions = struct {
+    max_line_bytes: usize,
+    alphabet: zfastq.Alphabet,
+    pair_name_policy: pairing.NamePolicy,
+};
+
+const DeinterleaveWriteError = error{
+    Output1WriteFailed,
+    Output2WriteFailed,
+};
+
+const OutputCleanupFailure = enum {
+    identity_unavailable,
+    inspect_failed,
+    replaced,
+    delete_failed,
+};
+
+const OutputCleanupPlan = union(enum) {
+    none,
+    remove,
+    failed: OutputCleanupFailure,
+};
+
+const DeinterleaveOutput = struct {
+    path: []const u8,
+    file: ?std.Io.File = null,
+    identity: ?std.Io.File.INode = null,
+    owns_path: bool = false,
+    write_buffer: [64 * 1024]u8 = undefined,
+    sink: io_layer.FileSink = undefined,
+    writer: zfastq.Writer = undefined,
+
+    fn init(path: []const u8) DeinterleaveOutput {
+        return .{ .path = path };
+    }
+
+    fn create(self: *DeinterleaveOutput, io: std.Io) ?CommandFailure {
+        const file = std.Io.Dir.cwd().createFile(io, self.path, .{ .exclusive = true }) catch |err| {
+            return if (err == error.PathAlreadyExists)
+                CommandFailure.plain("io_error", "output path already exists", 3)
+            else
+                CommandFailure.plain("io_error", "failed to create output", 3);
+        };
+        self.file = file;
+        self.owns_path = true;
+
+        const stat = file.stat(io) catch {
+            return CommandFailure.plain("io_error", "failed to inspect created output", 3);
+        };
+        self.identity = stat.inode;
+        self.sink = io_layer.FileSink.init(io, file, &self.write_buffer);
+        self.writer = zfastq.Writer.init(self.sink.byteSink());
+        return null;
+    }
+
+    fn close(self: *DeinterleaveOutput, io: std.Io) void {
+        if (self.file) |file| file.close(io);
+        self.file = null;
+    }
+
+    fn releasePath(self: *DeinterleaveOutput) void {
+        self.owns_path = false;
+    }
+
+    fn planCleanup(self: *DeinterleaveOutput, io: std.Io) OutputCleanupPlan {
+        if (!self.owns_path) return .none;
+        const expected = self.identity orelse return .{ .failed = .identity_unavailable };
+        const stat = std.Io.Dir.cwd().statFile(
+            io,
+            self.path,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
+            error.FileNotFound => {
+                self.owns_path = false;
+                return .none;
+            },
+            else => return .{ .failed = .inspect_failed },
+        };
+        if (stat.kind != .file or stat.inode != expected) {
+            return .{ .failed = .replaced };
+        }
+        return .remove;
+    }
+
+    fn applyCleanup(
+        self: *DeinterleaveOutput,
+        io: std.Io,
+        plan: OutputCleanupPlan,
+    ) ?OutputCleanupFailure {
+        switch (plan) {
+            .none => return null,
+            .failed => |failure| return failure,
+            .remove => {},
+        }
+        std.Io.Dir.cwd().deleteFile(io, self.path) catch |err| switch (err) {
+            error.FileNotFound => {
+                self.owns_path = false;
+                return null;
+            },
+            else => return .delete_failed,
+        };
+        self.owns_path = false;
+        return null;
+    }
+};
+
+noinline fn runDeinterleave(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    output1_path: ?[]const u8,
+    output2_path: ?[]const u8,
+    options: DeinterleaveOptions,
+) u8 {
+    const paths = validateDeinterleaveArguments(io, inputs, output1_path, output2_path) orelse
+        return 2;
+    const staging_limit = deinterleaveStagingLimit(options.max_line_bytes) catch {
+        std.Io.File.writeStreamingAll(
+            .stderr(),
+            io,
+            "error: deinterleave record staging size exceeds supported limit\n",
+        ) catch {};
+        return 4;
+    };
+
+    const input_label = inputs[0];
+    const owns_input = !std.mem.eql(u8, input_label, "-");
+    const input_file = if (owns_input)
+        std.Io.Dir.cwd().openFile(io, input_label, .{}) catch |err| {
+            const message = if (err == error.FileNotFound)
+                "file not found"
+            else
+                "failed to open file";
+            printPathError(io, input_label, message);
+            return 3;
+        }
+    else
+        std.Io.File.stdin();
+    defer if (owns_input) input_file.close(io);
+
+    var output1 = DeinterleaveOutput.init(paths[0]);
+    var output2 = DeinterleaveOutput.init(paths[1]);
+    if (output1.create(io)) |failure| {
+        printCommandFailure(io, output1.path, failure);
+        return finishFailedDeinterleave(io, &output1, &output2, failure.exit_code);
+    }
+    if (output2.create(io)) |failure| {
+        printCommandFailure(io, output2.path, failure);
+        return finishFailedDeinterleave(io, &output1, &output2, failure.exit_code);
+    }
+
+    var input: RecordInput = undefined;
+    input.init(io, input_file, false) catch {
+        const failure = CommandFailure.plain("io_error", "I/O error", 3);
+        printCommandFailure(io, input_label, failure);
+        return finishFailedDeinterleave(io, &output1, &output2, failure.exit_code);
+    };
+    defer input.deinit(io);
+
+    const failure = deinterleaveSource(
+        allocator,
+        input.byteSource(),
+        &output1.writer,
+        &output2.writer,
+        staging_limit,
+        options,
+    ) catch |err| {
+        const failed_output = if (err == error.Output1WriteFailed) &output1 else &output2;
+        printPathError(io, failed_output.path, "I/O error");
+        return finishFailedDeinterleave(io, &output1, &output2, 3);
+    };
+    if (failure) |details| {
+        printPairCommandFailure(io, inputs, .interleaved, details);
+        return finishFailedDeinterleave(io, &output1, &output2, details.exitCode());
+    }
+
+    flushDeinterleaveWriters(&output1.writer, &output2.writer) catch |err| {
+        const failed_output = if (err == error.Output1WriteFailed) &output1 else &output2;
+        printPathError(io, failed_output.path, "I/O error");
+        return finishFailedDeinterleave(io, &output1, &output2, 3);
+    };
+    output1.close(io);
+    output2.close(io);
+    output1.releasePath();
+    output2.releasePath();
+    return 0;
+}
+
+fn validateDeinterleaveArguments(
+    io: std.Io,
+    inputs: []const []const u8,
+    output1_path: ?[]const u8,
+    output2_path: ?[]const u8,
+) ?[2][]const u8 {
+    if (inputs.len != 1) {
+        std.Io.File.writeStreamingAll(
+            .stderr(),
+            io,
+            "error: deinterleave requires exactly one input\n",
+        ) catch {};
+        return null;
+    }
+    const path1 = output1_path orelse {
+        std.Io.File.writeStreamingAll(.stderr(), io, "error: deinterleave requires --out1\n") catch {};
+        return null;
+    };
+    const path2 = output2_path orelse {
+        std.Io.File.writeStreamingAll(.stderr(), io, "error: deinterleave requires --out2\n") catch {};
+        return null;
+    };
+    if (std.mem.eql(u8, path1, "-") or std.mem.eql(u8, path2, "-")) {
+        std.Io.File.writeStreamingAll(
+            .stderr(),
+            io,
+            "error: deinterleave output paths cannot be standard output\n",
+        ) catch {};
+        return null;
+    }
+    if (std.mem.eql(u8, path1, path2)) {
+        std.Io.File.writeStreamingAll(
+            .stderr(),
+            io,
+            "error: deinterleave output paths must differ\n",
+        ) catch {};
+        return null;
+    }
+    return .{ path1, path2 };
+}
+
+fn deinterleaveStagingLimit(max_line_bytes: usize) error{ArithmeticLimit}!usize {
+    const fields = std.math.mul(usize, max_line_bytes, 4) catch
+        return error.ArithmeticLimit;
+    return std.math.add(usize, fields, 4) catch error.ArithmeticLimit;
+}
+
+fn deinterleaveSource(
+    allocator: std.mem.Allocator,
+    source: zfastq.io.ByteSource,
+    writer1: *zfastq.Writer,
+    writer2: *zfastq.Writer,
+    staging_limit: usize,
+    options: DeinterleaveOptions,
+) DeinterleaveWriteError!?PairCommandFailure {
+    var reader = zfastq.Reader.init(
+        allocator,
+        source,
+        .{ .max_line_bytes = options.max_line_bytes },
+    ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
+    defer reader.deinit();
+    var staged_record: std.ArrayList(u8) = .empty;
+    defer staged_record.deinit(allocator);
+
+    while (true) {
+        var canonical_span1: ?[]const u8 = null;
+        const record1 = fastq.nextWithoutId(&reader, &canonical_span1) catch |err| {
+            return .{ .command = .{
+                .input_index = 0,
+                .details = mapReaderFailure(&reader, err),
+            } };
+        } orelse return null;
+        const record_index1 = reader.recordIndex() - 1;
+        const offsets1 = reader.currentRecordOffsets().?;
+        const semantic1 = validateCommandRecord(
+            record1,
+            offsets1,
+            record_index1,
+            options.alphabet,
+        );
+
+        var staged_header_len: usize = 0;
+        if (semantic1 == null) {
+            stageCanonicalRecord(
+                allocator,
+                &staged_record,
+                record1,
+                canonical_span1,
+                staging_limit,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return pairCommandFailure(
+                    0,
+                    "out_of_memory",
+                    "out of memory",
+                    3,
+                ),
+                error.ArithmeticLimit => return pairCommandFailure(
+                    0,
+                    "arithmetic_limit",
+                    "record staging size exceeds supported limit",
+                    4,
+                ),
+            };
+            staged_header_len = record1.header.len;
+        }
+
+        var canonical_span2: ?[]const u8 = null;
+        const record2 = fastq.nextWithoutId(&reader, &canonical_span2) catch |err| {
+            return .{ .command = .{
+                .input_index = 0,
+                .details = mapReaderFailure(&reader, err),
+            } };
+        } orelse return .{ .pair = .{ .count_mismatch = .{
+            .pair_index = record_index1 / 2,
+            .remaining_side = 0,
+            .record_indexes = .{
+                record_index1,
+                if (record_index1 == 0) null else record_index1 - 1,
+            },
+        } } };
+
+        if (semantic1) |details| {
+            return .{ .command = .{ .input_index = 0, .details = details } };
+        }
+
+        const record_index2 = reader.recordIndex() - 1;
+        const offsets2 = reader.currentRecordOffsets().?;
+        if (validateCommandRecord(
+            record2,
+            offsets2,
+            record_index2,
+            options.alphabet,
+        )) |details| {
+            return .{ .command = .{ .input_index = 0, .details = details } };
+        }
+
+        const staged_header = staged_record.items[1 .. 1 + staged_header_len];
+        const name1 = pairing.parseName(staged_header, options.pair_name_policy);
+        const name2 = pairing.parseName(record2.header, options.pair_name_policy);
+        if (!pairing.namesMatch(name1, name2)) {
+            return .{ .pair = .{ .name_mismatch = .{
+                .pair_index = record_index1 / 2,
+                .records = .{
+                    .init(name1, record_index1, offsets1.header),
+                    .init(name2, record_index2, offsets2.header),
+                },
+            } } };
+        }
+
+        fastq.writeCanonicalRecordSpan(writer1, staged_record.items) catch
+            return error.Output1WriteFailed;
+        if (canonical_span2) |span| {
+            fastq.writeCanonicalRecordSpan(writer2, span) catch
+                return error.Output2WriteFailed;
+        } else {
+            fastq.writeValidatedRecord(writer2, record2) catch
+                return error.Output2WriteFailed;
+        }
+    }
+}
+
+fn stageCanonicalRecord(
+    allocator: std.mem.Allocator,
+    staging: *std.ArrayList(u8),
+    record: zfastq.Record,
+    canonical_span: ?[]const u8,
+    staging_limit: usize,
+) error{ OutOfMemory, ArithmeticLimit }!void {
+    const required = if (canonical_span) |span|
+        span.len
+    else blk: {
+        var total: usize = 6;
+        inline for (&.{ record.header, record.sequence, record.plus, record.quality }) |field| {
+            total = std.math.add(usize, total, field.len) catch
+                return error.ArithmeticLimit;
+        }
+        break :blk total;
+    };
+    if (required > staging_limit) return error.ArithmeticLimit;
+
+    staging.clearRetainingCapacity();
+    staging.ensureTotalCapacityPrecise(allocator, required) catch return error.OutOfMemory;
+    if (canonical_span) |span| {
+        staging.appendSliceAssumeCapacity(span);
+        return;
+    }
+    staging.appendAssumeCapacity('@');
+    staging.appendSliceAssumeCapacity(record.header);
+    staging.appendAssumeCapacity('\n');
+    staging.appendSliceAssumeCapacity(record.sequence);
+    staging.appendSliceAssumeCapacity("\n+");
+    staging.appendSliceAssumeCapacity(record.plus);
+    staging.appendAssumeCapacity('\n');
+    staging.appendSliceAssumeCapacity(record.quality);
+    staging.appendAssumeCapacity('\n');
+}
+
+fn flushDeinterleaveWriters(
+    writer1: *zfastq.Writer,
+    writer2: *zfastq.Writer,
+) DeinterleaveWriteError!void {
+    writer1.flush() catch return error.Output1WriteFailed;
+    writer2.flush() catch return error.Output2WriteFailed;
+}
+
+fn finishFailedDeinterleave(
+    io: std.Io,
+    output1: *DeinterleaveOutput,
+    output2: *DeinterleaveOutput,
+    primary_exit_code: u8,
+) u8 {
+    const cleanup1 = output1.planCleanup(io);
+    const cleanup2 = output2.planCleanup(io);
+    output1.close(io);
+    output2.close(io);
+
+    var cleanup_exit_code: u8 = 0;
+    if (output1.applyCleanup(io, cleanup1)) |failure| {
+        printOutputCleanupFailure(io, output1.path, failure);
+        cleanup_exit_code = 3;
+    }
+    if (output2.applyCleanup(io, cleanup2)) |failure| {
+        printOutputCleanupFailure(io, output2.path, failure);
+        cleanup_exit_code = 3;
+    }
+    return @max(primary_exit_code, cleanup_exit_code);
+}
+
+fn printOutputCleanupFailure(
+    io: std.Io,
+    path: []const u8,
+    failure: OutputCleanupFailure,
+) void {
+    const message = switch (failure) {
+        .identity_unavailable => "cleanup failed: output identity is unavailable",
+        .inspect_failed => "cleanup failed: could not inspect output path",
+        .replaced => "cleanup failed: output path was replaced",
+        .delete_failed => "cleanup failed: could not remove output path",
+    };
+    printPathError(io, path, message);
+}
+
 // --- Machine output ---
 
 fn beginJsonDocument(json: *std.json.Stringify, schema: []const u8) !void {
@@ -2943,4 +3413,188 @@ test "[failure] - [exact sample]: the second pass repeats semantic validation" {
 
     try std.testing.expectEqualStrings("S002", failure.code);
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
+}
+
+const DeinterleaveTestSink = struct {
+    buffer: [256]u8 = undefined,
+    length: usize = 0,
+    fail_write: bool = false,
+    fail_flush: bool = false,
+    flush_count: usize = 0,
+
+    fn byteSink(self: *DeinterleaveTestSink) zfastq.io.ByteSink {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable = zfastq.io.ByteSink.VTable{
+        .write = write,
+        .flush = flush,
+    };
+
+    fn write(ctx: *anyopaque, bytes: []const u8) error{WriteFailed}!void {
+        const self: *DeinterleaveTestSink = @ptrCast(@alignCast(ctx));
+        if (self.fail_write) return error.WriteFailed;
+        const end = std.math.add(usize, self.length, bytes.len) catch
+            return error.WriteFailed;
+        if (end > self.buffer.len) return error.WriteFailed;
+        @memcpy(self.buffer[self.length..end], bytes);
+        self.length = end;
+    }
+
+    fn flush(ctx: *anyopaque) error{WriteFailed}!void {
+        const self: *DeinterleaveTestSink = @ptrCast(@alignCast(ctx));
+        self.flush_count += 1;
+        if (self.fail_flush) return error.WriteFailed;
+    }
+};
+
+test "[failure] - [deinterleave]: identifies both output write positions" {
+    const input = "@pair/1\nA\n+left\n!\n@pair/2\nT\n+right\n#\n";
+    const options = DeinterleaveOptions{
+        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+        .alphabet = .iupac,
+        .pair_name_policy = .illumina,
+    };
+    const staging_limit = try deinterleaveStagingLimit(options.max_line_bytes);
+
+    {
+        var source = io_layer.SliceSource.init(input);
+        var sink1 = DeinterleaveTestSink{ .fail_write = true };
+        var sink2 = DeinterleaveTestSink{};
+        var writer1 = zfastq.Writer.init(sink1.byteSink());
+        var writer2 = zfastq.Writer.init(sink2.byteSink());
+
+        try std.testing.expectError(
+            error.Output1WriteFailed,
+            deinterleaveSource(
+                std.testing.allocator,
+                source.byteSource(),
+                &writer1,
+                &writer2,
+                staging_limit,
+                options,
+            ),
+        );
+        try std.testing.expectEqual(@as(usize, 0), sink2.length);
+    }
+
+    {
+        var source = io_layer.SliceSource.init(input);
+        var sink1 = DeinterleaveTestSink{};
+        var sink2 = DeinterleaveTestSink{ .fail_write = true };
+        var writer1 = zfastq.Writer.init(sink1.byteSink());
+        var writer2 = zfastq.Writer.init(sink2.byteSink());
+
+        try std.testing.expectError(
+            error.Output2WriteFailed,
+            deinterleaveSource(
+                std.testing.allocator,
+                source.byteSource(),
+                &writer1,
+                &writer2,
+                staging_limit,
+                options,
+            ),
+        );
+        try std.testing.expectEqualStrings("@pair/1\nA\n+left\n!\n", sink1.buffer[0..sink1.length]);
+    }
+}
+
+test "[failure] - [deinterleave]: flushes outputs in order and stops after failure" {
+    var sink1 = DeinterleaveTestSink{ .fail_flush = true };
+    var sink2 = DeinterleaveTestSink{};
+    var writer1 = zfastq.Writer.init(sink1.byteSink());
+    var writer2 = zfastq.Writer.init(sink2.byteSink());
+
+    try std.testing.expectError(
+        error.Output1WriteFailed,
+        flushDeinterleaveWriters(&writer1, &writer2),
+    );
+    try std.testing.expectEqual(@as(usize, 1), sink1.flush_count);
+    try std.testing.expectEqual(@as(usize, 0), sink2.flush_count);
+
+    sink1.fail_flush = false;
+    sink2.fail_flush = true;
+    try std.testing.expectError(
+        error.Output2WriteFailed,
+        flushDeinterleaveWriters(&writer1, &writer2),
+    );
+    try std.testing.expectEqual(@as(usize, 2), sink1.flush_count);
+    try std.testing.expectEqual(@as(usize, 1), sink2.flush_count);
+}
+
+test "[failure] - [deinterleave]: staging allocation failure emits no output" {
+    var source = io_layer.SliceSource.init("@pair/1\nA\n+\n!\n@pair/2\nT\n+\n#\n");
+    var sink1 = DeinterleaveTestSink{};
+    var sink2 = DeinterleaveTestSink{};
+    var writer1 = zfastq.Writer.init(sink1.byteSink());
+    var writer2 = zfastq.Writer.init(sink2.byteSink());
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 2,
+    });
+    const options = DeinterleaveOptions{
+        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+        .alphabet = .iupac,
+        .pair_name_policy = .illumina,
+    };
+
+    const failure = (try deinterleaveSource(
+        failing.allocator(),
+        source.byteSource(),
+        &writer1,
+        &writer2,
+        try deinterleaveStagingLimit(options.max_line_bytes),
+        options,
+    )).?;
+
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u8, 3), failure.exitCode());
+    const command_failure = switch (failure) {
+        .command => |command| command.details,
+        .pair => return error.ExpectedCommandFailure,
+    };
+    try std.testing.expectEqualStrings("out_of_memory", command_failure.code);
+    try std.testing.expectEqual(@as(usize, 0), sink1.length);
+    try std.testing.expectEqual(@as(usize, 0), sink2.length);
+}
+
+test "[failure] - [deinterleave]: cleanup preserves a replacement and continues" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path1_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path2_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path1 = try std.fmt.bufPrint(
+        &path1_buffer,
+        ".zig-cache/tmp/{s}/r1.fastq",
+        .{tmp.sub_path},
+    );
+    const path2 = try std.fmt.bufPrint(
+        &path2_buffer,
+        ".zig-cache/tmp/{s}/r2.fastq",
+        .{tmp.sub_path},
+    );
+    var output1 = DeinterleaveOutput.init(path1);
+    var output2 = DeinterleaveOutput.init(path2);
+    try std.testing.expect(output1.create(io) == null);
+    try std.testing.expect(output2.create(io) == null);
+
+    try tmp.dir.deleteFile(io, "r1.fastq");
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "replacement" });
+
+    const cleanup1 = output1.planCleanup(io);
+    const cleanup2 = output2.planCleanup(io);
+    output1.close(io);
+    output2.close(io);
+    try std.testing.expectEqual(
+        OutputCleanupFailure.replaced,
+        output1.applyCleanup(io, cleanup1).?,
+    );
+    try std.testing.expect(output2.applyCleanup(io, cleanup2) == null);
+    var replacement: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "replacement",
+        try tmp.dir.readFile(io, "r1.fastq", &replacement),
+    );
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "r2.fastq", .{}));
 }
