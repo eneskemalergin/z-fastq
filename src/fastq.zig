@@ -374,8 +374,13 @@ const Range = struct {
 };
 
 const Line = struct {
-    range: Range,
+    content: []const u8,
     start_offset: u64,
+};
+
+const FallbackField = struct {
+    storage: []u8 = &.{},
+    len: usize = 0,
 };
 
 const BufferedRecord = struct {
@@ -404,8 +409,7 @@ pub const Reader = struct {
     buf: []u8,
     fill_end: usize,
     cursor: usize,
-    record_buf: []u8,
-    record_len: usize,
+    fallback_fields: [4]FallbackField,
     record_index: u64,
     byte_offset: u64,
     options: Options,
@@ -413,10 +417,6 @@ pub const Reader = struct {
     last_error: ?ParseError,
     record_offsets: RecordOffsets = undefined,
     current_record_offsets: ?RecordOffsets = null,
-    header_range: Range = undefined,
-    sequence_range: Range = undefined,
-    plus_range: Range = undefined,
-    quality_range: Range = undefined,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -425,15 +425,19 @@ pub const Reader = struct {
     ) !Reader {
         const buf = try allocator.alloc(u8, io_layer.DEFAULT_READER_BUFFER_BYTES);
         errdefer allocator.free(buf);
-        const record_buf = try allocator.alloc(u8, io_layer.DEFAULT_READER_BUFFER_BYTES);
+        const fallback_sequence = try allocator.alloc(u8, io_layer.DEFAULT_READER_BUFFER_BYTES);
         return .{
             .allocator = allocator,
             .source = source,
             .buf = buf,
             .fill_end = 0,
             .cursor = 0,
-            .record_buf = record_buf,
-            .record_len = 0,
+            .fallback_fields = .{
+                .{},
+                .{ .storage = fallback_sequence },
+                .{},
+                .{},
+            },
             .record_index = 0,
             .byte_offset = 0,
             .options = options,
@@ -443,7 +447,9 @@ pub const Reader = struct {
     }
 
     pub fn deinit(self: *Reader) void {
-        self.allocator.free(self.record_buf);
+        for (self.fallback_fields) |field| {
+            if (field.storage.len != 0) self.allocator.free(field.storage);
+        }
         self.allocator.free(self.buf);
         self.* = undefined;
     }
@@ -482,7 +488,7 @@ pub const Reader = struct {
         canonical_span.* = null;
         self.beginRecord();
         switch (try self.readBufferedRecord()) {
-            .incomplete => {},
+            .incomplete => return self.nextFallback(derive_id),
             .eof => return null,
             .record => |buffered| {
                 self.current_record_offsets = self.record_offsets;
@@ -501,6 +507,10 @@ pub const Reader = struct {
                 };
             },
         }
+    }
+
+    fn nextFallback(self: *Reader, comptime derive_id: bool) ReaderError!?Record {
+        self.beginFallbackRecord();
         while (true) {
             const line = try self.readLine();
             switch (try self.ingestLine(line)) {
@@ -508,14 +518,17 @@ pub const Reader = struct {
                 .continue_ => {},
                 .record_ready => {
                     self.current_record_offsets = self.record_offsets;
-                    const bytes = self.record_buf[0..self.record_len];
-                    const header = self.header_range.slice(bytes);
+                    const header_field = &self.fallback_fields[0];
+                    const plus_field = &self.fallback_fields[2];
+                    const header_bytes = header_field.storage[0..header_field.len];
+                    const plus_bytes = plus_field.storage[0..plus_field.len];
+                    const header = header_bytes[1..];
                     return .{
                         .header = header,
                         .id = if (derive_id) firstToken(header) else header[0..0],
-                        .sequence = self.sequence_range.slice(bytes),
-                        .plus = self.plus_range.slice(bytes),
-                        .quality = self.quality_range.slice(bytes),
+                        .sequence = self.fallback_fields[1].storage[0..self.fallback_fields[1].len],
+                        .plus = plus_bytes[1..],
+                        .quality = self.fallback_fields[3].storage[0..self.fallback_fields[3].len],
                     };
                 },
             }
@@ -526,10 +539,14 @@ pub const Reader = struct {
     pub fn advance(self: *Reader) ReaderError!bool {
         self.beginRecord();
         switch (try self.readBufferedRecord()) {
-            .incomplete => {},
+            .incomplete => return self.advanceFallback(),
             .eof => return false,
             .record => return true,
         }
+    }
+
+    fn advanceFallback(self: *Reader) ReaderError!bool {
+        self.beginFallbackRecord();
         while (true) {
             const line = try self.readLine();
             switch (try self.ingestLine(line)) {
@@ -548,9 +565,13 @@ pub const Reader = struct {
 
     fn beginRecord(self: *Reader) void {
         if (self.machine.expected == .header) {
-            self.record_len = 0;
             self.current_record_offsets = null;
         }
+    }
+
+    fn beginFallbackRecord(self: *Reader) void {
+        if (self.machine.expected != .header) return;
+        for (&self.fallback_fields) |*field| field.len = 0;
     }
 
     fn readBufferedRecord(self: *Reader) ReaderError!BufferedRecordResult {
@@ -625,7 +646,7 @@ pub const Reader = struct {
             return error.S004TruncatedRecord;
         };
         const line_kind = self.machine.expected;
-        const content = actual_line.range.slice(self.record_buf);
+        const content = actual_line.content;
         const first_byte = if (content.len == 0) null else content[0];
         const record_ready = self.machine.push(content.len, first_byte) catch |err| {
             return self.structuralError(err, actual_line.start_offset);
@@ -634,25 +655,15 @@ pub const Reader = struct {
         switch (line_kind) {
             .header => {
                 self.record_offsets.header = actual_line.start_offset;
-                self.header_range = .{
-                    .start = actual_line.range.start + 1,
-                    .end = actual_line.range.end,
-                };
             },
             .sequence => {
                 self.record_offsets.sequence = actual_line.start_offset;
-                self.sequence_range = actual_line.range;
             },
             .plus => {
                 self.record_offsets.plus = actual_line.start_offset;
-                self.plus_range = .{
-                    .start = actual_line.range.start + 1,
-                    .end = actual_line.range.end,
-                };
             },
             .quality => {
                 self.record_offsets.quality = actual_line.start_offset;
-                self.quality_range = actual_line.range;
             },
         }
         if (record_ready) {
@@ -713,36 +724,38 @@ pub const Reader = struct {
     }
 
     fn readLine(self: *Reader) ReaderError!?Line {
-        const content_start = self.record_len;
+        const field_index = @intFromEnum(self.machine.expected);
+        const field = &self.fallback_fields[field_index];
+        const content_start = field.len;
         const line_start_offset = self.byte_offset;
 
         while (true) {
             if (self.cursor < self.fill_end) {
                 const haystack = self.buf[self.cursor..self.fill_end];
                 if (std.mem.indexOfScalar(u8, haystack, '\n')) |rel| {
-                    try self.appendLineBytes(content_start, haystack[0..rel]);
+                    try self.appendLineBytes(field_index, content_start, haystack[0..rel], true);
                     self.cursor += rel + 1;
                     self.byte_offset += @intCast(rel + 1);
-                    self.stripLineCr(content_start);
+                    self.stripLineCr(field_index, content_start);
                     return .{
-                        .range = .{ .start = content_start, .end = self.record_len },
+                        .content = field.storage[0..field.len],
                         .start_offset = line_start_offset,
                     };
                 }
 
-                try self.appendLineBytes(content_start, haystack);
+                try self.appendLineBytes(field_index, content_start, haystack, false);
                 self.cursor = self.fill_end;
                 self.byte_offset += @intCast(haystack.len);
             }
 
             const got_data = try self.refill();
             if (!got_data) {
-                if (self.record_len > content_start) {
-                    if (self.record_len - content_start > self.options.max_line_bytes) {
+                if (field.len > content_start) {
+                    if (field.len - content_start > self.options.max_line_bytes) {
                         return error.LineTooLong;
                     }
                     return .{
-                        .range = .{ .start = content_start, .end = self.record_len },
+                        .content = field.storage[0..field.len],
                         .start_offset = line_start_offset,
                     };
                 }
@@ -753,51 +766,64 @@ pub const Reader = struct {
 
     fn appendLineBytes(
         self: *Reader,
+        field_index: usize,
         content_start: usize,
         chunk: []const u8,
+        complete: bool,
     ) ReaderError!void {
         if (chunk.len == 0) return;
-        const new_len = std.math.add(usize, self.record_len, chunk.len) catch
+        const field = &self.fallback_fields[field_index];
+        const new_len = std.math.add(usize, field.len, chunk.len) catch
             return error.LineTooLong;
         const line_len = new_len - content_start;
         if (line_len > self.options.max_line_bytes) {
             const excess = line_len - self.options.max_line_bytes;
             if (excess > 1 or chunk[chunk.len - 1] != '\r') return error.LineTooLong;
         }
-        try self.ensureRecordCapacity(new_len);
-        @memcpy(self.record_buf[self.record_len..new_len], chunk);
-        self.record_len = new_len;
+        try self.ensureFieldCapacity(field_index, new_len, complete);
+        @memcpy(field.storage[field.len..new_len], chunk);
+        field.len = new_len;
     }
 
-    fn stripLineCr(self: *Reader, content_start: usize) void {
-        if (self.record_len > content_start and self.record_buf[self.record_len - 1] == '\r') {
-            self.record_len -= 1;
+    fn stripLineCr(self: *Reader, field_index: usize, content_start: usize) void {
+        const field = &self.fallback_fields[field_index];
+        if (field.len > content_start and field.storage[field.len - 1] == '\r') {
+            field.len -= 1;
         }
     }
 
-    fn ensureRecordCapacity(self: *Reader, needed: usize) ReaderError!void {
-        if (needed <= self.record_buf.len) return;
-        const storage_limit = recordStorageLimit(self.options.max_line_bytes);
+    fn ensureFieldCapacity(
+        self: *Reader,
+        field_index: usize,
+        needed: usize,
+        complete: bool,
+    ) ReaderError!void {
+        const field = &self.fallback_fields[field_index];
+        if (needed <= field.storage.len) return;
+        const storage_limit = fieldStorageLimit(self.options.max_line_bytes);
         if (needed > storage_limit) return error.LineTooLong;
-        const doubled = std.math.add(usize, self.record_buf.len, self.record_buf.len) catch needed;
-        var grown_len = @min(@max(doubled, needed), storage_limit);
+        const doubled = std.math.add(usize, field.storage.len, field.storage.len) catch needed;
+        var grown_len = if (complete)
+            needed
+        else
+            @min(
+                @max(doubled, @max(io_layer.DEFAULT_READER_BUFFER_BYTES, needed)),
+                storage_limit,
+            );
         if (self.machine.expected == .quality) {
-            const sequence_len = self.sequence_range.end - self.sequence_range.start;
-            const quality_end = std.math.add(usize, self.plus_range.end, sequence_len) catch
-                return error.LineTooLong;
-            const quality_capacity = std.math.add(usize, quality_end, 1) catch
+            const quality_capacity = std.math.add(usize, self.machine.sequence_len, 1) catch
                 return error.LineTooLong;
             if (quality_capacity >= needed) grown_len = quality_capacity;
         }
-        self.record_buf = self.allocator.realloc(self.record_buf, grown_len) catch
-            return error.OutOfMemory;
+        field.storage = if (field.storage.len == 0)
+            self.allocator.alloc(u8, grown_len) catch return error.OutOfMemory
+        else
+            self.allocator.realloc(field.storage, grown_len) catch return error.OutOfMemory;
     }
 };
 
-fn recordStorageLimit(max_line_bytes: usize) usize {
-    const content_bytes = std.math.mul(usize, max_line_bytes, 4) catch
-        return std.math.maxInt(usize);
-    return std.math.add(usize, content_bytes, 1) catch std.math.maxInt(usize);
+fn fieldStorageLimit(max_line_bytes: usize) usize {
+    return std.math.add(usize, max_line_bytes, 1) catch std.math.maxInt(usize);
 }
 
 /// Returns the next borrowed record with an empty identifier and its canonical span when available.
@@ -1239,9 +1265,33 @@ const ReaderSpillFixture = struct {
     }
 };
 
-test "[edge] - [reader]: spill capacity stops at the complete-record limit" {
+fn readSpillForAllocationCheck(allocator: std.mem.Allocator, input: []const u8) !void {
+    var source = io_layer.SliceSource.init(input);
+    var reader = try Reader.init(allocator, source.byteSource(), .{});
+    defer reader.deinit();
+    _ = try reader.next();
+}
+
+test "[failure] - [reader]: partial fallback ownership is released after allocation failure" {
+    const input = try ReaderSpillFixture.init(
+        std.testing.allocator,
+        512 * 1024,
+        512 * 1024,
+        "\n",
+        true,
+    );
+    defer std.testing.allocator.free(input);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        readSpillForAllocationCheck,
+        .{input},
+    );
+}
+
+test "[edge] - [reader]: spill field capacities stop at the line limit" {
     const max_line_bytes = 80 * 1024;
-    const storage_limit = recordStorageLimit(max_line_bytes);
+    const storage_limit = fieldStorageLimit(max_line_bytes);
     const fill_bytes = [_]u8{ 'h', 'A', 'p', 'I' };
     const prefix_bytes = [_]?u8{ '@', null, '+', null };
 
@@ -1283,25 +1333,29 @@ test "[edge] - [reader]: spill capacity stops at the complete-record limit" {
         try std.testing.expectEqual(max_line_bytes, record.quality.len);
         try std.testing.expect(std.mem.allEqual(u8, record.sequence, 'A'));
         try std.testing.expect(std.mem.allEqual(u8, record.quality, 'I'));
-        try std.testing.expectEqual(storage_limit, reader.record_buf.len);
-        try std.testing.expectEqual(4 * max_line_bytes, reader.record_len);
-        try std.testing.expectEqual(1, tracking.resize_index + tracking.allocations - 2);
+        for (&reader.fallback_fields, 0..) |*field, field_index| {
+            try std.testing.expectEqual(max_line_bytes, field.len);
+            const expected_capacity = if (field_index == 1)
+                io_layer.DEFAULT_READER_BUFFER_BYTES
+            else if (crlf or field_index == 3)
+                storage_limit
+            else
+                max_line_bytes;
+            try std.testing.expectEqual(expected_capacity, field.storage.len);
+        }
         try std.testing.expectError(
             ReaderError.LineTooLong,
-            reader.ensureRecordCapacity(storage_limit + 1),
+            reader.ensureFieldCapacity(0, storage_limit + 1, false),
         );
-        try std.testing.expectEqual(storage_limit, reader.record_buf.len);
     }
 }
 
-test "[edge] - [reader]: record storage limit saturates after checked overflow" {
+test "[edge] - [reader]: field storage limit saturates after checked overflow" {
     const max = std.math.maxInt(usize);
-    const largest_exact = (max - 1) / 4;
 
-    try std.testing.expectEqual(4 * 1024 * 1024 + 1, recordStorageLimit(1024 * 1024));
-    try std.testing.expectEqual(4 * largest_exact + 1, recordStorageLimit(largest_exact));
-    try std.testing.expectEqual(max, recordStorageLimit(largest_exact + 1));
-    try std.testing.expectEqual(max, recordStorageLimit(max));
+    try std.testing.expectEqual(1024 * 1024 + 1, fieldStorageLimit(1024 * 1024));
+    try std.testing.expectEqual(max, fieldStorageLimit(max - 1));
+    try std.testing.expectEqual(max, fieldStorageLimit(max));
 }
 
 test "[failure] - [reader]: failed spill growth preserves owned storage" {
@@ -1319,20 +1373,19 @@ test "[failure] - [reader]: failed spill growth preserves owned storage" {
 
     try std.testing.expectError(
         ReaderError.OutOfMemory,
-        reader.ensureRecordCapacity(reader.record_buf.len + 1),
+        reader.ensureFieldCapacity(0, 1, false),
     );
-    try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.record_buf.len);
+    try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[0].storage.len);
 }
 
 test "[edge] - [reader]: quality spill reserves only its valid tail" {
     const sequence_len = 131_070;
-    const exact_capacity = io_layer.DEFAULT_READER_BUFFER_BYTES + 2;
     const Case = struct {
         quality_len: usize,
         ending: []const u8,
         final_ending: bool,
         expected_error: ?ReaderError,
-        expected_capacity: usize,
+        expected_quality_capacity: usize,
     };
     const cases = [_]Case{
         .{
@@ -1340,42 +1393,42 @@ test "[edge] - [reader]: quality spill reserves only its valid tail" {
             .ending = "\n",
             .final_ending = true,
             .expected_error = null,
-            .expected_capacity = exact_capacity,
+            .expected_quality_capacity = sequence_len + 1,
         },
         .{
             .quality_len = sequence_len,
             .ending = "\r\n",
             .final_ending = true,
             .expected_error = null,
-            .expected_capacity = exact_capacity,
+            .expected_quality_capacity = sequence_len + 1,
         },
         .{
             .quality_len = sequence_len,
             .ending = "\n",
             .final_ending = false,
             .expected_error = null,
-            .expected_capacity = exact_capacity,
+            .expected_quality_capacity = sequence_len + 1,
         },
         .{
             .quality_len = sequence_len - 1,
             .ending = "\n",
             .final_ending = true,
             .expected_error = error.S005LengthMismatch,
-            .expected_capacity = io_layer.DEFAULT_READER_BUFFER_BYTES,
+            .expected_quality_capacity = sequence_len + 1,
         },
         .{
             .quality_len = sequence_len + 1,
             .ending = "\n",
             .final_ending = true,
             .expected_error = error.S005LengthMismatch,
-            .expected_capacity = exact_capacity,
+            .expected_quality_capacity = sequence_len + 1,
         },
         .{
             .quality_len = sequence_len + 2,
             .ending = "\n",
             .final_ending = true,
             .expected_error = error.S005LengthMismatch,
-            .expected_capacity = 2 * io_layer.DEFAULT_READER_BUFFER_BYTES,
+            .expected_quality_capacity = sequence_len + 2,
         },
     };
 
@@ -1399,7 +1452,10 @@ test "[edge] - [reader]: quality spill reserves only its valid tail" {
             try std.testing.expectEqual(sequence_len, record.sequence.len);
             try std.testing.expectEqual(sequence_len, record.quality.len);
         }
-        try std.testing.expectEqual(case.expected_capacity, reader.record_buf.len);
+        try std.testing.expectEqual(
+            case.expected_quality_capacity,
+            reader.fallback_fields[3].storage.len,
+        );
     }
 
     for ([_]usize{ 512 * 1024, 1024 * 1024 }) |long_sequence_len| {
@@ -1418,7 +1474,13 @@ test "[edge] - [reader]: quality spill reserves only its valid tail" {
         const record = (try reader.next()).?;
         try std.testing.expectEqual(long_sequence_len, record.sequence.len);
         try std.testing.expectEqual(long_sequence_len, record.quality.len);
-        try std.testing.expectEqual(2 * long_sequence_len + 6, reader.record_buf.len);
+        try std.testing.expectEqual(@as(usize, 4), reader.fallback_fields[0].storage.len);
+        try std.testing.expectEqual(long_sequence_len, reader.fallback_fields[1].storage.len);
+        try std.testing.expectEqual(@as(usize, 1), reader.fallback_fields[2].storage.len);
+        try std.testing.expectEqual(
+            long_sequence_len + 1,
+            reader.fallback_fields[3].storage.len,
+        );
     }
 }
 
@@ -1435,16 +1497,19 @@ test "[failure] - [reader]: failed quality-tail reserve preserves owned storage"
 
     var source = io_layer.SliceSource.init(input);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = 2,
-        .resize_fail_index = 0,
+        .fail_index = 4,
     });
     var reader = try Reader.init(failing.allocator(), source.byteSource(), .{});
     defer reader.deinit();
-    const old_pointer = reader.record_buf.ptr;
 
     try std.testing.expectError(ReaderError.OutOfMemory, reader.next());
-    try std.testing.expectEqual(old_pointer, reader.record_buf.ptr);
-    try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.record_buf.len);
+    try std.testing.expectEqual(@as(usize, 4), reader.fallback_fields[0].storage.len);
+    try std.testing.expectEqual(
+        io_layer.DEFAULT_READER_BUFFER_BYTES,
+        reader.fallback_fields[1].storage.len,
+    );
+    try std.testing.expectEqual(@as(usize, 1), reader.fallback_fields[2].storage.len);
+    try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[3].storage.len);
     try std.testing.expect(failing.has_induced_failure);
 }
 

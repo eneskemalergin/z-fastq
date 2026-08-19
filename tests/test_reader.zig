@@ -558,9 +558,10 @@ test "[property] - [parser]: every input partition preserves the format result" 
     }
 }
 
-test "[edge] - [reader]: borrowed fields survive record-buffer growth" {
+test "[edge] - [reader]: fallback fields survive growth and owned copies survive advance" {
     const line_len = 1024 * 1024;
-    const total_len = 3 + line_len + 3 + line_len;
+    const next_record = "\n@next comment\nAC\n+note\n!!\n";
+    const total_len = 3 + line_len + 3 + line_len + next_record.len;
     const data = try std.testing.allocator.alloc(u8, total_len);
     defer std.testing.allocator.free(data);
 
@@ -572,6 +573,8 @@ test "[edge] - [reader]: borrowed fields survive record-buffer growth" {
     @memcpy(data[pos..][0..3], "\n+\n");
     pos += 3;
     @memset(data[pos..][0..line_len], 'I');
+    pos += line_len;
+    @memcpy(data[pos..][0..next_record.len], next_record);
 
     var source = zfastq.io.plain.SliceSource.init(data);
     var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
@@ -582,6 +585,19 @@ test "[edge] - [reader]: borrowed fields survive record-buffer growth" {
     try std.testing.expectEqual(line_len, parsed.quality.len);
     try std.testing.expect(std.mem.allEqual(u8, parsed.sequence, 'A'));
     try std.testing.expect(std.mem.allEqual(u8, parsed.quality, 'I'));
+
+    var owned = try zfastq.toOwned(std.testing.allocator, parsed);
+    defer owned.deinit();
+    const next = (try reader.next()).?;
+
+    try std.testing.expectEqualStrings("next comment", next.header);
+    try std.testing.expectEqualStrings("r", owned.header);
+    try std.testing.expectEqualStrings("r", owned.id);
+    try std.testing.expectEqual(line_len, owned.sequence.len);
+    try std.testing.expectEqualStrings("", owned.plus);
+    try std.testing.expectEqual(line_len, owned.quality.len);
+    try std.testing.expect(std.mem.allEqual(u8, owned.sequence, 'A'));
+    try std.testing.expect(std.mem.allEqual(u8, owned.quality, 'I'));
 }
 
 test "[unit] - [reader]: a common record allocates only during initialization" {
