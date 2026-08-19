@@ -53,6 +53,9 @@ test "[unit] - [writer]: supported records use exact LF serialization" {
 
 test "[failure] - [writer]: invalid fields are rejected before output" {
     const cases = [_]zfastq.Record{
+        .{ .header = "", .id = "", .sequence = "A", .plus = "", .quality = "!" },
+        .{ .header = " description", .id = "", .sequence = "A", .plus = "", .quality = "!" },
+        .{ .header = "\tdescription", .id = "", .sequence = "A", .plus = "", .quality = "!" },
         .{ .header = "r", .id = "r", .sequence = "AA", .plus = "", .quality = "!" },
         .{ .header = "r\nnext", .id = "r", .sequence = "A", .plus = "", .quality = "!" },
         .{ .header = "r", .id = "r", .sequence = "A\n", .plus = "", .quality = "!!" },

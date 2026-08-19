@@ -452,7 +452,8 @@ test "[cli] - [sample]: every record is validated before selection" {
         .{
             .path = "tests/data/synthetic/bad_header.fastq",
             .stderr = "error: tests/data/synthetic/bad_header.fastq: S003: " ++
-                "header line must start with '@' (record 0, line 1, offset 0)\n",
+                "header line must start with '@' and contain a nonempty identifier " ++
+                "(record 0, line 1, offset 0)\n",
         },
         .{
             .path = "tests/data/synthetic/truncated_record.fastq",

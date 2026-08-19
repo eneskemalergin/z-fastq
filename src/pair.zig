@@ -56,6 +56,7 @@ pub fn headersMatch(header1: []const u8, header2: []const u8, policy: NamePolicy
 }
 
 pub fn namesMatch(name1: Name, name2: Name) bool {
+    if (name1.normalized_id.len == 0 or name2.normalized_id.len == 0) return false;
     if (!std.mem.eql(u8, name1.normalized_id, name2.normalized_id)) return false;
     if (name1.mate_markers == 0b11 or name2.mate_markers == 0b11) return false;
     if ((name1.mate_markers == 0) != (name2.mate_markers == 0)) return false;

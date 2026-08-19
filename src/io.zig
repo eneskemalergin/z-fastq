@@ -26,7 +26,7 @@ else
 const GZIP_OPTIONAL_HEADER_BYTES_MAX: usize = 64 * 1024;
 
 /// Copied pull interface whose adapter must remain at a stable address and outlive it.
-/// A read initializes the returned prefix of the destination and returns zero only at EOF.
+/// A read initializes the returned prefix; for a nonempty destination, zero reports EOF.
 pub const ByteSource = struct {
     vtable: *const VTable,
     ctx: *anyopaque,
@@ -60,6 +60,7 @@ pub const ByteSink = struct {
     }
 };
 
+/// Pull adapter over borrowed in-memory bytes.
 pub const SliceSource = struct {
     data: []const u8,
     pos: usize = 0,
@@ -90,6 +91,7 @@ fn sliceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return copy_len;
 }
 
+/// Pull adapter over a borrowed standard reader.
 pub const ReaderSource = struct {
     reader: *std.Io.Reader,
 
@@ -114,6 +116,7 @@ fn readerRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return self.reader.readSliceShort(dest) catch error.ReadFailed;
 }
 
+/// Buffered pull adapter over a borrowed file handle and caller-owned buffer.
 pub const FileSource = struct {
     file_reader: std.Io.File.Reader,
 
@@ -421,6 +424,7 @@ fn reserveOptionalBytes(count: *usize, amount: usize) std.Io.Reader.Error!void {
     count.* += amount;
 }
 
+/// Push adapter into a borrowed fixed-capacity byte slice.
 pub const SliceSink = struct {
     buffer: []u8,
     pos: usize = 0,
@@ -458,6 +462,7 @@ fn sliceFlush(ctx: *anyopaque) WriteError!void {
     _ = ctx;
 }
 
+/// Push adapter over a borrowed standard writer.
 pub const WriterSink = struct {
     writer: *std.Io.Writer,
 
@@ -488,6 +493,7 @@ fn writerFlush(ctx: *anyopaque) WriteError!void {
     self.writer.flush() catch return error.WriteFailed;
 }
 
+/// Buffered push adapter over a borrowed file handle and caller-owned buffer.
 pub const FileSink = struct {
     file_writer: std.Io.File.Writer,
 

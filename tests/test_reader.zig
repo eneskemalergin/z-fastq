@@ -683,6 +683,17 @@ test "[unit] - [reader]: the ByteSource wrapper is copied by value" {
     try std.testing.expectEqualStrings("original", parsed.id);
 }
 
+test "[edge] - [byte source]: an empty destination does not consume input" {
+    var adapter = zfastq.io.plain.SliceSource.init("abc");
+    var source = adapter.byteSource();
+    var empty: [0]u8 = .{};
+    var first: [1]u8 = undefined;
+
+    try std.testing.expectEqual(@as(usize, 0), try source.read(&empty));
+    try std.testing.expectEqual(@as(usize, 1), try source.read(&first));
+    try std.testing.expectEqual(@as(u8, 'a'), first[0]);
+}
+
 test "[failure] - [reader]: allocation failure while growing storage propagates" {
     const line_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES + 1;
     const data = try std.testing.allocator.alloc(u8, line_len + 4);
@@ -819,7 +830,7 @@ test "[property] - [count scanner]: result and details are chunk invariant" {
     }
 }
 
-test "[fuzz] - [parser]: generated mutations keep Reader and scanner in agreement" {
+test "[property] - [parser]: generated mutations keep Reader and scanner in agreement" {
     var prng = std.Random.DefaultPrng.init(0x6a09e667f3bcc909);
     const random = prng.random();
     const mutations = [_]u8{ '\n', '\r', '@', '+', 0, 'A', '!' };
@@ -874,6 +885,16 @@ test "[fuzz] - [parser]: generated mutations keep Reader and scanner in agreemen
     }
 }
 
+test "[fuzz] - [parser]: arbitrary bytes keep Reader and scanner in agreement" {
+    const corpus = [_][]const u8{
+        "\x09\x00\x00\x00@r\nA\n+\n!\n",
+        "\x08\x00\x00\x00@\nA\n+\n!\n",
+        "\x0a\x00\x00\x00@ r\nA\n+\n!\n",
+        "\x04\x00\x00\x00\x00\xff\n@",
+    };
+    try std.testing.fuzz({}, fuzzReaderScannerAgreement, .{ .corpus = &corpus });
+}
+
 test "[property] - [parser]: structural details agree across chunk sizes" {
     const cases = [_]struct {
         data: []const u8,
@@ -884,6 +905,20 @@ test "[property] - [parser]: structural details agree across chunk sizes" {
     }{
         .{
             .data = "bad\nA\n+\n!\n",
+            .expected_error = error.S003InvalidHeader,
+            .code = .s003_invalid_header,
+            .line = 1,
+            .offset = 0,
+        },
+        .{
+            .data = "@\nA\n+\n!\n",
+            .expected_error = error.S003InvalidHeader,
+            .code = .s003_invalid_header,
+            .line = 1,
+            .offset = 0,
+        },
+        .{
+            .data = "@ description\nA\n+\n!\n",
             .expected_error = error.S003InvalidHeader,
             .code = .s003_invalid_header,
             .line = 1,
@@ -970,10 +1005,10 @@ test "[property] - [count scanner]: dense validation checks every field region" 
     }{
         .{
             .malformed_record = "@\nx\nAAAA\n+\n!!!!\n",
-            .expected_error = error.S001InvalidPlusLine,
-            .code = .s001_invalid_plus_line,
-            .line = 3,
-            .offset = 20,
+            .expected_error = error.S003InvalidHeader,
+            .code = .s003_invalid_header,
+            .line = 1,
+            .offset = 16,
         },
         .{
             .malformed_record = "@r2\nA\nAA\n+\n!!!!\n",
@@ -1418,6 +1453,15 @@ fn scannerOutcome(data: []const u8, chunk_len: usize) ParseOutcome {
         };
     };
     return .{ .count = scan.record_index };
+}
+
+fn fuzzReaderScannerAgreement(_: void, smith: *std.testing.Smith) !void {
+    var storage: [512]u8 = undefined;
+    const data = storage[0..smith.slice(&storage)];
+    const reader = try readerOutcome(data, 1);
+
+    try expectSameOutcome(reader, scannerOutcome(data, 1));
+    try expectSameOutcome(reader, scannerOutcome(data, 64));
 }
 
 fn expectSameOutcome(expected: ParseOutcome, actual: ParseOutcome) !void {

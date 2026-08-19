@@ -59,7 +59,7 @@ const DenseLayout = struct {
         const quality = record[layout.quality_start..layout.quality_end];
         const sequence_len = lineContentLen(sequence);
         const quality_len = lineContentLen(quality);
-        return record[0] == '@' and
+        return fastq.headerPrefixIsValid(record[0], record[1]) and
             record[layout.sequence_start - 1] == '\n' and
             !@call(.always_inline, containsNewline, .{header}) and
             lineContentLen(header) <= max_line_bytes and
@@ -94,6 +94,7 @@ pub const Scanner = struct {
     current_record_dense_eligible: bool = false,
     line_raw_len: usize = 0,
     line_first_byte: u8 = 0,
+    line_second_byte: u8 = 0,
     line_last_byte: u8 = 0,
     line_start_offset: u64 = 0,
     record_index: u64 = 0,
@@ -275,7 +276,7 @@ pub const Scanner = struct {
 
         const nl1 = if (header_line_bytes) |line_bytes| line_bytes - 1 else return 0;
         const hdr_len = lineContentLen(data[0..nl1]);
-        if (hdr_len == 0) {
+        if (hdr_len < 2 or !fastq.headerPrefixIsValid(data[0], data[1])) {
             self.disableFast();
             return 0;
         }
@@ -378,9 +379,13 @@ pub const Scanner = struct {
 
     fn consumeLineBytes(self: *Scanner, bytes: []const u8) fastq.ReaderError!void {
         if (bytes.len == 0) return;
-        if (self.line_raw_len == 0) self.line_first_byte = bytes[0];
+        const previous_len = self.line_raw_len;
+        if (previous_len == 0) self.line_first_byte = bytes[0];
         self.line_raw_len = std.math.add(usize, self.line_raw_len, bytes.len) catch
             return error.LineTooLong;
+        if (previous_len < 2 and self.line_raw_len >= 2) {
+            self.line_second_byte = bytes[1 - previous_len];
+        }
         self.line_last_byte = bytes[bytes.len - 1];
         if (self.line_raw_len > self.options.max_line_bytes) {
             const excess = self.line_raw_len - self.options.max_line_bytes;
@@ -413,7 +418,8 @@ pub const Scanner = struct {
         }
 
         const first_byte = if (content_len == 0) null else self.line_first_byte;
-        const record_ready = self.machine.push(content_len, first_byte) catch |err| {
+        const second_byte = if (content_len < 2) null else self.line_second_byte;
+        const record_ready = self.machine.push(content_len, first_byte, second_byte) catch |err| {
             return self.structuralError(err, self.line_start_offset);
         };
         if (record_ready) {
@@ -427,6 +433,7 @@ pub const Scanner = struct {
         }
         self.line_raw_len = 0;
         self.line_first_byte = 0;
+        self.line_second_byte = 0;
         self.line_last_byte = 0;
         self.line_start_offset = self.byte_offset;
     }

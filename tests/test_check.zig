@@ -38,7 +38,7 @@ const FIXTURES = [_]FixtureExpect{
     .{
         .name = "bad_header.fastq",
         .code = "S003",
-        .message = "header line must start with '@'",
+        .message = "header line must start with '@' and contain a nonempty identifier",
         .line = 1,
         .offset = 0,
     },
@@ -1360,6 +1360,20 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
         "",
         "error: -: S001: plus line must start with '+' " ++
             "(record 1, line 3, offset 18)\n",
+    );
+
+    const empty_identifier = try cli.runWithStdin(
+        allocator,
+        &.{ "check", "--interleaved", "--pair-names", "exact", "-" },
+        "@ description\nA\n+\n!\n@ unrelated\nT\n+\n#\n",
+        1,
+    );
+    try expectResult(
+        empty_identifier,
+        1,
+        "",
+        "error: -: S003: header line must start with '@' and contain a nonempty identifier " ++
+            "(record 0, line 1, offset 0)\n",
     );
 }
 

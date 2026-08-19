@@ -99,9 +99,11 @@ const FIXTURES = [_]FixtureExpect{
         .path = "bad_header.fastq",
         .exit_code = 1,
         .stderr = "error: tests/data/synthetic/bad_header.fastq: S003: " ++
-            "header line must start with '@' (record 0, line 1, offset 0)\n",
+            "header line must start with '@' and contain a nonempty identifier " ++
+            "(record 0, line 1, offset 0)\n",
         .stdin_stderr = "error: -: S003: " ++
-            "header line must start with '@' (record 0, line 1, offset 0)\n",
+            "header line must start with '@' and contain a nonempty identifier " ++
+            "(record 0, line 1, offset 0)\n",
     },
     .{
         .path = "truncated_record.fastq",
@@ -415,7 +417,8 @@ test "[cli] - [count]: all paths run and the highest exit class wins" {
     try std.testing.expectEqualStrings("1\n", result.stdout);
     try std.testing.expectEqualStrings(
         "error: tests/data/synthetic/bad_header.fastq: S003: " ++
-            "header line must start with '@' (record 0, line 1, offset 0)\n" ++
+            "header line must start with '@' and contain a nonempty identifier " ++
+            "(record 0, line 1, offset 0)\n" ++
             "error: tests/data/synthetic/does_not_exist.fastq: file not found\n",
         result.stderr,
     );
@@ -441,7 +444,7 @@ test "[cli] - [count]: files around stdin retain output order and exit precedenc
     try std.testing.expectEqual(@as(u8, 3), result.exit_code);
     try std.testing.expectEqualStrings("1\n5\n", result.stdout);
     try std.testing.expectEqualStrings(
-        "error: -: S003: header line must start with '@' " ++
+        "error: -: S003: header line must start with '@' and contain a nonempty identifier " ++
             "(record 0, line 1, offset 0)\n" ++
             "error: tests/data/synthetic/does_not_exist.fastq: file not found\n",
         result.stderr,

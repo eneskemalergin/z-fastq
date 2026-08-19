@@ -674,7 +674,8 @@ pub const Reader = struct {
             const line_kind = self.machine.expected;
             const content = self.buf[start..end];
             const first_byte = if (content.len == 0) null else content[0];
-            const record_ready = self.machine.push(content.len, first_byte) catch |err| {
+            const second_byte = if (content.len < 2) null else content[1];
+            const record_ready = self.machine.push(content.len, first_byte, second_byte) catch |err| {
                 return self.structuralError(err, start_offset);
             };
             ranges[line_index] = .{ .start = start, .end = end };
@@ -711,7 +712,8 @@ pub const Reader = struct {
         const line_kind = self.machine.expected;
         const content = actual_line.content;
         const first_byte = if (content.len == 0) null else content[0];
-        const record_ready = self.machine.push(content.len, first_byte) catch |err| {
+        const second_byte = if (content.len < 2) null else content[1];
+        const record_ready = self.machine.push(content.len, first_byte, second_byte) catch |err| {
             return self.structuralError(err, actual_line.start_offset);
         };
 
@@ -990,6 +992,7 @@ pub const Writer = struct {
     /// Rejects invalid fields before output; accepted records use LF line endings.
     pub fn writeRecord(self: *Writer, record: Record) WriterError!void {
         if (record.sequence.len != record.quality.len or
+            !identifierFirstByteIsValid(if (record.header.len == 0) null else record.header[0]) or
             !isWritableField(record.header) or
             !isWritableField(record.sequence) or
             !isWritableField(record.plus) or
@@ -1062,7 +1065,7 @@ pub fn diagnostic(err: Error) Diagnostic {
         },
         error.S003InvalidHeader => .{
             .code = .s003_invalid_header,
-            .message = "header line must start with '@'",
+            .message = "header line must start with '@' and contain a nonempty identifier",
             .line = 1,
         },
         error.S005LengthMismatch => .{
@@ -1086,10 +1089,17 @@ pub const Machine = struct {
     expected: ExpectedLine = .header,
     sequence_len: usize = 0,
 
-    pub fn push(self: *Machine, line_len: usize, first_byte: ?u8) Error!bool {
+    pub fn push(
+        self: *Machine,
+        line_len: usize,
+        first_byte: ?u8,
+        second_byte: ?u8,
+    ) Error!bool {
         switch (self.expected) {
             .header => {
-                if (first_byte != '@') return error.S003InvalidHeader;
+                if (!headerPrefixIsValid(first_byte, second_byte)) {
+                    return error.S003InvalidHeader;
+                }
                 self.expected = .sequence;
             },
             .sequence => {
@@ -1119,6 +1129,14 @@ pub const Machine = struct {
     }
 };
 
+pub fn headerPrefixIsValid(first_byte: ?u8, identifier_first_byte: ?u8) bool {
+    return first_byte == '@' and identifierFirstByteIsValid(identifier_first_byte);
+}
+
+fn identifierFirstByteIsValid(byte: ?u8) bool {
+    return byte != null and byte != ' ' and byte != '\t';
+}
+
 pub const CheckScannerError = error{
     Format,
     LineTooLong,
@@ -1139,6 +1157,7 @@ pub const CheckScanner = struct {
     machine: Machine = .{},
     line_len: usize = 0,
     first_byte: ?u8 = null,
+    second_byte: ?u8 = null,
     pending_cr: bool = false,
     line_start_offset: u64 = 0,
     sequence_start_offset: u64 = 0,
@@ -1223,6 +1242,9 @@ pub const CheckScanner = struct {
         self.line_len = std.math.add(usize, self.line_len, bytes.len) catch
             return error.LineTooLong;
         if (self.first_byte == null) self.first_byte = bytes[0];
+        if (self.second_byte == null and previous_len < 2 and self.line_len >= 2) {
+            self.second_byte = bytes[1 - previous_len];
+        }
 
         const semantic_end = if (bytes[bytes.len - 1] == '\r') bytes.len - 1 else bytes.len;
         self.pending_cr = semantic_end != bytes.len;
@@ -1272,8 +1294,13 @@ pub const CheckScanner = struct {
     fn finishLine(self: *CheckScanner, terminated: bool) CheckScannerError!void {
         const content_len = self.line_len - @intFromBool(terminated and self.pending_cr);
         const content_first = if (content_len == 0) null else self.first_byte;
+        const content_second = if (content_len < 2) null else self.second_byte;
         const line_kind = self.machine.expected;
-        const record_ready = self.machine.push(content_len, content_first) catch |err| {
+        const record_ready = self.machine.push(
+            content_len,
+            content_first,
+            content_second,
+        ) catch |err| {
             const details = diagnostic(err);
             self.storeError(
                 details.code,
@@ -1293,6 +1320,7 @@ pub const CheckScanner = struct {
 
         self.line_len = 0;
         self.first_byte = null;
+        self.second_byte = null;
         self.pending_cr = false;
         self.line_start_offset = self.byte_offset;
     }
@@ -1933,7 +1961,7 @@ test "[property] - [check scanner]: fragmented results match independent expecta
             .data = "r\nA\n+\n!\n",
             .expected = .{ .parse_error = expectedCheckError(
                 .s003_invalid_header,
-                "header line must start with '@'",
+                "header line must start with '@' and contain a nonempty identifier",
                 0,
                 0,
                 1,

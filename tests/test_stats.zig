@@ -534,7 +534,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
         one_byte,
         1,
         "",
-        "error: -: S003: header line must start with '@' " ++
+        "error: -: S003: header line must start with '@' and contain a nonempty identifier " ++
             "(record 0, line 1, offset 0)\n",
     );
 
