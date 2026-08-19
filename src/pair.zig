@@ -88,6 +88,7 @@ fn nextToken(header: []const u8, previous_end: usize) HeaderToken {
     return .{ .bytes = header[start..end], .ends_header = end == header.len };
 }
 
+// Keep the full matcher shared across paired command paths to avoid code growth.
 noinline fn illuminaHeadersMatch(header1: []const u8, header2: []const u8) bool {
     return terminalPairHeadersMatch(header1, header2) or
         namesMatch(parseName(header1, .illumina), parseName(header2, .illumina));

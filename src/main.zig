@@ -871,8 +871,7 @@ fn runSingleCheckCommand(
     return runCheck(io, inputs, options, json_output);
 }
 
-// Keep check code generation out of the measured count dispatch path.
-noinline fn runCheck(
+fn runCheck(
     io: std.Io,
     inputs: []const []const u8,
     options: CheckOptions,
@@ -895,8 +894,7 @@ noinline fn runCheck(
     return exit_code;
 }
 
-// Keep paired check code generation out of the measured single-input path.
-noinline fn runPairedCheckCommand(
+fn runPairedCheckCommand(
     io: std.Io,
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
@@ -1311,8 +1309,7 @@ fn mapCheckScannerFailure(
 
 // --- Stats command ---
 
-// Keep stats code generation out of the measured count dispatch path.
-noinline fn runStats(
+fn runStats(
     io: std.Io,
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
@@ -1593,7 +1590,7 @@ const SampleMode = union(enum) {
     count: u64,
 };
 
-noinline fn runSample(
+fn runSample(
     io: std.Io,
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
@@ -2084,7 +2081,7 @@ const InterleaveOptions = struct {
     pair_name_policy: pairing.NamePolicy,
 };
 
-noinline fn runInterleave(
+fn runInterleave(
     io: std.Io,
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
@@ -2366,7 +2363,7 @@ const DeinterleaveOutput = struct {
     }
 };
 
-noinline fn runDeinterleave(
+fn runDeinterleave(
     io: std.Io,
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
