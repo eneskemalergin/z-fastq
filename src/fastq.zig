@@ -826,8 +826,6 @@ fn fieldStorageLimit(max_line_bytes: usize) usize {
     return std.math.add(usize, max_line_bytes, 1) catch std.math.maxInt(usize);
 }
 
-/// Returns the next borrowed record with an empty identifier and its canonical span when available.
-/// The record and span expire when the reader advances again.
 pub fn nextWithoutId(
     reader: *Reader,
     canonical_span: *?[]const u8,
@@ -867,12 +865,10 @@ pub const Writer = struct {
     }
 };
 
-/// Writes a Reader record whose structure and command semantics were already validated.
 pub fn writeValidatedRecord(writer: *Writer, record: Record) WriteError!void {
     return writeRecordFields(writer, record);
 }
 
-/// Writes one borrowed record span already proven to have canonical LF framing.
 pub fn writeCanonicalRecordSpan(writer: *Writer, span: []const u8) WriteError!void {
     return writer.sink.write(span);
 }

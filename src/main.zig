@@ -2393,7 +2393,9 @@ noinline fn runDeinterleave(
     defer if (owns_input) input_file.close(io);
 
     var output1 = DeinterleaveOutput.init(paths[0]);
+    defer output1.close(io);
     var output2 = DeinterleaveOutput.init(paths[1]);
+    defer output2.close(io);
     if (output1.create(io)) |failure| {
         printCommandFailure(io, output1.path, failure);
         return finishFailedDeinterleave(io, &output1, &output2, failure.exit_code);
@@ -3575,7 +3577,9 @@ test "[failure] - [deinterleave]: cleanup preserves a replacement and continues"
         .{tmp.sub_path},
     );
     var output1 = DeinterleaveOutput.init(path1);
+    defer output1.close(io);
     var output2 = DeinterleaveOutput.init(path2);
+    defer output2.close(io);
     try std.testing.expect(output1.create(io) == null);
     try std.testing.expect(output2.create(io) == null);
 
