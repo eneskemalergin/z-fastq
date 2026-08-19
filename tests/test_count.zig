@@ -437,7 +437,7 @@ test "[cli] - [count]: files around stdin retain output order and exit precedenc
             "tests/data/synthetic/does_not_exist.fastq",
             "tests/data/synthetic/basic_valid.fastq",
         },
-        "not-a-header\nA\n+\n!\n",
+        "@ description\nA\n+\n!\n",
         3,
     );
 

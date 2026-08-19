@@ -168,6 +168,20 @@ test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
             "(record 0, line 3, offset 5)\n",
     );
 
+    const empty_identifier = try cli.runWithStdin(
+        allocator,
+        &.{ "check", "-" },
+        "@ description\nA\n+\n!\n",
+        1,
+    );
+    try expectResult(
+        empty_identifier,
+        1,
+        "",
+        "error: -: S003: header line must start with '@' and contain a nonempty identifier " ++
+            "(record 0, line 1, offset 0)\n",
+    );
+
     const semantic = try cli.runWithStdin(
         allocator,
         &.{ "check", "-" },

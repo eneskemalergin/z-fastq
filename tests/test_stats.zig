@@ -538,6 +538,20 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
             "(record 0, line 1, offset 0)\n",
     );
 
+    const empty_identifier = try runCli(
+        allocator,
+        &.{ "stats", "-" },
+        "@ description\nA\n+\n!\n",
+        1,
+    );
+    try expectCommand(
+        empty_identifier,
+        1,
+        "",
+        "error: -: S003: header line must start with '@' and contain a nonempty identifier " ++
+            "(record 0, line 1, offset 0)\n",
+    );
+
     var damaged = SAMPLE_GZIP;
     damaged[damaged.len - 8] ^= 1;
     const corrupt = try runCli(allocator, &.{ "stats", "-" }, &damaged, 1);
