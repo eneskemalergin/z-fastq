@@ -2516,6 +2516,7 @@ fn deinterleaveSource(
         } orelse return null;
         const record_index1 = reader.recordIndex() - 1;
         const offsets1 = reader.currentRecordOffsets().?;
+        const header1_len = record1.header.len;
         const semantic1 = validateCommandRecord(
             record1,
             offsets1,
@@ -2523,45 +2524,55 @@ fn deinterleaveSource(
             options.alphabet,
         );
 
-        var staged_header_len: usize = 0;
-        if (semantic1 == null) {
-            stageCanonicalRecord(
-                allocator,
-                &staged_record,
-                record1,
-                canonical_span1,
-                staging_limit,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return pairCommandFailure(
-                    0,
-                    "out_of_memory",
-                    "out of memory",
-                    3,
-                ),
-                error.ArithmeticLimit => return pairCommandFailure(
-                    0,
-                    "arithmetic_limit",
-                    "record staging size exceeds supported limit",
-                    4,
-                ),
-            };
-            staged_header_len = record1.header.len;
-        }
-
         var canonical_span2: ?[]const u8 = null;
-        const record2 = fastq.nextWithoutId(&reader, &canonical_span2) catch |err| {
+        var record2_is_buffered = true;
+        const buffered_record2 = fastq.nextBufferedWithoutId(
+            &reader,
+            &canonical_span2,
+        ) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
             } };
-        } orelse return .{ .pair = .{ .count_mismatch = .{
-            .pair_index = record_index1 / 2,
-            .remaining_side = 0,
-            .record_indexes = .{
-                record_index1,
-                if (record_index1 == 0) null else record_index1 - 1,
-            },
-        } } };
+        };
+        const record2 = buffered_record2 orelse record: {
+            record2_is_buffered = false;
+            if (semantic1 == null) {
+                stageCanonicalRecord(
+                    allocator,
+                    &staged_record,
+                    record1,
+                    canonical_span1,
+                    staging_limit,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return pairCommandFailure(
+                        0,
+                        "out_of_memory",
+                        "out of memory",
+                        3,
+                    ),
+                    error.ArithmeticLimit => return pairCommandFailure(
+                        0,
+                        "arithmetic_limit",
+                        "record staging size exceeds supported limit",
+                        4,
+                    ),
+                };
+            }
+            break :record fastq.nextWithoutId(&reader, &canonical_span2) catch |err| {
+                return .{ .command = .{
+                    .input_index = 0,
+                    .details = mapReaderFailure(&reader, err),
+                } };
+            } orelse return .{ .pair = .{ .count_mismatch = .{
+                .pair_index = record_index1 / 2,
+                .remaining_side = 0,
+                .record_indexes = .{
+                    record_index1,
+                    if (record_index1 == 0) null else record_index1 - 1,
+                },
+            } } };
+        };
 
         if (semantic1) |details| {
             return .{ .command = .{ .input_index = 0, .details = details } };
@@ -2578,8 +2589,11 @@ fn deinterleaveSource(
             return .{ .command = .{ .input_index = 0, .details = details } };
         }
 
-        const staged_header = staged_record.items[1 .. 1 + staged_header_len];
-        const name1 = pairing.parseName(staged_header, options.pair_name_policy);
+        const header1 = if (record2_is_buffered)
+            record1.header
+        else
+            staged_record.items[1 .. 1 + header1_len];
+        const name1 = pairing.parseName(header1, options.pair_name_policy);
         const name2 = pairing.parseName(record2.header, options.pair_name_policy);
         if (!pairing.namesMatch(name1, name2)) {
             return .{ .pair = .{ .name_mismatch = .{
@@ -2591,8 +2605,18 @@ fn deinterleaveSource(
             } } };
         }
 
-        fastq.writeCanonicalRecordSpan(writer1, staged_record.items) catch
-            return error.Output1WriteFailed;
+        if (record2_is_buffered) {
+            if (canonical_span1) |span| {
+                fastq.writeCanonicalRecordSpan(writer1, span) catch
+                    return error.Output1WriteFailed;
+            } else {
+                fastq.writeValidatedRecord(writer1, record1) catch
+                    return error.Output1WriteFailed;
+            }
+        } else {
+            fastq.writeCanonicalRecordSpan(writer1, staged_record.items) catch
+                return error.Output1WriteFailed;
+        }
         if (canonical_span2) |span| {
             fastq.writeCanonicalRecordSpan(writer2, span) catch
                 return error.Output2WriteFailed;
@@ -3526,7 +3550,22 @@ test "[failure] - [deinterleave]: flushes outputs in order and stops after failu
 }
 
 test "[failure] - [deinterleave]: staging allocation failure emits no output" {
-    var source = io_layer.SliceSource.init("@pair/1\nA\n+\n!\n@pair/2\nT\n+\n#\n");
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+    try input.appendSlice(std.testing.allocator, "@pair/1\nA\n+\n!\n@pair/2\n");
+    try input.appendNTimes(
+        std.testing.allocator,
+        'T',
+        zfastq.limits.DEFAULT_READER_BUFFER_BYTES,
+    );
+    try input.appendSlice(std.testing.allocator, "\n+\n");
+    try input.appendNTimes(
+        std.testing.allocator,
+        '#',
+        zfastq.limits.DEFAULT_READER_BUFFER_BYTES,
+    );
+    try input.append(std.testing.allocator, '\n');
+    var source = io_layer.SliceSource.init(input.items);
     var sink1 = DeinterleaveTestSink{};
     var sink2 = DeinterleaveTestSink{};
     var writer1 = zfastq.Writer.init(sink1.byteSink());

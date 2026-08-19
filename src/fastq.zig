@@ -490,23 +490,34 @@ pub const Reader = struct {
         switch (try self.readBufferedRecord()) {
             .incomplete => return self.nextFallback(derive_id),
             .eof => return null,
-            .record => |buffered| {
-                self.current_record_offsets = self.record_offsets;
-                const ranges = buffered.ranges;
-                const header = self.buf[ranges[0].start + 1 .. ranges[0].end];
-                canonical_span.* = if (buffered.canonical_range) |range|
-                    range.slice(self.buf)
-                else
-                    null;
-                return .{
-                    .header = header,
-                    .id = if (derive_id) firstToken(header) else header[0..0],
-                    .sequence = ranges[1].slice(self.buf),
-                    .plus = self.buf[ranges[2].start + 1 .. ranges[2].end],
-                    .quality = ranges[3].slice(self.buf),
-                };
-            },
+            .record => |buffered| return self.finishBufferedRecord(
+                buffered,
+                canonical_span,
+                derive_id,
+            ),
         }
+    }
+
+    fn finishBufferedRecord(
+        self: *Reader,
+        buffered: BufferedRecord,
+        canonical_span: *?[]const u8,
+        comptime derive_id: bool,
+    ) Record {
+        self.current_record_offsets = self.record_offsets;
+        const ranges = buffered.ranges;
+        const header = self.buf[ranges[0].start + 1 .. ranges[0].end];
+        canonical_span.* = if (buffered.canonical_range) |range|
+            range.slice(self.buf)
+        else
+            null;
+        return .{
+            .header = header,
+            .id = if (derive_id) firstToken(header) else header[0..0],
+            .sequence = ranges[1].slice(self.buf),
+            .plus = self.buf[ranges[2].start + 1 .. ranges[2].end],
+            .quality = ranges[3].slice(self.buf),
+        };
     }
 
     fn nextFallback(self: *Reader, comptime derive_id: bool) ReaderError!?Record {
@@ -831,6 +842,24 @@ pub fn nextWithoutId(
     canonical_span: *?[]const u8,
 ) ReaderError!?Record {
     return reader.nextWithCanonicalSpan(canonical_span, false);
+}
+
+pub fn nextBufferedWithoutId(
+    reader: *Reader,
+    canonical_span: *?[]const u8,
+) ReaderError!?Record {
+    canonical_span.* = null;
+    reader.beginRecord();
+    if (reader.cursor == reader.fill_end) return null;
+    return switch (try reader.readBufferedRecord()) {
+        .incomplete => null,
+        .eof => unreachable,
+        .record => |buffered| reader.finishBufferedRecord(
+            buffered,
+            canonical_span,
+            false,
+        ),
+    };
 }
 
 // --- Writer ---
@@ -1509,7 +1538,7 @@ test "[failure] - [reader]: failed quality-tail reserve preserves owned storage"
     try std.testing.expect(failing.has_induced_failure);
 }
 
-test "[property] - [record delivery]: sampling omits identifiers and spans only buffered LF records" {
+test "[property] - [record delivery]: omits identifiers and preserves buffered canonical spans" {
     const cases = [_]struct {
         input: []const u8,
         expected_output: []const u8,
@@ -1553,6 +1582,57 @@ test "[property] - [record delivery]: sampling omits identifiers and spans only 
         try std.testing.expectEqualStrings(case.expected_output, sink.written());
         try std.testing.expect((try nextWithoutId(&reader, &canonical_span)) == null);
         try std.testing.expect(canonical_span == null);
+    }
+
+    {
+        const input1 = "@pair/1\nAC\n+left\n!!\n";
+        const input2 = "@pair/2\nGT\n+right\n##\n";
+        const input = input1 ++ input2;
+        var source = io_layer.SliceSource.init(input);
+        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
+        var canonical_span1: ?[]const u8 = null;
+        const record1 = (try nextWithoutId(&reader, &canonical_span1)).?;
+        var canonical_span2: ?[]const u8 = null;
+        const record2 = (try nextBufferedWithoutId(&reader, &canonical_span2)).?;
+
+        try std.testing.expectEqualStrings("pair/1", record1.header);
+        try std.testing.expectEqualStrings("AC", record1.sequence);
+        try std.testing.expectEqualStrings("left", record1.plus);
+        try std.testing.expectEqualStrings("!!", record1.quality);
+        try std.testing.expectEqualStrings("pair/2", record2.header);
+        try std.testing.expectEqualStrings(input1, canonical_span1.?);
+        try std.testing.expectEqualStrings(input2, canonical_span2.?);
+    }
+
+    {
+        const input1 = "@pair/1\nAC\n+left\n!!\n";
+        const record2_prefix = "@pair/2\nGT\n+right\n";
+        const record2_suffix = "##\n";
+        const initial_input = input1 ++ record2_prefix;
+        const complete_input = initial_input ++ record2_suffix;
+        var source = io_layer.SliceSource.init(initial_input);
+        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
+        var canonical_span1: ?[]const u8 = null;
+        const record1 = (try nextWithoutId(&reader, &canonical_span1)).?;
+        source.data = complete_input;
+        const source_position = source.pos;
+        var canonical_span2: ?[]const u8 = null;
+
+        try std.testing.expect(
+            (try nextBufferedWithoutId(&reader, &canonical_span2)) == null,
+        );
+        try std.testing.expectEqual(source_position, source.pos);
+        try std.testing.expectEqualStrings("pair/1", record1.header);
+        try std.testing.expectEqualStrings(input1, canonical_span1.?);
+
+        const record2 = (try nextWithoutId(&reader, &canonical_span2)).?;
+        try std.testing.expectEqualStrings("pair/2", record2.header);
+        try std.testing.expectEqualStrings("GT", record2.sequence);
+        try std.testing.expectEqualStrings("right", record2.plus);
+        try std.testing.expectEqualStrings("##", record2.quality);
+        try std.testing.expect(canonical_span2 == null);
     }
 
     const header_len = io_layer.DEFAULT_READER_BUFFER_BYTES;
