@@ -2504,7 +2504,7 @@ fn deinterleaveSource(
     writer2: *zfastq.Writer,
     staging_limit: usize,
     options: DeinterleaveOptions,
-) DeinterleaveWriteError!?PairCommandFailure {
+) align(4096) DeinterleaveWriteError!?PairCommandFailure {
     var reader = zfastq.Reader.init(
         allocator,
         source,
@@ -2513,6 +2513,14 @@ fn deinterleaveSource(
     defer reader.deinit();
     var staged_record: std.ArrayList(u8) = .empty;
     defer staged_record.deinit(allocator);
+    var retained_record_storage: fastq.RetainedRecordStorage = .{};
+    defer retained_record_storage.deinit(allocator);
+
+    const FirstRecordStorage = enum {
+        reader,
+        retained,
+        staged,
+    };
 
     while (true) {
         var canonical_span1: ?[]const u8 = null;
@@ -2533,7 +2541,7 @@ fn deinterleaveSource(
         );
 
         var canonical_span2: ?[]const u8 = null;
-        var record2_is_buffered = true;
+        var record1_storage: FirstRecordStorage = .reader;
         const buffered_record2 = fastq.nextBufferedWithoutId(
             &reader,
             &canonical_span2,
@@ -2544,8 +2552,28 @@ fn deinterleaveSource(
             } };
         };
         const record2 = buffered_record2 orelse record: {
-            record2_is_buffered = false;
+            @branchHint(.cold);
+            var record2_requires_fallback = false;
             if (semantic1 == null) {
+                if (fastq.retainFallbackRecordStorage(
+                    &reader,
+                    &retained_record_storage,
+                    record1,
+                )) {
+                    record1_storage = .retained;
+                    const transferred_record2 = fastq.nextBufferedAfterFallbackTransfer(
+                        &reader,
+                        &canonical_span2,
+                    ) catch |err| {
+                        return .{ .command = .{
+                            .input_index = 0,
+                            .details = mapReaderFailure(&reader, err),
+                        } };
+                    };
+                    if (transferred_record2) |complete_record2| {
+                        break :record complete_record2;
+                    }
+                }
                 stageCanonicalRecord(
                     allocator,
                     &staged_record,
@@ -2566,8 +2594,17 @@ fn deinterleaveSource(
                         4,
                     ),
                 };
+                if (record1_storage == .retained) {
+                    fastq.restoreFallbackRecordStorage(&reader, &retained_record_storage);
+                    record2_requires_fallback = true;
+                }
+                record1_storage = .staged;
             }
-            break :record fastq.nextWithoutId(&reader, &canonical_span2) catch |err| {
+            const next_record = if (record2_requires_fallback)
+                fastq.nextFallbackWithoutId(&reader, &canonical_span2)
+            else
+                fastq.nextWithoutId(&reader, &canonical_span2);
+            break :record next_record catch |err| {
                 return .{ .command = .{
                     .input_index = 0,
                     .details = mapReaderFailure(&reader, err),
@@ -2597,10 +2634,10 @@ fn deinterleaveSource(
             return .{ .command = .{ .input_index = 0, .details = details } };
         }
 
-        const header1 = if (record2_is_buffered)
-            record1.header
-        else
-            staged_record.items[1 .. 1 + header1_len];
+        const header1 = switch (record1_storage) {
+            .reader, .retained => record1.header,
+            .staged => staged_record.items[1 .. 1 + header1_len],
+        };
         if (!pairing.headersMatch(header1, record2.header, options.pair_name_policy)) {
             const name1 = pairing.parseName(header1, options.pair_name_policy);
             const name2 = pairing.parseName(record2.header, options.pair_name_policy);
@@ -2613,17 +2650,21 @@ fn deinterleaveSource(
             } } };
         }
 
-        if (record2_is_buffered) {
-            if (canonical_span1) |span| {
-                fastq.writeCanonicalRecordSpan(writer1, span) catch
-                    return error.Output1WriteFailed;
-            } else {
-                fastq.writeValidatedRecord(writer1, record1) catch
-                    return error.Output1WriteFailed;
-            }
-        } else {
-            fastq.writeCanonicalRecordSpan(writer1, staged_record.items) catch
-                return error.Output1WriteFailed;
+        switch (record1_storage) {
+            .reader, .retained => {
+                if (canonical_span1) |span| {
+                    fastq.writeCanonicalRecordSpan(writer1, span) catch
+                        return error.Output1WriteFailed;
+                } else {
+                    fastq.writeValidatedRecord(writer1, record1) catch
+                        return error.Output1WriteFailed;
+                }
+            },
+            .staged => fastq.writeCanonicalRecordSpan(writer1, staged_record.items) catch
+                return error.Output1WriteFailed,
+        }
+        if (record1_storage == .retained) {
+            fastq.restoreFallbackRecordStorage(&reader, &retained_record_storage);
         }
         if (canonical_span2) |span| {
             fastq.writeCanonicalRecordSpan(writer2, span) catch
@@ -3598,6 +3639,54 @@ test "[failure] - [deinterleave]: staging allocation failure emits no output" {
 
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(@as(u8, 3), failure.exitCode());
+    const command_failure = switch (failure) {
+        .command => |command| command.details,
+        .pair => return error.ExpectedCommandFailure,
+    };
+    try std.testing.expectEqualStrings("out_of_memory", command_failure.code);
+    try std.testing.expectEqual(@as(usize, 0), sink1.length);
+    try std.testing.expectEqual(@as(usize, 0), sink2.length);
+}
+
+test "[failure] - [deinterleave]: retained storage is released when deferred staging fails" {
+    const first_field_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES - 7;
+    const second_field_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+    try input.appendSlice(std.testing.allocator, "@pair/1\n");
+    try input.appendNTimes(std.testing.allocator, 'A', first_field_len);
+    try input.appendSlice(std.testing.allocator, "\n+\n");
+    try input.appendNTimes(std.testing.allocator, '!', first_field_len);
+    try input.appendSlice(std.testing.allocator, "\n@pair/2\n");
+    try input.appendNTimes(std.testing.allocator, 'T', second_field_len);
+    try input.appendSlice(std.testing.allocator, "\n+\n");
+    try input.appendNTimes(std.testing.allocator, '#', second_field_len);
+    try input.append(std.testing.allocator, '\n');
+
+    var source = io_layer.SliceSource.init(input.items);
+    var sink1 = DeinterleaveTestSink{};
+    var sink2 = DeinterleaveTestSink{};
+    var writer1 = zfastq.Writer.init(sink1.byteSink());
+    var writer2 = zfastq.Writer.init(sink2.byteSink());
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 5,
+    });
+    const options = DeinterleaveOptions{
+        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+        .alphabet = .iupac,
+        .pair_name_policy = .illumina,
+    };
+
+    const failure = (try deinterleaveSource(
+        failing.allocator(),
+        source.byteSource(),
+        &writer1,
+        &writer2,
+        try deinterleaveStagingLimit(options.max_line_bytes),
+        options,
+    )).?;
+
+    try std.testing.expect(failing.has_induced_failure);
     const command_failure = switch (failure) {
         .command => |command| command.details,
         .pair => return error.ExpectedCommandFailure,

@@ -383,6 +383,17 @@ const FallbackField = struct {
     len: usize = 0,
 };
 
+pub const RetainedRecordStorage = struct {
+    fields: [4]FallbackField = .{ .{}, .{}, .{}, .{} },
+
+    pub fn deinit(self: *RetainedRecordStorage, allocator: std.mem.Allocator) void {
+        for (self.fields) |field| {
+            if (field.storage.len != 0) allocator.free(field.storage);
+        }
+        self.* = undefined;
+    }
+};
+
 const BufferedRecord = struct {
     ranges: [4]Range,
     canonical_range: ?Range,
@@ -901,6 +912,67 @@ pub fn nextBufferedWithoutId(
             false,
         ),
     };
+}
+
+pub fn retainFallbackRecordStorage(
+    reader: *Reader,
+    retained: *RetainedRecordStorage,
+    record: Record,
+) bool {
+    const fields = &reader.fallback_fields;
+    if (fields[0].len == 0 or
+        fields[2].len == 0 or
+        fields[0].len - 1 != record.header.len or
+        fields[1].len != record.sequence.len or
+        fields[2].len - 1 != record.plus.len or
+        fields[3].len != record.quality.len or
+        record.header.ptr != fields[0].storage.ptr + 1 or
+        record.sequence.ptr != fields[1].storage.ptr or
+        record.plus.ptr != fields[2].storage.ptr + 1 or
+        record.quality.ptr != fields[3].storage.ptr)
+    {
+        return false;
+    }
+    std.mem.swap([4]FallbackField, fields, &retained.fields);
+    return true;
+}
+
+pub fn restoreFallbackRecordStorage(
+    reader: *Reader,
+    retained: *RetainedRecordStorage,
+) void {
+    std.mem.swap([4]FallbackField, &reader.fallback_fields, &retained.fields);
+}
+
+pub fn nextBufferedAfterFallbackTransfer(
+    reader: *Reader,
+    canonical_span: *?[]const u8,
+) ReaderError!?Record {
+    canonical_span.* = null;
+    reader.beginRecord();
+    if (reader.cursor == 0 and reader.fill_end == reader.buf.len) {
+        return null;
+    }
+    const got_data = try reader.refill();
+    if (!got_data and reader.cursor == reader.fill_end) return null;
+    return switch (try reader.readBufferedRecord()) {
+        .incomplete => null,
+        .eof => null,
+        .record => |buffered| reader.finishBufferedRecord(
+            buffered,
+            canonical_span,
+            false,
+        ),
+    };
+}
+
+pub fn nextFallbackWithoutId(
+    reader: *Reader,
+    canonical_span: *?[]const u8,
+) ReaderError!?Record {
+    canonical_span.* = null;
+    reader.beginRecord();
+    return reader.nextFallback(false);
 }
 
 // --- Writer ---
@@ -1736,6 +1808,58 @@ test "[property] - [record delivery]: omits identifiers and preserves buffered c
     try std.testing.expectEqual(header_len, record.header.len);
     try std.testing.expectEqual(@as(usize, 0), record.id.len);
     try std.testing.expect(canonical_span == null);
+}
+
+test "[integration] - [record delivery]: retained fallback storage survives a refill" {
+    const field_len = io_layer.DEFAULT_READER_BUFFER_BYTES - 7;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+    try input.appendSlice(std.testing.allocator, "@pair/1\n");
+    try input.appendNTimes(std.testing.allocator, 'A', field_len);
+    try input.appendSlice(std.testing.allocator, "\n+\n");
+    try input.appendNTimes(std.testing.allocator, '!', field_len);
+    try input.appendSlice(std.testing.allocator, "\n@pair/2\nTT\n+right\n##\n");
+
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    {
+        var source = io_layer.SliceSource.init(input.items);
+        var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{});
+        defer reader.deinit();
+        var retained: RetainedRecordStorage = .{};
+        defer retained.deinit(tracking.allocator());
+
+        var canonical_span1: ?[]const u8 = null;
+        const record1 = (try nextWithoutId(&reader, &canonical_span1)).?;
+        try std.testing.expect(canonical_span1 == null);
+        try std.testing.expectEqual(field_len, record1.sequence.len);
+        try std.testing.expectEqual(field_len, record1.quality.len);
+
+        var canonical_span2: ?[]const u8 = null;
+        try std.testing.expect(
+            (try nextBufferedWithoutId(&reader, &canonical_span2)) == null,
+        );
+        const sequence_ptr = record1.sequence.ptr;
+        try std.testing.expect(retainFallbackRecordStorage(&reader, &retained, record1));
+        const allocations_before_refill = tracking.allocations;
+
+        const record2 = (try nextBufferedAfterFallbackTransfer(
+            &reader,
+            &canonical_span2,
+        )).?;
+        try std.testing.expectEqual(allocations_before_refill, tracking.allocations);
+        try std.testing.expectEqualStrings("pair/1", record1.header);
+        try std.testing.expect(std.mem.allEqual(u8, record1.sequence, 'A'));
+        try std.testing.expect(std.mem.allEqual(u8, record1.quality, '!'));
+        try std.testing.expectEqualStrings("pair/2", record2.header);
+        try std.testing.expectEqualStrings("TT", record2.sequence);
+        try std.testing.expectEqualStrings("right", record2.plus);
+        try std.testing.expectEqualStrings("##", record2.quality);
+
+        restoreFallbackRecordStorage(&reader, &retained);
+        try std.testing.expectEqual(sequence_ptr, reader.fallback_fields[1].storage.ptr);
+        try std.testing.expect((try nextWithoutId(&reader, &canonical_span2)) == null);
+    }
+    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
 }
 
 test "[integration] - [writer]: trusted Reader records match checked serialization" {
