@@ -173,6 +173,50 @@ test "[cli] - [deinterleave]: empty input creates two empty outputs" {
     try expectFile(allocator, empty_out2, "");
 }
 
+test "[cli] - [deinterleave]: exact policy compares complete first tokens" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const input_path = try tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const paths = try outputPaths(allocator, &tmp.sub_path, "exact-mismatch");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "input.fastq",
+        .data = "@cluster/1\nA\n+\n!\n@cluster/2\nT\n+\n#\n",
+    });
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "error: {s}: P001: paired identifiers or mate markers do not match (pair 0)\n" ++
+            "  R1: input={s}, record=0, offset=0, first_token=cluster/1 " ++
+            "[length=9, truncated=false], normalized_id=cluster/1 " ++
+            "[length=9, truncated=false], mate_markers=none\n" ++
+            "  R2: input={s}, record=1, offset=17, first_token=cluster/2 " ++
+            "[length=9, truncated=false], normalized_id=cluster/2 " ++
+            "[length=9, truncated=false], mate_markers=none\n",
+        .{ input_path, input_path, input_path },
+    );
+
+    try expectResult(
+        try cli.run(allocator, &.{
+            "deinterleave",
+            "--pair-names",
+            "exact",
+            "--out1",
+            paths[0],
+            "--out2",
+            paths[1],
+            input_path,
+        }),
+        1,
+        "",
+        expected,
+    );
+    try expectAbsent(paths[0]);
+    try expectAbsent(paths[1]);
+}
+
 test "[cli] - [deinterleave]: structural, semantic, pair, and odd-count precedence is exact" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -344,6 +388,13 @@ test "[cli] - [deinterleave]: validation failures on either mate remove both out
             .exit_code = 1,
             .error_tail = "S002: sequence byte is outside the selected alphabet " ++
                 "(record 1, line 2, offset 20)\n",
+        },
+        .{
+            .prefix = "both-semantic",
+            .input = "@bad/1\n.\n+\n!\n@bad/2\n.\n+\n!\n",
+            .exit_code = 1,
+            .error_tail = "S002: sequence byte is outside the selected alphabet " ++
+                "(record 0, line 2, offset 7)\n",
         },
     };
     for (cases) |case| {

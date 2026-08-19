@@ -472,6 +472,10 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
         .{ "check", "-h" },
         .{ "sample", "--help" },
         .{ "sample", "-h" },
+        .{ "interleave", "--help" },
+        .{ "interleave", "-h" },
+        .{ "deinterleave", "--help" },
+        .{ "deinterleave", "-h" },
     };
     for (command_help_cases) |args| {
         const result = try runCli(allocator, &args);
