@@ -83,7 +83,6 @@ fn runtimeHasPclmul() bool {
 
 // --- x86-64 PCLMUL ---
 
-// The folding schedule and constants are adapted from crc32fast 1.5.0.
 const X86Crc32 = struct {
     const Block = @Vector(2, u64);
     const Selector = enum {
