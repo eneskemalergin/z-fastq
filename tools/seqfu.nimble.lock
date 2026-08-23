@@ -1,0 +1,206 @@
+{
+  "version": 2,
+  "packages": {
+    "malebolgia": {
+      "version": "1.3.2",
+      "vcsRevision": "ab17bef08e8e84fabc33e0b039b324438e1ce27b",
+      "url": "https://github.com/Araq/malebolgia",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim"
+      ],
+      "checksums": {
+        "sha1": "5259d27784981c9146c823157d06fbba0bcf6d99"
+      }
+    },
+    "illwill": {
+      "version": "#v0.2.0",
+      "vcsRevision": "fe6f670c0cac93d525b4fe0b4430f89e4d616d48",
+      "url": "https://github.com/johnnovak/illwill",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim"
+      ],
+      "checksums": {
+        "sha1": "479bb995bb5704c49803f8c3b6d6d30e875fbaf3"
+      }
+    },
+    "argparse": {
+      "version": "4.0.2",
+      "vcsRevision": "8485f8cb9d86de9bfa2406ebf3b06691f8066c35",
+      "url": "https://github.com/iffy/nim-argparse",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim"
+      ],
+      "checksums": {
+        "sha1": "925c78825b1a84d2010011642774b279e3cf908a"
+      }
+    },
+    "checksums": {
+      "version": "0.2.2",
+      "vcsRevision": "0845c735a9746188b2257ee2cff672eb6ec26e8a",
+      "url": "https://github.com/nim-lang/checksums",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim"
+      ],
+      "checksums": {
+        "sha1": "6357ab195ec23e0e0a54d4d8b5e0212456bf899e"
+      }
+    },
+    "illwave": {
+      "version": "0.6.0",
+      "vcsRevision": "7558f89925f7c10e52559c80b26c7c090433a5c2",
+      "url": "https://github.com/ansiwave/illwave",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim"
+      ],
+      "checksums": {
+        "sha1": "5cbfaf7c7a82f58891d3cd24ed4facf5100dc53c"
+      }
+    },
+    "terminaltables": {
+      "version": "0.1.1",
+      "vcsRevision": "37981f5d403fb55688e00d24ab9b1d56e252f52b",
+      "url": "https://github.com/xmonader/nim-terminaltables",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim"
+      ],
+      "checksums": {
+        "sha1": "5fdf88d70cc1d904291204cd4f9e2adf992fb564"
+      }
+    },
+    "zip": {
+      "version": "0.3.1",
+      "vcsRevision": "bdc5783fefc1afb8eb622ff13d464a832ce1d507",
+      "url": "https://github.com/nim-lang/zip",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim"
+      ],
+      "checksums": {
+        "sha1": "747aab3c43ecb7b50671cdd0ec3b2edc2c83494c"
+      }
+    },
+    "readfq": {
+      "version": "#head",
+      "vcsRevision": "5a685b578fd57e286d3e88df979c6591b9f5f6ba",
+      "url": "https://github.com/andreas-wilm/nimreadfq",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim",
+        "zip"
+      ],
+      "checksums": {
+        "sha1": "ccbc39fee4294baa99236d999f801413919e1cb9"
+      }
+    },
+    "colorize": {
+      "version": "0.2.0",
+      "vcsRevision": "39435f76aa0ec3a30b027e913aa95a9e427d45f0",
+      "url": "https://github.com/molnarmark/colorize",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim"
+      ],
+      "checksums": {
+        "sha1": "d117ee80952dd88c92459becda027c8411ea254b"
+      }
+    },
+    "ansiutils": {
+      "version": "0.2.0",
+      "vcsRevision": "65811c1556cd103a060dcf0e08d2d5090633b8fd",
+      "url": "https://github.com/ansiwave/ansiutils",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim"
+      ],
+      "checksums": {
+        "sha1": "72933b45b2ad9202538d60c61830557c2a724d1a"
+      }
+    },
+    "nimwave": {
+      "version": "1.2.1",
+      "vcsRevision": "1fc33782bb87fa97b67b0978a635e344eae9b8ab",
+      "url": "https://github.com/ansiwave/nimwave",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim",
+        "ansiutils",
+        "illwave"
+      ],
+      "checksums": {
+        "sha1": "fa28e264903a58b91c31e39a0eb9af259a49be38"
+      }
+    },
+    "tableview": {
+      "version": "0.5.2",
+      "vcsRevision": "61a7f01d07973db25a2024720c7293ed1181deb5",
+      "url": "https://www.github.com/telatin/tabview",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim",
+        "nimwave",
+        "illwave",
+        "argparse"
+      ],
+      "checksums": {
+        "sha1": "40747ade06713d68d7ef63263c98bff397266e35"
+      }
+    },
+    "unicodedb": {
+      "version": "0.13.2",
+      "vcsRevision": "66f2458710dc641dd4640368f9483c8a0ec70561",
+      "url": "https://github.com/nitely/nim-unicodedb",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim"
+      ],
+      "checksums": {
+        "sha1": "739102d885d99bb4571b1955f5f12aee423c935b"
+      }
+    },
+    "regex": {
+      "version": "0.26.3",
+      "vcsRevision": "4593305ed1e49731fc75af1dc572dd2559aad19c",
+      "url": "https://github.com/nitely/nim-regex",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim",
+        "unicodedb"
+      ],
+      "checksums": {
+        "sha1": "4d24e7d7441137cd202e16f2359a5807ddbdc31f"
+      }
+    },
+    "docopt": {
+      "version": "#v0.7.1",
+      "vcsRevision": "efaa112b6df172a9168c4eb581ab8dda1fbcfe2a",
+      "url": "https://github.com/docopt/docopt.nim",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim",
+        "regex"
+      ],
+      "checksums": {
+        "sha1": "387f1ae17f3b7620c7814cf44a52d3d91b8906e9"
+      }
+    },
+    "iterutils": {
+      "version": "0.4",
+      "vcsRevision": "6243972399deb9d2c4290e7165abe8fd3beabb8c",
+      "url": "https://github.com/def-/iterutils",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim"
+      ],
+      "checksums": {
+        "sha1": "962ab341126646658f229bff3656d41501e3b298"
+      }
+    }
+  },
+  "tasks": {}
+}

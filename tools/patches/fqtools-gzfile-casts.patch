@@ -1,0 +1,22 @@
+diff --git a/src/fqfile.c b/src/fqfile.c
+index 0f8b7b1..f0d061f 100644
+--- a/src/fqfile.c
++++ b/src/fqfile.c
+@@ -190 +190 @@ void fqfile_close_file_fastq_compressed(fqfile *f){
+-    if((gzFile*)(f->handle) != NULL) gzclose((gzFile*)(f->handle));
++    if((gzFile)(f->handle) != NULL) gzclose((gzFile)(f->handle));
+@@ -212 +212 @@ fqbytecount fqfile_read_fastq_compressed(fqfile *f, char *buffer, fqbytecount buffer_n){
+-    return (fqbytecount)gzread((gzFile*)(((fqfile*)f)->handle), buffer, (int)buffer_n); // Read into the buffer
++    return (fqbytecount)gzread((gzFile)(((fqfile*)f)->handle), buffer, (int)buffer_n); // Read into the buffer
+@@ -265 +265 @@ fqbytecount fqfile_write_fastq_compressed(fqfile *f, char *buffer, fqbytecount buffer_n){
+-    return (fqbytecount)gzwrite((gzFile*)(f->handle), buffer, (unsigned int)buffer_n);
++    return (fqbytecount)gzwrite((gzFile)(f->handle), buffer, (unsigned int)buffer_n);
+@@ -275 +275 @@ fqbytecount fqfile_writechar_fastq_compressed(fqfile *f, char c){
+-    return (fqbytecount)gzwrite((gzFile*)(f->handle), &c, 1);
++    return (fqbytecount)gzwrite((gzFile)(f->handle), &c, 1);
+@@ -285 +285 @@ char fqfile_eof_file_fastq_compressed(fqfile *f){
+-    return gzeof((gzFile*)(((fqfile*)f)->handle));
++    return gzeof((gzFile)(((fqfile*)f)->handle));
+@@ -302 +302 @@ void fqfile_flush_file_fastq_compressed(fqfile *f){
+-    gzflush((gzFile*)(((fqfile*)f)->handle), 0);
++    gzflush((gzFile)(((fqfile*)f)->handle), 0);
