@@ -2,10 +2,18 @@
 .zig*
 zig*
 
-# Development related folder
-tools/
+# Tool inputs are tracked; installed and archived state is local
+tools/archive/
+tools/bin/
+tools/venv/
+tools/.local/
+
+# Development related folders
 data/
-!tests/data/
-!tests/data/**
 plan/
 ref/
+tmp/
+
+# Exceptions
+!tests/data/
+!tests/data/**
