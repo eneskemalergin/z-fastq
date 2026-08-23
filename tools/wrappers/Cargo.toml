@@ -1,0 +1,28 @@
+[package]
+name = "z-fastq-benchmark-wrappers"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "needletail-adapter"
+path = "src/bin/needletail.rs"
+
+[[bin]]
+name = "helicase-adapter"
+path = "src/bin/helicase.rs"
+
+[dependencies]
+helicase = { version = "=0.2.0", default-features = false, features = ["gz"] }
+needletail = { version = "=0.7.3", default-features = false, features = ["flate2"] }
+
+[features]
+default = []
+native-cpu = []
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "symbols"
