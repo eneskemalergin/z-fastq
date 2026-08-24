@@ -24,6 +24,7 @@ PEER_NAMES=(
     fqkit
     seqkit
     rasusa
+    fasten
     seqfu
     irma-core
     fastqvalidator
@@ -46,7 +47,7 @@ Usage:
   tools/install.sh --help              show this help
 
 Names: venv, wrappers, seqtk, fqtools, fq, fqkit, seqkit, rasusa,
-       seqfu, irma-core, fastqvalidator, fastp, bbtools, peers, all
+       fasten, seqfu, irma-core, fastqvalidator, fastp, bbtools, peers, all
 
 The installer uses commands already on PATH. It does not use the repository
 root .venv, install system packages, edit PATH, or activate an environment.
@@ -529,6 +530,7 @@ peer_version() {
         fqkit) printf '%s\n' "$FQKIT_VERSION" ;;
         seqkit) printf '%s\n' "$SEQKIT_VERSION" ;;
         rasusa) printf '%s\n' "$RASUSA_VERSION" ;;
+        fasten) printf '%s\n' "$FASTEN_VERSION" ;;
         seqfu) printf '%s\n' "$SEQFU_VERSION" ;;
         irma-core) printf '%s\n' "$IRMA_CORE_VERSION" ;;
         fastqvalidator) printf '%s\n' "$FASTQ_VALIDATOR_VERSION" ;;
@@ -546,6 +548,7 @@ peer_recipe() {
         fqkit) printf '%s\n' "$FQKIT_RECIPE" ;;
         seqkit) printf '%s\n' "$SEQKIT_RECIPE" ;;
         rasusa) printf '%s\n' "$RASUSA_RECIPE" ;;
+        fasten) printf '%s\n' "$FASTEN_RECIPE" ;;
         seqfu) printf '%s\n' "$SEQFU_RECIPE" ;;
         irma-core) printf '%s\n' "$IRMA_CORE_RECIPE" ;;
         fastqvalidator) printf '%s\n' "$FASTQ_VALIDATOR_RECIPE" ;;
@@ -563,6 +566,7 @@ peer_binaries() {
         fqkit) printf 'fqkit\n' ;;
         seqkit) printf 'seqkit\n' ;;
         rasusa) printf 'rasusa\n' ;;
+        fasten) printf 'fasten_sample\n' ;;
         seqfu) printf 'seqfu\n' ;;
         irma-core) printf 'irma-core\n' ;;
         fastqvalidator) printf 'fastQValidator\n' ;;
@@ -580,6 +584,7 @@ peer_source() {
         fqkit) printf 'tag version%s\n' "$FQKIT_VERSION" ;;
         seqkit) printf 'release v%s\n' "$SEQKIT_VERSION" ;;
         rasusa) printf 'release %s\n' "$RASUSA_VERSION" ;;
+        fasten) printf 'published crate %s with Cargo.lock\n' "$FASTEN_VERSION" ;;
         seqfu) printf 'tag v%s; Nim %s; locked Nimble dependencies\n' "$SEQFU_VERSION" "$NIM_VERSION" ;;
         irma-core) printf 'release v%s\n' "$IRMA_CORE_VERSION" ;;
         fastqvalidator)
@@ -595,7 +600,7 @@ peer_source() {
 
 peer_uses_build_jobs() {
     case "$1" in
-        seqtk|fqtools|fqkit|seqfu|fastqvalidator) return 0 ;;
+        seqtk|fqtools|fqkit|fasten|seqfu|fastqvalidator) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -606,7 +611,7 @@ peer_build_environment() {
             require_command cc >/dev/null
             cc --version | sed -n '1p'
             ;;
-        fqkit)
+        fqkit|fasten)
             require_command rustc >/dev/null
             rustc --version
             ;;
@@ -695,6 +700,10 @@ check_peer_version() {
             output="$("$root/bin/rasusa" --version 2>&1)"
             [[ "$output" == *"$RASUSA_VERSION"* ]]
             ;;
+        fasten)
+            output="$("$root/bin/fasten_sample" --version 2>&1)"
+            [[ "$output" == *"$FASTEN_VERSION"* ]]
+            ;;
         seqfu)
             output="$("$root/bin/seqfu" version 2>&1)"
             [[ "$output" == "$SEQFU_VERSION" ]]
@@ -759,6 +768,16 @@ check_peer_smoke() {
                     "$fixture" >/dev/null 2>&1
                 [[ "$(wc -l <"$smoke_dir/rasusa.fastq")" == 8 ]]
                 ;;
+            fasten)
+                printf '%s\n' \
+                    '@pair/1' 'ACGTN' '+' '#####' \
+                    '@pair/2' 'TGCAN' '+' '#####' \
+                    >"$smoke_dir/interleaved.fastq"
+                "$root/bin/fasten_sample" --paired-end --frequency 1 \
+                    <"$smoke_dir/interleaved.fastq" \
+                    >"$smoke_dir/fasten.fastq"
+                cmp "$smoke_dir/interleaved.fastq" "$smoke_dir/fasten.fastq"
+                ;;
             seqfu)
                 output="$("$root/bin/seqfu" count "$fixture")"
                 [[ "$output" == "$fixture"$'\t5\t'* ]]
@@ -807,17 +826,27 @@ check_peer_smoke() {
                 [[ -s "$smoke_dir/fastp.json" ]]
                 ;;
             bbtools)
-                sed -n '1,4p' "$fixture" | sed '1s/$/\/1/' \
-                    >"$smoke_dir/source-r1.fastq"
-                sed -n '1,4p' "$fixture" | sed '1s/$/\/2/' \
-                    >"$smoke_dir/source-r2.fastq"
+                printf '%s\n' \
+                    '@pair/1' 'ACGTA' '+' '#####' \
+                    '@pair/2' 'TGCAC' '+' '#####' \
+                    >"$smoke_dir/interleaved.fastq"
                 "$root/bin/reformat.sh" \
-                    in="$smoke_dir/source-r1.fastq" \
+                    -Xmx200m \
+                    in="$smoke_dir/interleaved.fastq" \
                     out="$smoke_dir/reformat.fastq" \
+                    int=t \
+                    verifyinterleaved=t \
+                    samplerate=1 \
+                    sampleseed=11 \
                     overwrite=t \
                     threads=1 \
-                    qin=33 >/dev/null 2>&1
-                cmp "$smoke_dir/source-r1.fastq" "$smoke_dir/reformat.fastq"
+                    qin=33 \
+                    qout=33 >/dev/null 2>&1
+                cmp "$smoke_dir/interleaved.fastq" "$smoke_dir/reformat.fastq"
+                sed -n '1,4p' "$smoke_dir/interleaved.fastq" \
+                    >"$smoke_dir/source-r1.fastq"
+                sed -n '5,8p' "$smoke_dir/interleaved.fastq" \
+                    >"$smoke_dir/source-r2.fastq"
                 "$root/bin/repair.sh" \
                     in1="$smoke_dir/source-r1.fastq" \
                     in2="$smoke_dir/source-r2.fastq" \
@@ -1015,6 +1044,32 @@ build_rasusa() {
     BUILD_DESCRIPTION='upstream Linux x86-64 GNU release binary'
 }
 
+build_fasten() {
+    local stage="$1"
+    local archive="$ACTIVE_WORK/fasten-$FASTEN_VERSION.crate"
+    local source="$ACTIVE_WORK/fasten-$FASTEN_VERSION"
+    local cargo_home="$ACTIVE_WORK/cargo-home"
+    local target="$ACTIVE_WORK/target"
+    local build_log="$ACTIVE_WORK/fasten-build.log"
+    download \
+        "https://static.crates.io/crates/fasten/fasten-$FASTEN_VERSION.crate" \
+        "$archive"
+    tar -xzf "$archive" -C "$ACTIVE_WORK"
+    echo "build: fasten $FASTEN_VERSION"
+    if ! CARGO_HOME="$cargo_home" CARGO_TARGET_DIR="$target" \
+        cargo build --locked --release --bin fasten_sample \
+        --manifest-path "$source/Cargo.toml" -j "$TOOL_JOBS" \
+        >"$build_log" 2>&1; then
+        echo "error: Fasten build failed" >&2
+        tail -n 100 "$build_log" >&2
+        return 1
+    fi
+    install -m 755 "$target/release/fasten_sample" "$stage/bin/fasten_sample"
+    printf -v BUILD_DESCRIPTION \
+        'cargo build --locked --release --bin fasten_sample -j %s' \
+        "$TOOL_JOBS"
+}
+
 build_seqfu() {
     local stage="$1"
     local source_archive="$ACTIVE_WORK/seqfu.tar.gz"
@@ -1172,7 +1227,7 @@ build_bbtools() {
     for script in bbversion.sh reformat.sh repair.sh; do
         ln -s "../runtime/$script" "$stage/bin/$script"
     done
-    BUILD_DESCRIPTION='upstream compiled Java classes; source files removed'
+    BUILD_DESCRIPTION='upstream compiled Java classes; source removed'
 }
 
 build_peer() {
@@ -1185,6 +1240,7 @@ build_peer() {
         fqkit) build_fqkit "$stage" ;;
         seqkit) build_seqkit "$stage" ;;
         rasusa) build_rasusa "$stage" ;;
+        fasten) build_fasten "$stage" ;;
         seqfu) build_seqfu "$stage" ;;
         irma-core) build_irma_core "$stage" ;;
         fastqvalidator) build_fastqvalidator "$stage" ;;
@@ -1197,7 +1253,7 @@ build_peer() {
 strip_peer() {
     local name="$1"
     local stage="$2"
-    [[ "$name" != bbtools ]] || return
+    [[ "$name" != bbtools ]] || return 0
 
     strip --strip-all "$stage/bin/$(peer_binaries "$name")"
     BUILD_DESCRIPTION="$BUILD_DESCRIPTION; stripped"
@@ -1223,7 +1279,7 @@ require_peer_commands() {
             require_command cc
             require_command patch
             ;;
-        fqkit)
+        fqkit|fasten)
             require_command cargo
             require_command rustc
             ;;
@@ -1359,7 +1415,7 @@ run_install_target() {
             install_wrappers
             install_peers
             ;;
-        seqtk|fqtools|fq|fqkit|seqkit|rasusa|seqfu|irma-core|fastqvalidator|fastp|bbtools)
+        seqtk|fqtools|fq|fqkit|seqkit|rasusa|fasten|seqfu|irma-core|fastqvalidator|fastp|bbtools)
             install_peer "$1"
             ;;
         *) return 1 ;;
@@ -1376,7 +1432,7 @@ run_check_target() {
             check_wrappers
             check_peers
             ;;
-        seqtk|fqtools|fq|fqkit|seqkit|rasusa|seqfu|irma-core|fastqvalidator|fastp|bbtools)
+        seqtk|fqtools|fq|fqkit|seqkit|rasusa|fasten|seqfu|irma-core|fastqvalidator|fastp|bbtools)
             check_peer "$1"
             ;;
         *) return 1 ;;
