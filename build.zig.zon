@@ -1,6 +1,6 @@
 .{
     .name = .z_fastq,
-    .version = "0.0.12",
+    .version = "0.0.13",
     .fingerprint = 0x87a2d3e31f4c5c5d,
     .minimum_zig_version = "0.16.0",
     .paths = .{

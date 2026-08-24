@@ -30,6 +30,8 @@ The project as a whole is not dependency-free. The accelerated build compiles ve
 ./zig-out/bin/z-fastq check --interleaved [--json] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
 ./zig-out/bin/z-fastq sample --fraction P [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
 ./zig-out/bin/z-fastq sample --count K [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] <path>
+./zig-out/bin/z-fastq sample --paired --fraction P [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
+./zig-out/bin/z-fastq sample --interleaved --fraction P [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
 ./zig-out/bin/z-fastq interleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
 ./zig-out/bin/z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
 ```
@@ -43,6 +45,8 @@ The project as a whole is not dependency-free. The accelerated build compiles ve
 `check --paired` validates two inputs in lock step, and `check --interleaved` validates consecutive records as R1 and R2. The default Illumina name policy recognizes modern second-token mate fields, legacy first-token `/1` and `/2`, and terminal mate suffixes on the second token. Equal unmarked first tokens also pass. `--pair-names exact` instead requires complete first-token equality. P001 reports name or mate-direction disagreement; P002 reports unequal two-file counts or an odd interleaved record. Paired mode accepts standard input on at most one side.
 
 `sample --fraction` selects complete records independently with probability P and writes plain FASTQ with LF endings. P uses the exact decimal grammar documented by `--help`, and the seed is an unsigned 64-bit decimal value that defaults to 11. Selected indexes and output bytes match `seqtk sample` on the screened subset with LF endings, nonempty records, bare plus lines, printable ASCII headers, a signed 64-bit seed, and a P that seqtk also interprets as a fraction. Every record is validated before selection, so fraction 0 cannot hide invalid input. Values that parse to fraction 0 or fraction 1 avoid random-number work.
+
+`sample --paired --fraction` and `sample --interleaved --fraction` make one decision per validated pair and write selected pairs as mate 1 then mate 2 on stdout. Both forms validate every mate and pair relationship even when the pair is not selected. The two-file form permits standard input on one side. Paired exact-count sampling is not implemented.
 
 `sample --count` selects exactly `min(K, N)` records from a regular plain or gzip file containing N valid records. It uses a bounded index reservoir compatible with `seqtk sample -2`, then reopens and validates the file before writing selected records in input order. K is an unsigned 64-bit decimal value. Standard input is rejected because exact mode requires two passes. The command compares file identity, size, modification time, and the two record counts as a best-effort change guard. Concurrent modification that preserves those signals is unsupported. Output is not transactional and may contain a valid prefix if the second pass fails.
 

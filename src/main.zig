@@ -58,6 +58,8 @@ const USAGE =
     \\Sample usage:
     \\  z-fastq sample --fraction P [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
     \\  z-fastq sample --count K [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] path
+    \\  z-fastq sample --paired --fraction P [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
+    \\  z-fastq sample --interleaved --fraction P [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
     \\
     \\Interleave usage:
     \\  z-fastq interleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
@@ -275,7 +277,9 @@ pub fn main(init: std.process.Init) !void {
             };
             continue;
         }
-        if (command == .check and std.mem.eql(u8, arg, "--paired")) {
+        if ((command == .check or command == .sample) and
+            std.mem.eql(u8, arg, "--paired"))
+        {
             if (pair_mode == .interleaved) {
                 std.Io.File.writeStreamingAll(
                     .stderr(),
@@ -287,7 +291,9 @@ pub fn main(init: std.process.Init) !void {
             pair_mode = .paired;
             continue;
         }
-        if (command == .check and std.mem.eql(u8, arg, "--interleaved")) {
+        if ((command == .check or command == .sample) and
+            std.mem.eql(u8, arg, "--interleaved"))
+        {
             if (pair_mode == .paired) {
                 std.Io.File.writeStreamingAll(
                     .stderr(),
@@ -299,7 +305,8 @@ pub fn main(init: std.process.Init) !void {
             pair_mode = .interleaved;
             continue;
         }
-        if ((command == .check or command == .interleave or command == .deinterleave) and
+        if ((command == .check or command == .sample or command == .interleave or
+            command == .deinterleave) and
             std.mem.eql(u8, arg, "--pair-names"))
         {
             const value = args.next() orelse {
@@ -388,6 +395,9 @@ pub fn main(init: std.process.Init) !void {
                 .fraction = fraction,
                 .count = sample_count,
                 .seed = sample_seed,
+                .pair_mode = pair_mode,
+                .pair_name_policy = pair_name_policy,
+                .pair_names_set = pair_names_set,
             },
         ),
         .interleave => runInterleave(io, gpa, positional.items, .{
@@ -1583,6 +1593,9 @@ const SampleOptions = struct {
     fraction: ?sampling.Fraction,
     count: ?u64,
     seed: u64,
+    pair_mode: PairMode = .none,
+    pair_name_policy: pairing.NamePolicy = .illumina,
+    pair_names_set: bool = false,
 };
 
 const SampleMode = union(enum) {
@@ -1616,6 +1629,17 @@ fn runSample(
         ) catch {};
         return 2;
     };
+    if (options.pair_mode != .none) {
+        return runPairedFractionSampleCommand(io, allocator, inputs, mode, options);
+    }
+    if (options.pair_names_set) {
+        std.Io.File.writeStreamingAll(
+            .stderr(),
+            io,
+            "error: --pair-names requires --paired or --interleaved\n",
+        ) catch {};
+        return 2;
+    }
     if (inputs.len != 1) {
         std.Io.File.writeStreamingAll(
             .stderr(),
@@ -1668,6 +1692,314 @@ fn runSample(
         return @max(output_exit, details.exit_code);
     }
     return output_exit;
+}
+
+fn runPairedFractionSampleCommand(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    mode: SampleMode,
+    options: SampleOptions,
+) u8 {
+    const fraction = switch (mode) {
+        .fraction => |fraction| fraction,
+        .count => {
+            std.Io.File.writeStreamingAll(
+                .stderr(),
+                io,
+                "error: paired exact-count sampling is not available\n",
+            ) catch {};
+            return 2;
+        },
+    };
+    const expected_inputs: usize = if (options.pair_mode == .paired) 2 else 1;
+    if (inputs.len != expected_inputs) {
+        const message = if (options.pair_mode == .paired)
+            "error: sample --paired requires exactly two inputs\n"
+        else
+            "error: sample --interleaved requires exactly one input\n";
+        std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
+        return 2;
+    }
+    if (options.pair_mode == .paired and
+        std.mem.eql(u8, inputs[0], "-") and
+        std.mem.eql(u8, inputs[1], "-"))
+    {
+        std.Io.File.writeStreamingAll(
+            .stderr(),
+            io,
+            "error: paired sample inputs may contain standard input at most once\n",
+        ) catch {};
+        return 2;
+    }
+
+    const staging_limit = if (options.pair_mode == .interleaved and fraction != .none)
+        deinterleaveStagingLimit(options.max_line_bytes) catch {
+            std.Io.File.writeStreamingAll(
+                .stderr(),
+                io,
+                "error: sample record staging size exceeds supported limit\n",
+            ) catch {};
+            return 4;
+        }
+    else
+        0;
+
+    var stdout_buffer: [64 * 1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    var sink_adapter = io_layer.WriterSink.init(&stdout_writer.interface);
+    var writer = zfastq.Writer.init(sink_adapter.byteSink());
+    var selector = sampling.Selector.init(fraction, options.seed);
+    const failure = (switch (options.pair_mode) {
+        .none => unreachable,
+        .paired => interleaveInputs(io, allocator, inputs, &writer, .{
+            .max_line_bytes = options.max_line_bytes,
+            .alphabet = options.alphabet,
+            .pair_name_policy = options.pair_name_policy,
+            .selector = &selector,
+        }),
+        .interleaved => sampleInterleavedFractionInput(
+            io,
+            allocator,
+            inputs[0],
+            &writer,
+            &selector,
+            staging_limit,
+            options,
+        ),
+    }) catch {
+        writer.flush() catch {};
+        return 3;
+    };
+
+    var output_exit: u8 = 0;
+    writer.flush() catch {
+        output_exit = 3;
+    };
+    if (failure) |details| {
+        printPairCommandFailure(io, inputs, options.pair_mode, details);
+        return @max(output_exit, details.exitCode());
+    }
+    return output_exit;
+}
+
+fn sampleInterleavedFractionInput(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    input_label: []const u8,
+    writer: *zfastq.Writer,
+    selector: *sampling.Selector,
+    staging_limit: usize,
+    options: SampleOptions,
+) error{WriteFailed}!?PairCommandFailure {
+    var input: RecordInput = undefined;
+    if (initRecordInput(&input, io, input_label)) |failure| {
+        return .{ .command = .{ .input_index = 0, .details = failure } };
+    }
+    defer input.deinit(io);
+
+    var reader = zfastq.Reader.init(
+        allocator,
+        input.byteSource(),
+        .{ .max_line_bytes = options.max_line_bytes },
+    ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
+    defer reader.deinit();
+    var normalized_id: std.ArrayList(u8) = .empty;
+    defer normalized_id.deinit(allocator);
+    var staged_record: std.ArrayList(u8) = .empty;
+    defer staged_record.deinit(allocator);
+    var retained_record_storage: fastq.RetainedRecordStorage = .{};
+    defer retained_record_storage.deinit(allocator);
+
+    const FirstRecordStorage = enum {
+        unused,
+        reader,
+        retained,
+        staged,
+    };
+
+    while (true) {
+        var canonical_span1: ?[]const u8 = null;
+        const record1 = fastq.nextWithoutId(&reader, &canonical_span1) catch |err| {
+            return .{ .command = .{
+                .input_index = 0,
+                .details = mapReaderFailure(&reader, err),
+            } };
+        } orelse return null;
+        const record_index1 = reader.recordIndex() - 1;
+        const offsets1 = reader.currentRecordOffsets().?;
+        const semantic1 = validateCommandRecord(
+            record1,
+            offsets1,
+            record_index1,
+            options.alphabet,
+        );
+
+        var first_token_len: usize = 0;
+        var first_mate_marker: ?u2 = null;
+        var mate1_markers: u2 = 0;
+        var selected = false;
+        if (semantic1 == null) {
+            const name1 = pairing.parseName(record1.header, options.pair_name_policy);
+            normalized_id.clearRetainingCapacity();
+            normalized_id.ensureTotalCapacityPrecise(
+                allocator,
+                name1.normalized_id.len,
+            ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
+            normalized_id.appendSliceAssumeCapacity(name1.normalized_id);
+            first_token_len = name1.first_token.len;
+            first_mate_marker = name1.first_mate_marker;
+            mate1_markers = name1.mate_markers;
+            selected = selector.selectRecord();
+        }
+
+        var canonical_span2: ?[]const u8 = null;
+        var record1_storage: FirstRecordStorage = .unused;
+        const record2 = (if (!selected)
+            fastq.nextWithoutId(&reader, &canonical_span2) catch |err| {
+                return .{ .command = .{
+                    .input_index = 0,
+                    .details = mapReaderFailure(&reader, err),
+                } };
+            }
+        else record: {
+            record1_storage = .reader;
+            const buffered_record2 = fastq.nextBufferedWithoutId(
+                &reader,
+                &canonical_span2,
+            ) catch |err| {
+                return .{ .command = .{
+                    .input_index = 0,
+                    .details = mapReaderFailure(&reader, err),
+                } };
+            };
+            if (buffered_record2) |complete_record2| break :record complete_record2;
+
+            var record2_requires_fallback = false;
+            if (fastq.retainFallbackRecordStorage(
+                &reader,
+                &retained_record_storage,
+                record1,
+            )) {
+                record1_storage = .retained;
+                const transferred_record2 = fastq.nextBufferedAfterFallbackTransfer(
+                    &reader,
+                    &canonical_span2,
+                ) catch |err| {
+                    return .{ .command = .{
+                        .input_index = 0,
+                        .details = mapReaderFailure(&reader, err),
+                    } };
+                };
+                if (transferred_record2) |complete_record2| break :record complete_record2;
+            }
+            stageCanonicalRecord(
+                allocator,
+                &staged_record,
+                record1,
+                canonical_span1,
+                staging_limit,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return pairCommandFailure(
+                    0,
+                    "out_of_memory",
+                    "out of memory",
+                    3,
+                ),
+                error.ArithmeticLimit => return pairCommandFailure(
+                    0,
+                    "arithmetic_limit",
+                    "record staging size exceeds supported limit",
+                    4,
+                ),
+            };
+            if (record1_storage == .retained) {
+                fastq.restoreFallbackRecordStorage(&reader, &retained_record_storage);
+                record2_requires_fallback = true;
+            }
+            record1_storage = .staged;
+            const next_record = if (record2_requires_fallback)
+                fastq.nextFallbackWithoutId(&reader, &canonical_span2)
+            else
+                fastq.nextWithoutId(&reader, &canonical_span2);
+            break :record next_record catch |err| {
+                return .{ .command = .{
+                    .input_index = 0,
+                    .details = mapReaderFailure(&reader, err),
+                } };
+            };
+        }) orelse return .{ .pair = .{ .count_mismatch = .{
+            .pair_index = record_index1 / 2,
+            .remaining_side = 0,
+            .record_indexes = .{
+                record_index1,
+                if (record_index1 == 0) null else record_index1 - 1,
+            },
+        } } };
+
+        if (semantic1) |failure| {
+            return .{ .command = .{ .input_index = 0, .details = failure } };
+        }
+
+        const record_index2 = reader.recordIndex() - 1;
+        const offsets2 = reader.currentRecordOffsets().?;
+        if (validateCommandRecord(
+            record2,
+            offsets2,
+            record_index2,
+            options.alphabet,
+        )) |failure| {
+            return .{ .command = .{ .input_index = 0, .details = failure } };
+        }
+
+        const name1: pairing.Name = .{
+            .first_token = normalized_id.items,
+            .normalized_id = normalized_id.items,
+            .mate_markers = mate1_markers,
+            .first_mate_marker = first_mate_marker,
+        };
+        const name2 = pairing.parseName(record2.header, options.pair_name_policy);
+        if (!pairing.namesMatch(name1, name2)) {
+            return .{ .pair = .{ .name_mismatch = .{
+                .pair_index = record_index1 / 2,
+                .records = .{
+                    .initStored(
+                        normalized_id.items,
+                        first_token_len,
+                        first_mate_marker,
+                        mate1_markers,
+                        record_index1,
+                        offsets1.header,
+                    ),
+                    .init(name2, record_index2, offsets2.header),
+                },
+            } } };
+        }
+        if (!selected) continue;
+
+        switch (record1_storage) {
+            .unused => unreachable,
+            .reader, .retained => {
+                if (canonical_span1) |span| {
+                    fastq.writeCanonicalRecordSpan(writer, span) catch
+                        return error.WriteFailed;
+                } else {
+                    fastq.writeValidatedRecord(writer, record1) catch
+                        return error.WriteFailed;
+                }
+            },
+            .staged => fastq.writeCanonicalRecordSpan(writer, staged_record.items) catch
+                return error.WriteFailed,
+        }
+        if (record1_storage == .retained) {
+            fastq.restoreFallbackRecordStorage(&reader, &retained_record_storage);
+        }
+        if (canonical_span2) |span| {
+            fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
+        } else {
+            fastq.writeValidatedRecord(writer, record2) catch return error.WriteFailed;
+        }
+    }
 }
 
 fn sampleFractionFile(
@@ -2079,6 +2411,7 @@ const InterleaveOptions = struct {
     max_line_bytes: usize,
     alphabet: zfastq.Alphabet,
     pair_name_policy: pairing.NamePolicy,
+    selector: ?*sampling.Selector = null,
 };
 
 fn runInterleave(
@@ -2231,6 +2564,10 @@ fn interleaveInputs(
                     .init(name2, record_index2, offsets2.header),
                 },
             } } };
+        }
+
+        if (options.selector) |selector| {
+            if (!selector.selectRecord()) continue;
         }
 
         if (canonical_span1) |span| {
@@ -3484,6 +3821,53 @@ test "[failure] - [exact sample]: the second pass repeats semantic validation" {
     )).?;
 
     try std.testing.expectEqualStrings("S002", failure.code);
+    try std.testing.expectEqual(@as(usize, 0), sink.written().len);
+}
+
+test "[edge] - [paired fraction sample]: fraction zero does not stage mate one" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var input_bytes: std.ArrayList(u8) = .empty;
+    defer input_bytes.deinit(std.testing.allocator);
+    try input_bytes.appendSlice(std.testing.allocator, "@large/1 ");
+    try input_bytes.appendNTimes(std.testing.allocator, 'x', 128 * 1024);
+    try input_bytes.appendSlice(
+        std.testing.allocator,
+        "\nA\n+\n!\n@large/2\nT\n+\n#\n",
+    );
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pairs.fastq",
+        .data = input_bytes.items,
+    });
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        ".zig-cache/tmp/{s}/pairs.fastq",
+        .{tmp.sub_path},
+    );
+    var output: [1]u8 = undefined;
+    var sink = io_layer.SliceSink.init(&output);
+    var writer = zfastq.Writer.init(sink.byteSink());
+    var selector = sampling.Selector.init(.none, 11);
+
+    const failure = try sampleInterleavedFractionInput(
+        io,
+        std.testing.allocator,
+        path,
+        &writer,
+        &selector,
+        0,
+        .{
+            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+            .alphabet = .iupac,
+            .fraction = .none,
+            .count = null,
+            .seed = 11,
+            .pair_mode = .interleaved,
+        },
+    );
+    try std.testing.expect(failure == null);
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
 }
 
