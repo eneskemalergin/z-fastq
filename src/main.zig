@@ -1838,33 +1838,37 @@ fn sampleInterleavedFractionInput(
         var first_token_len: usize = 0;
         var first_mate_marker: ?u2 = null;
         var mate1_markers: u2 = 0;
-        var selected = false;
-        if (semantic1 == null) {
-            const name1 = pairing.parseName(record1.header, options.pair_name_policy);
-            normalized_id.clearRetainingCapacity();
-            normalized_id.ensureTotalCapacityPrecise(
-                allocator,
-                name1.normalized_id.len,
-            ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
-            normalized_id.appendSliceAssumeCapacity(name1.normalized_id);
-            first_token_len = name1.first_token.len;
-            first_mate_marker = name1.first_mate_marker;
-            mate1_markers = name1.mate_markers;
-            selected = selector.selectRecord();
-        }
+        const selected = semantic1 == null and selector.selectRecord();
 
         var canonical_span2: ?[]const u8 = null;
         var record1_storage: FirstRecordStorage = .unused;
-        const record2 = (if (!selected)
-            fastq.nextWithoutId(&reader, &canonical_span2) catch |err| {
-                return .{ .command = .{
-                    .input_index = 0,
-                    .details = mapReaderFailure(&reader, err),
-                } };
+        const buffered_record2 = fastq.nextBufferedWithoutId(
+            &reader,
+            &canonical_span2,
+        ) catch |err| {
+            return .{ .command = .{
+                .input_index = 0,
+                .details = mapReaderFailure(&reader, err),
+            } };
+        };
+        const both_headers_borrowed = buffered_record2 != null;
+        const record2 = (if (buffered_record2) |complete_record2| buffered: {
+            if (selected) record1_storage = .reader;
+            break :buffered complete_record2;
+        } else record: {
+            if (semantic1 == null) {
+                const name1 = pairing.parseName(record1.header, options.pair_name_policy);
+                normalized_id.clearRetainingCapacity();
+                normalized_id.ensureTotalCapacityPrecise(
+                    allocator,
+                    name1.normalized_id.len,
+                ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
+                normalized_id.appendSliceAssumeCapacity(name1.normalized_id);
+                first_token_len = name1.first_token.len;
+                first_mate_marker = name1.first_mate_marker;
+                mate1_markers = name1.mate_markers;
             }
-        else record: {
-            record1_storage = .reader;
-            const buffered_record2 = fastq.nextBufferedWithoutId(
+            if (!selected) break :record fastq.nextWithoutId(
                 &reader,
                 &canonical_span2,
             ) catch |err| {
@@ -1873,8 +1877,8 @@ fn sampleInterleavedFractionInput(
                     .details = mapReaderFailure(&reader, err),
                 } };
             };
-            if (buffered_record2) |complete_record2| break :record complete_record2;
 
+            record1_storage = .reader;
             var record2_requires_fallback = false;
             if (fastq.retainFallbackRecordStorage(
                 &reader,
@@ -1952,28 +1956,46 @@ fn sampleInterleavedFractionInput(
             return .{ .command = .{ .input_index = 0, .details = failure } };
         }
 
-        const name1: pairing.Name = .{
-            .first_token = normalized_id.items,
-            .normalized_id = normalized_id.items,
-            .mate_markers = mate1_markers,
-            .first_mate_marker = first_mate_marker,
-        };
-        const name2 = pairing.parseName(record2.header, options.pair_name_policy);
-        if (!pairing.namesMatch(name1, name2)) {
-            return .{ .pair = .{ .name_mismatch = .{
-                .pair_index = record_index1 / 2,
-                .records = .{
-                    .initStored(
-                        normalized_id.items,
-                        first_token_len,
-                        first_mate_marker,
-                        mate1_markers,
-                        record_index1,
-                        offsets1.header,
-                    ),
-                    .init(name2, record_index2, offsets2.header),
-                },
-            } } };
+        if (both_headers_borrowed) {
+            if (!pairing.headersMatch(
+                record1.header,
+                record2.header,
+                options.pair_name_policy,
+            )) {
+                const name1 = pairing.parseName(record1.header, options.pair_name_policy);
+                const name2 = pairing.parseName(record2.header, options.pair_name_policy);
+                return .{ .pair = .{ .name_mismatch = .{
+                    .pair_index = record_index1 / 2,
+                    .records = .{
+                        .init(name1, record_index1, offsets1.header),
+                        .init(name2, record_index2, offsets2.header),
+                    },
+                } } };
+            }
+        } else {
+            const name1: pairing.Name = .{
+                .first_token = normalized_id.items,
+                .normalized_id = normalized_id.items,
+                .mate_markers = mate1_markers,
+                .first_mate_marker = first_mate_marker,
+            };
+            const name2 = pairing.parseName(record2.header, options.pair_name_policy);
+            if (!pairing.namesMatch(name1, name2)) {
+                return .{ .pair = .{ .name_mismatch = .{
+                    .pair_index = record_index1 / 2,
+                    .records = .{
+                        .initStored(
+                            normalized_id.items,
+                            first_token_len,
+                            first_mate_marker,
+                            mate1_markers,
+                            record_index1,
+                            offsets1.header,
+                        ),
+                        .init(name2, record_index2, offsets2.header),
+                    },
+                } } };
+            }
         }
         if (!selected) continue;
 
@@ -3824,7 +3846,7 @@ test "[failure] - [exact sample]: the second pass repeats semantic validation" {
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
 }
 
-test "[edge] - [paired fraction sample]: fraction zero does not stage mate one" {
+test "[edge] - [paired fraction sample]: fraction zero keeps buffered mate one borrowed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3850,10 +3872,13 @@ test "[edge] - [paired fraction sample]: fraction zero does not stage mate one" 
     var sink = io_layer.SliceSink.init(&output);
     var writer = zfastq.Writer.init(sink.byteSink());
     var selector = sampling.Selector.init(.none, 11);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 2,
+    });
 
     const failure = try sampleInterleavedFractionInput(
         io,
-        std.testing.allocator,
+        failing.allocator(),
         path,
         &writer,
         &selector,
@@ -3868,6 +3893,7 @@ test "[edge] - [paired fraction sample]: fraction zero does not stage mate one" 
         },
     );
     try std.testing.expect(failure == null);
+    try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
 }
 

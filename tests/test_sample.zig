@@ -793,6 +793,7 @@ test "[cli] - [paired fraction sample]: failing pairs leave only earlier complet
     defer tmp.cleanup();
     const r1_path = try tempPath(allocator, &tmp.sub_path, "r1.fastq");
     const r2_path = try tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    const pairs_path = try tempPath(allocator, &tmp.sub_path, "pairs.fastq");
     const first_pair = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n";
 
     try tmp.dir.writeFile(io, .{
@@ -847,6 +848,34 @@ test "[cli] - [paired fraction sample]: failing pairs leave only earlier complet
     );
 
     try tmp.dir.writeFile(io, .{
+        .sub_path = "pairs.fastq",
+        .data = "@left/1\nA\n+\n!\n@right/2\nT\n+\n#\n",
+    });
+    const buffered_mismatch = try std.fmt.allocPrint(
+        allocator,
+        "error: {s}: P001: paired identifiers or mate markers do not match (pair 0)\n" ++
+            "  R1: input={s}, record=0, offset=0, first_token=left/1 " ++
+            "[length=6, truncated=false], normalized_id=left " ++
+            "[length=4, truncated=false], mate_markers=1\n" ++
+            "  R2: input={s}, record=1, offset=14, first_token=right/2 " ++
+            "[length=7, truncated=false], normalized_id=right " ++
+            "[length=5, truncated=false], mate_markers=2\n",
+        .{ pairs_path, pairs_path, pairs_path },
+    );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--interleaved",
+            "--fraction",
+            "0",
+            pairs_path,
+        }),
+        1,
+        "",
+        buffered_mismatch,
+    );
+
+    try tmp.dir.writeFile(io, .{
         .sub_path = "r1.fastq",
         .data = "@ok/1\nA\n+\n!\n@bad/1\nC\n+\n$\n",
     });
@@ -884,6 +913,29 @@ test "[cli] - [paired fraction sample]: failing pairs leave only earlier complet
         "",
         "error: -: S002: sequence byte is outside the selected alphabet " ++
             "(record 1, line 2, offset 20)\n",
+    );
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pairs.fastq",
+        .data = "@bad/1\n.\n+\n!\n@bad/2\nA\nx\n!\n",
+    });
+    const buffered_precedence = try std.fmt.allocPrint(
+        allocator,
+        "error: {s}: S001: plus line must start with '+' " ++
+            "(record 1, line 3, offset 22)\n",
+        .{pairs_path},
+    );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--interleaved",
+            "--fraction",
+            "0",
+            pairs_path,
+        }),
+        1,
+        "",
+        buffered_precedence,
     );
 
     try tmp.dir.writeFile(io, .{
