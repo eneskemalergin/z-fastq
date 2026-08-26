@@ -996,7 +996,7 @@ test "[integration] - [paired fraction sample]: gzip, stdin layouts, and source 
     );
 }
 
-test "[cli] - [paired fraction sample]: failing pairs leave only earlier complete pairs" {
+test "[cli] - [paired sample]: failing pairs leave only earlier complete pairs" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1352,7 +1352,7 @@ test "[cli] - [paired fraction sample]: failing pairs leave only earlier complet
     );
 }
 
-test "[edge] - [paired fraction sample]: refill-spanning 512 KiB mates preserve output" {
+test "[edge] - [paired sample]: refill-spanning 512 KiB mates preserve output" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1436,7 +1436,7 @@ test "[edge] - [paired fraction sample]: refill-spanning 512 KiB mates preserve 
     );
 }
 
-test "[cli] - [paired fraction sample]: arguments and output failures retain their classes" {
+test "[cli] - [paired sample]: arguments and output failures retain their classes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
