@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(bool, "use_isa_l", use_isa_l);
 
-    const lib_module = b.createModule(.{
+    const lib_module = b.addModule("z-fastq", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -303,12 +303,12 @@ fn addIsaLAssembly(b: *std.Build, output_name: []const u8, source: []const u8) s
         "-f",
         "elf64",
         "-DINTEL_CET_ENABLED",
-        "-Ivendor/ISA-L/",
-        "-Ivendor/ISA-L/crc/",
-        "-Ivendor/ISA-L/igzip/",
-        "-Ivendor/ISA-L/include/",
-        "-o",
     });
+    assemble.addPrefixedDirectoryArg("-I", b.path("vendor/ISA-L"));
+    assemble.addPrefixedDirectoryArg("-I", b.path("vendor/ISA-L/crc"));
+    assemble.addPrefixedDirectoryArg("-I", b.path("vendor/ISA-L/igzip"));
+    assemble.addPrefixedDirectoryArg("-I", b.path("vendor/ISA-L/include"));
+    assemble.addArg("-o");
     const output = assemble.addOutputFileArg(output_name);
     assemble.addFileArg(b.path(b.fmt("vendor/ISA-L/{s}", .{source})));
     const includes = [_][]const u8{

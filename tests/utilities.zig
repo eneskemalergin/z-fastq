@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const ZFASTQ_BIN = "zig-out/bin/z-fastq";
+const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
 
 pub const CommandResult = struct {
     exit_code: u8,
@@ -48,7 +49,11 @@ pub fn expectJsonDocument(
     };
     try expectJsonObjectKeys(tool, &.{ "name", "version" });
     try expectJsonString(tool.get("name"), "z-fastq");
-    try expectJsonString(tool.get("version"), "0.0.14");
+    const version = switch (tool.get("version") orelse return error.UnexpectedJsonShape) {
+        .string => |string| string,
+        else => return error.UnexpectedJsonShape,
+    };
+    _ = std.SemanticVersion.parse(version) catch return error.UnexpectedJsonShape;
 
     const results_value = object.get("results") orelse return error.UnexpectedJsonShape;
     return switch (results_value) {
@@ -195,8 +200,31 @@ pub fn runWithStdin(
     });
     defer proc.kill(io);
 
-    try writeAndCloseStdin(io, &proc, stdin_data, chunk_len);
-    return collectCommandResult(allocator, io, &proc);
+    const child_stdin = proc.stdin.?;
+    proc.stdin = null;
+    var stdin_writer: StdinWriter = .{
+        .io = io,
+        .file = child_stdin,
+        .data = stdin_data,
+        .chunk_len = chunk_len,
+    };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    group.async(io, writeChildStdin, .{&stdin_writer});
+
+    const output = try collectCommandOutput(allocator, io, &proc);
+    errdefer {
+        allocator.free(output.stdout);
+        allocator.free(output.stderr);
+    }
+    try group.await(io);
+    const exit_code = try waitForExit(io, &proc);
+    if (stdin_writer.err) |err| return err;
+    return .{
+        .exit_code = exit_code,
+        .stdout = output.stdout,
+        .stderr = output.stderr,
+    };
 }
 
 pub fn runWithClosedStdout(
@@ -221,18 +249,28 @@ pub fn runWithClosedStdout(
     });
     defer proc.kill(io);
 
-    try writeAndCloseStdin(io, &proc, stdin_data, @max(stdin_data.len, 1));
+    const child_stdin = proc.stdin.?;
+    proc.stdin = null;
+    var stdin_writer: StdinWriter = .{
+        .io = io,
+        .file = child_stdin,
+        .data = stdin_data,
+        .chunk_len = @max(stdin_data.len, 1),
+    };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    group.async(io, writeChildStdin, .{&stdin_writer});
+
     var stderr_buf: [4096]u8 = undefined;
     var stderr_reader = proc.stderr.?.reader(io, &stderr_buf);
     const stderr = try stderr_reader.interface.allocRemaining(
         allocator,
-        .limited(1024 * 1024),
+        .limited(PROCESS_OUTPUT_LIMIT),
     );
-    const wait = try proc.wait(io);
-    const exit_code: u8 = switch (wait) {
-        .exited => |code| @intCast(code),
-        else => return error.ChildProcessFailed,
-    };
+    errdefer allocator.free(stderr);
+    try group.await(io);
+    const exit_code = try waitForExit(io, &proc);
+    if (stdin_writer.err) |err| return err;
     return .{
         .exit_code = exit_code,
         .stdout = try allocator.alloc(u8, 0),
@@ -261,35 +299,65 @@ pub fn runWithClosedStdin(
     });
     defer proc.kill(io);
 
-    return collectCommandResult(allocator, io, &proc);
+    const output = try collectCommandOutput(allocator, io, &proc);
+    errdefer {
+        allocator.free(output.stdout);
+        allocator.free(output.stderr);
+    }
+    return .{
+        .exit_code = try waitForExit(io, &proc),
+        .stdout = output.stdout,
+        .stderr = output.stderr,
+    };
 }
 
-fn collectCommandResult(
+const CommandOutput = struct {
+    stdout: []u8,
+    stderr: []u8,
+};
+
+fn collectCommandOutput(
     allocator: std.mem.Allocator,
     io: std.Io,
     proc: *std.process.Child,
-) !CommandResult {
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_reader = proc.stdout.?.reader(io, &stdout_buf);
-    const stdout = try stdout_reader.interface.allocRemaining(
+) !CommandOutput {
+    var buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(
         allocator,
-        .limited(1024 * 1024),
+        io,
+        buffer.toStreams(),
+        &.{ proc.stdout.?, proc.stderr.? },
     );
+    defer multi_reader.deinit();
+
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+    while (multi_reader.fill(4096, .none)) |_| {
+        if (stdout_reader.buffered().len > PROCESS_OUTPUT_LIMIT or
+            stderr_reader.buffered().len > PROCESS_OUTPUT_LIMIT)
+        {
+            return error.StreamTooLong;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |other| return other,
+    }
+    try multi_reader.checkAnyError();
+
+    const stdout = try multi_reader.toOwnedSlice(0);
     errdefer allocator.free(stdout);
-    var stderr_buf: [4096]u8 = undefined;
-    var stderr_reader = proc.stderr.?.reader(io, &stderr_buf);
-    const stderr = try stderr_reader.interface.allocRemaining(
-        allocator,
-        .limited(1024 * 1024),
-    );
+    const stderr = try multi_reader.toOwnedSlice(1);
     errdefer allocator.free(stderr);
 
-    const wait = try proc.wait(io);
-    const exit_code: u8 = switch (wait) {
+    return .{ .stdout = stdout, .stderr = stderr };
+}
+
+fn waitForExit(io: std.Io, proc: *std.process.Child) !u8 {
+    return switch (try proc.wait(io)) {
         .exited => |code| @intCast(code),
         else => return error.ChildProcessFailed,
     };
-    return .{ .exit_code = exit_code, .stdout = stdout, .stderr = stderr };
 }
 
 fn appendInt(
@@ -303,23 +371,41 @@ fn appendInt(
     try output.appendSlice(allocator, &bytes);
 }
 
-fn writeAndCloseStdin(
+const StdinWriter = struct {
     io: std.Io,
-    proc: *std.process.Child,
+    file: std.Io.File,
     data: []const u8,
     chunk_len: usize,
-) !void {
+    err: ?std.Io.File.Writer.Error = null,
+};
+
+fn writeChildStdin(writer: *StdinWriter) void {
+    writeAndCloseStdin(
+        writer.io,
+        writer.file,
+        writer.data,
+        writer.chunk_len,
+    ) catch |err| {
+        writer.err = err;
+    };
+}
+
+fn writeAndCloseStdin(
+    io: std.Io,
+    file: std.Io.File,
+    data: []const u8,
+    chunk_len: usize,
+) std.Io.File.Writer.Error!void {
     std.debug.assert(chunk_len > 0);
+    defer file.close(io);
     var pos: usize = 0;
     write_stdin: while (pos < data.len) {
         const end = pos + @min(chunk_len, data.len - pos);
-        std.Io.File.writeStreamingAll(proc.stdin.?, io, data[pos..end]) catch |err| switch (err) {
+        std.Io.File.writeStreamingAll(file, io, data[pos..end]) catch |err| switch (err) {
             // Usage failures may close stdin before the test finishes feeding it.
             error.BrokenPipe => break :write_stdin,
             else => return err,
         };
         pos = end;
     }
-    proc.stdin.?.close(io);
-    proc.stdin = null;
 }

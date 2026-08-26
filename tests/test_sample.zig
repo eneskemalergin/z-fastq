@@ -1621,6 +1621,23 @@ test "[cli] - [sample]: a later malformed record leaves the selected prefix" {
     );
 }
 
+test "[cli] - [sample]: piped input and output make progress together" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var input: std.ArrayList(u8) = .empty;
+    for (0..8192) |_| try input.appendSlice(allocator, "@r\nACGT\n+\n!!!!\n");
+    const result = try cli.runWithStdin(
+        allocator,
+        &.{ "sample", "--fraction", "1", "-" },
+        input.items,
+        4096,
+    );
+
+    try expectResult(result, 0, input.items, "");
+}
+
 test "[cli] - [sample]: numeric grammar maps to exact exit classes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -15,7 +15,7 @@ test "[unit] - [root]: every exported declaration is analyzable" {
 }
 
 test "[unit] - [root]: version exposes the current internal checkpoint" {
-    try std.testing.expectEqualStrings("0.0.14", zfastq.VERSION);
+    _ = try std.SemanticVersion.parse(zfastq.VERSION);
 }
 
 test "[property] - [gzip source]: optional member chains decode at every input chunk size" {

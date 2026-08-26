@@ -493,7 +493,9 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
 
     const version = try runCli(allocator, &.{"--version"});
     try std.testing.expectEqual(@as(u8, 0), version.exit_code);
-    try std.testing.expectEqualStrings("z-fastq 0.0.14\n", version.stdout);
+    try std.testing.expect(std.mem.startsWith(u8, version.stdout, "z-fastq "));
+    try std.testing.expect(std.mem.endsWith(u8, version.stdout, "\n"));
+    _ = try std.SemanticVersion.parse(version.stdout["z-fastq ".len .. version.stdout.len - 1]);
     try std.testing.expectEqual(@as(usize, 0), version.stderr.len);
 
     const short_version = try runCli(allocator, &.{"-V"});

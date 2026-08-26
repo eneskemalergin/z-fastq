@@ -1,6 +1,6 @@
 # z-fastq
 
-Fast Zig CLI for streaming FASTQ work, with a secondary library surface.
+Fast, single-core Zig CLI for streaming FASTQ work.
 
 ## Build
 
@@ -60,9 +60,9 @@ Paired and interleaved sampling treat each validated pair as one selection unit 
 
 Exit status 1 reports invalid FASTQ, 2 reports command-line usage, 3 reports I/O or unexpected allocation failure, and 4 reports configured or arithmetic limits. Untrusted command, option, and path bytes are displayed using printable ASCII, doubled backslashes, and uppercase `\xHH` escapes for all other bytes.
 
-## Secondary library surface
+## Optional Zig module
 
-The current secondary surface is exported from `src/root.zig`; package-manager registration is planned. It provides `Reader`, `Writer`, borrowed `Record`, `OwnedRecord`, structural and semantic diagnostics, allocation-free record validation with `validateRecord()`, `count_scan`, the checked allocation-free `Stats` accumulator, plain and gzip `io` adapters, shared `limits`, and `VERSION`.
+The CLI is the primary product. The tertiary Zig surface is exported from `src/root.zig` and registered as the `z-fastq` package module. It provides `Reader`, `Writer`, borrowed `Record`, `OwnedRecord`, structural and semantic diagnostics, allocation-free record validation with `validateRecord()`, `count_scan`, the checked allocation-free `Stats` accumulator, plain and gzip `io` adapters, shared `limits`, and `VERSION`.
 
 Records returned by `Reader.next()` borrow reader storage until the next reader advance or deinitialization. Use `toOwned()` and later `OwnedRecord.deinit()` when a record must outlive that boundary. Byte-source and byte-sink wrappers are copied, but their referenced adapters must outlive the reader or writer. `io.gzip.ReaderSource` validates RFC 1952 headers, DEFLATE payloads, trailers, and concatenated members while borrowing a `std.Io.Reader` with at least ten buffer bytes.
 
