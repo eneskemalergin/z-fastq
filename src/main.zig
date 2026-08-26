@@ -41,7 +41,7 @@ const USAGE =
     \\
     \\Sample options:
     \\  --fraction P         Use 0, 1, 0.DIGITS, or 1.ZEROES
-    \\  --count K            Select exactly min(K, records) from a file
+    \\  --count K            Select exactly min(K, records or pairs) from paths
     \\  --seed S             Use an unsigned decimal u64 seed (default 11)
     \\
     \\Count usage:
@@ -60,6 +60,8 @@ const USAGE =
     \\  z-fastq sample --count K [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] path
     \\  z-fastq sample --paired --fraction P [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
     \\  z-fastq sample --interleaved --fraction P [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
+    \\  z-fastq sample --paired --count K [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] R1-path R2-path
+    \\  z-fastq sample --interleaved --count K [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] path
     \\
     \\Interleave usage:
     \\  z-fastq interleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
@@ -1022,15 +1024,31 @@ fn checkPaired(
     }
     defer input2.deinit(io);
 
-    var reader1 = zfastq.Reader.init(
+    return checkPairedSources(
         allocator,
         input1.byteSource(),
+        input2.byteSource(),
+        options,
+        null,
+    );
+}
+
+fn checkPairedSources(
+    allocator: std.mem.Allocator,
+    source1: zfastq.io.ByteSource,
+    source2: zfastq.io.ByteSource,
+    options: PairedCheckOptions,
+    exact_selector: ?*sampling.ExactSelector,
+) ?PairCommandFailure {
+    var reader1 = zfastq.Reader.init(
+        allocator,
+        source1,
         .{ .max_line_bytes = options.max_line_bytes },
     ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
     defer reader1.deinit();
     var reader2 = zfastq.Reader.init(
         allocator,
-        input2.byteSource(),
+        source2,
         .{ .max_line_bytes = options.max_line_bytes },
     ) catch return pairCommandFailure(1, "out_of_memory", "out of memory", 3);
     defer reader2.deinit();
@@ -1092,6 +1110,12 @@ fn checkPaired(
                 },
             } } };
         }
+
+        if (exact_selector) |selector| {
+            selector.considerRecord(allocator, reader1.recordIndex()) catch |err| {
+                return exactPairSelectionFailure(err);
+            };
+        }
     }
 }
 
@@ -1107,9 +1131,23 @@ fn checkInterleaved(
     }
     defer input.deinit(io);
 
-    var reader = zfastq.Reader.init(
+    return checkInterleavedSource(
         allocator,
         input.byteSource(),
+        options,
+        null,
+    );
+}
+
+fn checkInterleavedSource(
+    allocator: std.mem.Allocator,
+    source: zfastq.io.ByteSource,
+    options: PairedCheckOptions,
+    exact_selector: ?*sampling.ExactSelector,
+) ?PairCommandFailure {
+    var reader = zfastq.Reader.init(
+        allocator,
+        source,
         .{ .max_line_bytes = options.max_line_bytes },
     ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
     defer reader.deinit();
@@ -1189,7 +1227,25 @@ fn checkInterleaved(
                 },
             } } };
         }
+
+        if (exact_selector) |selector| {
+            selector.considerRecord(allocator, reader.recordIndex() / 2) catch |err| {
+                return exactPairSelectionFailure(err);
+            };
+        }
     }
+}
+
+fn exactPairSelectionFailure(err: sampling.ReservoirError) PairCommandFailure {
+    return switch (err) {
+        error.OutOfMemory => pairCommandFailure(0, "out_of_memory", "out of memory", 3),
+        error.Overflow => pairCommandFailure(
+            0,
+            "arithmetic_limit",
+            "sample index storage exceeds supported limit",
+            4,
+        ),
+    };
 }
 
 fn initRecordInput(
@@ -1603,6 +1659,39 @@ const SampleMode = union(enum) {
     count: u64,
 };
 
+const ExactPairOutputCursor = struct {
+    select_all: bool,
+    indexes: []const u64,
+    selected_cursor: usize = 0,
+    pair_count: u64 = 0,
+
+    fn selectPair(self: *ExactPairOutputCursor, pair_number: u64) bool {
+        self.pair_count = pair_number;
+        if (self.select_all) return true;
+        if (self.selected_cursor == self.indexes.len or
+            self.indexes[self.selected_cursor] != pair_number)
+        {
+            return false;
+        }
+        self.selected_cursor += 1;
+        return true;
+    }
+};
+
+const PairOutputSelector = union(enum) {
+    all,
+    fraction: *sampling.Selector,
+    exact: *ExactPairOutputCursor,
+
+    fn selectPair(self: *PairOutputSelector, pair_number: u64) bool {
+        return switch (self.*) {
+            .all => true,
+            .fraction => |selector| selector.selectRecord(),
+            .exact => |cursor| cursor.selectPair(pair_number),
+        };
+    }
+};
+
 fn runSample(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1630,7 +1719,7 @@ fn runSample(
         return 2;
     };
     if (options.pair_mode != .none) {
-        return runPairedFractionSampleCommand(io, allocator, inputs, mode, options);
+        return runPairSampleCommand(io, allocator, inputs, mode, options);
     }
     if (options.pair_names_set) {
         std.Io.File.writeStreamingAll(
@@ -1694,24 +1783,13 @@ fn runSample(
     return output_exit;
 }
 
-fn runPairedFractionSampleCommand(
+fn runPairSampleCommand(
     io: std.Io,
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
     mode: SampleMode,
     options: SampleOptions,
 ) u8 {
-    const fraction = switch (mode) {
-        .fraction => |fraction| fraction,
-        .count => {
-            std.Io.File.writeStreamingAll(
-                .stderr(),
-                io,
-                "error: paired exact-count sampling is not available\n",
-            ) catch {};
-            return 2;
-        },
-    };
     const expected_inputs: usize = if (options.pair_mode == .paired) 2 else 1;
     if (inputs.len != expected_inputs) {
         const message = if (options.pair_mode == .paired)
@@ -1721,50 +1799,76 @@ fn runPairedFractionSampleCommand(
         std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
         return 2;
     }
-    if (options.pair_mode == .paired and
-        std.mem.eql(u8, inputs[0], "-") and
-        std.mem.eql(u8, inputs[1], "-"))
-    {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: paired sample inputs may contain standard input at most once\n",
-        ) catch {};
-        return 2;
-    }
-
-    const staging_limit = if (options.pair_mode == .interleaved and fraction != .none)
-        deinterleaveStagingLimit(options.max_line_bytes) catch {
+    switch (mode) {
+        .count => {
+            for (inputs) |input| {
+                if (!std.mem.eql(u8, input, "-")) continue;
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: paired exact-count sampling requires file paths\n",
+                ) catch {};
+                return 2;
+            }
+        },
+        .fraction => if (options.pair_mode == .paired and
+            std.mem.eql(u8, inputs[0], "-") and
+            std.mem.eql(u8, inputs[1], "-"))
+        {
             std.Io.File.writeStreamingAll(
                 .stderr(),
                 io,
-                "error: sample record staging size exceeds supported limit\n",
+                "error: paired sample inputs may contain standard input at most once\n",
             ) catch {};
-            return 4;
-        }
-    else
-        0;
+            return 2;
+        },
+    }
 
     var stdout_buffer: [64 * 1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     var sink_adapter = io_layer.WriterSink.init(&stdout_writer.interface);
     var writer = zfastq.Writer.init(sink_adapter.byteSink());
-    var selector = sampling.Selector.init(fraction, options.seed);
-    const failure = (switch (options.pair_mode) {
-        .none => unreachable,
-        .paired => interleaveInputs(io, allocator, inputs, &writer, .{
-            .max_line_bytes = options.max_line_bytes,
-            .alphabet = options.alphabet,
-            .pair_name_policy = options.pair_name_policy,
-            .selector = &selector,
-        }),
-        .interleaved => sampleInterleavedFractionInput(
+    const failure = (switch (mode) {
+        .fraction => |fraction| blk: {
+            const staging_limit = if (options.pair_mode == .interleaved and
+                fraction != .none)
+                deinterleaveStagingLimit(options.max_line_bytes) catch {
+                    std.Io.File.writeStreamingAll(
+                        .stderr(),
+                        io,
+                        "error: sample record staging size exceeds supported limit\n",
+                    ) catch {};
+                    return 4;
+                }
+            else
+                0;
+            var selector = sampling.Selector.init(fraction, options.seed);
+            var output_selector: PairOutputSelector = .{ .fraction = &selector };
+            break :blk switch (options.pair_mode) {
+                .none => unreachable,
+                .paired => interleaveInputs(io, allocator, inputs, &writer, .{
+                    .max_line_bytes = options.max_line_bytes,
+                    .alphabet = options.alphabet,
+                    .pair_name_policy = options.pair_name_policy,
+                    .selection = output_selector,
+                }),
+                .interleaved => sampleInterleavedFractionInput(
+                    io,
+                    allocator,
+                    inputs[0],
+                    &writer,
+                    &output_selector,
+                    staging_limit,
+                    options,
+                ),
+            };
+        },
+        .count => |count| sampleExactPairs(
             io,
             allocator,
-            inputs[0],
+            inputs,
             &writer,
-            &selector,
-            staging_limit,
+            count,
             options,
         ),
     }) catch {
@@ -1788,7 +1892,7 @@ fn sampleInterleavedFractionInput(
     allocator: std.mem.Allocator,
     input_label: []const u8,
     writer: *zfastq.Writer,
-    selector: *sampling.Selector,
+    selection: *PairOutputSelector,
     staging_limit: usize,
     options: SampleOptions,
 ) error{WriteFailed}!?PairCommandFailure {
@@ -1798,9 +1902,27 @@ fn sampleInterleavedFractionInput(
     }
     defer input.deinit(io);
 
-    var reader = zfastq.Reader.init(
+    return sampleInterleavedSource(
         allocator,
         input.byteSource(),
+        writer,
+        selection,
+        staging_limit,
+        options,
+    );
+}
+
+fn sampleInterleavedSource(
+    allocator: std.mem.Allocator,
+    source: zfastq.io.ByteSource,
+    writer: *zfastq.Writer,
+    selection: *PairOutputSelector,
+    staging_limit: usize,
+    options: SampleOptions,
+) error{WriteFailed}!?PairCommandFailure {
+    var reader = zfastq.Reader.init(
+        allocator,
+        source,
         .{ .max_line_bytes = options.max_line_bytes },
     ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
     defer reader.deinit();
@@ -1838,7 +1960,8 @@ fn sampleInterleavedFractionInput(
         var first_token_len: usize = 0;
         var first_mate_marker: ?u2 = null;
         var mate1_markers: u2 = 0;
-        const selected = semantic1 == null and selector.selectRecord();
+        const selected = semantic1 == null and
+            selection.selectPair(record_index1 / 2 + 1);
 
         var canonical_span2: ?[]const u8 = null;
         var record1_storage: FirstRecordStorage = .unused;
@@ -2427,13 +2550,405 @@ fn inputChangedFailure() CommandFailure {
     );
 }
 
+const ExactPairSnapshots = union(enum) {
+    paired: [2]FileSnapshot,
+    interleaved: FileSnapshot,
+};
+
+const ExactPairFirstPass = union(enum) {
+    success: struct {
+        snapshots: ExactPairSnapshots,
+        pair_count: u64,
+    },
+    failure: PairCommandFailure,
+};
+
+const ExactPairInput = union(enum) {
+    success: FileSnapshot,
+    failure: CommandFailure,
+};
+
+fn sampleExactPairs(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    writer: *zfastq.Writer,
+    count: u64,
+    options: SampleOptions,
+) error{WriteFailed}!?PairCommandFailure {
+    var selector = sampling.ExactSelector.init(count, options.seed);
+    defer selector.deinit(allocator);
+
+    const first = sampleExactPairFirstPass(io, allocator, inputs, &selector, options);
+    const completed = switch (first) {
+        .failure => |failure| return failure,
+        .success => |success| success,
+    };
+    return switch (selector.finish()) {
+        .none => null,
+        .all => sampleExactPairSecondPass(
+            true,
+            io,
+            allocator,
+            inputs,
+            writer,
+            &.{},
+            completed.snapshots,
+            completed.pair_count,
+            options,
+        ),
+        .indexes => |indexes| sampleExactPairSecondPass(
+            false,
+            io,
+            allocator,
+            inputs,
+            writer,
+            indexes,
+            completed.snapshots,
+            completed.pair_count,
+            options,
+        ),
+    };
+}
+
+fn sampleExactPairFirstPass(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    selector: *sampling.ExactSelector,
+    options: SampleOptions,
+) ExactPairFirstPass {
+    const pair_options = PairedCheckOptions{
+        .max_line_bytes = options.max_line_bytes,
+        .alphabet = options.alphabet,
+        .pair_mode = options.pair_mode,
+        .pair_name_policy = options.pair_name_policy,
+    };
+    return switch (options.pair_mode) {
+        .none => unreachable,
+        .paired => sampleExactPairedFirstPass(
+            io,
+            allocator,
+            inputs,
+            selector,
+            pair_options,
+        ),
+        .interleaved => sampleExactInterleavedFirstPass(
+            io,
+            allocator,
+            inputs[0],
+            selector,
+            pair_options,
+        ),
+    };
+}
+
+fn sampleExactPairedFirstPass(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    selector: *sampling.ExactSelector,
+    options: PairedCheckOptions,
+) ExactPairFirstPass {
+    var input1: RecordInput = undefined;
+    const snapshot1 = switch (initExactPairInput(&input1, io, inputs[0], null)) {
+        .failure => |failure| return .{ .failure = .{ .command = .{
+            .input_index = 0,
+            .details = failure,
+        } } },
+        .success => |snapshot| snapshot,
+    };
+    defer input1.deinit(io);
+
+    var input2: RecordInput = undefined;
+    const snapshot2 = switch (initExactPairInput(&input2, io, inputs[1], null)) {
+        .failure => |failure| return .{ .failure = .{ .command = .{
+            .input_index = 1,
+            .details = failure,
+        } } },
+        .success => |snapshot| snapshot,
+    };
+    defer input2.deinit(io);
+
+    const failure = checkPairedSources(
+        allocator,
+        input1.byteSource(),
+        input2.byteSource(),
+        options,
+        selector,
+    );
+    if (exactPairSnapshotFailure(&input1, io, snapshot1, 0)) |changed| {
+        return .{ .failure = changed };
+    }
+    if (exactPairSnapshotFailure(&input2, io, snapshot2, 1)) |changed| {
+        return .{ .failure = changed };
+    }
+    if (failure) |details| return .{ .failure = details };
+    return .{ .success = .{
+        .snapshots = .{ .paired = .{ snapshot1, snapshot2 } },
+        .pair_count = selector.record_count,
+    } };
+}
+
+fn sampleExactInterleavedFirstPass(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    selector: *sampling.ExactSelector,
+    options: PairedCheckOptions,
+) ExactPairFirstPass {
+    var input: RecordInput = undefined;
+    const snapshot = switch (initExactPairInput(&input, io, path, null)) {
+        .failure => |failure| return .{ .failure = .{ .command = .{
+            .input_index = 0,
+            .details = failure,
+        } } },
+        .success => |captured| captured,
+    };
+    defer input.deinit(io);
+
+    const failure = checkInterleavedSource(
+        allocator,
+        input.byteSource(),
+        options,
+        selector,
+    );
+    if (exactPairSnapshotFailure(&input, io, snapshot, 0)) |changed| {
+        return .{ .failure = changed };
+    }
+    if (failure) |details| return .{ .failure = details };
+    return .{ .success = .{
+        .snapshots = .{ .interleaved = snapshot },
+        .pair_count = selector.record_count,
+    } };
+}
+
+fn sampleExactPairSecondPass(
+    select_all: bool,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    writer: *zfastq.Writer,
+    indexes: []const u64,
+    snapshots: ExactPairSnapshots,
+    expected_count: u64,
+    options: SampleOptions,
+) error{WriteFailed}!?PairCommandFailure {
+    return switch (snapshots) {
+        .paired => |paired_snapshots| sampleExactPairedSecondPass(
+            select_all,
+            io,
+            allocator,
+            inputs,
+            writer,
+            indexes,
+            paired_snapshots,
+            expected_count,
+            options,
+        ),
+        .interleaved => |snapshot| sampleExactInterleavedSecondPass(
+            select_all,
+            io,
+            allocator,
+            inputs[0],
+            writer,
+            indexes,
+            snapshot,
+            expected_count,
+            options,
+        ),
+    };
+}
+
+fn sampleExactPairedSecondPass(
+    select_all: bool,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    writer: *zfastq.Writer,
+    indexes: []const u64,
+    snapshots: [2]FileSnapshot,
+    expected_count: u64,
+    options: SampleOptions,
+) error{WriteFailed}!?PairCommandFailure {
+    var input1: RecordInput = undefined;
+    switch (initExactPairInput(&input1, io, inputs[0], snapshots[0])) {
+        .failure => |failure| return .{ .command = .{ .input_index = 0, .details = failure } },
+        .success => {},
+    }
+    defer input1.deinit(io);
+
+    var input2: RecordInput = undefined;
+    switch (initExactPairInput(&input2, io, inputs[1], snapshots[1])) {
+        .failure => |failure| return .{ .command = .{ .input_index = 1, .details = failure } },
+        .success => {},
+    }
+    defer input2.deinit(io);
+
+    var cursor = ExactPairOutputCursor{
+        .select_all = select_all,
+        .indexes = indexes,
+    };
+    var selection: PairOutputSelector = .{ .exact = &cursor };
+    const failure = try interleaveSources(
+        allocator,
+        input1.byteSource(),
+        input2.byteSource(),
+        writer,
+        &selection,
+        .{
+            .max_line_bytes = options.max_line_bytes,
+            .alphabet = options.alphabet,
+            .pair_name_policy = options.pair_name_policy,
+        },
+    );
+    if (exactPairSnapshotFailure(&input1, io, snapshots[0], 0)) |changed| return changed;
+    if (exactPairSnapshotFailure(&input2, io, snapshots[1], 1)) |changed| return changed;
+    if (failure) |details| {
+        if (pairCountMismatchInput(details)) |input_index| {
+            return inputChangedPairFailure(input_index);
+        }
+        return details;
+    }
+    if (cursor.pair_count != expected_count or
+        (!select_all and cursor.selected_cursor != indexes.len))
+    {
+        return inputChangedPairFailure(0);
+    }
+    return null;
+}
+
+fn sampleExactInterleavedSecondPass(
+    select_all: bool,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    writer: *zfastq.Writer,
+    indexes: []const u64,
+    snapshot: FileSnapshot,
+    expected_count: u64,
+    options: SampleOptions,
+) error{WriteFailed}!?PairCommandFailure {
+    const staging_limit = deinterleaveStagingLimit(options.max_line_bytes) catch {
+        return pairCommandFailure(
+            0,
+            "arithmetic_limit",
+            "record staging size exceeds supported limit",
+            4,
+        );
+    };
+    var input: RecordInput = undefined;
+    switch (initExactPairInput(&input, io, path, snapshot)) {
+        .failure => |failure| return .{ .command = .{ .input_index = 0, .details = failure } },
+        .success => {},
+    }
+    defer input.deinit(io);
+
+    var cursor = ExactPairOutputCursor{
+        .select_all = select_all,
+        .indexes = indexes,
+    };
+    var selection: PairOutputSelector = .{ .exact = &cursor };
+    const failure = try sampleInterleavedSource(
+        allocator,
+        input.byteSource(),
+        writer,
+        &selection,
+        staging_limit,
+        options,
+    );
+    if (exactPairSnapshotFailure(&input, io, snapshot, 0)) |changed| return changed;
+    if (failure) |details| {
+        if (pairCountMismatchInput(details) != null) return inputChangedPairFailure(0);
+        return details;
+    }
+    if (cursor.pair_count != expected_count or
+        (!select_all and cursor.selected_cursor != indexes.len))
+    {
+        return inputChangedPairFailure(0);
+    }
+    return null;
+}
+
+fn initExactPairInput(
+    input: *RecordInput,
+    io: std.Io,
+    path: []const u8,
+    expected_snapshot: ?FileSnapshot,
+) ExactPairInput {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
+        return .{ .failure = if (expected_snapshot != null and err == error.FileNotFound)
+            inputChangedFailure()
+        else if (expected_snapshot != null)
+            CommandFailure.plain("io_error", "failed to reopen file", 3)
+        else if (err == error.FileNotFound)
+            CommandFailure.plain("io_error", "file not found", 3)
+        else
+            CommandFailure.plain("io_error", "failed to open file", 3) };
+    };
+    const snapshot = fileSnapshot(file, io) catch |err| {
+        file.close(io);
+        return .{ .failure = if (expected_snapshot != null and err == error.NotRegularFile)
+            inputChangedFailure()
+        else if (err == error.NotRegularFile)
+            CommandFailure.plain(
+                "io_error",
+                "exact-count sampling requires a regular file",
+                3,
+            )
+        else
+            CommandFailure.plain("io_error", "failed to inspect file", 3) };
+    };
+    if (expected_snapshot) |expected| {
+        if (!sameFileSnapshot(expected, snapshot)) {
+            file.close(io);
+            return .{ .failure = inputChangedFailure() };
+        }
+    }
+    input.init(io, file, true) catch {
+        file.close(io);
+        return .{ .failure = CommandFailure.plain("io_error", "I/O error", 3) };
+    };
+    return .{ .success = snapshot };
+}
+
+fn exactPairSnapshotFailure(
+    input: *RecordInput,
+    io: std.Io,
+    expected: FileSnapshot,
+    input_index: u1,
+) ?PairCommandFailure {
+    const final = fileSnapshot(input.file, io) catch {
+        return pairCommandFailure(input_index, "io_error", "failed to inspect file", 3);
+    };
+    if (!sameFileSnapshot(expected, final)) return inputChangedPairFailure(input_index);
+    return null;
+}
+
+fn inputChangedPairFailure(input_index: u1) PairCommandFailure {
+    return .{ .command = .{
+        .input_index = input_index,
+        .details = inputChangedFailure(),
+    } };
+}
+
+fn pairCountMismatchInput(failure: PairCommandFailure) ?u1 {
+    return switch (failure) {
+        .command => null,
+        .pair => |details| switch (details) {
+            .name_mismatch => null,
+            .count_mismatch => |mismatch| mismatch.remaining_side,
+        },
+    };
+}
+
 // --- Interleave command ---
 
 const InterleaveOptions = struct {
     max_line_bytes: usize,
     alphabet: zfastq.Alphabet,
     pair_name_policy: pairing.NamePolicy,
-    selector: ?*sampling.Selector = null,
+    selection: PairOutputSelector = .all,
 };
 
 fn runInterleave(
@@ -2505,15 +3020,34 @@ fn interleaveInputs(
     }
     defer input2.deinit(io);
 
-    var reader1 = zfastq.Reader.init(
+    var selection = options.selection;
+    return interleaveSources(
         allocator,
         input1.byteSource(),
+        input2.byteSource(),
+        writer,
+        &selection,
+        options,
+    );
+}
+
+fn interleaveSources(
+    allocator: std.mem.Allocator,
+    source1: zfastq.io.ByteSource,
+    source2: zfastq.io.ByteSource,
+    writer: *zfastq.Writer,
+    selection: *PairOutputSelector,
+    options: InterleaveOptions,
+) error{WriteFailed}!?PairCommandFailure {
+    var reader1 = zfastq.Reader.init(
+        allocator,
+        source1,
         .{ .max_line_bytes = options.max_line_bytes },
     ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
     defer reader1.deinit();
     var reader2 = zfastq.Reader.init(
         allocator,
-        input2.byteSource(),
+        source2,
         .{ .max_line_bytes = options.max_line_bytes },
     ) catch return pairCommandFailure(1, "out_of_memory", "out of memory", 3);
     defer reader2.deinit();
@@ -2588,9 +3122,7 @@ fn interleaveInputs(
             } } };
         }
 
-        if (options.selector) |selector| {
-            if (!selector.selectRecord()) continue;
-        }
+        if (!selection.selectPair(reader1.recordIndex())) continue;
 
         if (canonical_span1) |span| {
             fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
@@ -3846,6 +4378,445 @@ test "[failure] - [exact sample]: the second pass repeats semantic validation" {
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
 }
 
+test "[failure] - [paired exact sample]: each input snapshot is checked independently" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "@a/1\nA\n+\n!\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "@a/2\nT\n+\n#\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pairs.fastq",
+        .data = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n",
+    });
+
+    var path1_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path1 = try std.fmt.bufPrint(
+        &path1_buffer,
+        ".zig-cache/tmp/{s}/r1.fastq",
+        .{tmp.sub_path},
+    );
+    var path2_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path2 = try std.fmt.bufPrint(
+        &path2_buffer,
+        ".zig-cache/tmp/{s}/r2.fastq",
+        .{tmp.sub_path},
+    );
+    var pairs_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const pairs_path = try std.fmt.bufPrint(
+        &pairs_path_buffer,
+        ".zig-cache/tmp/{s}/pairs.fastq",
+        .{tmp.sub_path},
+    );
+    const inputs = [_][]const u8{ path1, path2 };
+
+    const file1 = try std.Io.Dir.cwd().openFile(io, path1, .{});
+    const snapshot1 = try fileSnapshot(file1, io);
+    file1.close(io);
+    const file2 = try std.Io.Dir.cwd().openFile(io, path2, .{});
+    const snapshot2 = try fileSnapshot(file2, io);
+    file2.close(io);
+    const pair_file = try std.Io.Dir.cwd().openFile(io, pairs_path, .{});
+    const pair_snapshot = try fileSnapshot(pair_file, io);
+    pair_file.close(io);
+    const options = SampleOptions{
+        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+        .alphabet = .iupac,
+        .fraction = null,
+        .count = 1,
+        .seed = 11,
+        .pair_mode = .paired,
+    };
+
+    for (0..2) |changed_input| {
+        var snapshots = [2]FileSnapshot{ snapshot1, snapshot2 };
+        snapshots[changed_input].size += 1;
+        var output: [64]u8 = undefined;
+        var sink = io_layer.SliceSink.init(&output);
+        var writer = zfastq.Writer.init(sink.byteSink());
+        const failure = (try sampleExactPairedSecondPass(
+            true,
+            io,
+            std.testing.allocator,
+            &inputs,
+            &writer,
+            &.{},
+            snapshots,
+            1,
+            options,
+        )).?;
+        const command = switch (failure) {
+            .command => |command| command,
+            .pair => return error.ExpectedCommandFailure,
+        };
+        try std.testing.expectEqual(@as(u1, @intCast(changed_input)), command.input_index);
+        try std.testing.expectEqualStrings("input_changed", command.details.code);
+        try std.testing.expectEqual(@as(usize, 0), sink.written().len);
+    }
+
+    var changed_pair_snapshot = pair_snapshot;
+    changed_pair_snapshot.size += 1;
+    var output: [64]u8 = undefined;
+    var sink = io_layer.SliceSink.init(&output);
+    var writer = zfastq.Writer.init(sink.byteSink());
+    const failure = (try sampleExactInterleavedSecondPass(
+        true,
+        io,
+        std.testing.allocator,
+        pairs_path,
+        &writer,
+        &.{},
+        changed_pair_snapshot,
+        1,
+        .{
+            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+            .alphabet = .iupac,
+            .fraction = null,
+            .count = 1,
+            .seed = 11,
+            .pair_mode = .interleaved,
+        },
+    )).?;
+    const command = switch (failure) {
+        .command => |command| command,
+        .pair => return error.ExpectedCommandFailure,
+    };
+    try std.testing.expectEqualStrings("input_changed", command.details.code);
+    try std.testing.expectEqual(@as(usize, 0), sink.written().len);
+}
+
+test "[failure] - [paired exact sample]: the second pass revalidates and keeps complete output" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path1_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path1 = try std.fmt.bufPrint(
+        &path1_buffer,
+        ".zig-cache/tmp/{s}/r1.fastq",
+        .{tmp.sub_path},
+    );
+    var path2_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path2 = try std.fmt.bufPrint(
+        &path2_buffer,
+        ".zig-cache/tmp/{s}/r2.fastq",
+        .{tmp.sub_path},
+    );
+    var pairs_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const pairs_path = try std.fmt.bufPrint(
+        &pairs_path_buffer,
+        ".zig-cache/tmp/{s}/pairs.fastq",
+        .{tmp.sub_path},
+    );
+    const inputs = [_][]const u8{ path1, path2 };
+    const first_pair = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n";
+    const paired_options = SampleOptions{
+        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+        .alphabet = .iupac,
+        .fraction = null,
+        .count = 1,
+        .seed = 11,
+        .pair_mode = .paired,
+    };
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "@a/1\nA\n+\n!\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "@a/2\nT\n+\n#\n" });
+    const file1 = try std.Io.Dir.cwd().openFile(io, path1, .{});
+    const snapshot1 = try fileSnapshot(file1, io);
+    file1.close(io);
+    const file2 = try std.Io.Dir.cwd().openFile(io, path2, .{});
+    const snapshot2 = try fileSnapshot(file2, io);
+    file2.close(io);
+
+    var paired_output: [64]u8 = undefined;
+    var paired_sink = io_layer.SliceSink.init(&paired_output);
+    var paired_writer = zfastq.Writer.init(paired_sink.byteSink());
+    const count_failure = (try sampleExactPairedSecondPass(
+        true,
+        io,
+        std.testing.allocator,
+        &inputs,
+        &paired_writer,
+        &.{},
+        .{ snapshot1, snapshot2 },
+        2,
+        paired_options,
+    )).?;
+    const count_command = switch (count_failure) {
+        .command => |command| command,
+        .pair => return error.ExpectedCommandFailure,
+    };
+    try std.testing.expectEqualStrings("input_changed", count_command.details.code);
+    try std.testing.expectEqualStrings(first_pair, paired_sink.written());
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pairs.fastq",
+        .data = first_pair ++ "@odd/1\nC\n+\n$\n",
+    });
+    const pair_file = try std.Io.Dir.cwd().openFile(io, pairs_path, .{});
+    const pair_snapshot = try fileSnapshot(pair_file, io);
+    pair_file.close(io);
+    var interleaved_output: [64]u8 = undefined;
+    var interleaved_sink = io_layer.SliceSink.init(&interleaved_output);
+    var interleaved_writer = zfastq.Writer.init(interleaved_sink.byteSink());
+    const odd_failure = (try sampleExactInterleavedSecondPass(
+        true,
+        io,
+        std.testing.allocator,
+        pairs_path,
+        &interleaved_writer,
+        &.{},
+        pair_snapshot,
+        1,
+        .{
+            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+            .alphabet = .iupac,
+            .fraction = null,
+            .count = 1,
+            .seed = 11,
+            .pair_mode = .interleaved,
+        },
+    )).?;
+    const odd_command = switch (odd_failure) {
+        .command => |command| command,
+        .pair => return error.ExpectedCommandFailure,
+    };
+    try std.testing.expectEqualStrings("input_changed", odd_command.details.code);
+    try std.testing.expectEqualStrings(first_pair, interleaved_sink.written());
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "@left/1\nA\n+\n!\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "@right/2\nT\n+\n#\n" });
+    const mismatch_file1 = try std.Io.Dir.cwd().openFile(io, path1, .{});
+    const mismatch_snapshot1 = try fileSnapshot(mismatch_file1, io);
+    mismatch_file1.close(io);
+    const mismatch_file2 = try std.Io.Dir.cwd().openFile(io, path2, .{});
+    const mismatch_snapshot2 = try fileSnapshot(mismatch_file2, io);
+    mismatch_file2.close(io);
+    var mismatch_output: [64]u8 = undefined;
+    var mismatch_sink = io_layer.SliceSink.init(&mismatch_output);
+    var mismatch_writer = zfastq.Writer.init(mismatch_sink.byteSink());
+    const mismatch_failure = (try sampleExactPairedSecondPass(
+        true,
+        io,
+        std.testing.allocator,
+        &inputs,
+        &mismatch_writer,
+        &.{},
+        .{ mismatch_snapshot1, mismatch_snapshot2 },
+        1,
+        paired_options,
+    )).?;
+    switch (mismatch_failure) {
+        .command => return error.ExpectedPairFailure,
+        .pair => |pair| switch (pair) {
+            .name_mismatch => {},
+            .count_mismatch => return error.ExpectedNameMismatch,
+        },
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatch_sink.written().len);
+
+    const validation_cases = [_]struct {
+        r1: []const u8,
+        r2: []const u8,
+        failed_input: u1,
+        code: []const u8,
+    }{
+        .{
+            .r1 = "@bad/1\n.\n+\n!\n",
+            .r2 = "@bad/2\nT\n+\n#\n",
+            .failed_input = 0,
+            .code = "S002",
+        },
+        .{
+            .r1 = "@bad/1\nA\n+\n!\n",
+            .r2 = "@bad/2\n.\n+\n#\n",
+            .failed_input = 1,
+            .code = "S002",
+        },
+        .{
+            .r1 = "@bad/1\nA\n+\n!\n",
+            .r2 = "@bad/2\nT\nx\n#\n",
+            .failed_input = 1,
+            .code = "S001",
+        },
+    };
+    for (validation_cases) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = case.r1 });
+        try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = case.r2 });
+        const semantic_file1 = try std.Io.Dir.cwd().openFile(io, path1, .{});
+        const semantic_snapshot1 = try fileSnapshot(semantic_file1, io);
+        semantic_file1.close(io);
+        const semantic_file2 = try std.Io.Dir.cwd().openFile(io, path2, .{});
+        const semantic_snapshot2 = try fileSnapshot(semantic_file2, io);
+        semantic_file2.close(io);
+        var semantic_output: [64]u8 = undefined;
+        var semantic_sink = io_layer.SliceSink.init(&semantic_output);
+        var semantic_writer = zfastq.Writer.init(semantic_sink.byteSink());
+        const semantic_failure = (try sampleExactPairedSecondPass(
+            true,
+            io,
+            std.testing.allocator,
+            &inputs,
+            &semantic_writer,
+            &.{},
+            .{ semantic_snapshot1, semantic_snapshot2 },
+            1,
+            paired_options,
+        )).?;
+        const command = switch (semantic_failure) {
+            .command => |command| command,
+            .pair => return error.ExpectedCommandFailure,
+        };
+        try std.testing.expectEqual(case.failed_input, command.input_index);
+        try std.testing.expectEqualStrings(case.code, command.details.code);
+        try std.testing.expectEqual(@as(usize, 0), semantic_sink.written().len);
+    }
+}
+
+fn exerciseExactPairAllocations(allocator: std.mem.Allocator) !void {
+    const r1 = "@a/1\nA\n+\n!\n@b/1\nC\n+\n#\n@c/1\nG\n+\n$\n";
+    const r2 = "@a/2\nT\n+\n!\n@b/2\nG\n+\n#\n@c/2\nC\n+\n$\n";
+    const interleaved =
+        "@a/1\nA\n+\n!\n@a/2\nT\n+\n!\n" ++
+        "@b/1\nC\n+\n#\n@b/2\nG\n+\n#\n" ++
+        "@c/1\nG\n+\n$\n@c/2\nC\n+\n$\n";
+    const options = PairedCheckOptions{
+        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+        .alphabet = .iupac,
+        .pair_mode = .paired,
+        .pair_name_policy = .illumina,
+    };
+
+    {
+        var source1 = io_layer.SliceSource.init(r1);
+        var source2 = io_layer.SliceSource.init(r2);
+        var selector = sampling.ExactSelector.init(1, 11);
+        defer selector.deinit(allocator);
+        if (checkPairedSources(
+            allocator,
+            source1.byteSource(),
+            source2.byteSource(),
+            options,
+            &selector,
+        )) |failure| {
+            return pairAllocationFailure(failure);
+        }
+        try std.testing.expect(selector.finish() == .indexes);
+    }
+
+    {
+        var source = io_layer.SliceSource.init(interleaved);
+        var selector = sampling.ExactSelector.init(1, 11);
+        defer selector.deinit(allocator);
+        var interleaved_options = options;
+        interleaved_options.pair_mode = .interleaved;
+        if (checkInterleavedSource(
+            allocator,
+            source.byteSource(),
+            interleaved_options,
+            &selector,
+        )) |failure| {
+            return pairAllocationFailure(failure);
+        }
+        try std.testing.expect(selector.finish() == .indexes);
+    }
+}
+
+fn pairAllocationFailure(failure: PairCommandFailure) error{ OutOfMemory, UnexpectedFailure } {
+    return switch (failure) {
+        .command => |details| if (std.mem.eql(u8, details.details.code, "out_of_memory"))
+            error.OutOfMemory
+        else
+            error.UnexpectedFailure,
+        .pair => error.UnexpectedFailure,
+    };
+}
+
+test "[failure] - [paired exact sample]: allocation failures release all state" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseExactPairAllocations,
+        .{},
+    );
+}
+
+test "[edge] - [paired exact sample]: target above pair count keeps indexes implicit" {
+    var source1 = io_layer.SliceSource.init("@a/1\nA\n+\n!\n@b/1\nC\n+\n#\n");
+    var source2 = io_layer.SliceSource.init("@a/2\nT\n+\n!\n@b/2\nG\n+\n#\n");
+    var selector = sampling.ExactSelector.init(3, 11);
+    defer selector.deinit(std.testing.allocator);
+
+    const failure = checkPairedSources(
+        std.testing.allocator,
+        source1.byteSource(),
+        source2.byteSource(),
+        .{
+            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+            .alphabet = .iupac,
+            .pair_mode = .paired,
+            .pair_name_policy = .illumina,
+        },
+        &selector,
+    );
+
+    try std.testing.expect(failure == null);
+    try std.testing.expect(selector.finish() == .all);
+    try std.testing.expectEqual(@as(usize, 0), selector.indexes.capacity);
+}
+
+test "[failure] - [paired exact sample]: a read failure follows complete earlier pairs" {
+    const FailingSource = struct {
+        data: []const u8,
+        position: usize = 0,
+        fail_at: usize,
+
+        fn byteSource(self: *@This()) zfastq.io.ByteSource {
+            return .{ .ctx = self, .vtable = &vtable };
+        }
+
+        const vtable = zfastq.io.ByteSource.VTable{ .read = read };
+
+        fn read(ctx: *anyopaque, dest: []u8) error{ReadFailed}!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (dest.len == 0) return 0;
+            if (self.position == self.fail_at) return error.ReadFailed;
+            const end = @min(self.fail_at, self.position + dest.len);
+            const amount = end - self.position;
+            @memcpy(dest[0..amount], self.data[self.position..end]);
+            self.position = end;
+            return amount;
+        }
+    };
+    const first1 = "@a/1\nA\n+\n!\n";
+    const first2 = "@a/2\nT\n+\n!\n";
+    var source1 = FailingSource{
+        .data = first1 ++ "@b/1\nC\n+\n#\n",
+        .fail_at = first1.len,
+    };
+    var source2 = io_layer.SliceSource.init(first2 ++ "@b/2\nG\n+\n#\n");
+    var selector = sampling.ExactSelector.init(1, 11);
+    defer selector.deinit(std.testing.allocator);
+
+    const failure = checkPairedSources(
+        std.testing.allocator,
+        source1.byteSource(),
+        source2.byteSource(),
+        .{
+            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+            .alphabet = .iupac,
+            .pair_mode = .paired,
+            .pair_name_policy = .illumina,
+        },
+        &selector,
+    ).?;
+
+    const command = switch (failure) {
+        .command => |command| command,
+        .pair => return error.ExpectedCommandFailure,
+    };
+    try std.testing.expectEqual(@as(u1, 0), command.input_index);
+    try std.testing.expectEqualStrings("io_error", command.details.code);
+    try std.testing.expectEqual(@as(u64, 1), selector.record_count);
+}
+
 test "[edge] - [paired fraction sample]: fraction zero keeps buffered mate one borrowed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3872,6 +4843,7 @@ test "[edge] - [paired fraction sample]: fraction zero keeps buffered mate one b
     var sink = io_layer.SliceSink.init(&output);
     var writer = zfastq.Writer.init(sink.byteSink());
     var selector = sampling.Selector.init(.none, 11);
+    var output_selector: PairOutputSelector = .{ .fraction = &selector };
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
         .fail_index = 2,
     });
@@ -3881,7 +4853,7 @@ test "[edge] - [paired fraction sample]: fraction zero keeps buffered mate one b
         failing.allocator(),
         path,
         &writer,
-        &selector,
+        &output_selector,
         0,
         .{
             .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,

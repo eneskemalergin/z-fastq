@@ -41,7 +41,7 @@ const EXPECTED_USAGE =
     \\
     \\Sample options:
     \\  --fraction P         Use 0, 1, 0.DIGITS, or 1.ZEROES
-    \\  --count K            Select exactly min(K, records) from a file
+    \\  --count K            Select exactly min(K, records or pairs) from paths
     \\  --seed S             Use an unsigned decimal u64 seed (default 11)
     \\
     \\Count usage:
@@ -60,6 +60,8 @@ const EXPECTED_USAGE =
     \\  z-fastq sample --count K [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] path
     \\  z-fastq sample --paired --fraction P [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
     \\  z-fastq sample --interleaved --fraction P [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
+    \\  z-fastq sample --paired --count K [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] R1-path R2-path
+    \\  z-fastq sample --interleaved --count K [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] path
     \\
     \\Interleave usage:
     \\  z-fastq interleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
@@ -491,7 +493,7 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
 
     const version = try runCli(allocator, &.{"--version"});
     try std.testing.expectEqual(@as(u8, 0), version.exit_code);
-    try std.testing.expectEqualStrings("z-fastq 0.0.13\n", version.stdout);
+    try std.testing.expectEqualStrings("z-fastq 0.0.14\n", version.stdout);
     try std.testing.expectEqual(@as(usize, 0), version.stderr.len);
 
     const short_version = try runCli(allocator, &.{"-V"});

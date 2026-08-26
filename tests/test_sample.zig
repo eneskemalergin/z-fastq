@@ -80,6 +80,30 @@ fn appendSelectedPairs(
     }
 }
 
+fn appendExactSelectedPairs(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    pair_count: u64,
+    target: u64,
+    seed: u64,
+) !void {
+    var selector = sampling.ExactSelector.init(target, seed);
+    defer selector.deinit(allocator);
+    var pair_number: u64 = 1;
+    while (pair_number <= pair_count) : (pair_number += 1) {
+        try selector.considerRecord(allocator, pair_number);
+    }
+    switch (selector.finish()) {
+        .none => {},
+        .all => for (0..pair_count) |pair_index| {
+            try appendSelectedPairs(allocator, output, &.{@intCast(pair_index)});
+        },
+        .indexes => |indexes| for (indexes) |selected| {
+            try appendSelectedPairs(allocator, output, &.{@intCast(selected - 1)});
+        },
+    }
+}
+
 test "[unit] - [MT19937-64]: scalar seed 5489 matches the published vector" {
     const expected = [_]u64{
         14514284786278117030,
@@ -560,6 +584,194 @@ test "[cli] - [paired fraction sample]: frozen pair indexes match logical record
     }
 }
 
+test "[cli] - [paired exact sample]: pair indexes match the exact selector" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var r1: std.ArrayList(u8) = .empty;
+    var r2: std.ArrayList(u8) = .empty;
+    var interleaved: std.ArrayList(u8) = .empty;
+    for (0..16) |pair_index| {
+        try appendPair(allocator, &r1, &r2, &interleaved, pair_index);
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = r1.items });
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = r2.items });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "interleaved.fastq",
+        .data = interleaved.items,
+    });
+    const r1_path = try tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const r2_path = try tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    const interleaved_path = try tempPath(
+        allocator,
+        &tmp.sub_path,
+        "interleaved.fastq",
+    );
+
+    const cases = [_]struct {
+        count: []const u8,
+        seed: []const u8,
+        target: u64,
+        seed_value: u64,
+    }{
+        .{ .count = "0", .seed = "11", .target = 0, .seed_value = 11 },
+        .{ .count = "1", .seed = "11", .target = 1, .seed_value = 11 },
+        .{ .count = "3", .seed = "11", .target = 3, .seed_value = 11 },
+        .{ .count = "16", .seed = "11", .target = 16, .seed_value = 11 },
+        .{ .count = "20", .seed = "11", .target = 20, .seed_value = 11 },
+        .{
+            .count = "2",
+            .seed = "18446744073709551615",
+            .target = 2,
+            .seed_value = std.math.maxInt(u64),
+        },
+        .{
+            .count = "18446744073709551615",
+            .seed = "11",
+            .target = std.math.maxInt(u64),
+            .seed_value = 11,
+        },
+    };
+
+    var expected: std.ArrayList(u8) = .empty;
+    for (cases) |case| {
+        expected.clearRetainingCapacity();
+        try appendExactSelectedPairs(
+            allocator,
+            &expected,
+            16,
+            case.target,
+            case.seed_value,
+        );
+        try expectResult(
+            try cli.run(allocator, &.{
+                "sample",
+                "--paired",
+                "--count",
+                case.count,
+                "--seed",
+                case.seed,
+                r1_path,
+                r2_path,
+            }),
+            0,
+            expected.items,
+            "",
+        );
+        try expectResult(
+            try cli.run(allocator, &.{
+                "sample",
+                "--interleaved",
+                "--count",
+                case.count,
+                "--seed",
+                case.seed,
+                interleaved_path,
+            }),
+            0,
+            expected.items,
+            "",
+        );
+    }
+}
+
+test "[integration] - [paired exact sample]: gzip and exact-name fields match plain input" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const r1 = "@same left opaque\r\nAC\r\n+left annotation\r\n!~\r\n";
+    const r2 = "@same right opaque\r\nGT\r\n+right annotation\r\n#$\r\n";
+    const interleaved = r1 ++ r2;
+    const expected =
+        "@same left opaque\nAC\n+left annotation\n!~\n" ++
+        "@same right opaque\nGT\n+right annotation\n#$\n";
+    var gzip1: std.ArrayList(u8) = .empty;
+    var gzip2: std.ArrayList(u8) = .empty;
+    var gzip_interleaved: std.ArrayList(u8) = .empty;
+    try cli.appendGzipMember(allocator, &gzip1, r1, .{});
+    try cli.appendGzipMember(allocator, &gzip2, r2, .{});
+    try cli.appendGzipMember(allocator, &gzip_interleaved, interleaved, .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq.gz", .data = gzip1.items });
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq.gz", .data = gzip2.items });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pairs.fastq.gz",
+        .data = gzip_interleaved.items,
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty1.fastq", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty2.fastq", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty-pairs.fastq", .data = "" });
+
+    const gzip1_path = try tempPath(allocator, &tmp.sub_path, "r1.fastq.gz");
+    const gzip2_path = try tempPath(allocator, &tmp.sub_path, "r2.fastq.gz");
+    const gzip_pairs_path = try tempPath(allocator, &tmp.sub_path, "pairs.fastq.gz");
+    const empty1_path = try tempPath(allocator, &tmp.sub_path, "empty1.fastq");
+    const empty2_path = try tempPath(allocator, &tmp.sub_path, "empty2.fastq");
+    const empty_pairs_path = try tempPath(allocator, &tmp.sub_path, "empty-pairs.fastq");
+
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--paired",
+            "--count",
+            "1",
+            "--pair-names",
+            "exact",
+            gzip1_path,
+            gzip2_path,
+        }),
+        0,
+        expected,
+        "",
+    );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--interleaved",
+            "--count",
+            "1",
+            "--pair-names",
+            "exact",
+            gzip_pairs_path,
+        }),
+        0,
+        expected,
+        "",
+    );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--paired",
+            "--count",
+            "18446744073709551615",
+            empty1_path,
+            empty2_path,
+        }),
+        0,
+        "",
+        "",
+    );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--interleaved",
+            "--count",
+            "18446744073709551615",
+            empty_pairs_path,
+        }),
+        0,
+        "",
+        "",
+    );
+}
+
 test "[cli] - [paired fraction sample]: fields, exact names, empty input, and LF output are preserved" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -830,6 +1042,19 @@ test "[cli] - [paired fraction sample]: failing pairs leave only earlier complet
         mismatch,
     );
     try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--paired",
+            "--count",
+            "1",
+            r1_path,
+            r2_path,
+        }),
+        1,
+        "",
+        mismatch,
+    );
+    try expectResult(
         try cli.runWithStdin(
             allocator,
             &.{ "sample", "--interleaved", "--fraction", "0", "-" },
@@ -874,6 +1099,18 @@ test "[cli] - [paired fraction sample]: failing pairs leave only earlier complet
         "",
         buffered_mismatch,
     );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--interleaved",
+            "--count",
+            "1",
+            pairs_path,
+        }),
+        1,
+        "",
+        buffered_mismatch,
+    );
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "r1.fastq",
@@ -900,6 +1137,19 @@ test "[cli] - [paired fraction sample]: failing pairs leave only earlier complet
         }),
         1,
         first_pair,
+        mate2_semantic,
+    );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--paired",
+            "--count",
+            "1",
+            r1_path,
+            r2_path,
+        }),
+        1,
+        "",
         mate2_semantic,
     );
     try expectResult(
@@ -931,6 +1181,18 @@ test "[cli] - [paired fraction sample]: failing pairs leave only earlier complet
             "--interleaved",
             "--fraction",
             "0",
+            pairs_path,
+        }),
+        1,
+        "",
+        buffered_precedence,
+    );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--interleaved",
+            "--count",
+            "1",
             pairs_path,
         }),
         1,
@@ -990,6 +1252,19 @@ test "[cli] - [paired fraction sample]: failing pairs leave only earlier complet
         first_pair,
         unequal,
     );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--paired",
+            "--count",
+            "1",
+            r1_path,
+            r2_path,
+        }),
+        1,
+        "",
+        unequal,
+    );
 
     const late_structural = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n@bad/1\nC\n+\n$\n@bad/2\nG\nx\n%\n";
     try expectResult(
@@ -1016,6 +1291,28 @@ test "[cli] - [paired fraction sample]: failing pairs leave only earlier complet
         "error: -: P002: paired input is missing a mate " ++
             "(pair 1, remaining R1, last R1 record 2, last R2 record 1)\n",
     );
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pairs.fastq",
+        .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n@odd/1\nC\n+\n$\n",
+    });
+    const odd = try std.fmt.allocPrint(
+        allocator,
+        "error: {s}: P002: paired input is missing a mate " ++
+            "(pair 1, remaining R1, last R1 record 2, last R2 record 1)\n",
+        .{pairs_path},
+    );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--interleaved",
+            "--count",
+            "1",
+            pairs_path,
+        }),
+        1,
+        "",
+        odd,
+    );
 
     try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "@ok/1\nA\n+\n!\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "@ok/2\nT\n+\n#\n" });
@@ -1023,6 +1320,30 @@ test "[cli] - [paired fraction sample]: failing pairs leave only earlier complet
         try cli.runWithClosedStdout(
             allocator,
             &.{ "sample", "--paired", "--fraction", "1", r1_path, r2_path },
+            "",
+        ),
+        3,
+        "",
+        "",
+    );
+    try expectResult(
+        try cli.runWithClosedStdout(
+            allocator,
+            &.{ "sample", "--paired", "--count", "1", r1_path, r2_path },
+            "",
+        ),
+        3,
+        "",
+        "",
+    );
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pairs.fastq",
+        .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n",
+    });
+    try expectResult(
+        try cli.runWithClosedStdout(
+            allocator,
+            &.{ "sample", "--interleaved", "--count", "1", pairs_path },
             "",
         ),
         3,
@@ -1063,6 +1384,18 @@ test "[edge] - [paired fraction sample]: refill-spanning 512 KiB mates preserve 
         try cli.run(allocator, &.{
             "sample",
             "--interleaved",
+            "--count",
+            "1",
+            pairs_path,
+        }),
+        0,
+        first_large.items,
+        "",
+    );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--interleaved",
             "--fraction",
             "0",
             pairs_path,
@@ -1082,6 +1415,18 @@ test "[edge] - [paired fraction sample]: refill-spanning 512 KiB mates preserve 
             "sample",
             "--interleaved",
             "--fraction",
+            "1",
+            pairs_path,
+        }),
+        0,
+        second_large.items,
+        "",
+    );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--interleaved",
+            "--count",
             "1",
             pairs_path,
         }),
@@ -1121,12 +1466,12 @@ test "[cli] - [paired fraction sample]: arguments and output failures retain the
             .stderr = "error: paired sample inputs may contain standard input at most once\n",
         },
         .{
-            .args = &.{ "sample", "--paired", "--count", "1", EMPTY_PATH, EMPTY_PATH },
-            .stderr = "error: paired exact-count sampling is not available\n",
+            .args = &.{ "sample", "--paired", "--count", "1", "-", EMPTY_PATH },
+            .stderr = "error: paired exact-count sampling requires file paths\n",
         },
         .{
-            .args = &.{ "sample", "--interleaved", "--count", "1", EMPTY_PATH },
-            .stderr = "error: paired exact-count sampling is not available\n",
+            .args = &.{ "sample", "--interleaved", "--count", "1", "-" },
+            .stderr = "error: paired exact-count sampling requires file paths\n",
         },
     };
     for (cases) |case| {
