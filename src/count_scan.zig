@@ -11,10 +11,6 @@ pub const Options = struct {
     max_line_bytes: usize = io_layer.DEFAULT_MAX_LINE_BYTES,
 };
 
-const MAX_KNOWN_LAYOUTS = 8;
-const MAX_HEADER_INDEX_BYTES = 128;
-const NO_LAYOUT_INDEX = 255;
-
 // Bare plus lines let the fast path derive every tail offset from the sequence length.
 const DenseLayout = struct {
     sequence_start: usize,
@@ -86,9 +82,6 @@ pub const Scanner = struct {
     machine: fastq.Machine = .{},
     fast_path_enabled: bool = false,
     layout: ?DenseLayout = null,
-    known_layouts: [MAX_KNOWN_LAYOUTS]DenseLayout = undefined,
-    known_layout_count: u8 = 0,
-    layout_by_header: [MAX_HEADER_INDEX_BYTES]u8 = [_]u8{NO_LAYOUT_INDEX} ** MAX_HEADER_INDEX_BYTES,
     last_header_line_bytes: usize = 0,
     current_record_minimal_plus: bool = false,
     current_record_dense_eligible: bool = false,
@@ -158,29 +151,21 @@ pub const Scanner = struct {
 
         while (cursor < data.len) {
             const remaining = data[cursor..];
-            const header_line_bytes = headerLineBytesAt(remaining);
-            const run = consumeWithKnownLayouts(self, remaining, header_line_bytes);
-            if (run.count > 0) {
-                self.record_index += run.count;
-                cursor += run.count * run.stride;
-                continue;
+            if (self.layout) |active| {
+                const run = self.tryStrideBlock(remaining, active);
+                if (run.count > 0) {
+                    self.record_index += run.count;
+                    cursor += run.count * run.stride;
+                    continue;
+                }
             }
 
-            const consumed = try self.tryFastRecord(remaining, header_line_bytes);
+            const consumed = try self.tryFastRecord(remaining, headerLineBytesAt(remaining));
             if (consumed == 0) return cursor;
             self.record_index += 1;
             cursor += consumed;
         }
         return cursor;
-    }
-
-    fn smallestKnownStride(self: *const Scanner) usize {
-        var min = self.known_layouts[0].record_stride;
-        var i: usize = 1;
-        while (i < self.known_layout_count) : (i += 1) {
-            min = @min(min, self.known_layouts[i].record_stride);
-        }
-        return min;
     }
 
     fn tryStrideBlock(self: *Scanner, data: []const u8, layout: DenseLayout) StrideRun {
@@ -191,60 +176,6 @@ pub const Scanner = struct {
             return .{ .count = count, .stride = layout.record_stride };
         }
         return .{};
-    }
-
-    fn consumeWithKnownLayouts(
-        self: *Scanner,
-        data: []const u8,
-        header_line_bytes: ?usize,
-    ) StrideRun {
-        if (self.known_layout_count == 0) return .{};
-        if (data.len < self.smallestKnownStride()) return .{};
-        if (data[0] != '@') return .{};
-
-        var tried_stride: ?usize = null;
-
-        if (header_line_bytes) |h| {
-            if (self.layoutByHeader(h)) |layout| {
-                tried_stride = layout.record_stride;
-                const run = self.tryStrideBlock(data, layout);
-                if (run.count > 0) return run;
-            }
-        }
-
-        if (self.layout) |active| {
-            const already_tried = tried_stride != null and active.record_stride == tried_stride.?;
-            const header_ok = header_line_bytes == null or active.sequence_start == header_line_bytes.?;
-            if (!already_tried and header_ok) {
-                const run = self.tryStrideBlock(data, active);
-                if (run.count > 0) return run;
-            }
-        }
-
-        var i: usize = 0;
-        while (i < self.known_layout_count) : (i += 1) {
-            const layout = self.known_layouts[i];
-            if (tried_stride) |t| {
-                if (layout.record_stride == t) continue;
-            }
-            if (self.layout) |active| {
-                if (layout.record_stride == active.record_stride) continue;
-            }
-            if (header_line_bytes) |h| {
-                if (layout.sequence_start != h) continue;
-            }
-            const run = self.tryStrideBlock(data, layout);
-            if (run.count > 0) return run;
-        }
-
-        return .{};
-    }
-
-    fn layoutByHeader(self: *const Scanner, header_line_bytes: usize) ?DenseLayout {
-        if (header_line_bytes >= self.layout_by_header.len) return null;
-        const idx = self.layout_by_header[header_line_bytes];
-        if (idx == NO_LAYOUT_INDEX or idx >= self.known_layout_count) return null;
-        return self.known_layouts[idx];
     }
 
     fn consumeStrideBlock(data: []const u8, layout: DenseLayout, max_line_bytes: usize) usize {
@@ -275,6 +206,7 @@ pub const Scanner = struct {
         }
 
         const nl1 = if (header_line_bytes) |line_bytes| line_bytes - 1 else return 0;
+        if (nl1 > 0 and data[nl1 - 1] == '\r') return 0;
         const hdr_len = lineContentLen(data[0..nl1]);
         if (hdr_len < 2 or !fastq.headerPrefixIsValid(data[0], data[1])) {
             self.disableFast();
@@ -287,49 +219,38 @@ pub const Scanner = struct {
         const seq_len = nl2_rel;
         const after_seq = std.math.add(usize, seq_start, seq_len) catch return 0;
         if (after_seq >= data.len or data[after_seq] != '\n') return 0;
+        if (seq_len > 0 and data[after_seq - 1] == '\r') return 0;
         const sequence_len = lineContentLen(data[seq_start..after_seq]);
         if (sequence_len > self.options.max_line_bytes) return error.LineTooLong;
 
         const plus_start = std.math.add(usize, after_seq, 1) catch return 0;
-        if (plus_start + 1 >= data.len) return 0;
-        if (data[plus_start] != '+' or data[plus_start + 1] != '\n') return 0;
+        if (plus_start >= data.len or data[plus_start] != '+') return 0;
+        const plus_nl_rel = if (plus_start + 1 < data.len and data[plus_start + 1] == '\n')
+            1
+        else
+            std.mem.indexOfScalar(u8, data[plus_start..], '\n') orelse return 0;
+        const plus_end = std.math.add(usize, plus_start, plus_nl_rel) catch return 0;
+        if (plus_nl_rel > 0 and data[plus_end - 1] == '\r') return 0;
+        if (plus_nl_rel > self.options.max_line_bytes) return error.LineTooLong;
 
-        const qual_start = std.math.add(usize, plus_start, 2) catch return 0;
+        const qual_start = std.math.add(usize, plus_end, 1) catch return 0;
         const after_qual = std.math.add(usize, qual_start, seq_len) catch return 0;
         if (after_qual >= data.len) return 0;
         if (containsNewline(data[qual_start..after_qual])) return 0;
         if (data[after_qual] != '\n') return 0;
+        if (seq_len > 0 and data[after_qual - 1] == '\r') return 0;
         const quality_len = lineContentLen(data[qual_start..after_qual]);
         if (quality_len > self.options.max_line_bytes) return error.LineTooLong;
         if (quality_len != sequence_len) return 0;
 
         const record_end = after_qual + 1;
-        if (DenseLayout.fromRecordEnd(record_end, seq_len)) |layout| {
-            self.rememberLayout(layout);
-            self.layout = layout;
-            self.fast_path_enabled = true;
+        if (plus_nl_rel == 1) {
+            self.layout = DenseLayout.fromRecordEnd(record_end, seq_len);
+        } else {
+            self.layout = null;
         }
+        self.fast_path_enabled = true;
         return record_end;
-    }
-
-    fn rememberLayout(self: *Scanner, layout: DenseLayout) void {
-        var i: usize = 0;
-        while (i < self.known_layout_count) : (i += 1) {
-            if (self.known_layouts[i].record_stride == layout.record_stride) {
-                if (layout.sequence_start < self.layout_by_header.len) {
-                    self.layout_by_header[layout.sequence_start] = @intCast(i);
-                }
-                return;
-            }
-        }
-        if (self.known_layout_count < MAX_KNOWN_LAYOUTS) {
-            const idx = self.known_layout_count;
-            self.known_layouts[idx] = layout;
-            self.known_layout_count += 1;
-            if (layout.sequence_start < self.layout_by_header.len) {
-                self.layout_by_header[layout.sequence_start] = idx;
-            }
-        }
     }
 
     fn feedSlow(self: *Scanner, data: []const u8) fastq.ReaderError!usize {
@@ -359,8 +280,6 @@ pub const Scanner = struct {
     fn disableFast(self: *Scanner) void {
         self.fast_path_enabled = false;
         self.layout = null;
-        self.known_layout_count = 0;
-        self.layout_by_header = [_]u8{NO_LAYOUT_INDEX} ** MAX_HEADER_INDEX_BYTES;
         self.last_header_line_bytes = 0;
         self.current_record_minimal_plus = false;
         self.current_record_dense_eligible = false;
@@ -371,7 +290,6 @@ pub const Scanner = struct {
         const with_header = std.math.add(usize, header_line_bytes, doubled) catch return;
         const record_bytes = std.math.add(usize, with_header, 4) catch return;
         if (DenseLayout.fromRecordEnd(record_bytes, seq_len)) |layout| {
-            self.rememberLayout(layout);
             self.layout = layout;
             self.fast_path_enabled = true;
         }
@@ -424,11 +342,13 @@ pub const Scanner = struct {
         };
         if (record_ready) {
             self.record_index += 1;
-            if (self.current_record_minimal_plus and
-                self.current_record_dense_eligible and
-                !had_cr)
-            {
-                self.learnDenseLayout(self.machine.sequence_len, self.last_header_line_bytes);
+            if (self.current_record_dense_eligible and !had_cr) {
+                self.fast_path_enabled = true;
+                if (self.current_record_minimal_plus) {
+                    self.learnDenseLayout(self.machine.sequence_len, self.last_header_line_bytes);
+                } else {
+                    self.layout = null;
+                }
             }
         }
         self.line_raw_len = 0;
@@ -552,4 +472,14 @@ test "[edge] - [header scan]: indexed boundaries and exceptional forms are exact
 
     try std.testing.expectEqual(@as(?usize, null), headerLineBytesAt(data[0..128]));
     try std.testing.expectEqual(@as(?usize, 4), headerLineBytesAt("@h\r\n"));
+}
+
+test "[unit] - [derived record]: annotated plus lines stay on the complete-record path" {
+    const data = "@a\nAC\n+first\n!!\n@longer\nG\n+second note\n#\n";
+    var scanner = Scanner.init(.{ .max_line_bytes = 64 });
+    scanner.fast_path_enabled = true;
+
+    try std.testing.expectEqual(data.len, try scanner.feedFast(data));
+    try std.testing.expectEqual(@as(u64, 2), scanner.record_index);
+    try std.testing.expect(scanner.layout == null);
 }

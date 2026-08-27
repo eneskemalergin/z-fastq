@@ -1102,7 +1102,7 @@ test "[unit] - [count scanner]: dense stride blocks count uniform records" {
     const n = try zfastq.count_scan.countSlice(buf[0..pos], .{}, &scan);
     try std.testing.expectEqual(@as(u64, 3), n);
 }
-test "[property] - [count scanner]: known stride layouts may alternate" {
+test "[property] - [count scanner]: record strides may alternate" {
     const hdr_a = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/1\n";
     const hdr_b = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/12\n";
 
