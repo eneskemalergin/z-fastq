@@ -1102,6 +1102,23 @@ test "[unit] - [count scanner]: dense stride blocks count uniform records" {
     const n = try zfastq.count_scan.countSlice(buf[0..pos], .{}, &scan);
     try std.testing.expectEqual(@as(u64, 3), n);
 }
+
+test "[unit] - [count scanner]: dense batching waits for two matching records" {
+    const short = "@a\nAC\n+\n!!\n";
+    const long = "@long\nA\n+\n!\n";
+    var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 64 });
+
+    try std.testing.expectEqual(short.len, try scan.feed(short));
+    try std.testing.expect(!scan.layout_confirmed);
+    try std.testing.expectEqual(short.len, try scan.feed(short));
+    try std.testing.expect(scan.layout_confirmed);
+
+    try std.testing.expectEqual(long.len, try scan.feed(long));
+    try std.testing.expect(!scan.layout_confirmed);
+    try std.testing.expectEqual(long.len, try scan.feed(long));
+    try std.testing.expect(scan.layout_confirmed);
+}
+
 test "[property] - [count scanner]: record strides may alternate" {
     const hdr_a = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/1\n";
     const hdr_b = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/12\n";

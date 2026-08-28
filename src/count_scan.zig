@@ -69,6 +69,15 @@ const DenseLayout = struct {
             quality_len <= max_line_bytes and
             quality_len == sequence_len;
     }
+
+    fn eql(a: DenseLayout, b: DenseLayout) bool {
+        return a.sequence_start == b.sequence_start and
+            a.sequence_end == b.sequence_end and
+            a.plus_start == b.plus_start and
+            a.quality_start == b.quality_start and
+            a.quality_end == b.quality_end and
+            a.record_stride == b.record_stride;
+    }
 };
 
 const StrideRun = struct {
@@ -82,6 +91,7 @@ pub const Scanner = struct {
     machine: fastq.Machine = .{},
     fast_path_enabled: bool = false,
     layout: ?DenseLayout = null,
+    layout_confirmed: bool = false,
     last_header_line_bytes: usize = 0,
     current_record_minimal_plus: bool = false,
     current_record_dense_eligible: bool = false,
@@ -151,12 +161,15 @@ pub const Scanner = struct {
 
         while (cursor < data.len) {
             const remaining = data[cursor..];
-            if (self.layout) |active| {
-                const run = self.tryStrideBlock(remaining, active);
-                if (run.count > 0) {
-                    self.record_index += run.count;
-                    cursor += run.count * run.stride;
-                    continue;
+            if (self.layout_confirmed) {
+                if (self.layout) |active| {
+                    const run = self.tryStrideBlock(remaining, active);
+                    if (run.count > 0) {
+                        self.record_index += run.count;
+                        cursor += run.count * run.stride;
+                        continue;
+                    }
+                    if (remaining.len >= active.record_stride) self.observeDenseLayout(null);
                 }
             }
 
@@ -172,7 +185,6 @@ pub const Scanner = struct {
         if (data.len < layout.record_stride) return .{};
         const count = consumeStrideBlock(data, layout, self.options.max_line_bytes);
         if (count > 0) {
-            self.layout = layout;
             return .{ .count = count, .stride = layout.record_stride };
         }
         return .{};
@@ -245,9 +257,9 @@ pub const Scanner = struct {
 
         const record_end = after_qual + 1;
         if (plus_nl_rel == 1) {
-            self.layout = DenseLayout.fromRecordEnd(record_end, seq_len);
+            self.observeDenseLayout(DenseLayout.fromRecordEnd(record_end, seq_len));
         } else {
-            self.layout = null;
+            self.observeDenseLayout(null);
         }
         self.fast_path_enabled = true;
         return record_end;
@@ -280,6 +292,7 @@ pub const Scanner = struct {
     fn disableFast(self: *Scanner) void {
         self.fast_path_enabled = false;
         self.layout = null;
+        self.layout_confirmed = false;
         self.last_header_line_bytes = 0;
         self.current_record_minimal_plus = false;
         self.current_record_dense_eligible = false;
@@ -290,9 +303,19 @@ pub const Scanner = struct {
         const with_header = std.math.add(usize, header_line_bytes, doubled) catch return;
         const record_bytes = std.math.add(usize, with_header, 4) catch return;
         if (DenseLayout.fromRecordEnd(record_bytes, seq_len)) |layout| {
-            self.layout = layout;
+            self.observeDenseLayout(layout);
             self.fast_path_enabled = true;
         }
+    }
+
+    fn observeDenseLayout(self: *Scanner, next: ?DenseLayout) void {
+        const candidate = next orelse {
+            self.layout = null;
+            self.layout_confirmed = false;
+            return;
+        };
+        self.layout_confirmed = if (self.layout) |previous| previous.eql(candidate) else false;
+        self.layout = candidate;
     }
 
     fn consumeLineBytes(self: *Scanner, bytes: []const u8) fastq.ReaderError!void {
@@ -347,8 +370,10 @@ pub const Scanner = struct {
                 if (self.current_record_minimal_plus) {
                     self.learnDenseLayout(self.machine.sequence_len, self.last_header_line_bytes);
                 } else {
-                    self.layout = null;
+                    self.observeDenseLayout(null);
                 }
+            } else {
+                self.observeDenseLayout(null);
             }
         }
         self.line_raw_len = 0;
