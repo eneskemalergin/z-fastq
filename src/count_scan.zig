@@ -60,12 +60,11 @@ const DenseLayout = struct {
             !@call(.always_inline, containsNewline, .{header}) and
             lineContentLen(header) <= max_line_bytes and
             record[layout.sequence_end] == '\n' and
-            !@call(.always_inline, containsNewline, .{sequence}) and
+            !@call(.always_inline, containsNewlinePair, .{ sequence, quality }) and
             sequence_len <= max_line_bytes and
             record[layout.plus_start] == '+' and
             record[layout.plus_start + 1] == '\n' and
             record[layout.quality_end] == '\n' and
-            !@call(.always_inline, containsNewline, .{quality}) and
             quality_len <= max_line_bytes and
             quality_len == sequence_len;
     }
@@ -433,6 +432,39 @@ fn containsNewline(bytes: []const u8) bool {
 
     for (bytes) |byte| {
         if (byte == '\n') return true;
+    }
+    return false;
+}
+
+fn containsNewlinePair(first: []const u8, second: []const u8) bool {
+    std.debug.assert(first.len == second.len);
+
+    const vector_len = std.simd.suggestVectorLength(u8) orelse @sizeOf(usize);
+    const Vector = @Vector(vector_len, u8);
+    const newline: Vector = @splat('\n');
+
+    if (first.len >= vector_len) {
+        const full_end = first.len - first.len % vector_len;
+        var pos: usize = 0;
+        while (pos < full_end) : (pos += vector_len) {
+            const first_chunk: Vector = first[pos..][0..vector_len].*;
+            const second_chunk: Vector = second[pos..][0..vector_len].*;
+            const first_has_newline = @reduce(.Or, first_chunk == newline);
+            const second_has_newline = @reduce(.Or, second_chunk == newline);
+            if (first_has_newline or second_has_newline) return true;
+        }
+        if (pos < first.len) {
+            const first_chunk: Vector = first[first.len - vector_len ..][0..vector_len].*;
+            const second_chunk: Vector = second[second.len - vector_len ..][0..vector_len].*;
+            const first_has_newline = @reduce(.Or, first_chunk == newline);
+            const second_has_newline = @reduce(.Or, second_chunk == newline);
+            if (first_has_newline or second_has_newline) return true;
+        }
+        return false;
+    }
+
+    for (first, second) |first_byte, second_byte| {
+        if (first_byte == '\n' or second_byte == '\n') return true;
     }
     return false;
 }
