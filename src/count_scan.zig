@@ -219,45 +219,46 @@ pub const Scanner = struct {
 
         const nl1 = if (header_line_bytes) |line_bytes| line_bytes - 1 else return 0;
         if (nl1 > 0 and data[nl1 - 1] == '\r') return 0;
-        const hdr_len = lineContentLen(data[0..nl1]);
-        if (hdr_len < 2 or !fastq.headerPrefixIsValid(data[0], data[1])) {
+        if (nl1 < 2 or !fastq.headerPrefixIsValid(data[0], data[1])) {
             self.disableFast();
             return 0;
         }
-        if (hdr_len > self.options.max_line_bytes) return error.LineTooLong;
+        if (nl1 > self.options.max_line_bytes) return error.LineTooLong;
 
         const seq_start = nl1 + 1;
         const nl2_rel = findNewline(data[seq_start..]) orelse return 0;
         const seq_len = nl2_rel;
-        const after_seq = std.math.add(usize, seq_start, seq_len) catch return 0;
-        if (after_seq >= data.len or data[after_seq] != '\n') return 0;
+        const after_seq = seq_start + seq_len;
         if (seq_len > 0 and data[after_seq - 1] == '\r') return 0;
-        const sequence_len = lineContentLen(data[seq_start..after_seq]);
-        if (sequence_len > self.options.max_line_bytes) return error.LineTooLong;
+        if (seq_len > self.options.max_line_bytes) return error.LineTooLong;
 
-        const plus_start = std.math.add(usize, after_seq, 1) catch return 0;
+        const plus_start = after_seq + 1;
         if (plus_start >= data.len or data[plus_start] != '+') return 0;
         const plus_nl_rel = if (plus_start + 1 < data.len and data[plus_start + 1] == '\n')
             1
         else
             std.mem.indexOfScalar(u8, data[plus_start..], '\n') orelse return 0;
-        const plus_end = std.math.add(usize, plus_start, plus_nl_rel) catch return 0;
+        const plus_end = plus_start + plus_nl_rel;
         if (plus_nl_rel > 0 and data[plus_end - 1] == '\r') return 0;
         if (plus_nl_rel > self.options.max_line_bytes) return error.LineTooLong;
 
-        const qual_start = std.math.add(usize, plus_end, 1) catch return 0;
-        const after_qual = std.math.add(usize, qual_start, seq_len) catch return 0;
-        if (after_qual >= data.len) return 0;
+        const qual_start = plus_end + 1;
+        if (seq_len >= data.len - qual_start) return 0;
+        const after_qual = qual_start + seq_len;
         if (containsNewline(data[qual_start..after_qual])) return 0;
         if (data[after_qual] != '\n') return 0;
         if (seq_len > 0 and data[after_qual - 1] == '\r') return 0;
-        const quality_len = lineContentLen(data[qual_start..after_qual]);
-        if (quality_len > self.options.max_line_bytes) return error.LineTooLong;
-        if (quality_len != sequence_len) return 0;
 
         const record_end = after_qual + 1;
         if (plus_nl_rel == 1) {
-            self.observeDenseLayout(DenseLayout.fromRecordEnd(record_end, seq_len));
+            self.observeDenseLayout(.{
+                .sequence_start = seq_start,
+                .sequence_end = after_seq,
+                .plus_start = plus_start,
+                .quality_start = qual_start,
+                .quality_end = after_qual,
+                .record_stride = record_end,
+            });
         } else {
             self.observeDenseLayout(null);
         }
