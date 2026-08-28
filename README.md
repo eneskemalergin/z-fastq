@@ -9,10 +9,11 @@ Requires Zig 0.16.0 available as `zig` on `PATH`.
 ```bash
 zig build
 zig build test
+zig build test -Dstatic=true -Doptimize=ReleaseSafe
 zig build -Dstatic=true -Doptimize=ReleaseFast
 ```
 
-Debug is the development build. ReleaseFast is always single-threaded, static, and stripped; `-Dstatic=true` states that required release configuration explicitly.
+`zig build` defaults to Debug. Use ReleaseSafe to check the optimized static release path with runtime safety, then ReleaseFast for the final single-threaded, static, stripped binary. `-Dstatic=true` states the required release configuration explicitly.
 
 The supported Linux x86-64 build uses the vendored ISA-L 2.32.1 stateful inflate and CRC path by default. Building this path from source requires NASM 2.14.01 or newer. Use `-Disa-l=false` to exclude ISA-L, NASM, and its C linkage from the build. The Zig path runtime-selects PCLMUL CRC-32 on supported x86-64 processors and retains a portable fallback. Both paths stream through bounded storage and validate the same project-owned gzip framing, CRC-32, ISIZE, and concatenated-member behavior.
 

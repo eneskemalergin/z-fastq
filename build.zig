@@ -6,10 +6,10 @@ pub fn build(b: *std.Build) void {
     const requested_target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     switch (optimize) {
-        .Debug, .ReleaseFast => {},
+        .Debug, .ReleaseSafe, .ReleaseFast => {},
         else => {
             std.debug.print(
-                "error: z-fastq builds only in Debug or ReleaseFast\n",
+                "error: z-fastq builds only in Debug, ReleaseSafe, or ReleaseFast\n",
                 .{},
             );
             std.process.exit(1);
@@ -24,17 +24,17 @@ pub fn build(b: *std.Build) void {
         );
         std.process.exit(1);
     }
-    const static_release = optimize == .ReleaseFast;
-    if (b.option(bool, "static", "Confirm the static ReleaseFast build")) |requested_static| {
-        if (requested_static != static_release) {
+    const release_build = optimize == .ReleaseSafe or optimize == .ReleaseFast;
+    if (b.option(bool, "static", "Confirm a static release build")) |requested_static| {
+        if (requested_static != release_build) {
             std.debug.print(
-                "error: Debug is the development build and ReleaseFast is always static\n",
+                "error: Debug is native; ReleaseSafe and ReleaseFast are always static\n",
                 .{},
             );
             std.process.exit(1);
         }
     }
-    const target = if (static_release)
+    const target = if (release_build)
         b.resolveTargetQuery(.{
             .cpu_arch = .x86_64,
             .os_tag = .linux,
