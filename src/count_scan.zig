@@ -227,7 +227,7 @@ pub const Scanner = struct {
         if (hdr_len > self.options.max_line_bytes) return error.LineTooLong;
 
         const seq_start = nl1 + 1;
-        const nl2_rel = std.mem.indexOfScalar(u8, data[seq_start..], '\n') orelse return 0;
+        const nl2_rel = findNewline(data[seq_start..]) orelse return 0;
         const seq_len = nl2_rel;
         const after_seq = std.math.add(usize, seq_start, seq_len) catch return 0;
         if (after_seq >= data.len or data[after_seq] != '\n') return 0;
@@ -440,9 +440,34 @@ fn containsNewline(bytes: []const u8) bool {
     return false;
 }
 
+fn findNewline(bytes: []const u8) ?usize {
+    const Vector = @Vector(16, u8);
+    const newline: Vector = @splat('\n');
+
+    var pos: usize = 0;
+    while (bytes.len - pos >= 32) : (pos += 32) {
+        const first: Vector = bytes[pos..][0..16].*;
+        const second: Vector = bytes[pos + 16 ..][0..16].*;
+        const first_mask: u16 = @bitCast(first == newline);
+        const second_mask: u16 = @bitCast(second == newline);
+        const mask = @as(u32, first_mask) | @as(u32, second_mask) << 16;
+        if (mask != 0) return pos + @as(usize, @intCast(@ctz(mask)));
+    }
+    if (bytes.len - pos >= 16) {
+        const block: Vector = bytes[pos..][0..16].*;
+        const mask: u16 = @bitCast(block == newline);
+        if (mask != 0) return pos + @as(usize, @intCast(@ctz(mask)));
+        pos += 16;
+    }
+    for (bytes[pos..], pos..) |byte, index| {
+        if (byte == '\n') return index;
+    }
+    return null;
+}
+
 fn headerLineBytesAt(data: []const u8) ?usize {
     if (data.len == 0 or data[0] != '@') return null;
-    const rel = std.mem.indexOfScalar(u8, data, '\n') orelse return null;
+    const rel = findNewline(data) orelse return null;
     return rel + 1;
 }
 
