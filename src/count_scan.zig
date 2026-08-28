@@ -173,7 +173,7 @@ pub const Scanner = struct {
                 }
             }
 
-            const consumed = try self.tryFastRecord(remaining, headerLineBytesAt(remaining));
+            const consumed = try self.tryFastRecord(remaining);
             if (consumed == 0) return cursor;
             self.record_index += 1;
             cursor += consumed;
@@ -206,57 +206,53 @@ pub const Scanner = struct {
         return accepted;
     }
 
-    fn tryFastRecord(
-        self: *Scanner,
-        data: []const u8,
-        header_line_bytes: ?usize,
-    ) fastq.ReaderError!usize {
+    fn tryFastRecord(self: *Scanner, data: []const u8) fastq.ReaderError!usize {
         if (data.len == 0) return 0;
         if (data[0] != '@') {
             self.disableFast();
             return 0;
         }
 
-        const nl1 = if (header_line_bytes) |line_bytes| line_bytes - 1 else return 0;
-        if (nl1 > 0 and data[nl1 - 1] == '\r') return 0;
-        if (nl1 < 2 or !fastq.headerPrefixIsValid(data[0], data[1])) {
+        var line_ends: [4]usize = undefined;
+        if (!findRecordNewlines(data, &line_ends)) return 0;
+
+        const header_end = line_ends[0];
+        const sequence_start = header_end + 1;
+        const sequence_end = line_ends[1];
+        const sequence_len = sequence_end - sequence_start;
+        const plus_start = sequence_end + 1;
+        const plus_end = line_ends[2];
+        const plus_len = plus_end - plus_start;
+        const quality_start = plus_end + 1;
+        const quality_end = line_ends[3];
+        const quality_len = quality_end - quality_start;
+
+        if ((header_end > 0 and data[header_end - 1] == '\r') or
+            (sequence_len > 0 and data[sequence_end - 1] == '\r') or
+            (plus_len > 0 and data[plus_end - 1] == '\r') or
+            (quality_len > 0 and data[quality_end - 1] == '\r'))
+        {
+            return 0;
+        }
+        if (header_end < 2 or !fastq.headerPrefixIsValid(data[0], data[1])) {
             self.disableFast();
             return 0;
         }
-        if (nl1 > self.options.max_line_bytes) return error.LineTooLong;
+        if (header_end > self.options.max_line_bytes) return error.LineTooLong;
+        if (sequence_len > self.options.max_line_bytes) return error.LineTooLong;
+        if (plus_len == 0 or data[plus_start] != '+') return 0;
+        if (plus_len > self.options.max_line_bytes) return error.LineTooLong;
+        if (quality_len > self.options.max_line_bytes) return error.LineTooLong;
+        if (quality_len != sequence_len) return 0;
 
-        const seq_start = nl1 + 1;
-        const nl2_rel = findNewline(data[seq_start..]) orelse return 0;
-        const seq_len = nl2_rel;
-        const after_seq = seq_start + seq_len;
-        if (seq_len > 0 and data[after_seq - 1] == '\r') return 0;
-        if (seq_len > self.options.max_line_bytes) return error.LineTooLong;
-
-        const plus_start = after_seq + 1;
-        if (plus_start >= data.len or data[plus_start] != '+') return 0;
-        const plus_nl_rel = if (plus_start + 1 < data.len and data[plus_start + 1] == '\n')
-            1
-        else
-            std.mem.indexOfScalar(u8, data[plus_start..], '\n') orelse return 0;
-        const plus_end = plus_start + plus_nl_rel;
-        if (plus_nl_rel > 0 and data[plus_end - 1] == '\r') return 0;
-        if (plus_nl_rel > self.options.max_line_bytes) return error.LineTooLong;
-
-        const qual_start = plus_end + 1;
-        if (seq_len >= data.len - qual_start) return 0;
-        const after_qual = qual_start + seq_len;
-        if (containsNewline(data[qual_start..after_qual])) return 0;
-        if (data[after_qual] != '\n') return 0;
-        if (seq_len > 0 and data[after_qual - 1] == '\r') return 0;
-
-        const record_end = after_qual + 1;
-        if (plus_nl_rel == 1) {
+        const record_end = quality_end + 1;
+        if (plus_len == 1) {
             self.observeDenseLayout(.{
-                .sequence_start = seq_start,
-                .sequence_end = after_seq,
+                .sequence_start = sequence_start,
+                .sequence_end = sequence_end,
                 .plus_start = plus_start,
-                .quality_start = qual_start,
-                .quality_end = after_qual,
+                .quality_start = quality_start,
+                .quality_end = quality_end,
                 .record_stride = record_end,
             });
         } else {
@@ -441,35 +437,43 @@ fn containsNewline(bytes: []const u8) bool {
     return false;
 }
 
-fn findNewline(bytes: []const u8) ?usize {
+fn findRecordNewlines(bytes: []const u8, line_ends: *[4]usize) bool {
     const Vector = @Vector(16, u8);
     const newline: Vector = @splat('\n');
 
+    var found: usize = 0;
     var pos: usize = 0;
     while (bytes.len - pos >= 32) : (pos += 32) {
         const first: Vector = bytes[pos..][0..16].*;
         const second: Vector = bytes[pos + 16 ..][0..16].*;
         const first_mask: u16 = @bitCast(first == newline);
         const second_mask: u16 = @bitCast(second == newline);
-        const mask = @as(u32, first_mask) | @as(u32, second_mask) << 16;
-        if (mask != 0) return pos + @as(usize, @intCast(@ctz(mask)));
+        var mask = @as(u32, first_mask) | @as(u32, second_mask) << 16;
+        while (mask != 0) {
+            line_ends[found] = pos + @as(usize, @intCast(@ctz(mask)));
+            found += 1;
+            if (found == line_ends.len) return true;
+            mask &= mask - 1;
+        }
     }
     if (bytes.len - pos >= 16) {
         const block: Vector = bytes[pos..][0..16].*;
-        const mask: u16 = @bitCast(block == newline);
-        if (mask != 0) return pos + @as(usize, @intCast(@ctz(mask)));
+        var mask: u16 = @bitCast(block == newline);
+        while (mask != 0) {
+            line_ends[found] = pos + @as(usize, @intCast(@ctz(mask)));
+            found += 1;
+            if (found == line_ends.len) return true;
+            mask &= mask - 1;
+        }
         pos += 16;
     }
     for (bytes[pos..], pos..) |byte, index| {
-        if (byte == '\n') return index;
+        if (byte != '\n') continue;
+        line_ends[found] = index;
+        found += 1;
+        if (found == line_ends.len) return true;
     }
-    return null;
-}
-
-fn headerLineBytesAt(data: []const u8) ?usize {
-    if (data.len == 0 or data[0] != '@') return null;
-    const rel = findNewline(data) orelse return null;
-    return rel + 1;
+    return false;
 }
 
 /// Counts all records in one slice and replaces `scanner` with the final state.
@@ -505,24 +509,25 @@ test "[failure] - [dense layout]: construction rejects impossible geometry" {
     try std.testing.expect(DenseLayout.fromRecordEnd(max, max) == null);
 }
 
-test "[edge] - [header scan]: indexed boundaries and exceptional forms are exact" {
-    var data: [130]u8 = undefined;
-    @memset(&data, 'H');
-    data[0] = '@';
+test "[edge] - [record newline scan]: vector boundaries and incomplete input are exact" {
+    const cases = [_][4]usize{
+        .{ 14, 15, 30, 31 },
+        .{ 15, 16, 31, 32 },
+        .{ 30, 31, 62, 63 },
+        .{ 31, 32, 63, 64 },
+        .{ 126, 127, 128, 129 },
+    };
 
-    data[126] = '\n';
-    try std.testing.expectEqual(@as(?usize, 127), headerLineBytesAt(data[0..127]));
+    for (cases) |expected| {
+        var data: [131]u8 = @splat('x');
+        for (expected) |index| data[index] = '\n';
+        data[130] = '\n';
+        var actual: [4]usize = undefined;
 
-    data[126] = 'H';
-    data[127] = '\n';
-    try std.testing.expectEqual(@as(?usize, 128), headerLineBytesAt(data[0..128]));
-
-    data[127] = 'H';
-    data[128] = '\n';
-    try std.testing.expectEqual(@as(?usize, 129), headerLineBytesAt(data[0..129]));
-
-    try std.testing.expectEqual(@as(?usize, null), headerLineBytesAt(data[0..128]));
-    try std.testing.expectEqual(@as(?usize, 4), headerLineBytesAt("@h\r\n"));
+        try std.testing.expect(findRecordNewlines(&data, &actual));
+        try std.testing.expectEqual(expected, actual);
+        try std.testing.expect(!findRecordNewlines(data[0..expected[3]], &actual));
+    }
 }
 
 test "[unit] - [derived record]: annotated plus lines stay on the complete-record path" {

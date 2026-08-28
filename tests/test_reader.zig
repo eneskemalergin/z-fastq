@@ -1200,7 +1200,7 @@ test "[edge] - [count scanner]: a non-minimal plus record does not disable fast 
     try std.testing.expectEqual(@as(u64, 2), n);
 }
 
-test "[edge] - [count scanner]: a non-minimal plus line uses structural fallback" {
+test "[edge] - [count scanner]: an annotated plus line stays on the complete-record path" {
     const data =
         \\@read3
         \\AAAA
