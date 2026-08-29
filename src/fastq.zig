@@ -57,6 +57,11 @@ pub const Record = struct {
     quality: []const u8,
 };
 
+pub const RecordPayload = struct {
+    sequence: []const u8,
+    quality: []const u8,
+};
+
 pub const Alphabet = enum {
     iupac,
     acgtn,
@@ -399,11 +404,18 @@ const BufferedRecord = struct {
     canonical_range: ?Range,
 };
 
-const BufferedRecordResult = union(enum) {
-    incomplete,
-    eof,
-    record: BufferedRecord,
+const BufferedPayload = struct {
+    sequence: Range,
+    quality: Range,
 };
+
+fn BufferedRecordResult(comptime full_record: bool) type {
+    return union(enum) {
+        incomplete,
+        eof,
+        record: if (full_record) BufferedRecord else BufferedPayload,
+    };
+}
 
 fn findLineEnds(bytes: []const u8, ends: *[4]usize) bool {
     if (std.simd.suggestVectorLength(u8)) |vector_len| {
@@ -544,7 +556,7 @@ pub const Reader = struct {
     ) ReaderError!?Record {
         canonical_span.* = null;
         self.beginRecord();
-        switch (try self.readBufferedRecord()) {
+        switch (try self.readBufferedRecord(true)) {
             .incomplete => return self.nextFallback(derive_id),
             .eof => return null,
             .record => |buffered| return self.finishBufferedRecord(
@@ -577,27 +589,55 @@ pub const Reader = struct {
         };
     }
 
+    fn nextPayload(self: *Reader) ReaderError!?RecordPayload {
+        self.beginRecord();
+        switch (try self.readBufferedRecord(false)) {
+            .incomplete => return self.nextFallbackPayload(),
+            .eof => return null,
+            .record => |buffered| {
+                self.current_record_offsets = self.record_offsets;
+                return .{
+                    .sequence = buffered.sequence.slice(self.buf),
+                    .quality = buffered.quality.slice(self.buf),
+                };
+            },
+        }
+    }
+
     fn nextFallback(self: *Reader, comptime derive_id: bool) ReaderError!?Record {
+        if (!try self.readFallbackRecord()) return null;
+        const header_field = &self.fallback_fields[0];
+        const plus_field = &self.fallback_fields[2];
+        const header_bytes = header_field.storage[0..header_field.len];
+        const plus_bytes = plus_field.storage[0..plus_field.len];
+        const header = header_bytes[1..];
+        return .{
+            .header = header,
+            .id = if (derive_id) firstToken(header) else header[0..0],
+            .sequence = self.fallback_fields[1].storage[0..self.fallback_fields[1].len],
+            .plus = plus_bytes[1..],
+            .quality = self.fallback_fields[3].storage[0..self.fallback_fields[3].len],
+        };
+    }
+
+    fn nextFallbackPayload(self: *Reader) ReaderError!?RecordPayload {
+        if (!try self.readFallbackRecord()) return null;
+        return .{
+            .sequence = self.fallback_fields[1].storage[0..self.fallback_fields[1].len],
+            .quality = self.fallback_fields[3].storage[0..self.fallback_fields[3].len],
+        };
+    }
+
+    fn readFallbackRecord(self: *Reader) ReaderError!bool {
         self.beginFallbackRecord();
         while (true) {
             const line = try self.readLine();
             switch (try self.ingestLine(line)) {
-                .eof => return null,
+                .eof => return false,
                 .continue_ => {},
                 .record_ready => {
                     self.current_record_offsets = self.record_offsets;
-                    const header_field = &self.fallback_fields[0];
-                    const plus_field = &self.fallback_fields[2];
-                    const header_bytes = header_field.storage[0..header_field.len];
-                    const plus_bytes = plus_field.storage[0..plus_field.len];
-                    const header = header_bytes[1..];
-                    return .{
-                        .header = header,
-                        .id = if (derive_id) firstToken(header) else header[0..0],
-                        .sequence = self.fallback_fields[1].storage[0..self.fallback_fields[1].len],
-                        .plus = plus_bytes[1..],
-                        .quality = self.fallback_fields[3].storage[0..self.fallback_fields[3].len],
-                    };
+                    return true;
                 },
             }
         }
@@ -606,7 +646,7 @@ pub const Reader = struct {
     /// Consumes one record without returning its fields, or returns false at clean EOF.
     pub fn advance(self: *Reader) ReaderError!bool {
         self.beginRecord();
-        switch (try self.readBufferedRecord()) {
+        switch (try self.readBufferedRecord(true)) {
             .incomplete => return self.advanceFallback(),
             .eof => return false,
             .record => return true,
@@ -642,7 +682,10 @@ pub const Reader = struct {
         for (&self.fallback_fields) |*field| field.len = 0;
     }
 
-    fn readBufferedRecord(self: *Reader) ReaderError!BufferedRecordResult {
+    fn readBufferedRecord(
+        self: *Reader,
+        comptime full_record: bool,
+    ) ReaderError!BufferedRecordResult(full_record) {
         if (self.machine.expected != .header) return .incomplete;
         if (self.cursor == self.fill_end and !try self.refill()) return .eof;
 
@@ -652,6 +695,7 @@ pub const Reader = struct {
         }
 
         var ranges: [4]Range = undefined;
+        var payload: BufferedPayload = undefined;
         var canonical = true;
         const record_start = self.cursor;
         for (0..4) |line_index| {
@@ -664,7 +708,7 @@ pub const Reader = struct {
                 raw_end - 1
             else
                 raw_end;
-            canonical = canonical and end == raw_end;
+            if (full_record) canonical = canonical and end == raw_end;
             if (end - start > self.options.max_line_bytes) return error.LineTooLong;
 
             const start_offset = self.byte_offset;
@@ -678,24 +722,34 @@ pub const Reader = struct {
             const record_ready = self.machine.push(content.len, first_byte, second_byte) catch |err| {
                 return self.structuralError(err, start_offset);
             };
-            ranges[line_index] = .{ .start = start, .end = end };
+            const range: Range = .{ .start = start, .end = end };
+            if (full_record) ranges[line_index] = range;
             switch (line_kind) {
                 .header => self.record_offsets.header = start_offset,
-                .sequence => self.record_offsets.sequence = start_offset,
+                .sequence => {
+                    self.record_offsets.sequence = start_offset;
+                    if (!full_record) payload.sequence = range;
+                },
                 .plus => self.record_offsets.plus = start_offset,
-                .quality => self.record_offsets.quality = start_offset,
+                .quality => {
+                    self.record_offsets.quality = start_offset;
+                    if (!full_record) payload.quality = range;
+                },
             }
             std.debug.assert(record_ready == (line_index == 3));
         }
 
         self.record_index += 1;
-        return .{ .record = .{
-            .ranges = ranges,
-            .canonical_range = if (canonical)
-                .{ .start = record_start, .end = record_start + relative_ends[3] + 1 }
-            else
-                null,
-        } };
+        return if (full_record)
+            .{ .record = .{
+                .ranges = ranges,
+                .canonical_range = if (canonical)
+                    .{ .start = record_start, .end = record_start + relative_ends[3] + 1 }
+                else
+                    null,
+            } }
+        else
+            .{ .record = payload };
     }
 
     fn ingestLine(self: *Reader, line: ?Line) ReaderError!IngestResult {
@@ -898,6 +952,10 @@ pub fn nextWithoutId(
     return reader.nextWithCanonicalSpan(canonical_span, false);
 }
 
+pub fn nextPayload(reader: *Reader) ReaderError!?RecordPayload {
+    return reader.nextPayload();
+}
+
 pub fn nextBufferedWithoutId(
     reader: *Reader,
     canonical_span: *?[]const u8,
@@ -905,7 +963,7 @@ pub fn nextBufferedWithoutId(
     canonical_span.* = null;
     reader.beginRecord();
     if (reader.cursor == reader.fill_end) return null;
-    return switch (try reader.readBufferedRecord()) {
+    return switch (try reader.readBufferedRecord(true)) {
         .incomplete => null,
         .eof => unreachable,
         .record => |buffered| reader.finishBufferedRecord(
@@ -957,7 +1015,7 @@ pub fn nextBufferedAfterFallbackTransfer(
     }
     const got_data = try reader.refill();
     if (!got_data and reader.cursor == reader.fill_end) return null;
-    return switch (try reader.readBufferedRecord()) {
+    return switch (try reader.readBufferedRecord(true)) {
         .incomplete => null,
         .eof => null,
         .record => |buffered| reader.finishBufferedRecord(
@@ -1431,6 +1489,118 @@ const ReaderSpillFixture = struct {
     }
 };
 
+const ProjectionTestSource = struct {
+    data: []const u8,
+    pos: usize = 0,
+    split: usize,
+    split_pending: bool,
+    fail_at: ?usize,
+
+    fn init(data: []const u8, split: usize, fail_at: ?usize) ProjectionTestSource {
+        return .{
+            .data = data,
+            .split = split,
+            .split_pending = split > 0 and split < data.len,
+            .fail_at = fail_at,
+        };
+    }
+
+    fn byteSource(self: *ProjectionTestSource) ByteSource {
+        return .{ .vtable = &vtable, .ctx = self };
+    }
+
+    const vtable = ByteSource.VTable{ .read = read };
+
+    fn read(ctx: *anyopaque, dest: []u8) error{ReadFailed}!usize {
+        const self: *ProjectionTestSource = @ptrCast(@alignCast(ctx));
+        if (self.fail_at) |fail_at| {
+            if (self.pos >= fail_at) return error.ReadFailed;
+        }
+        if (self.pos == self.data.len) return 0;
+
+        var end = self.pos + @min(dest.len, self.data.len - self.pos);
+        if (self.split_pending) {
+            self.split_pending = false;
+            end = @min(end, self.split);
+        }
+        if (self.fail_at) |fail_at| end = @min(end, fail_at);
+        const bytes = self.data[self.pos..end];
+        @memcpy(dest[0..bytes.len], bytes);
+        self.pos = end;
+        return bytes.len;
+    }
+};
+
+fn expectProjectionErrorEqual(expected: ?ParseError, actual: ?ParseError) !void {
+    if (expected) |expected_error| {
+        const actual_error = actual orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(expected_error.code, actual_error.code);
+        try std.testing.expectEqualStrings(expected_error.message, actual_error.message);
+        try std.testing.expectEqual(expected_error.record_index, actual_error.record_index);
+        try std.testing.expectEqual(expected_error.byte_offset, actual_error.byte_offset);
+        try std.testing.expectEqual(expected_error.line_in_record, actual_error.line_in_record);
+    } else {
+        try std.testing.expect(actual == null);
+    }
+}
+
+fn expectPayloadProjection(
+    input: []const u8,
+    split: usize,
+    fail_at: ?usize,
+    options: Options,
+) !void {
+    var full_source = ProjectionTestSource.init(input, split, fail_at);
+    var full_reader = try Reader.init(
+        std.testing.allocator,
+        full_source.byteSource(),
+        options,
+    );
+    defer full_reader.deinit();
+
+    var payload_source = ProjectionTestSource.init(input, split, fail_at);
+    var payload_reader = try Reader.init(
+        std.testing.allocator,
+        payload_source.byteSource(),
+        options,
+    );
+    defer payload_reader.deinit();
+
+    while (true) {
+        const full_result = full_reader.next();
+        const payload_result = nextPayload(&payload_reader);
+        if (full_result) |full_record| {
+            const payload_record = try payload_result;
+            try std.testing.expectEqual(full_record == null, payload_record == null);
+            if (full_record) |record| {
+                const payload = payload_record.?;
+                try std.testing.expectEqualStrings(record.sequence, payload.sequence);
+                try std.testing.expectEqualStrings(record.quality, payload.quality);
+            }
+            try std.testing.expectEqual(full_reader.recordIndex(), payload_reader.recordIndex());
+            try std.testing.expectEqual(full_reader.byteOffset(), payload_reader.byteOffset());
+            try std.testing.expectEqual(
+                full_reader.currentRecordOffsets(),
+                payload_reader.currentRecordOffsets(),
+            );
+            if (full_record == null) return;
+        } else |expected_error| {
+            try std.testing.expectError(expected_error, payload_result);
+            try std.testing.expectEqual(full_reader.recordIndex(), payload_reader.recordIndex());
+            try std.testing.expectEqual(full_reader.byteOffset(), payload_reader.byteOffset());
+            try std.testing.expectEqual(
+                full_reader.currentRecordOffsets(),
+                payload_reader.currentRecordOffsets(),
+            );
+            try expectProjectionErrorEqual(
+                full_reader.takeLastError(),
+                payload_reader.takeLastError(),
+            );
+            return;
+        }
+    }
+}
+
 fn readSpillForAllocationCheck(allocator: std.mem.Allocator, input: []const u8) !void {
     var source = io_layer.SliceSource.init(input);
     var reader = try Reader.init(allocator, source.byteSource(), .{});
@@ -1475,6 +1645,38 @@ test "[property] - [reader]: structural masks match scalar line boundaries" {
 
     var incomplete_ends: [4]usize = undefined;
     try std.testing.expect(!findLineEnds("a\nb\nc\n", &incomplete_ends));
+}
+
+test "[property] - [reader]: payload projection preserves delivery and failures" {
+    const valid =
+        "@first description\nACGT\n+annotated\n!!!!\n" ++
+        "@empty\r\n\r\n+\r\n\r\n" ++
+        "@tail\nN\n+\n#";
+    for (0..valid.len + 1) |split| {
+        try expectPayloadProjection(valid, split, null, .{});
+    }
+
+    const malformed = [_]struct {
+        input: []const u8,
+        split: usize,
+        options: Options = .{},
+    }{
+        .{ .input = "@r\nAC\n+\n", .split = 5 },
+        .{ .input = "r\nA\n+\n!\n", .split = 3 },
+        .{ .input = "@r\nA\n-\n!\n", .split = 6 },
+        .{ .input = "@r\nAA\n+\n!\n", .split = 7 },
+        .{
+            .input = "@long\nA\n+\n!\n",
+            .split = 4,
+            .options = .{ .max_line_bytes = 4 },
+        },
+    };
+    for (malformed) |case| {
+        try expectPayloadProjection(case.input, 0, null, case.options);
+        try expectPayloadProjection(case.input, case.split, null, case.options);
+    }
+
+    try expectPayloadProjection(valid, 4, 9, .{});
 }
 
 test "[failure] - [reader]: partial fallback ownership is released after allocation failure" {

@@ -1548,11 +1548,16 @@ fn collectStats(
     defer reader.deinit();
 
     var stats: zfastq.Stats = .{};
-    var canonical_span: ?[]const u8 = null;
-    while (fastq.nextWithoutId(&reader, &canonical_span) catch |err| {
+    while (fastq.nextPayload(&reader) catch |err| {
         return .{ .failure = mapReaderFailure(&reader, err) };
-    }) |record| {
-        stats.addRecord(record) catch |err| switch (err) {
+    }) |payload| {
+        stats.addRecord(.{
+            .header = "",
+            .id = "",
+            .sequence = payload.sequence,
+            .plus = "",
+            .quality = payload.quality,
+        }) catch |err| switch (err) {
             error.S006InvalidQuality => {
                 const quality_error = stats.takeLastQualityError() orelse {
                     return .{ .failure = CommandFailure.plain(
