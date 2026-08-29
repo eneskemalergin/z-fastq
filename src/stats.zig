@@ -233,6 +233,7 @@ fn payloadTotalsVector(
 ) StatsError!PayloadTotals {
     const half_len = vector_len / 2;
     const vectors_per_quality_block: usize = std.math.maxInt(u8) - 1;
+    const vectors_per_base_block: usize = std.math.maxInt(u8) - 1;
     const Bytes = @Vector(vector_len, u8);
     const Mask = @Vector(vector_len, bool);
     const Lanes = @Vector(half_len, u16);
@@ -337,20 +338,32 @@ fn payloadTotalsVector(
     var base_index: usize = 0;
     while (sequence.len - base_index >= vector_len) {
         const remaining_vectors = (sequence.len - base_index) / vector_len;
-        const block_limit: usize = if (tail_len != 0 and
-            remaining_vectors <= std.math.maxInt(u8))
-            std.math.maxInt(u8) - 1
-        else
-            std.math.maxInt(u8);
-        const block_vectors = @min(remaining_vectors, block_limit);
+        const block_vectors = @min(remaining_vectors, vectors_per_base_block);
         var a_lanes: Bytes = @splat(0);
         var c_lanes: Bytes = @splat(0);
         var g_lanes: Bytes = @splat(0);
         var t_lanes: Bytes = @splat(0);
         var n_lanes: Bytes = @splat(0);
 
-        var vector_index: usize = 0;
-        while (vector_index < block_vectors) : (vector_index += 1) {
+        var vectors_left = block_vectors;
+        while (vectors_left >= 2) : (vectors_left -= 2) {
+            const first_bases: Bytes = sequence[base_index..][0..vector_len].*;
+            const second_bases: Bytes = sequence[base_index + vector_len ..][0..vector_len].*;
+            const first_normalized = first_bases & case_mask;
+            const second_normalized = second_bases & case_mask;
+            a_lanes += @select(u8, first_normalized == a_base, ones, zeros) +
+                @select(u8, second_normalized == a_base, ones, zeros);
+            c_lanes += @select(u8, first_normalized == c_base, ones, zeros) +
+                @select(u8, second_normalized == c_base, ones, zeros);
+            g_lanes += @select(u8, first_normalized == g_base, ones, zeros) +
+                @select(u8, second_normalized == g_base, ones, zeros);
+            t_lanes += @select(u8, first_normalized == t_base, ones, zeros) +
+                @select(u8, second_normalized == t_base, ones, zeros);
+            n_lanes += @select(u8, first_normalized == n_base, ones, zeros) +
+                @select(u8, second_normalized == n_base, ones, zeros);
+            base_index += 2 * vector_len;
+        }
+        if (vectors_left == 1) {
             const bases: Bytes = sequence[base_index..][0..vector_len].*;
             const normalized = bases & case_mask;
             a_lanes += @select(u8, normalized == a_base, ones, zeros);
