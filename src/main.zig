@@ -2343,7 +2343,8 @@ fn sampleExactFirstPass(
         };
         if (n == 0) break;
         _ = scanner.feed(buf[0..n]) catch |err| {
-            failure = mapCheckScannerFailure(&scanner, err);
+            failure = considerExactRecords(allocator, selector, scanner.record_index);
+            if (failure == null) failure = mapCheckScannerFailure(&scanner, err);
             break;
         };
         failure = considerExactRecords(allocator, selector, scanner.record_index);
@@ -4188,6 +4189,45 @@ test "[unit] - [exact sample]: every retained file-change signal is compared" {
     changed = baseline;
     changed.mtime_nanoseconds += 1;
     try std.testing.expect(!sameFileSnapshot(baseline, changed));
+}
+
+test "[failure] - [exact sample]: selection allocation failure precedes later block format error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "records.fastq",
+        .data = "@one\nA\n+\n!\n" ++
+            "@two\nC\n+\n#\n" ++
+            "@bad\nG\nx\n$\n",
+    });
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        ".zig-cache/tmp/{s}/records.fastq",
+        .{tmp.sub_path},
+    );
+    var selector = sampling.ExactSelector.init(1, 11);
+    defer selector.deinit(std.testing.allocator);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+
+    const result = sampleExactFirstPass(io, failing.allocator(), path, &selector, .{
+        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+        .alphabet = .iupac,
+        .fraction = null,
+        .count = 1,
+        .seed = 11,
+    });
+    const failure = switch (result) {
+        .success => return error.ExpectedFailure,
+        .failure => |failure| failure,
+    };
+
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqualStrings("out_of_memory", failure.code);
+    try std.testing.expectEqual(@as(u64, 2), selector.record_count);
 }
 
 test "[failure] - [exact sample]: final record-count change keeps a valid prefix" {
