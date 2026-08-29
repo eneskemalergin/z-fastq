@@ -237,7 +237,7 @@ fn payloadTotalsVector(
     const Lanes = @Vector(half_len, u16);
     const ReductionLanes = @Vector(half_len, u32);
     const minimum: Bytes = @splat(33);
-    const maximum: Bytes = @splat(126);
+    const maximum_score: Bytes = @splat(93);
     const q20_minimum: Bytes = @splat(53);
     const q30_minimum: Bytes = @splat(63);
     const case_mask: Bytes = @splat(0xdf);
@@ -263,7 +263,8 @@ fn payloadTotalsVector(
         var vector_index: usize = 0;
         while (vector_index < block_vectors) : (vector_index += 1) {
             const encoded: Bytes = quality[byte_index..][0..vector_len].*;
-            const invalid = (encoded < minimum) | (encoded > maximum);
+            const score_bytes = encoded -% minimum;
+            const invalid = score_bytes > maximum_score;
             if (@reduce(.Or, invalid)) {
                 const lane = std.simd.firstTrue(invalid).?;
                 quality_error.* = .{
@@ -273,7 +274,7 @@ fn payloadTotalsVector(
                 return error.S006InvalidQuality;
             }
 
-            const scores = std.simd.deinterlace(2, encoded - minimum);
+            const scores = std.simd.deinterlace(2, score_bytes);
             sum_lanes += @as(Lanes, @intCast(scores[0])) + @as(Lanes, @intCast(scores[1]));
 
             const q20 = std.simd.deinterlace(2, @select(u8, encoded >= q20_minimum, ones, zeros));
@@ -382,6 +383,20 @@ test "[unit] - [statistics]: quality accumulator width uses the checked bound" {
         const boundary: usize = @intCast(common_limit);
         try std.testing.expectEqual(common_limit * 93, maxQualitySum(boundary).?);
         try std.testing.expect(maxQualitySum(boundary + 1) == null);
+    }
+}
+
+test "[property] - [statistics]: wrapped quality scores preserve the valid range" {
+    for (0..std.math.maxInt(u8) + 1) |value| {
+        const encoded: u8 = @intCast(value);
+        const wrapped_score = encoded -% 33;
+        if (fastq.decodePhred33(encoded)) |score| {
+            try std.testing.expect(wrapped_score <= 93);
+            try std.testing.expectEqual(score, wrapped_score);
+        } else |err| {
+            try std.testing.expectEqual(error.InvalidQuality, err);
+            try std.testing.expect(wrapped_score > 93);
+        }
     }
 }
 
