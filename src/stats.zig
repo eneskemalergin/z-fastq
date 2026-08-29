@@ -232,14 +232,15 @@ fn payloadTotalsVector(
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
     const half_len = vector_len / 2;
-    const vectors_per_block = std.math.maxInt(u16) / (2 * 93);
+    const vectors_per_quality_block: usize = std.math.maxInt(u8) - 1;
     const Bytes = @Vector(vector_len, u8);
+    const Mask = @Vector(vector_len, bool);
     const Lanes = @Vector(half_len, u16);
     const ReductionLanes = @Vector(half_len, u32);
-    const minimum: Bytes = @splat(33);
+    const phred_offset: Bytes = @splat(33);
     const maximum_score: Bytes = @splat(93);
-    const q20_minimum: Bytes = @splat(53);
-    const q30_minimum: Bytes = @splat(63);
+    const q20_score: Bytes = @splat(20);
+    const q30_score: Bytes = @splat(30);
     const case_mask: Bytes = @splat(0xdf);
     const a_base: Bytes = @splat('A');
     const c_base: Bytes = @splat('C');
@@ -255,39 +256,54 @@ fn payloadTotalsVector(
     var byte_index: usize = 0;
     while (quality.len - byte_index >= vector_len) {
         const remaining_vectors = (quality.len - byte_index) / vector_len;
-        const block_vectors = @min(remaining_vectors, vectors_per_block);
+        const block_vectors = @min(remaining_vectors, vectors_per_quality_block);
+        const block_start = byte_index;
         var sum_lanes: Lanes = @splat(0);
-        var q20_lanes: Lanes = @splat(0);
-        var q30_lanes: Lanes = @splat(0);
+        var q20_lanes: Bytes = @splat(0);
+        var q30_lanes: Bytes = @splat(0);
+        var invalid_lanes: Mask = @splat(false);
 
-        var vector_index: usize = 0;
-        while (vector_index < block_vectors) : (vector_index += 1) {
+        var vectors_left = block_vectors;
+        while (vectors_left >= 2) : (vectors_left -= 2) {
+            const first_encoded: Bytes = quality[byte_index..][0..vector_len].*;
+            const second_encoded: Bytes = quality[byte_index + vector_len ..][0..vector_len].*;
+            const first_scores = first_encoded -% phred_offset;
+            const second_scores = second_encoded -% phred_offset;
+            invalid_lanes |= (first_scores > maximum_score) | (second_scores > maximum_score);
+
+            const score_pairs = first_scores +% second_scores;
+            const scores = std.simd.deinterlace(2, score_pairs);
+            sum_lanes += @as(Lanes, @intCast(scores[0])) + @as(Lanes, @intCast(scores[1]));
+
+            q20_lanes += @select(u8, first_scores >= q20_score, ones, zeros) +
+                @select(u8, second_scores >= q20_score, ones, zeros);
+            q30_lanes += @select(u8, first_scores >= q30_score, ones, zeros) +
+                @select(u8, second_scores >= q30_score, ones, zeros);
+            byte_index += 2 * vector_len;
+        }
+        if (vectors_left == 1) {
             const encoded: Bytes = quality[byte_index..][0..vector_len].*;
-            const score_bytes = encoded -% minimum;
-            const invalid = score_bytes > maximum_score;
-            if (@reduce(.Or, invalid)) {
-                const lane = std.simd.firstTrue(invalid).?;
-                quality_error.* = .{
-                    .byte_index = byte_index + lane,
-                    .byte = quality[byte_index + lane],
-                };
-                return error.S006InvalidQuality;
-            }
+            const score_bytes = encoded -% phred_offset;
+            invalid_lanes |= score_bytes > maximum_score;
 
             const scores = std.simd.deinterlace(2, score_bytes);
             sum_lanes += @as(Lanes, @intCast(scores[0])) + @as(Lanes, @intCast(scores[1]));
-
-            const q20 = std.simd.deinterlace(2, @select(u8, encoded >= q20_minimum, ones, zeros));
-            q20_lanes += @as(Lanes, @intCast(q20[0])) + @as(Lanes, @intCast(q20[1]));
-
-            const q30 = std.simd.deinterlace(2, @select(u8, encoded >= q30_minimum, ones, zeros));
-            q30_lanes += @as(Lanes, @intCast(q30[0])) + @as(Lanes, @intCast(q30[1]));
+            q20_lanes += @select(u8, score_bytes >= q20_score, ones, zeros);
+            q30_lanes += @select(u8, score_bytes >= q30_score, ones, zeros);
             byte_index += vector_len;
         }
 
+        if (@reduce(.Or, invalid_lanes)) {
+            return rejectInvalidQualityBlock(
+                quality[block_start..byte_index],
+                block_start,
+                quality_error,
+            );
+        }
+
         quality_sum += @reduce(.Add, @as(ReductionLanes, @intCast(sum_lanes)));
-        q20_bases += @reduce(.Add, @as(ReductionLanes, @intCast(q20_lanes)));
-        q30_bases += @reduce(.Add, @as(ReductionLanes, @intCast(q30_lanes)));
+        q20_bases += sumBaseLanes(vector_len, q20_lanes);
+        q30_bases += sumBaseLanes(vector_len, q30_lanes);
     }
 
     var base_counts = [_]usize{0} ** 6;
@@ -353,6 +369,21 @@ fn payloadTotalsVector(
     };
 }
 
+fn rejectInvalidQualityBlock(
+    quality: []const u8,
+    base_index: usize,
+    quality_error: *?QualityError,
+) error{S006InvalidQuality} {
+    for (quality, base_index..) |quality_byte, byte_index| {
+        _ = fastq.decodePhred33(quality_byte) catch {
+            quality_error.* = .{ .byte_index = byte_index, .byte = quality_byte };
+            return error.S006InvalidQuality;
+        };
+    }
+    std.debug.assert(false);
+    return error.S006InvalidQuality;
+}
+
 fn sumBaseLanes(
     comptime vector_len: comptime_int,
     lanes: @Vector(vector_len, u8),
@@ -406,9 +437,10 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
         vector_len % 2 != 0 or
         vector_len > std.math.maxInt(u16) / std.math.maxInt(u8)) return;
 
-    const quality_block_len = vector_len * (std.math.maxInt(u16) / (2 * 93));
-    const base_block_len = vector_len * std.math.maxInt(u8);
-    const max_len = @max(quality_block_len, base_block_len) + vector_len + 1;
+    const quality_vectors_per_block: usize = std.math.maxInt(u8) - 1;
+    const quality_block_len: usize = vector_len * quality_vectors_per_block;
+    const base_block_len: usize = vector_len * std.math.maxInt(u8);
+    const max_len: usize = base_block_len + @as(usize, vector_len) + 1;
     const lengths = [_]usize{
         0,
         1,
@@ -421,9 +453,11 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
         base_block_len - 1,
         base_block_len,
         base_block_len + 1,
+        quality_block_len - vector_len,
         quality_block_len - 1,
         quality_block_len,
         quality_block_len + 1,
+        quality_block_len + vector_len,
     };
     const qualities = [_]u8{ 33, 52, 53, 62, 63, 126 };
     const sequence = try std.testing.allocator.alloc(u8, max_len);
@@ -454,8 +488,67 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
         try std.testing.expectEqualDeep(scalar_error, vector_error);
     }
 
-    const invalid_len = 2 * vector_len + 3;
-    const invalid_indices = [_]usize{ 0, vector_len - 1, vector_len, invalid_len - 1 };
+    @memset(quality[0..quality_block_len], 126);
+    var maximum_scalar_error: ?QualityError = null;
+    var maximum_vector_error: ?QualityError = null;
+    const maximum_scalar = try payloadTotalsScalar(
+        u64,
+        sequence[0..quality_block_len],
+        quality[0..quality_block_len],
+        &maximum_scalar_error,
+    );
+    const maximum_vector = try payloadTotals(
+        u64,
+        sequence[0..quality_block_len],
+        quality[0..quality_block_len],
+        &maximum_vector_error,
+    );
+    try std.testing.expectEqualDeep(maximum_scalar, maximum_vector);
+    try std.testing.expectEqualDeep(maximum_scalar_error, maximum_vector_error);
+
+    for (0..quality_vectors_per_block) |vector_index| {
+        const encoded: u8 = if (vector_index % 2 == 0) 32 else 33;
+        @memset(
+            quality[vector_index * vector_len ..][0..vector_len],
+            encoded,
+        );
+    }
+    const bound_len = quality_block_len - vector_len;
+    var bound_scalar_error: ?QualityError = null;
+    var bound_vector_error: ?QualityError = null;
+    try std.testing.expectError(
+        error.S006InvalidQuality,
+        payloadTotalsScalar(
+            u64,
+            sequence[0..bound_len],
+            quality[0..bound_len],
+            &bound_scalar_error,
+        ),
+    );
+    try std.testing.expectError(
+        error.S006InvalidQuality,
+        payloadTotals(
+            u64,
+            sequence[0..bound_len],
+            quality[0..bound_len],
+            &bound_vector_error,
+        ),
+    );
+    try std.testing.expectEqualDeep(bound_scalar_error, bound_vector_error);
+
+    for (quality, 0..) |*quality_byte, index| {
+        quality_byte.* = qualities[index % qualities.len];
+    }
+
+    const invalid_len = quality_block_len + vector_len;
+    const invalid_indices = [_]usize{
+        0,
+        vector_len - 1,
+        (quality_vectors_per_block / 2) * vector_len + vector_len / 2,
+        quality_block_len - 1,
+        quality_block_len,
+        invalid_len - 1,
+    };
     for (invalid_indices, 0..) |invalid_index, case_index| {
         const original = quality[invalid_index];
         quality[invalid_index] = if (case_index % 2 == 0) 32 else 127;
@@ -478,8 +571,10 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
         quality[invalid_index] = original;
     }
 
-    quality[1] = 127;
-    quality[vector_len - 1] = 32;
+    const first_invalid = 3 * vector_len + 1;
+    const later_invalid = quality_block_len - 1;
+    quality[later_invalid] = 127;
+    quality[first_invalid] = 32;
     var scalar_error: ?QualityError = null;
     var vector_error: ?QualityError = null;
     try std.testing.expectError(
@@ -501,4 +596,6 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
         ),
     );
     try std.testing.expectEqualDeep(scalar_error, vector_error);
+    quality[first_invalid] = qualities[first_invalid % qualities.len];
+    quality[later_invalid] = qualities[later_invalid % qualities.len];
 }
