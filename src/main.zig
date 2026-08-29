@@ -1237,10 +1237,16 @@ fn checkInterleavedSource(
 }
 
 fn exactPairSelectionFailure(err: sampling.ReservoirError) PairCommandFailure {
+    return .{ .command = .{
+        .input_index = 0,
+        .details = exactSelectionFailure(err),
+    } };
+}
+
+fn exactSelectionFailure(err: sampling.ReservoirError) CommandFailure {
     return switch (err) {
-        error.OutOfMemory => pairCommandFailure(0, "out_of_memory", "out of memory", 3),
-        error.Overflow => pairCommandFailure(
-            0,
+        error.OutOfMemory => CommandFailure.plain("out_of_memory", "out of memory", 3),
+        error.Overflow => CommandFailure.plain(
             "arithmetic_limit",
             "sample index storage exceeds supported limit",
             4,
@@ -2316,34 +2322,10 @@ fn sampleExactFirstPass(
     selector: *sampling.ExactSelector,
     options: SampleOptions,
 ) ExactFirstPass {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return .{ .failure = CommandFailure.plain(
-            "io_error",
-            "file not found",
-            3,
-        ) },
-        else => return .{ .failure = CommandFailure.plain(
-            "io_error",
-            "failed to open file",
-            3,
-        ) },
-    };
-    const initial = fileSnapshot(file, io) catch |err| {
-        file.close(io);
-        return .{ .failure = switch (err) {
-            error.NotRegularFile => CommandFailure.plain(
-                "io_error",
-                "exact-count sampling requires a regular file",
-                3,
-            ),
-            else => CommandFailure.plain("io_error", "failed to inspect file", 3),
-        } };
-    };
-
     var input: RecordInput = undefined;
-    input.init(io, file, true) catch {
-        file.close(io);
-        return .{ .failure = CommandFailure.plain("io_error", "I/O error", 3) };
+    const initial = switch (initExactInput(&input, io, path, null)) {
+        .failure => |failure| return .{ .failure = failure },
+        .success => |snapshot| snapshot,
     };
     defer input.deinit(io);
 
@@ -2376,8 +2358,9 @@ fn sampleExactFirstPass(
         }
     }
 
-    const final = fileSnapshot(input.file, io) catch return .{ .failure = CommandFailure.plain("io_error", "failed to inspect file", 3) };
-    if (!sameFileSnapshot(initial, final)) return .{ .failure = inputChangedFailure() };
+    if (exactInputSnapshotFailure(&input, io, initial)) |snapshot_failure| {
+        return .{ .failure = snapshot_failure };
+    }
     if (failure) |details| return .{ .failure = details };
     return .{ .success = .{
         .snapshot = initial,
@@ -2391,14 +2374,7 @@ fn considerExactRecords(
 ) ?CommandFailure {
     while (selector.record_count < completed_records) {
         selector.considerRecord(allocator, selector.record_count + 1) catch |err| {
-            return switch (err) {
-                error.OutOfMemory => CommandFailure.plain("out_of_memory", "out of memory", 3),
-                error.Overflow => CommandFailure.plain(
-                    "arithmetic_limit",
-                    "sample index storage exceeds supported limit",
-                    4,
-                ),
-            };
+            return exactSelectionFailure(err);
         };
     }
     return null;
@@ -2415,27 +2391,11 @@ fn sampleExactSecondPass(
     expected_count: u64,
     options: SampleOptions,
 ) error{WriteFailed}!?CommandFailure {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return inputChangedFailure(),
-        else => return CommandFailure.plain("io_error", "failed to reopen file", 3),
-    };
-    const initial = fileSnapshot(file, io) catch |err| {
-        file.close(io);
-        return switch (err) {
-            error.NotRegularFile => inputChangedFailure(),
-            else => CommandFailure.plain("io_error", "failed to inspect file", 3),
-        };
-    };
-    if (!sameFileSnapshot(expected_snapshot, initial)) {
-        file.close(io);
-        return inputChangedFailure();
-    }
-
     var input: RecordInput = undefined;
-    input.init(io, file, true) catch {
-        file.close(io);
-        return CommandFailure.plain("io_error", "I/O error", 3);
-    };
+    switch (initExactInput(&input, io, path, expected_snapshot)) {
+        .failure => |failure| return failure,
+        .success => {},
+    }
     defer input.deinit(io);
 
     var reader = zfastq.Reader.init(
@@ -2466,9 +2426,9 @@ fn sampleExactSecondPass(
         },
     };
 
-    const final = fileSnapshot(input.file, io) catch
-        return CommandFailure.plain("io_error", "failed to inspect file", 3);
-    if (!sameFileSnapshot(expected_snapshot, final)) return inputChangedFailure();
+    if (exactInputSnapshotFailure(&input, io, expected_snapshot)) |snapshot_failure| {
+        return snapshot_failure;
+    }
     if (failure) |details| return details;
     if (reader.recordIndex() != expected_count or
         (!select_all and selected_cursor != selected.len))
@@ -2513,12 +2473,11 @@ const ExactPairSnapshots = union(enum) {
 const ExactPairFirstPass = union(enum) {
     success: struct {
         snapshots: ExactPairSnapshots,
-        pair_count: u64,
     },
     failure: PairCommandFailure,
 };
 
-const ExactPairInput = union(enum) {
+const ExactInput = union(enum) {
     success: FileSnapshot,
     failure: CommandFailure,
 };
@@ -2549,7 +2508,7 @@ fn sampleExactPairs(
             writer,
             &.{},
             completed.snapshots,
-            completed.pair_count,
+            selector.record_count,
             options,
         ),
         .indexes => |indexes| sampleExactPairSecondPass(
@@ -2560,7 +2519,7 @@ fn sampleExactPairs(
             writer,
             indexes,
             completed.snapshots,
-            completed.pair_count,
+            selector.record_count,
             options,
         ),
     };
@@ -2606,7 +2565,7 @@ fn sampleExactPairedFirstPass(
     options: PairedCheckOptions,
 ) ExactPairFirstPass {
     var input1: RecordInput = undefined;
-    const snapshot1 = switch (initExactPairInput(&input1, io, inputs[0], null)) {
+    const snapshot1 = switch (initExactInput(&input1, io, inputs[0], null)) {
         .failure => |failure| return .{ .failure = .{ .command = .{
             .input_index = 0,
             .details = failure,
@@ -2616,7 +2575,7 @@ fn sampleExactPairedFirstPass(
     defer input1.deinit(io);
 
     var input2: RecordInput = undefined;
-    const snapshot2 = switch (initExactPairInput(&input2, io, inputs[1], null)) {
+    const snapshot2 = switch (initExactInput(&input2, io, inputs[1], null)) {
         .failure => |failure| return .{ .failure = .{ .command = .{
             .input_index = 1,
             .details = failure,
@@ -2641,7 +2600,6 @@ fn sampleExactPairedFirstPass(
     if (failure) |details| return .{ .failure = details };
     return .{ .success = .{
         .snapshots = .{ .paired = .{ snapshot1, snapshot2 } },
-        .pair_count = selector.record_count,
     } };
 }
 
@@ -2653,7 +2611,7 @@ fn sampleExactInterleavedFirstPass(
     options: PairedCheckOptions,
 ) ExactPairFirstPass {
     var input: RecordInput = undefined;
-    const snapshot = switch (initExactPairInput(&input, io, path, null)) {
+    const snapshot = switch (initExactInput(&input, io, path, null)) {
         .failure => |failure| return .{ .failure = .{ .command = .{
             .input_index = 0,
             .details = failure,
@@ -2674,7 +2632,6 @@ fn sampleExactInterleavedFirstPass(
     if (failure) |details| return .{ .failure = details };
     return .{ .success = .{
         .snapshots = .{ .interleaved = snapshot },
-        .pair_count = selector.record_count,
     } };
 }
 
@@ -2727,14 +2684,14 @@ fn sampleExactPairedSecondPass(
     options: SampleOptions,
 ) error{WriteFailed}!?PairCommandFailure {
     var input1: RecordInput = undefined;
-    switch (initExactPairInput(&input1, io, inputs[0], snapshots[0])) {
+    switch (initExactInput(&input1, io, inputs[0], snapshots[0])) {
         .failure => |failure| return .{ .command = .{ .input_index = 0, .details = failure } },
         .success => {},
     }
     defer input1.deinit(io);
 
     var input2: RecordInput = undefined;
-    switch (initExactPairInput(&input2, io, inputs[1], snapshots[1])) {
+    switch (initExactInput(&input2, io, inputs[1], snapshots[1])) {
         .failure => |failure| return .{ .command = .{ .input_index = 1, .details = failure } },
         .success => {},
     }
@@ -2793,7 +2750,7 @@ fn sampleExactInterleavedSecondPass(
         );
     };
     var input: RecordInput = undefined;
-    switch (initExactPairInput(&input, io, path, snapshot)) {
+    switch (initExactInput(&input, io, path, snapshot)) {
         .failure => |failure| return .{ .command = .{ .input_index = 0, .details = failure } },
         .success => {},
     }
@@ -2825,12 +2782,12 @@ fn sampleExactInterleavedSecondPass(
     return null;
 }
 
-fn initExactPairInput(
+fn initExactInput(
     input: *RecordInput,
     io: std.Io,
     path: []const u8,
     expected_snapshot: ?FileSnapshot,
-) ExactPairInput {
+) ExactInput {
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         return .{ .failure = if (expected_snapshot != null and err == error.FileNotFound)
             inputChangedFailure()
@@ -2873,10 +2830,22 @@ fn exactPairSnapshotFailure(
     expected: FileSnapshot,
     input_index: u1,
 ) ?PairCommandFailure {
+    const failure = exactInputSnapshotFailure(input, io, expected) orelse return null;
+    return .{ .command = .{
+        .input_index = input_index,
+        .details = failure,
+    } };
+}
+
+fn exactInputSnapshotFailure(
+    input: *RecordInput,
+    io: std.Io,
+    expected: FileSnapshot,
+) ?CommandFailure {
     const final = fileSnapshot(input.file, io) catch {
-        return pairCommandFailure(input_index, "io_error", "failed to inspect file", 3);
+        return CommandFailure.plain("io_error", "failed to inspect file", 3);
     };
-    if (!sameFileSnapshot(expected, final)) return inputChangedPairFailure(input_index);
+    if (!sameFileSnapshot(expected, final)) return inputChangedFailure();
     return null;
 }
 
