@@ -2262,7 +2262,6 @@ const FileSnapshot = struct {
 const ExactFirstPass = union(enum) {
     success: struct {
         snapshot: FileSnapshot,
-        record_count: u64,
     },
     failure: CommandFailure,
 };
@@ -2293,7 +2292,7 @@ fn sampleExactFile(
             writer,
             &.{},
             completed.snapshot,
-            completed.record_count,
+            selector.record_count,
             options,
         ),
         .indexes => |indexes| sampleExactSecondPass(
@@ -2304,7 +2303,7 @@ fn sampleExactFile(
             writer,
             indexes,
             completed.snapshot,
-            completed.record_count,
+            selector.record_count,
             options,
         ),
     };
@@ -2348,80 +2347,33 @@ fn sampleExactFirstPass(
     };
     defer input.deinit(io);
 
-    var considered_records: u64 = 0;
     var failure: ?CommandFailure = null;
-    var record_count: u64 = 0;
-    switch (input.source) {
-        .plain => {
-            var scanner = fastq.CheckScanner.init(
-                .{ .max_line_bytes = options.max_line_bytes },
-                .{ .alphabet = options.alphabet },
-            );
-            const source = input.byteSource();
-            var buf: [SAMPLE_SCAN_BUFFER_BYTES]u8 = undefined;
-            while (true) {
-                const n = source.read(&buf) catch {
-                    failure = CommandFailure.plain("io_error", "I/O error", 3);
-                    break;
-                };
-                if (n == 0) break;
-                _ = scanner.feed(buf[0..n]) catch |err| {
-                    failure = mapCheckScannerFailure(&scanner, err);
-                    break;
-                };
-                failure = considerExactRecords(
-                    allocator,
-                    selector,
-                    &considered_records,
-                    scanner.record_index,
-                );
-                if (failure != null) break;
-            }
-            if (failure == null) {
-                scanner.finishEof() catch |err| {
-                    failure = mapCheckScannerFailure(&scanner, err);
-                };
-                if (failure == null) {
-                    failure = considerExactRecords(
-                        allocator,
-                        selector,
-                        &considered_records,
-                        scanner.record_index,
-                    );
-                }
-            }
-            record_count = scanner.record_index;
-        },
-        .gzip => {
-            var reader = zfastq.Reader.init(
-                allocator,
-                input.byteSource(),
-                .{ .max_line_bytes = options.max_line_bytes },
-            ) catch return .{ .failure = CommandFailure.plain(
-                "out_of_memory",
-                "out of memory",
-                3,
-            ) };
-            defer reader.deinit();
-
-            while (true) switch (nextValidatedSampleRecord(&reader, options.alphabet)) {
-                .done => break,
-                .failure => |details| {
-                    failure = details;
-                    break;
-                },
-                .record => {
-                    failure = considerExactRecords(
-                        allocator,
-                        selector,
-                        &considered_records,
-                        reader.recordIndex(),
-                    );
-                    if (failure != null) break;
-                },
-            };
-            record_count = reader.recordIndex();
-        },
+    var scanner = fastq.CheckScanner.init(
+        .{ .max_line_bytes = options.max_line_bytes },
+        .{ .alphabet = options.alphabet },
+    );
+    const source = input.byteSource();
+    var buf: [SAMPLE_SCAN_BUFFER_BYTES]u8 = undefined;
+    while (true) {
+        const n = source.read(&buf) catch {
+            failure = CommandFailure.plain("io_error", "I/O error", 3);
+            break;
+        };
+        if (n == 0) break;
+        _ = scanner.feed(buf[0..n]) catch |err| {
+            failure = mapCheckScannerFailure(&scanner, err);
+            break;
+        };
+        failure = considerExactRecords(allocator, selector, scanner.record_index);
+        if (failure != null) break;
+    }
+    if (failure == null) {
+        scanner.finishEof() catch |err| {
+            failure = mapCheckScannerFailure(&scanner, err);
+        };
+        if (failure == null) {
+            failure = considerExactRecords(allocator, selector, scanner.record_index);
+        }
     }
 
     const final = fileSnapshot(input.file, io) catch return .{ .failure = CommandFailure.plain("io_error", "failed to inspect file", 3) };
@@ -2429,19 +2381,16 @@ fn sampleExactFirstPass(
     if (failure) |details| return .{ .failure = details };
     return .{ .success = .{
         .snapshot = initial,
-        .record_count = record_count,
     } };
 }
 
 fn considerExactRecords(
     allocator: std.mem.Allocator,
     selector: *sampling.ExactSelector,
-    considered_records: *u64,
     completed_records: u64,
 ) ?CommandFailure {
-    while (considered_records.* < completed_records) {
-        considered_records.* += 1;
-        selector.considerRecord(allocator, considered_records.*) catch |err| {
+    while (selector.record_count < completed_records) {
+        selector.considerRecord(allocator, selector.record_count + 1) catch |err| {
             return switch (err) {
                 error.OutOfMemory => CommandFailure.plain("out_of_memory", "out of memory", 3),
                 error.Overflow => CommandFailure.plain(
