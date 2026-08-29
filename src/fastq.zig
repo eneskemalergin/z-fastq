@@ -96,20 +96,10 @@ pub fn validateRecord(record: Record, options: ValidationOptions) ?SemanticError
         }
     }
     if (firstInvalidSequence(record.sequence, options.alphabet)) |byte_index| {
-        return .{
-            .code = .s002_invalid_sequence_alphabet,
-            .message = "sequence byte is outside the selected alphabet",
-            .field = .sequence,
-            .byte_index = byte_index,
-        };
+        return semanticSequenceError(byte_index);
     }
     if (firstInvalidQuality(record.quality)) |byte_index| {
-        return .{
-            .code = .s006_invalid_quality_range,
-            .message = "quality byte must be ASCII 33 through 126",
-            .field = .quality,
-            .byte_index = byte_index,
-        };
+        return semanticQualityError(byte_index);
     }
     return null;
 }
@@ -120,55 +110,75 @@ fn validateRecordVector(
     record: Record,
 ) ?SemanticError {
     const Bytes = @Vector(vector_len, u8);
-    const minimum: Bytes = @splat(33);
-    const maximum: Bytes = @splat(126);
+    const Mask = @Vector(vector_len, bool);
 
-    var quality_failure: ?usize = null;
+    if (record.sequence.len < vector_len) {
+        if (firstInvalidSequenceScalar(record.sequence, alphabet, 0)) |byte_index| {
+            return semanticSequenceError(byte_index);
+        }
+        if (firstInvalidQualityScalar(record.quality, 0)) |byte_index| {
+            return semanticQualityError(byte_index);
+        }
+        return null;
+    }
+
+    var sequence_invalid: Mask = @splat(false);
+    var quality_invalid: Mask = @splat(false);
     var byte_index: usize = 0;
-    while (record.sequence.len - byte_index >= vector_len) : (byte_index += vector_len) {
-        const sequence: Bytes = record.sequence[byte_index..][0..vector_len].*;
-        const sequence_invalid = invalidSequenceVector(vector_len, alphabet, sequence);
-        if (@reduce(.Or, sequence_invalid)) {
-            return .{
-                .code = .s002_invalid_sequence_alphabet,
-                .message = "sequence byte is outside the selected alphabet",
-                .field = .sequence,
-                .byte_index = byte_index + std.simd.firstTrue(sequence_invalid).?,
-            };
-        }
+    while (record.sequence.len - byte_index >= 2 * vector_len) : (byte_index += 2 * vector_len) {
+        const sequence0: Bytes = record.sequence[byte_index..][0..vector_len].*;
+        const sequence1: Bytes = record.sequence[byte_index + vector_len ..][0..vector_len].*;
+        sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence0) |
+            invalidSequenceVector(vector_len, alphabet, sequence1);
 
-        if (quality_failure == null) {
-            const quality: Bytes = record.quality[byte_index..][0..vector_len].*;
-            const quality_invalid = (quality < minimum) | (quality > maximum);
-            if (@reduce(.Or, quality_invalid)) {
-                quality_failure = byte_index + std.simd.firstTrue(quality_invalid).?;
-            }
-        }
+        const quality0: Bytes = record.quality[byte_index..][0..vector_len].*;
+        const quality1: Bytes = record.quality[byte_index + vector_len ..][0..vector_len].*;
+        quality_invalid |= invalidQualityVector(vector_len, quality0) |
+            invalidQualityVector(vector_len, quality1);
     }
-    while (byte_index < record.sequence.len) : (byte_index += 1) {
-        if (!alphabetAccepts(alphabet, record.sequence[byte_index])) {
-            return .{
-                .code = .s002_invalid_sequence_alphabet,
-                .message = "sequence byte is outside the selected alphabet",
-                .field = .sequence,
-                .byte_index = byte_index,
-            };
-        }
-        if (quality_failure == null and
-            (record.quality[byte_index] < 33 or record.quality[byte_index] > 126))
-        {
-            quality_failure = byte_index;
-        }
+    if (record.sequence.len - byte_index >= vector_len) {
+        const sequence: Bytes = record.sequence[byte_index..][0..vector_len].*;
+        sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence);
+        const quality: Bytes = record.quality[byte_index..][0..vector_len].*;
+        quality_invalid |= invalidQualityVector(vector_len, quality);
+        byte_index += vector_len;
     }
-    if (quality_failure) |invalid_index| {
-        return .{
-            .code = .s006_invalid_quality_range,
-            .message = "quality byte must be ASCII 33 through 126",
-            .field = .quality,
-            .byte_index = invalid_index,
-        };
+    if (byte_index < record.sequence.len) {
+        const tail_start = record.sequence.len - vector_len;
+        const active = uncheckedTailMask(vector_len, byte_index - tail_start);
+        const sequence: Bytes = record.sequence[tail_start..][0..vector_len].*;
+        sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence) & active;
+        const quality: Bytes = record.quality[tail_start..][0..vector_len].*;
+        quality_invalid |= invalidQualityVector(vector_len, quality) & active;
+    }
+
+    if (@reduce(.Or, sequence_invalid)) {
+        return semanticSequenceError(
+            firstInvalidSequenceScalar(record.sequence, alphabet, 0).?,
+        );
+    }
+    if (@reduce(.Or, quality_invalid)) {
+        return semanticQualityError(firstInvalidQualityScalar(record.quality, 0).?);
     }
     return null;
+}
+
+fn semanticSequenceError(byte_index: usize) SemanticError {
+    return .{
+        .code = .s002_invalid_sequence_alphabet,
+        .message = "sequence byte is outside the selected alphabet",
+        .field = .sequence,
+        .byte_index = byte_index,
+    };
+}
+
+fn semanticQualityError(byte_index: usize) SemanticError {
+    return .{
+        .code = .s006_invalid_quality_range,
+        .message = "quality byte must be ASCII 33 through 126",
+        .field = .quality,
+        .byte_index = byte_index,
+    };
 }
 
 /// Decodes one Phred+33 byte and rejects values outside ASCII 33 through 126.
@@ -193,16 +203,33 @@ fn firstInvalidSequenceVector(
     sequence: []const u8,
 ) ?usize {
     const Bytes = @Vector(vector_len, u8);
+    const Mask = @Vector(vector_len, bool);
 
-    var byte_index: usize = 0;
-    while (sequence.len - byte_index >= vector_len) : (byte_index += vector_len) {
-        const bytes: Bytes = sequence[byte_index..][0..vector_len].*;
-        const invalid = invalidSequenceVector(vector_len, alphabet, bytes);
-        if (@reduce(.Or, invalid)) {
-            return byte_index + std.simd.firstTrue(invalid).?;
-        }
+    if (sequence.len < vector_len) {
+        return firstInvalidSequenceScalar(sequence, alphabet, 0);
     }
-    return firstInvalidSequenceScalar(sequence[byte_index..], alphabet, byte_index);
+
+    var invalid: Mask = @splat(false);
+    var byte_index: usize = 0;
+    while (sequence.len - byte_index >= 2 * vector_len) : (byte_index += 2 * vector_len) {
+        const bytes0: Bytes = sequence[byte_index..][0..vector_len].*;
+        const bytes1: Bytes = sequence[byte_index + vector_len ..][0..vector_len].*;
+        invalid |= invalidSequenceVector(vector_len, alphabet, bytes0) |
+            invalidSequenceVector(vector_len, alphabet, bytes1);
+    }
+    if (sequence.len - byte_index >= vector_len) {
+        const bytes: Bytes = sequence[byte_index..][0..vector_len].*;
+        invalid |= invalidSequenceVector(vector_len, alphabet, bytes);
+        byte_index += vector_len;
+    }
+    if (byte_index < sequence.len) {
+        const tail_start = sequence.len - vector_len;
+        const active = uncheckedTailMask(vector_len, byte_index - tail_start);
+        const bytes: Bytes = sequence[tail_start..][0..vector_len].*;
+        invalid |= invalidSequenceVector(vector_len, alphabet, bytes) & active;
+    }
+    if (!@reduce(.Or, invalid)) return null;
+    return firstInvalidSequenceScalar(sequence, alphabet, 0);
 }
 
 fn invalidSequenceVector(
@@ -250,18 +277,47 @@ fn firstInvalidQualityVector(
     quality: []const u8,
 ) ?usize {
     const Bytes = @Vector(vector_len, u8);
-    const minimum: Bytes = @splat(33);
-    const maximum: Bytes = @splat(126);
+    const Mask = @Vector(vector_len, bool);
 
+    if (quality.len < vector_len) return firstInvalidQualityScalar(quality, 0);
+
+    var invalid: Mask = @splat(false);
     var byte_index: usize = 0;
-    while (quality.len - byte_index >= vector_len) : (byte_index += vector_len) {
-        const bytes: Bytes = quality[byte_index..][0..vector_len].*;
-        const invalid = (bytes < minimum) | (bytes > maximum);
-        if (@reduce(.Or, invalid)) {
-            return byte_index + std.simd.firstTrue(invalid).?;
-        }
+    while (quality.len - byte_index >= 2 * vector_len) : (byte_index += 2 * vector_len) {
+        const bytes0: Bytes = quality[byte_index..][0..vector_len].*;
+        const bytes1: Bytes = quality[byte_index + vector_len ..][0..vector_len].*;
+        invalid |= invalidQualityVector(vector_len, bytes0) |
+            invalidQualityVector(vector_len, bytes1);
     }
-    return firstInvalidQualityScalar(quality[byte_index..], byte_index);
+    if (quality.len - byte_index >= vector_len) {
+        const bytes: Bytes = quality[byte_index..][0..vector_len].*;
+        invalid |= invalidQualityVector(vector_len, bytes);
+        byte_index += vector_len;
+    }
+    if (byte_index < quality.len) {
+        const tail_start = quality.len - vector_len;
+        const active = uncheckedTailMask(vector_len, byte_index - tail_start);
+        const bytes: Bytes = quality[tail_start..][0..vector_len].*;
+        invalid |= invalidQualityVector(vector_len, bytes) & active;
+    }
+    if (!@reduce(.Or, invalid)) return null;
+    return firstInvalidQualityScalar(quality, 0);
+}
+
+fn invalidQualityVector(
+    comptime vector_len: comptime_int,
+    quality: @Vector(vector_len, u8),
+) @Vector(vector_len, bool) {
+    const Bytes = @Vector(vector_len, u8);
+    return (quality < @as(Bytes, @splat(33))) | (quality > @as(Bytes, @splat(126)));
+}
+
+fn uncheckedTailMask(
+    comptime vector_len: comptime_int,
+    checked_prefix: usize,
+) @Vector(vector_len, bool) {
+    const Indexes = @Vector(vector_len, usize);
+    return std.simd.iota(usize, vector_len) >= @as(Indexes, @splat(checked_prefix));
 }
 
 fn firstInvalidQualityScalar(quality: []const u8, start_index: usize) ?usize {
@@ -2329,13 +2385,7 @@ test "[property] - [check scanner]: refill-spanning records match Reader" {
 
 test "[property] - [check scanner]: generated semantic mutations retain exact locations" {
     const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
-    for ([_]usize{
-        1,
-        vector_len - 1,
-        vector_len,
-        vector_len + 1,
-        2 * vector_len + 1,
-    }) |field_len| {
+    for (1..2 * vector_len + 2) |field_len| {
         var data: std.ArrayList(u8) = .empty;
         defer data.deinit(std.testing.allocator);
         try data.appendSlice(std.testing.allocator, "@ok\nA\n+\n!\n@r\n");
@@ -2359,7 +2409,7 @@ test "[property] - [check scanner]: generated semantic mutations retain exact lo
                 sequence_error,
                 try referenceCheckOutcome(data.items, .{}, .{}),
             );
-            for ([_]usize{ 1, vector_len, vector_len + 1 }) |chunk_len| {
+            for (1..2 * vector_len + 2) |chunk_len| {
                 try expectCheckOutcome(
                     sequence_error,
                     directCheckOutcome(data.items, chunk_len, .{}, .{}),
@@ -2379,7 +2429,7 @@ test "[property] - [check scanner]: generated semantic mutations retain exact lo
                 quality_error,
                 try referenceCheckOutcome(data.items, .{}, .{}),
             );
-            for ([_]usize{ 1, vector_len, vector_len + 1 }) |chunk_len| {
+            for (1..2 * vector_len + 2) |chunk_len| {
                 try expectCheckOutcome(
                     quality_error,
                     directCheckOutcome(data.items, chunk_len, .{}, .{}),
@@ -2496,21 +2546,12 @@ fn expectCheckOutcome(expected: CheckTestOutcome, actual: CheckTestOutcome) !voi
 
 test "[property] - [record validation]: vector quality validation matches scalar results" {
     const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
-    const max_len = 2 * vector_len + 1;
+    const max_len = 4 * vector_len - 1;
     const quality = try std.testing.allocator.alloc(u8, max_len);
     defer std.testing.allocator.free(quality);
 
     @memset(quality, '!');
-    for ([_]usize{
-        0,
-        1,
-        vector_len - 1,
-        vector_len,
-        vector_len + 1,
-        2 * vector_len - 1,
-        2 * vector_len,
-        2 * vector_len + 1,
-    }) |length| {
+    for (0..max_len + 1) |length| {
         try std.testing.expectEqual(null, firstInvalidQualityScalar(quality[0..length], 0));
         try std.testing.expectEqual(null, firstInvalidQuality(quality[0..length]));
     }
@@ -2533,6 +2574,30 @@ test "[property] - [record validation]: vector quality validation matches scalar
         quality[invalid_index] = '!';
     }
 
+    for (1..vector_len) |remainder| {
+        const length = 2 * vector_len + remainder;
+        const overlap_index = length - vector_len;
+        quality[overlap_index] = 32;
+        try std.testing.expectEqual(
+            overlap_index,
+            firstInvalidQualityScalar(quality[0..length], 0).?,
+        );
+        try std.testing.expectEqual(overlap_index, firstInvalidQuality(quality[0..length]).?);
+        quality[overlap_index] = '!';
+
+        quality[length - 1] = 127;
+        try std.testing.expectEqual(
+            length - 1,
+            firstInvalidQualityScalar(quality[0..length], 0).?,
+        );
+        try std.testing.expectEqual(length - 1, firstInvalidQuality(quality[0..length]).?);
+        quality[length - 1] = '!';
+    }
+
+    quality[0] = 32;
+    try std.testing.expectEqual(@as(usize, 0), firstInvalidQuality(quality[0..1]).?);
+    quality[0] = '!';
+
     quality[vector_len] = 127;
     quality[1] = 32;
     try std.testing.expectEqual(@as(usize, 1), firstInvalidQualityScalar(quality, 0).?);
@@ -2541,22 +2606,13 @@ test "[property] - [record validation]: vector quality validation matches scalar
 
 test "[property] - [record validation]: vector sequence validation matches scalar policies" {
     const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
-    const max_len = 2 * vector_len + 1;
+    const max_len = 4 * vector_len - 1;
     const sequence = try std.testing.allocator.alloc(u8, max_len);
     defer std.testing.allocator.free(sequence);
 
     for ([_]Alphabet{ .iupac, .acgtn }) |alphabet| {
         @memset(sequence, 'A');
-        for ([_]usize{
-            0,
-            1,
-            vector_len - 1,
-            vector_len,
-            vector_len + 1,
-            2 * vector_len - 1,
-            2 * vector_len,
-            2 * vector_len + 1,
-        }) |length| {
+        for (0..max_len + 1) |length| {
             try std.testing.expectEqual(
                 null,
                 firstInvalidSequenceScalar(sequence[0..length], alphabet, 0),
@@ -2588,6 +2644,39 @@ test "[property] - [record validation]: vector sequence validation matches scala
             sequence[invalid_index] = 'A';
         }
 
+        for (1..vector_len) |remainder| {
+            const length = 2 * vector_len + remainder;
+            const overlap_index = length - vector_len;
+            sequence[overlap_index] = '.';
+            try std.testing.expectEqual(
+                overlap_index,
+                firstInvalidSequenceScalar(sequence[0..length], alphabet, 0).?,
+            );
+            try std.testing.expectEqual(
+                overlap_index,
+                firstInvalidSequence(sequence[0..length], alphabet).?,
+            );
+            sequence[overlap_index] = 'A';
+
+            sequence[length - 1] = 0xff;
+            try std.testing.expectEqual(
+                length - 1,
+                firstInvalidSequenceScalar(sequence[0..length], alphabet, 0).?,
+            );
+            try std.testing.expectEqual(
+                length - 1,
+                firstInvalidSequence(sequence[0..length], alphabet).?,
+            );
+            sequence[length - 1] = 'A';
+        }
+
+        sequence[0] = '.';
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            firstInvalidSequence(sequence[0..1], alphabet).?,
+        );
+        sequence[0] = 'A';
+
         sequence[vector_len] = '.';
         sequence[1] = 0xff;
         try std.testing.expectEqual(
@@ -2600,7 +2689,7 @@ test "[property] - [record validation]: vector sequence validation matches scala
 
 test "[property] - [record validation]: fused vectors preserve field precedence" {
     const vector_len = std.simd.suggestVectorLength(u8) orelse return;
-    const length = 2 * vector_len + 1;
+    const length = 4 * vector_len - 1;
     const sequence = try std.testing.allocator.alloc(u8, length);
     defer std.testing.allocator.free(sequence);
     const quality = try std.testing.allocator.alloc(u8, length);
@@ -2615,16 +2704,27 @@ test "[property] - [record validation]: fused vectors preserve field precedence"
         .plus = "",
         .quality = quality,
     };
-    try std.testing.expect(validateRecord(record, .{}) == null);
+    for (0..length + 1) |field_len| {
+        const current = Record{
+            .header = record.header,
+            .id = record.id,
+            .sequence = record.sequence[0..field_len],
+            .plus = record.plus,
+            .quality = record.quality[0..field_len],
+        };
+        try std.testing.expect(validateRecord(current, .{}) == null);
+        if (field_len == 0) continue;
 
-    quality[1] = 32;
-    sequence[vector_len] = '.';
-    const sequence_error = validateRecord(record, .{}).?;
-    try std.testing.expectEqual(SemanticField.sequence, sequence_error.field);
-    try std.testing.expectEqual(vector_len, sequence_error.byte_index);
+        quality[0] = 32;
+        sequence[field_len - 1] = '.';
+        const sequence_error = validateRecord(current, .{}).?;
+        try std.testing.expectEqual(SemanticField.sequence, sequence_error.field);
+        try std.testing.expectEqual(field_len - 1, sequence_error.byte_index);
 
-    sequence[vector_len] = 'A';
-    const quality_error = validateRecord(record, .{}).?;
-    try std.testing.expectEqual(SemanticField.quality, quality_error.field);
-    try std.testing.expectEqual(@as(usize, 1), quality_error.byte_index);
+        sequence[field_len - 1] = 'A';
+        const quality_error = validateRecord(current, .{}).?;
+        try std.testing.expectEqual(SemanticField.quality, quality_error.field);
+        try std.testing.expectEqual(@as(usize, 0), quality_error.byte_index);
+        quality[0] = '!';
+    }
 }
