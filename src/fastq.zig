@@ -1265,6 +1265,58 @@ fn newlineMask(block: *const [STRUCTURAL_BLOCK_BYTES]u8) u64 {
     return @bitCast(bytes == @as(Bytes, @splat('\n')));
 }
 
+fn firstLineFeed(bytes: []const u8) ?usize {
+    var block_start: usize = 0;
+    while (bytes.len - block_start >= STRUCTURAL_BLOCK_BYTES) {
+        const line_feeds = newlineMask(bytes[block_start..][0..STRUCTURAL_BLOCK_BYTES]);
+        if (line_feeds != 0) {
+            return block_start + @as(usize, @intCast(@ctz(line_feeds)));
+        }
+        block_start += STRUCTURAL_BLOCK_BYTES;
+    }
+    for (bytes[block_start..], block_start..) |byte, byte_index| {
+        if (byte == '\n') return byte_index;
+    }
+    return null;
+}
+
+fn firstValidSequenceLineEnd(bytes: []const u8, alphabet: Alphabet) ?usize {
+    return switch (alphabet) {
+        .iupac => firstValidSequenceLineEndFor(.iupac, bytes),
+        .acgtn => firstValidSequenceLineEndFor(.acgtn, bytes),
+    };
+}
+
+fn firstValidSequenceLineEndFor(
+    comptime alphabet: Alphabet,
+    bytes: []const u8,
+) ?usize {
+    const Bytes = @Vector(STRUCTURAL_BLOCK_BYTES, u8);
+    var block_start: usize = 0;
+    while (bytes.len - block_start >= STRUCTURAL_BLOCK_BYTES) {
+        const block: Bytes = bytes[block_start..][0..STRUCTURAL_BLOCK_BYTES].*;
+        const line_feeds: u64 = @bitCast(block == @as(Bytes, @splat('\n')));
+        const invalid: u64 = @bitCast(invalidSequenceVector(
+            STRUCTURAL_BLOCK_BYTES,
+            alphabet,
+            block,
+        ));
+        if (line_feeds != 0) {
+            const lane: u6 = @intCast(@ctz(line_feeds));
+            const preceding = (@as(u64, 1) << lane) -% 1;
+            if (invalid & preceding != 0) return null;
+            return block_start + @as(usize, lane);
+        }
+        if (invalid != 0) return null;
+        block_start += STRUCTURAL_BLOCK_BYTES;
+    }
+    for (bytes[block_start..], block_start..) |byte, byte_index| {
+        if (byte == '\n') return byte_index;
+        if (!alphabetAccepts(alphabet, byte)) return null;
+    }
+    return null;
+}
+
 pub const CheckScanner = struct {
     max_line_bytes: usize,
     alphabet: Alphabet,
@@ -1290,6 +1342,100 @@ pub const CheckScanner = struct {
     }
 
     pub fn feed(self: *CheckScanner, data: []const u8) CheckScannerError!usize {
+        var consumed: usize = 0;
+        while (consumed < data.len) {
+            if (self.consumeCompleteRecord(data[consumed..])) |record_len| {
+                consumed += record_len;
+                continue;
+            }
+            consumed += try self.consumeIncrementalRecord(data[consumed..]);
+        }
+        return data.len;
+    }
+
+    fn consumeCompleteRecord(self: *CheckScanner, data: []const u8) ?usize {
+        if (!self.atRecordBoundary()) return null;
+
+        const header_end = firstLineFeed(data) orelse return null;
+        const header = data[0..header_end];
+        if (header.len > self.max_line_bytes or
+            (header.len != 0 and header[header.len - 1] == '\r')) return null;
+
+        var machine = self.machine;
+        if (machine.push(
+            header.len,
+            if (header.len == 0) null else header[0],
+            if (header.len < 2) null else header[1],
+        ) catch return null) return null;
+
+        const sequence_start = header_end + 1;
+        const sequence_len = firstValidSequenceLineEnd(
+            data[sequence_start..],
+            self.alphabet,
+        ) orelse return null;
+        if (sequence_len > self.max_line_bytes) return null;
+        if (machine.push(sequence_len, null, null) catch return null) return null;
+
+        const plus_start = sequence_start + sequence_len + 1;
+        const plus_len = firstLineFeed(data[plus_start..]) orelse return null;
+        const plus = data[plus_start..][0..plus_len];
+        if (plus.len > self.max_line_bytes or
+            (plus.len != 0 and plus[plus.len - 1] == '\r')) return null;
+        if (machine.push(
+            plus.len,
+            if (plus.len == 0) null else plus[0],
+            if (plus.len < 2) null else plus[1],
+        ) catch return null) return null;
+
+        const quality_start = plus_start + plus_len + 1;
+        if (sequence_len >= data.len - quality_start) return null;
+        const quality_end = quality_start + sequence_len;
+        if (data[quality_end] != '\n') return null;
+        const quality = data[quality_start..quality_end];
+        if (firstInvalidQuality(quality) != null) return null;
+        if (!(machine.push(quality.len, null, null) catch return null)) return null;
+
+        const record_len = quality_end + 1;
+        const record_len_u64 = std.math.cast(u64, record_len) orelse return null;
+        const next_offset = std.math.add(u64, self.byte_offset, record_len_u64) catch
+            return null;
+        const sequence_offset = std.math.add(
+            u64,
+            self.byte_offset,
+            std.math.cast(u64, sequence_start) orelse return null,
+        ) catch return null;
+        const quality_offset = std.math.add(
+            u64,
+            self.byte_offset,
+            std.math.cast(u64, quality_start) orelse return null,
+        ) catch return null;
+        const next_record_index = std.math.add(u64, self.record_index, 1) catch return null;
+
+        self.machine = machine;
+        self.sequence_start_offset = sequence_offset;
+        self.quality_start_offset = quality_offset;
+        self.record_index = next_record_index;
+        self.byte_offset = next_offset;
+        self.line_start_offset = next_offset;
+        return record_len;
+    }
+
+    fn atRecordBoundary(self: *const CheckScanner) bool {
+        return self.machine.expected == .header and
+            self.line_len == 0 and
+            self.first_byte == null and
+            self.second_byte == null and
+            !self.pending_cr and
+            self.sequence_failure == null and
+            self.quality_failure == null and
+            self.line_start_offset == self.byte_offset;
+    }
+
+    fn consumeIncrementalRecord(
+        self: *CheckScanner,
+        data: []const u8,
+    ) CheckScannerError!usize {
+        const initial_record_index = self.record_index;
         var segment_start: usize = 0;
         var block_start: usize = 0;
         while (data.len - block_start >= STRUCTURAL_BLOCK_BYTES) {
@@ -1300,6 +1446,7 @@ pub const CheckScanner = struct {
                 try self.advanceOffset(line_end - segment_start + 1);
                 try self.finishLine(true);
                 segment_start = line_end + 1;
+                if (self.record_index != initial_record_index) return segment_start;
                 line_feeds &= line_feeds - 1;
             }
             block_start += STRUCTURAL_BLOCK_BYTES;
@@ -1311,6 +1458,7 @@ pub const CheckScanner = struct {
             try self.advanceOffset(line_end - segment_start + 1);
             try self.finishLine(true);
             segment_start = line_end + 1;
+            if (self.record_index != initial_record_index) return segment_start;
         }
         if (segment_start < data.len) {
             try self.consumeLineBytes(data[segment_start..]);
@@ -2189,6 +2337,80 @@ test "[property] - [check scanner]: structural masks preserve newline positions"
         expected |= @as(u64, 1) << @intCast(lane);
     }
     try std.testing.expectEqual(expected, newlineMask(&block));
+}
+
+test "[property] - [check scanner]: fused sequence scan preserves delimiter boundaries" {
+    var bytes: [2 * STRUCTURAL_BLOCK_BYTES + 2]u8 = @splat('A');
+    for (0..bytes.len) |line_end| {
+        @memset(&bytes, 'A');
+        bytes[line_end] = '\n';
+        try std.testing.expectEqual(
+            line_end,
+            firstValidSequenceLineEnd(&bytes, .iupac).?,
+        );
+        try std.testing.expectEqual(
+            line_end,
+            firstValidSequenceLineEnd(&bytes, .acgtn).?,
+        );
+
+        if (line_end != 0) {
+            bytes[line_end - 1] = '.';
+            try std.testing.expect(firstValidSequenceLineEnd(&bytes, .iupac) == null);
+            bytes[line_end - 1] = 'A';
+        }
+        if (line_end + 1 < bytes.len) {
+            bytes[line_end + 1] = '.';
+            try std.testing.expectEqual(
+                line_end,
+                firstValidSequenceLineEnd(&bytes, .iupac).?,
+            );
+        }
+    }
+
+    @memset(&bytes, 'A');
+    bytes[STRUCTURAL_BLOCK_BYTES] = 'R';
+    bytes[STRUCTURAL_BLOCK_BYTES + 1] = '\n';
+    try std.testing.expectEqual(
+        STRUCTURAL_BLOCK_BYTES + 1,
+        firstValidSequenceLineEnd(&bytes, .iupac).?,
+    );
+    try std.testing.expect(firstValidSequenceLineEnd(&bytes, .acgtn) == null);
+}
+
+test "[unit] - [check scanner]: complete record path commits only proved records" {
+    const record1 = "@r one\nACGTN\n+note\n!!!!!\n";
+    const record2 = "@s\n\n+\n\n";
+    const input = record1 ++ record2;
+    var scanner = CheckScanner.init(.{}, .{});
+
+    try std.testing.expectEqual(record1.len, scanner.consumeCompleteRecord(input).?);
+    try std.testing.expectEqual(@as(u64, 1), scanner.record_index);
+    try std.testing.expectEqual(@as(u64, record1.len), scanner.byte_offset);
+    try std.testing.expectEqual(
+        record2.len,
+        scanner.consumeCompleteRecord(input[record1.len..]).?,
+    );
+    try std.testing.expectEqual(@as(u64, 2), scanner.record_index);
+    try std.testing.expectEqual(@as(u64, input.len), scanner.byte_offset);
+
+    for ([_][]const u8{
+        "@r\r\nA\r\n+\r\n!\r\n",
+        "@r\nA\n+\n",
+        "r\nA\n+\n!\n",
+        "@r\n.\n+\n!\n",
+        "@r\nA\n+\n\x7f\n",
+        "@r\nAA\n+\n!\n",
+    }) |data| {
+        var fallback = CheckScanner.init(.{}, .{});
+        const before = fallback;
+        try std.testing.expect(fallback.consumeCompleteRecord(data) == null);
+        try std.testing.expectEqualDeep(before, fallback);
+    }
+
+    var limited = CheckScanner.init(.{ .max_line_bytes = 1 }, .{});
+    const before = limited;
+    try std.testing.expect(limited.consumeCompleteRecord("@r\nA\n+\n!\n") == null);
+    try std.testing.expectEqualDeep(before, limited);
 }
 
 test "[property] - [check scanner]: fragmented results match independent expectations and Reader" {
