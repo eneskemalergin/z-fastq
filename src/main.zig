@@ -1548,7 +1548,8 @@ fn collectStats(
     defer reader.deinit();
 
     var stats: zfastq.Stats = .{};
-    while (reader.next() catch |err| {
+    var canonical_span: ?[]const u8 = null;
+    while (fastq.nextWithoutId(&reader, &canonical_span) catch |err| {
         return .{ .failure = mapReaderFailure(&reader, err) };
     }) |record| {
         stats.addRecord(record) catch |err| switch (err) {
