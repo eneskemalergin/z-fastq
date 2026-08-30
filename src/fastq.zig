@@ -637,9 +637,18 @@ pub const Reader = struct {
         canonical_span: *?[]const u8,
         comptime derive_id: bool,
     ) ReaderError!?Record {
+        return self.nextRecord(canonical_span, derive_id, true);
+    }
+
+    fn nextRecord(
+        self: *Reader,
+        canonical_span: *?[]const u8,
+        comptime derive_id: bool,
+        comptime include_canonical_span: bool,
+    ) ReaderError!?Record {
         canonical_span.* = null;
         self.beginRecord();
-        switch (try self.readBufferedRecord(true)) {
+        switch (try self.readBufferedRecord(true, include_canonical_span)) {
             .incomplete => return self.nextFallback(derive_id),
             .eof => return null,
             .record => |buffered| return self.finishBufferedRecord(
@@ -674,7 +683,7 @@ pub const Reader = struct {
 
     fn nextPayload(self: *Reader) ReaderError!?RecordPayload {
         self.beginRecord();
-        switch (try self.readBufferedRecord(false)) {
+        switch (try self.readBufferedRecord(false, false)) {
             .incomplete => return self.nextFallbackPayload(),
             .eof => return null,
             .record => |buffered| {
@@ -729,7 +738,7 @@ pub const Reader = struct {
     /// Consumes one record without returning its fields, or returns false at clean EOF.
     pub fn advance(self: *Reader) ReaderError!bool {
         self.beginRecord();
-        switch (try self.readBufferedRecord(true)) {
+        switch (try self.readBufferedRecord(true, false)) {
             .incomplete => return self.advanceFallback(),
             .eof => return false,
             .record => return true,
@@ -768,6 +777,7 @@ pub const Reader = struct {
     fn readBufferedRecord(
         self: *Reader,
         comptime full_record: bool,
+        comptime include_canonical_span: bool,
     ) ReaderError!BufferedRecordResult(full_record) {
         if (self.machine.expected != .header) return .incomplete;
         if (self.cursor == self.fill_end and !try self.refill()) return .eof;
@@ -791,7 +801,7 @@ pub const Reader = struct {
                 raw_end - 1
             else
                 raw_end;
-            if (full_record) canonical = canonical and end == raw_end;
+            if (include_canonical_span) canonical = canonical and end == raw_end;
             if (end - start > self.options.max_line_bytes) return error.LineTooLong;
 
             const start_offset = self.byte_offset;
@@ -826,7 +836,7 @@ pub const Reader = struct {
         return if (full_record)
             .{ .record = .{
                 .ranges = ranges,
-                .canonical_range = if (canonical)
+                .canonical_range = if (include_canonical_span and canonical)
                     .{ .start = record_start, .end = record_start + relative_ends[3] + 1 }
                 else
                     null,
@@ -1035,6 +1045,11 @@ pub fn nextWithoutId(
     return reader.nextWithCanonicalSpan(canonical_span, false);
 }
 
+pub fn nextRecordWithoutId(reader: *Reader) ReaderError!?Record {
+    var unused_canonical_span: ?[]const u8 = null;
+    return reader.nextRecord(&unused_canonical_span, false, false);
+}
+
 pub fn nextPayload(reader: *Reader) ReaderError!?RecordPayload {
     return reader.nextPayload();
 }
@@ -1043,10 +1058,23 @@ pub fn nextBufferedWithoutId(
     reader: *Reader,
     canonical_span: *?[]const u8,
 ) ReaderError!?Record {
+    return nextBufferedRecord(reader, canonical_span, true);
+}
+
+pub fn nextBufferedRecordWithoutId(reader: *Reader) ReaderError!?Record {
+    var unused_canonical_span: ?[]const u8 = null;
+    return nextBufferedRecord(reader, &unused_canonical_span, false);
+}
+
+fn nextBufferedRecord(
+    reader: *Reader,
+    canonical_span: *?[]const u8,
+    comptime include_canonical_span: bool,
+) ReaderError!?Record {
     canonical_span.* = null;
     reader.beginRecord();
     if (reader.cursor == reader.fill_end) return null;
-    return switch (try reader.readBufferedRecord(true)) {
+    return switch (try reader.readBufferedRecord(true, include_canonical_span)) {
         .incomplete => null,
         .eof => unreachable,
         .record => |buffered| reader.finishBufferedRecord(
@@ -1098,7 +1126,7 @@ pub fn nextBufferedAfterFallbackTransfer(
     }
     const got_data = try reader.refill();
     if (!got_data and reader.cursor == reader.fill_end) return null;
-    return switch (try reader.readBufferedRecord(true)) {
+    return switch (try reader.readBufferedRecord(true, true)) {
         .incomplete => null,
         .eof => null,
         .record => |buffered| reader.finishBufferedRecord(
@@ -1905,16 +1933,33 @@ fn expectPayloadProjection(
     );
     defer payload_reader.deinit();
 
+    var record_source = ProjectionTestSource.init(input, split, fail_at);
+    var record_reader = try Reader.init(
+        std.testing.allocator,
+        record_source.byteSource(),
+        options,
+    );
+    defer record_reader.deinit();
+
     while (true) {
         const full_result = full_reader.next();
         const payload_result = nextPayload(&payload_reader);
+        const record_result = nextRecordWithoutId(&record_reader);
         if (full_result) |full_record| {
             const payload_record = try payload_result;
+            const projected_record = try record_result;
             try std.testing.expectEqual(full_record == null, payload_record == null);
+            try std.testing.expectEqual(full_record == null, projected_record == null);
             if (full_record) |record| {
                 const payload = payload_record.?;
+                const projected = projected_record.?;
                 try std.testing.expectEqualStrings(record.sequence, payload.sequence);
                 try std.testing.expectEqualStrings(record.quality, payload.quality);
+                try std.testing.expectEqualStrings(record.header, projected.header);
+                try std.testing.expectEqualStrings(record.sequence, projected.sequence);
+                try std.testing.expectEqualStrings(record.plus, projected.plus);
+                try std.testing.expectEqualStrings(record.quality, projected.quality);
+                try std.testing.expectEqual(@as(usize, 0), projected.id.len);
             }
             try std.testing.expectEqual(full_reader.recordIndex(), payload_reader.recordIndex());
             try std.testing.expectEqual(full_reader.byteOffset(), payload_reader.byteOffset());
@@ -1922,19 +1967,31 @@ fn expectPayloadProjection(
                 full_reader.currentRecordOffsets(),
                 payload_reader.currentRecordOffsets(),
             );
+            try std.testing.expectEqual(full_reader.recordIndex(), record_reader.recordIndex());
+            try std.testing.expectEqual(full_reader.byteOffset(), record_reader.byteOffset());
+            try std.testing.expectEqual(
+                full_reader.currentRecordOffsets(),
+                record_reader.currentRecordOffsets(),
+            );
             if (full_record == null) return;
         } else |expected_error| {
             try std.testing.expectError(expected_error, payload_result);
+            try std.testing.expectError(expected_error, record_result);
             try std.testing.expectEqual(full_reader.recordIndex(), payload_reader.recordIndex());
             try std.testing.expectEqual(full_reader.byteOffset(), payload_reader.byteOffset());
             try std.testing.expectEqual(
                 full_reader.currentRecordOffsets(),
                 payload_reader.currentRecordOffsets(),
             );
-            try expectProjectionErrorEqual(
-                full_reader.takeLastError(),
-                payload_reader.takeLastError(),
+            const full_error = full_reader.takeLastError();
+            try expectProjectionErrorEqual(full_error, payload_reader.takeLastError());
+            try std.testing.expectEqual(full_reader.recordIndex(), record_reader.recordIndex());
+            try std.testing.expectEqual(full_reader.byteOffset(), record_reader.byteOffset());
+            try std.testing.expectEqual(
+                full_reader.currentRecordOffsets(),
+                record_reader.currentRecordOffsets(),
             );
+            try expectProjectionErrorEqual(full_error, record_reader.takeLastError());
             return;
         }
     }
@@ -1986,7 +2043,7 @@ test "[property] - [reader]: structural masks match scalar line boundaries" {
     try std.testing.expect(!findLineEnds("a\nb\nc\n", &incomplete_ends));
 }
 
-test "[property] - [reader]: payload projection preserves delivery and failures" {
+test "[property] - [reader]: field projections preserve delivery and failures" {
     const valid =
         "@first description\nACGT\n+annotated\n!!!!\n" ++
         "@empty\r\n\r\n+\r\n\r\n" ++

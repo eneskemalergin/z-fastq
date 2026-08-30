@@ -1055,15 +1055,13 @@ fn checkPairedSources(
     var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        var canonical_span1: ?[]const u8 = null;
-        const record1 = fastq.nextWithoutId(&reader1, &canonical_span1) catch |err| {
+        const record1 = fastq.nextRecordWithoutId(&reader1) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader1, err),
             } };
         };
-        var canonical_span2: ?[]const u8 = null;
-        const record2 = fastq.nextWithoutId(&reader2, &canonical_span2) catch |err| {
+        const record2 = fastq.nextRecordWithoutId(&reader2) catch |err| {
             return .{ .command = .{
                 .input_index = 1,
                 .details = mapReaderFailure(&reader2, err),
@@ -1169,8 +1167,7 @@ fn checkInterleavedSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        var canonical_span1: ?[]const u8 = null;
-        const record1 = fastq.nextWithoutId(&reader, &canonical_span1) catch |err| {
+        const record1 = fastq.nextRecordWithoutId(&reader) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
@@ -1188,11 +1185,7 @@ fn checkInterleavedSource(
         var first_token_len: usize = 0;
         var first_mate_marker: ?u2 = null;
         var mate1_markers: u2 = 0;
-        var canonical_span2: ?[]const u8 = null;
-        const buffered_record2 = fastq.nextBufferedWithoutId(
-            &reader,
-            &canonical_span2,
-        ) catch |err| {
+        const buffered_record2 = fastq.nextBufferedRecordWithoutId(&reader) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
@@ -1212,7 +1205,7 @@ fn checkInterleavedSource(
                 first_mate_marker = name1.first_mate_marker;
                 mate1_markers = name1.mate_markers;
             }
-            break :record fastq.nextWithoutId(&reader, &canonical_span2) catch |err| {
+            break :record fastq.nextRecordWithoutId(&reader) catch |err| {
                 return .{ .command = .{
                     .input_index = 0,
                     .details = mapReaderFailure(&reader, err),
