@@ -1287,10 +1287,100 @@ fn firstValidSequenceLineEnd(bytes: []const u8, alphabet: Alphabet) ?usize {
     };
 }
 
+const SequenceLineScan = union(enum) {
+    line_end: usize,
+    invalid_start: usize,
+    incomplete,
+};
+
+fn firstInvalidCheckSequence(
+    sequence: []const u8,
+    alphabet: Alphabet,
+    use_full_iupac: *bool,
+) ?usize {
+    return switch (alphabet) {
+        .acgtn => firstInvalidSequence(sequence, .acgtn),
+        .iupac => if (use_full_iupac.*)
+            firstInvalidSequence(sequence, .iupac)
+        else
+            firstInvalidNarrowIupacSequence(sequence, use_full_iupac),
+    };
+}
+
+fn firstInvalidNarrowIupacSequence(
+    sequence: []const u8,
+    use_full_iupac: *bool,
+) ?usize {
+    return switch (scanSequenceLineFor(.acgtn, sequence)) {
+        .incomplete => null,
+        .line_end => |line_end| line_end,
+        .invalid_start => |start| switch (scanSequenceLineFor(
+            .iupac,
+            sequence[start..],
+        )) {
+            .incomplete => result: {
+                use_full_iupac.* = true;
+                break :result null;
+            },
+            .line_end => |line_end| start + line_end,
+            .invalid_start => firstInvalidSequenceScalar(
+                sequence[start..],
+                .iupac,
+                start,
+            ),
+        },
+    };
+}
+
+fn firstValidCheckSequenceLineEnd(
+    bytes: []const u8,
+    alphabet: Alphabet,
+    use_full_iupac: *bool,
+) ?usize {
+    return switch (alphabet) {
+        .acgtn => firstValidSequenceLineEndFor(.acgtn, bytes),
+        .iupac => if (use_full_iupac.*)
+            firstValidSequenceLineEndFor(.iupac, bytes)
+        else
+            firstValidNarrowIupacSequenceLineEnd(bytes, use_full_iupac),
+    };
+}
+
+fn firstValidNarrowIupacSequenceLineEnd(
+    bytes: []const u8,
+    use_full_iupac: *bool,
+) ?usize {
+    return switch (scanSequenceLineFor(.acgtn, bytes)) {
+        .line_end => |line_end| line_end,
+        .incomplete => null,
+        .invalid_start => |start| switch (scanSequenceLineFor(.iupac, bytes[start..])) {
+            .line_end => |line_end| result: {
+                use_full_iupac.* = true;
+                break :result start + line_end;
+            },
+            .incomplete => result: {
+                use_full_iupac.* = true;
+                break :result null;
+            },
+            .invalid_start => null,
+        },
+    };
+}
+
 fn firstValidSequenceLineEndFor(
     comptime alphabet: Alphabet,
     bytes: []const u8,
 ) ?usize {
+    return switch (scanSequenceLineFor(alphabet, bytes)) {
+        .line_end => |line_end| line_end,
+        .invalid_start, .incomplete => null,
+    };
+}
+
+fn scanSequenceLineFor(
+    comptime alphabet: Alphabet,
+    bytes: []const u8,
+) SequenceLineScan {
     const Bytes = @Vector(STRUCTURAL_BLOCK_BYTES, u8);
     var block_start: usize = 0;
     while (bytes.len - block_start >= STRUCTURAL_BLOCK_BYTES) {
@@ -1304,22 +1394,23 @@ fn firstValidSequenceLineEndFor(
         if (line_feeds != 0) {
             const lane: u6 = @intCast(@ctz(line_feeds));
             const preceding = (@as(u64, 1) << lane) -% 1;
-            if (invalid & preceding != 0) return null;
-            return block_start + @as(usize, lane);
+            if (invalid & preceding != 0) return .{ .invalid_start = block_start };
+            return .{ .line_end = block_start + @as(usize, lane) };
         }
-        if (invalid != 0) return null;
+        if (invalid != 0) return .{ .invalid_start = block_start };
         block_start += STRUCTURAL_BLOCK_BYTES;
     }
     for (bytes[block_start..], block_start..) |byte, byte_index| {
-        if (byte == '\n') return byte_index;
-        if (!alphabetAccepts(alphabet, byte)) return null;
+        if (byte == '\n') return .{ .line_end = byte_index };
+        if (!alphabetAccepts(alphabet, byte)) return .{ .invalid_start = byte_index };
     }
-    return null;
+    return .incomplete;
 }
 
 pub const CheckScanner = struct {
     max_line_bytes: usize,
     alphabet: Alphabet,
+    use_full_iupac: bool = false,
     machine: Machine = .{},
     line_len: usize = 0,
     first_byte: ?u8 = null,
@@ -1369,9 +1460,11 @@ pub const CheckScanner = struct {
         ) catch return null) return null;
 
         const sequence_start = header_end + 1;
-        const sequence_len = firstValidSequenceLineEnd(
+        var use_full_iupac = self.use_full_iupac;
+        const sequence_len = firstValidCheckSequenceLineEnd(
             data[sequence_start..],
             self.alphabet,
+            &use_full_iupac,
         ) orelse return null;
         if (sequence_len > self.max_line_bytes) return null;
         if (machine.push(sequence_len, null, null) catch return null) return null;
@@ -1412,6 +1505,7 @@ pub const CheckScanner = struct {
         const next_record_index = std.math.add(u64, self.record_index, 1) catch return null;
 
         self.machine = machine;
+        self.use_full_iupac = use_full_iupac;
         self.sequence_start_offset = sequence_offset;
         self.quality_start_offset = quality_offset;
         self.record_index = next_record_index;
@@ -1523,7 +1617,11 @@ pub const CheckScanner = struct {
         switch (self.machine.expected) {
             .sequence => {
                 if (self.sequence_failure != null) return;
-                const relative = firstInvalidSequence(bytes, self.alphabet) orelse return;
+                const relative = firstInvalidCheckSequence(
+                    bytes,
+                    self.alphabet,
+                    &self.use_full_iupac,
+                ) orelse return;
                 self.sequence_failure = std.math.add(usize, start_index, relative) catch
                     return error.ArithmeticLimit;
             },
@@ -1539,9 +1637,19 @@ pub const CheckScanner = struct {
 
     fn classifyByte(self: *CheckScanner, byte: u8, byte_index: usize) void {
         switch (self.machine.expected) {
-            .sequence => if (self.sequence_failure == null and
-                !alphabetAccepts(self.alphabet, byte))
-            {
+            .sequence => {
+                if (self.sequence_failure != null) return;
+                if (self.alphabet == .acgtn or self.use_full_iupac) {
+                    if (!alphabetAccepts(self.alphabet, byte)) {
+                        self.sequence_failure = byte_index;
+                    }
+                    return;
+                }
+                if (alphabetAccepts(.acgtn, byte)) return;
+                if (alphabetAccepts(.iupac, byte)) {
+                    self.use_full_iupac = true;
+                    return;
+                }
                 self.sequence_failure = byte_index;
             },
             .quality => if (self.quality_failure == null and
@@ -2377,6 +2485,66 @@ test "[property] - [check scanner]: fused sequence scan preserves delimiter boun
     try std.testing.expect(firstValidSequenceLineEnd(&bytes, .acgtn) == null);
 }
 
+test "[property] - [check scanner]: adaptive IUPAC validation preserves byte policy" {
+    for (0..256) |value| {
+        const sequence = [_]u8{@intCast(value)};
+        var use_full_iupac = false;
+        try std.testing.expectEqual(
+            firstInvalidSequenceScalar(&sequence, .iupac, 0),
+            firstInvalidCheckSequence(&sequence, .iupac, &use_full_iupac),
+        );
+        try std.testing.expectEqual(
+            alphabetAccepts(.iupac, sequence[0]) and !alphabetAccepts(.acgtn, sequence[0]),
+            use_full_iupac,
+        );
+
+        use_full_iupac = false;
+        try std.testing.expectEqual(
+            firstInvalidSequenceScalar(&sequence, .acgtn, 0),
+            firstInvalidCheckSequence(&sequence, .acgtn, &use_full_iupac),
+        );
+        try std.testing.expect(!use_full_iupac);
+    }
+
+    var block: [STRUCTURAL_BLOCK_BYTES]u8 = @splat('A');
+    block[1] = '\n';
+    block[2] = 'R';
+    var use_full_iupac = false;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        firstValidCheckSequenceLineEnd(&block, .iupac, &use_full_iupac).?,
+    );
+    try std.testing.expect(!use_full_iupac);
+
+    block[0] = 'R';
+    use_full_iupac = false;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        firstValidCheckSequenceLineEnd(&block, .iupac, &use_full_iupac).?,
+    );
+    try std.testing.expect(use_full_iupac);
+
+    var sequence: [2 * STRUCTURAL_BLOCK_BYTES]u8 = @splat('A');
+    sequence[31] = 'R';
+    sequence[70] = '.';
+    use_full_iupac = false;
+    try std.testing.expectEqual(
+        @as(usize, 70),
+        firstInvalidCheckSequence(&sequence, .iupac, &use_full_iupac).?,
+    );
+    try std.testing.expect(!use_full_iupac);
+
+    sequence[5] = '.';
+    try std.testing.expectEqual(
+        @as(usize, 5),
+        firstInvalidCheckSequence(&sequence, .iupac, &use_full_iupac).?,
+    );
+    sequence[5] = 'A';
+    sequence[70] = 'A';
+    try std.testing.expect(firstInvalidCheckSequence(&sequence, .iupac, &use_full_iupac) == null);
+    try std.testing.expect(use_full_iupac);
+}
+
 test "[unit] - [check scanner]: complete record path commits only proved records" {
     const record1 = "@r one\nACGTN\n+note\n!!!!!\n";
     const record2 = "@s\n\n+\n\n";
@@ -2396,6 +2564,7 @@ test "[unit] - [check scanner]: complete record path commits only proved records
     for ([_][]const u8{
         "@r\r\nA\r\n+\r\n!\r\n",
         "@r\nA\n+\n",
+        "@r\nR\n+\n",
         "r\nA\n+\n!\n",
         "@r\n.\n+\n!\n",
         "@r\nA\n+\n\x7f\n",
@@ -2411,6 +2580,19 @@ test "[unit] - [check scanner]: complete record path commits only proved records
     const before = limited;
     try std.testing.expect(limited.consumeCompleteRecord("@r\nA\n+\n!\n") == null);
     try std.testing.expectEqualDeep(before, limited);
+
+    var wide = CheckScanner.init(.{}, .{});
+    try std.testing.expect(wide.consumeCompleteRecord("@r\nR\n+\n!\n") != null);
+    try std.testing.expect(wide.use_full_iupac);
+}
+
+test "[unit] - [check scanner]: adaptive IUPAC state survives a chunk seam" {
+    var scanner = CheckScanner.init(.{}, .{});
+    _ = try scanner.feed("@r\nR");
+    try std.testing.expect(scanner.use_full_iupac);
+    _ = try scanner.feed("\n+\n!\n");
+    try scanner.finishEof();
+    try std.testing.expectEqual(@as(u64, 1), scanner.record_index);
 }
 
 test "[property] - [check scanner]: fragmented results match independent expectations and Reader" {
@@ -2426,6 +2608,30 @@ test "[property] - [check scanner]: fragmented results match independent expecta
         .{ .data = "@r\r\nA\r\n+\r\n!\r\n", .expected = .{ .valid = 1 } },
         .{ .data = "@r\nA\n+\n!", .expected = .{ .valid = 1 } },
         .{ .data = "@r\nR\n+\n!\n", .expected = .{ .valid = 1 } },
+        .{
+            .data = "@r\r\nURYSWKMBDHVuryswkmbdhv\r\n+\r\n!!!!!!!!!!!!!!!!!!!!!!\r\n",
+            .expected = .{ .valid = 1 },
+        },
+        .{
+            .data = "@r\n.R\n+\n!!\n",
+            .expected = .{ .parse_error = expectedCheckError(
+                .s002_invalid_sequence_alphabet,
+                "sequence byte is outside the selected alphabet",
+                0,
+                3,
+                2,
+            ) },
+        },
+        .{
+            .data = "@r\nR.\n+\n!!\n",
+            .expected = .{ .parse_error = expectedCheckError(
+                .s002_invalid_sequence_alphabet,
+                "sequence byte is outside the selected alphabet",
+                0,
+                4,
+                2,
+            ) },
+        },
         .{
             .data = "@r\nR\n+\n!\n",
             .validation_options = .{ .alphabet = .acgtn },
