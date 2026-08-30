@@ -2035,6 +2035,29 @@ fn nextAfterPreservingInterleavedMate1(
     };
 }
 
+fn writePreservedInterleavedMate1(
+    writer: *zfastq.Writer,
+    reader: *zfastq.Reader,
+    retained: *fastq.RetainedRecordStorage,
+    staged: []const u8,
+    record: zfastq.Record,
+    canonical_span: ?[]const u8,
+    storage: InterleavedFirstRecordStorage,
+) error{WriteFailed}!void {
+    switch (storage) {
+        .unused => unreachable,
+        .reader, .retained => if (canonical_span) |span| {
+            try fastq.writeCanonicalRecordSpan(writer, span);
+        } else {
+            try fastq.writeValidatedRecord(writer, record);
+        },
+        .staged => try fastq.writeCanonicalRecordSpan(writer, staged),
+    }
+    if (storage == .retained) {
+        fastq.restoreFallbackRecordStorage(reader, retained);
+    }
+}
+
 fn sampleInterleavedSource(
     allocator: std.mem.Allocator,
     source: zfastq.io.ByteSource,
@@ -2213,23 +2236,15 @@ fn sampleInterleavedSource(
         }
         if (!selected) continue;
 
-        switch (record1_storage) {
-            .unused => unreachable,
-            .reader, .retained => {
-                if (canonical_span1) |span| {
-                    fastq.writeCanonicalRecordSpan(writer, span) catch
-                        return error.WriteFailed;
-                } else {
-                    fastq.writeValidatedRecord(writer, record1) catch
-                        return error.WriteFailed;
-                }
-            },
-            .staged => fastq.writeCanonicalRecordSpan(writer, staged_record.items) catch
-                return error.WriteFailed,
-        }
-        if (record1_storage == .retained) {
-            fastq.restoreFallbackRecordStorage(&reader, &retained_record_storage);
-        }
+        try writePreservedInterleavedMate1(
+            writer,
+            &reader,
+            &retained_record_storage,
+            staged_record.items,
+            record1,
+            canonical_span1,
+            record1_storage,
+        );
         if (canonical_span2) |span| {
             fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
         } else {
@@ -3021,19 +3036,15 @@ fn sampleExactInterleavedSecondPass(
             break :record preserved.?.record;
         } orelse break;
 
-        switch (record1_storage) {
-            .unused => unreachable,
-            .reader, .retained => if (canonical_span1) |span| {
-                fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
-            } else {
-                fastq.writeValidatedRecord(writer, record1) catch return error.WriteFailed;
-            },
-            .staged => fastq.writeCanonicalRecordSpan(writer, staged_record.items) catch
-                return error.WriteFailed,
-        }
-        if (record1_storage == .retained) {
-            fastq.restoreFallbackRecordStorage(&reader, &retained_record_storage);
-        }
+        try writePreservedInterleavedMate1(
+            writer,
+            &reader,
+            &retained_record_storage,
+            staged_record.items,
+            record1,
+            canonical_span1,
+            record1_storage,
+        );
         if (canonical_span2) |span| {
             fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
         } else {
@@ -3728,23 +3739,15 @@ fn deinterleaveSource(
             } } };
         }
 
-        switch (record1_storage) {
-            .unused => unreachable,
-            .reader, .retained => {
-                if (canonical_span1) |span| {
-                    fastq.writeCanonicalRecordSpan(writer1, span) catch
-                        return error.Output1WriteFailed;
-                } else {
-                    fastq.writeValidatedRecord(writer1, record1) catch
-                        return error.Output1WriteFailed;
-                }
-            },
-            .staged => fastq.writeCanonicalRecordSpan(writer1, staged_record.items) catch
-                return error.Output1WriteFailed,
-        }
-        if (record1_storage == .retained) {
-            fastq.restoreFallbackRecordStorage(&reader, &retained_record_storage);
-        }
+        writePreservedInterleavedMate1(
+            writer1,
+            &reader,
+            &retained_record_storage,
+            staged_record.items,
+            record1,
+            canonical_span1,
+            record1_storage,
+        ) catch return error.Output1WriteFailed;
         if (canonical_span2) |span| {
             fastq.writeCanonicalRecordSpan(writer2, span) catch
                 return error.Output2WriteFailed;
