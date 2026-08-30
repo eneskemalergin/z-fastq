@@ -3608,12 +3608,6 @@ fn deinterleaveSource(
     defer retained_record_storage.deinit(allocator);
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
-    const FirstRecordStorage = enum {
-        reader,
-        retained,
-        staged,
-    };
-
     while (true) {
         var canonical_span1: ?[]const u8 = null;
         const record1 = fastq.nextWithoutId(&reader, &canonical_span1) catch |err| {
@@ -3633,7 +3627,7 @@ fn deinterleaveSource(
         );
 
         var canonical_span2: ?[]const u8 = null;
-        var record1_storage: FirstRecordStorage = .reader;
+        var record1_storage: InterleavedFirstRecordStorage = .reader;
         const buffered_record2 = fastq.nextBufferedWithoutId(
             &reader,
             &canonical_span2,
@@ -3645,63 +3639,54 @@ fn deinterleaveSource(
         };
         const record2 = buffered_record2 orelse record: {
             @branchHint(.cold);
-            var record2_requires_fallback = false;
-            if (semantic1 == null) {
-                if (fastq.retainFallbackRecordStorage(
+            if (semantic1 != null) {
+                break :record fastq.nextWithoutId(
                     &reader,
-                    &retained_record_storage,
-                    record1,
-                )) {
-                    record1_storage = .retained;
-                    const transferred_record2 = fastq.nextBufferedAfterFallbackTransfer(
-                        &reader,
-                        &canonical_span2,
-                    ) catch |err| {
-                        return .{ .command = .{
-                            .input_index = 0,
-                            .details = mapReaderFailure(&reader, err),
-                        } };
-                    };
-                    if (transferred_record2) |complete_record2| {
-                        break :record complete_record2;
-                    }
-                }
-                stageCanonicalRecord(
-                    allocator,
-                    &staged_record,
-                    record1,
-                    canonical_span1,
-                    staging_limit,
-                ) catch |err| switch (err) {
-                    error.OutOfMemory => return pairCommandFailure(
-                        0,
-                        "out_of_memory",
-                        "out of memory",
-                        3,
-                    ),
-                    error.ArithmeticLimit => return pairCommandFailure(
-                        0,
-                        "arithmetic_limit",
-                        "record staging size exceeds supported limit",
-                        4,
-                    ),
-                };
-                if (record1_storage == .retained) {
-                    fastq.restoreFallbackRecordStorage(&reader, &retained_record_storage);
-                    record2_requires_fallback = true;
-                }
-                record1_storage = .staged;
+                    &canonical_span2,
+                ) catch |err| {
+                    return .{ .command = .{
+                        .input_index = 0,
+                        .details = mapReaderFailure(&reader, err),
+                    } };
+                } orelse return .{ .pair = .{ .count_mismatch = .{
+                    .pair_index = record_index1 / 2,
+                    .remaining_side = 0,
+                    .record_indexes = .{
+                        record_index1,
+                        if (record_index1 == 0) null else record_index1 - 1,
+                    },
+                } } };
             }
-            const next_record = if (record2_requires_fallback)
-                fastq.nextFallbackWithoutId(&reader, &canonical_span2)
-            else
-                fastq.nextWithoutId(&reader, &canonical_span2);
-            break :record next_record catch |err| {
-                return .{ .command = .{
+
+            const preserved = nextAfterPreservingInterleavedMate1(
+                allocator,
+                &reader,
+                &retained_record_storage,
+                &staged_record,
+                record1,
+                canonical_span1,
+                staging_limit,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return pairCommandFailure(
+                    0,
+                    "out_of_memory",
+                    "out of memory",
+                    3,
+                ),
+                error.ArithmeticLimit => return pairCommandFailure(
+                    0,
+                    "arithmetic_limit",
+                    "record staging size exceeds supported limit",
+                    4,
+                ),
+                else => return .{ .command = .{
                     .input_index = 0,
-                    .details = mapReaderFailure(&reader, err),
-                } };
-            } orelse return .{ .pair = .{ .count_mismatch = .{
+                    .details = mapReaderFailure(&reader, @errorCast(err)),
+                } },
+            };
+            canonical_span2 = preserved.canonical_span;
+            record1_storage = preserved.first_storage;
+            break :record preserved.record orelse return .{ .pair = .{ .count_mismatch = .{
                 .pair_index = record_index1 / 2,
                 .remaining_side = 0,
                 .record_indexes = .{
@@ -3727,6 +3712,7 @@ fn deinterleaveSource(
         }
 
         const header1 = switch (record1_storage) {
+            .unused => unreachable,
             .reader, .retained => record1.header,
             .staged => staged_record.items[1 .. 1 + header1_len],
         };
@@ -3743,6 +3729,7 @@ fn deinterleaveSource(
         }
 
         switch (record1_storage) {
+            .unused => unreachable,
             .reader, .retained => {
                 if (canonical_span1) |span| {
                     fastq.writeCanonicalRecordSpan(writer1, span) catch
