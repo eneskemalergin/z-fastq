@@ -671,15 +671,12 @@ const CommandFailure = struct {
 };
 
 fn validateCommandRecord(
+    validator: *fastq.AdaptiveRecordValidator,
     record: zfastq.Record,
     offsets: zfastq.RecordOffsets,
     record_index: u64,
-    alphabet: zfastq.Alphabet,
 ) ?CommandFailure {
-    return mapSemanticFailure(zfastq.validateRecord(
-        record,
-        .{ .alphabet = alphabet },
-    ), offsets, record_index);
+    return mapSemanticFailure(validator.validate(record), offsets, record_index);
 }
 
 fn mapSemanticFailure(
@@ -1100,15 +1097,17 @@ fn checkPairedSources(
         const record_index2 = reader2.recordIndex() - 1;
         const offsets1 = reader1.currentRecordOffsets().?;
         const offsets2 = reader2.currentRecordOffsets().?;
-        if (mapSemanticFailure(
-            validator1.validate(record1.?),
+        if (validateCommandRecord(
+            &validator1,
+            record1.?,
             offsets1,
             record_index1,
         )) |failure| {
             return .{ .command = .{ .input_index = 0, .details = failure } };
         }
-        if (mapSemanticFailure(
-            validator2.validate(record2.?),
+        if (validateCommandRecord(
+            &validator2,
+            record2.?,
             offsets2,
             record_index2,
         )) |failure| {
@@ -1173,6 +1172,7 @@ fn checkInterleavedSource(
     defer reader.deinit();
     var normalized_id: std.ArrayList(u8) = .empty;
     defer normalized_id.deinit(allocator);
+    var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
         var canonical_span1: ?[]const u8 = null;
@@ -1184,7 +1184,12 @@ fn checkInterleavedSource(
         } orelse return null;
         const record_index1 = reader.recordIndex() - 1;
         const offsets1 = reader.currentRecordOffsets().?;
-        const semantic1 = validatePairRecord(record1, offsets1, record_index1, options);
+        const semantic1 = validateCommandRecord(
+            &validator,
+            record1,
+            offsets1,
+            record_index1,
+        );
 
         var first_token_len: usize = 0;
         var first_mate_marker: ?u2 = null;
@@ -1234,7 +1239,12 @@ fn checkInterleavedSource(
 
         const record_index2 = reader.recordIndex() - 1;
         const offsets2 = reader.currentRecordOffsets().?;
-        if (validatePairRecord(record2, offsets2, record_index2, options)) |failure| {
+        if (validateCommandRecord(
+            &validator,
+            record2,
+            offsets2,
+            record_index2,
+        )) |failure| {
             return .{ .command = .{ .input_index = 0, .details = failure } };
         }
 
@@ -1334,15 +1344,6 @@ fn pairCommandFailure(
         .input_index = input_index,
         .details = CommandFailure.plain(code, message, exit_code),
     } };
-}
-
-fn validatePairRecord(
-    record: zfastq.Record,
-    offsets: zfastq.RecordOffsets,
-    record_index: u64,
-    options: PairedCheckOptions,
-) ?CommandFailure {
-    return validateCommandRecord(record, offsets, record_index, options.alphabet);
 }
 
 fn lastRecordIndex(reader: *const zfastq.Reader) ?u64 {
@@ -2054,6 +2055,7 @@ fn sampleInterleavedSource(
     defer staged_record.deinit(allocator);
     var retained_record_storage: fastq.RetainedRecordStorage = .{};
     defer retained_record_storage.deinit(allocator);
+    var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
         var canonical_span1: ?[]const u8 = null;
@@ -2066,10 +2068,10 @@ fn sampleInterleavedSource(
         const record_index1 = reader.recordIndex() - 1;
         const offsets1 = reader.currentRecordOffsets().?;
         const semantic1 = validateCommandRecord(
+            &validator,
             record1,
             offsets1,
             record_index1,
-            options.alphabet,
         );
 
         var first_token_len: usize = 0;
@@ -2160,10 +2162,10 @@ fn sampleInterleavedSource(
         const record_index2 = reader.recordIndex() - 1;
         const offsets2 = reader.currentRecordOffsets().?;
         if (validateCommandRecord(
+            &validator,
             record2,
             offsets2,
             record_index2,
-            options.alphabet,
         )) |failure| {
             return .{ .command = .{ .input_index = 0, .details = failure } };
         }
@@ -2286,8 +2288,9 @@ fn sampleFractionSource(
         .{ .max_line_bytes = options.max_line_bytes },
     ) catch return CommandFailure.plain("out_of_memory", "out of memory", 3);
     defer reader.deinit();
+    var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
-    while (true) switch (nextValidatedSampleRecord(&reader, options.alphabet)) {
+    while (true) switch (nextValidatedSampleRecord(&reader, &validator)) {
         .done => return null,
         .failure => |failure| return failure,
         .record => |validated| {
@@ -2315,7 +2318,7 @@ const SampleRecordOutcome = union(enum) {
 
 fn nextValidatedSampleRecord(
     reader: *zfastq.Reader,
-    alphabet: zfastq.Alphabet,
+    validator: *fastq.AdaptiveRecordValidator,
 ) SampleRecordOutcome {
     var canonical_span: ?[]const u8 = null;
     const record = fastq.nextWithoutId(reader, &canonical_span) catch |err| {
@@ -2323,10 +2326,10 @@ fn nextValidatedSampleRecord(
     } orelse return .done;
     const offsets = reader.currentRecordOffsets() orelse return .{ .failure = CommandFailure.plain("io_error", "record location is unavailable", 3) };
     if (validateCommandRecord(
+        validator,
         record,
         offsets,
         reader.recordIndex() - 1,
-        alphabet,
     )) |failure| {
         return .{ .failure = failure };
     }
@@ -3249,6 +3252,8 @@ fn interleaveSources(
         .{ .max_line_bytes = options.max_line_bytes },
     ) catch return pairCommandFailure(1, "out_of_memory", "out of memory", 3);
     defer reader2.deinit();
+    var validator1 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
+    var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
         var canonical_span1: ?[]const u8 = null;
@@ -3288,18 +3293,18 @@ fn interleaveSources(
         const offsets1 = reader1.currentRecordOffsets().?;
         const offsets2 = reader2.currentRecordOffsets().?;
         if (validateCommandRecord(
+            &validator1,
             record1.?,
             offsets1,
             record_index1,
-            options.alphabet,
         )) |failure| {
             return .{ .command = .{ .input_index = 0, .details = failure } };
         }
         if (validateCommandRecord(
+            &validator2,
             record2.?,
             offsets2,
             record_index2,
-            options.alphabet,
         )) |failure| {
             return .{ .command = .{ .input_index = 1, .details = failure } };
         }
@@ -3601,6 +3606,7 @@ fn deinterleaveSource(
     defer staged_record.deinit(allocator);
     var retained_record_storage: fastq.RetainedRecordStorage = .{};
     defer retained_record_storage.deinit(allocator);
+    var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     const FirstRecordStorage = enum {
         reader,
@@ -3620,10 +3626,10 @@ fn deinterleaveSource(
         const offsets1 = reader.currentRecordOffsets().?;
         const header1_len = record1.header.len;
         const semantic1 = validateCommandRecord(
+            &validator,
             record1,
             offsets1,
             record_index1,
-            options.alphabet,
         );
 
         var canonical_span2: ?[]const u8 = null;
@@ -3712,10 +3718,10 @@ fn deinterleaveSource(
         const record_index2 = reader.recordIndex() - 1;
         const offsets2 = reader.currentRecordOffsets().?;
         if (validateCommandRecord(
+            &validator,
             record2,
             offsets2,
             record_index2,
-            options.alphabet,
         )) |details| {
             return .{ .command = .{ .input_index = 0, .details = details } };
         }
