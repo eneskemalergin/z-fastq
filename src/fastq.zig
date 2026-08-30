@@ -87,15 +87,19 @@ pub const SemanticError = struct {
 /// Checks only sequence alphabet and Phred+33 bytes without allocating.
 /// Structural prefixes, completeness, and equal field lengths remain caller-owned.
 pub fn validateRecord(record: Record, options: ValidationOptions) ?SemanticError {
+    return switch (options.alphabet) {
+        .iupac => validateRecordFor(.iupac, record),
+        .acgtn => validateRecordFor(.acgtn, record),
+    };
+}
+
+fn validateRecordFor(comptime alphabet: Alphabet, record: Record) ?SemanticError {
     if (record.sequence.len == record.quality.len) {
         if (std.simd.suggestVectorLength(u8)) |vector_len| {
-            return switch (options.alphabet) {
-                .iupac => validateRecordVector(vector_len, .iupac, record),
-                .acgtn => validateRecordVector(vector_len, .acgtn, record),
-            };
+            return validateRecordVector(vector_len, alphabet, record);
         }
     }
-    if (firstInvalidSequence(record.sequence, options.alphabet)) |byte_index| {
+    if (firstInvalidSequence(record.sequence, alphabet)) |byte_index| {
         return semanticSequenceError(byte_index);
     }
     if (firstInvalidQuality(record.quality)) |byte_index| {
@@ -103,6 +107,29 @@ pub fn validateRecord(record: Record, options: ValidationOptions) ?SemanticError
     }
     return null;
 }
+
+pub const AdaptiveRecordValidator = struct {
+    alphabet: Alphabet,
+    use_full_iupac: bool = false,
+
+    pub fn init(options: ValidationOptions) AdaptiveRecordValidator {
+        return .{ .alphabet = options.alphabet };
+    }
+
+    pub fn validate(self: *AdaptiveRecordValidator, record: Record) ?SemanticError {
+        if (self.alphabet == .acgtn) return validateRecordFor(.acgtn, record);
+        if (self.use_full_iupac) return validateRecordFor(.iupac, record);
+
+        const narrow_error = validateRecordFor(.acgtn, record) orelse return null;
+        if (narrow_error.field == .quality) return narrow_error;
+
+        const full_error = validateRecordFor(.iupac, record);
+        if (full_error == null or full_error.?.field == .quality) {
+            self.use_full_iupac = true;
+        }
+        return full_error;
+    }
+};
 
 fn validateRecordVector(
     comptime vector_len: comptime_int,
@@ -3113,6 +3140,86 @@ test "[property] - [record validation]: vector sequence validation matches scala
         );
         try std.testing.expectEqual(@as(usize, 1), firstInvalidSequence(sequence, alphabet).?);
     }
+}
+
+test "[property] - [record validation]: adaptive IUPAC state preserves byte policy" {
+    for (0..256) |value| {
+        const sequence = [_]u8{@intCast(value)};
+        const record: Record = .{
+            .header = "r",
+            .id = "r",
+            .sequence = &sequence,
+            .plus = "",
+            .quality = "!",
+        };
+        var validator = AdaptiveRecordValidator.init(.{});
+        try std.testing.expectEqualDeep(
+            validateRecord(record, .{}),
+            validator.validate(record),
+        );
+        try std.testing.expectEqual(
+            alphabetAccepts(.iupac, sequence[0]) and
+                !alphabetAccepts(.acgtn, sequence[0]),
+            validator.use_full_iupac,
+        );
+    }
+
+    var validator = AdaptiveRecordValidator.init(.{});
+    const bad_quality: Record = .{
+        .header = "r",
+        .id = "r",
+        .sequence = "A",
+        .plus = "",
+        .quality = " ",
+    };
+    try std.testing.expectEqualDeep(
+        validateRecord(bad_quality, .{}),
+        validator.validate(bad_quality),
+    );
+    try std.testing.expect(!validator.use_full_iupac);
+
+    const wider: Record = .{
+        .header = "r",
+        .id = "r",
+        .sequence = "R",
+        .plus = "",
+        .quality = "!",
+    };
+    try std.testing.expect(validator.validate(wider) == null);
+    try std.testing.expect(validator.use_full_iupac);
+    const invalid: Record = .{
+        .header = "s",
+        .id = "s",
+        .sequence = ".",
+        .plus = "",
+        .quality = "!",
+    };
+    try std.testing.expectEqualDeep(
+        validateRecord(invalid, .{}),
+        validator.validate(invalid),
+    );
+
+    var independent = AdaptiveRecordValidator.init(.{});
+    try std.testing.expect(!independent.use_full_iupac);
+    const wider_bad_quality: Record = .{
+        .header = "t",
+        .id = "t",
+        .sequence = "R",
+        .plus = "",
+        .quality = " ",
+    };
+    try std.testing.expectEqualDeep(
+        validateRecord(wider_bad_quality, .{}),
+        independent.validate(wider_bad_quality),
+    );
+    try std.testing.expect(independent.use_full_iupac);
+
+    var acgtn = AdaptiveRecordValidator.init(.{ .alphabet = .acgtn });
+    try std.testing.expectEqualDeep(
+        validateRecord(wider, .{ .alphabet = .acgtn }),
+        acgtn.validate(wider),
+    );
+    try std.testing.expect(!acgtn.use_full_iupac);
 }
 
 test "[property] - [record validation]: fused vectors preserve field precedence" {

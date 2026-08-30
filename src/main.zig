@@ -676,10 +676,18 @@ fn validateCommandRecord(
     record_index: u64,
     alphabet: zfastq.Alphabet,
 ) ?CommandFailure {
-    const semantic_error = zfastq.validateRecord(
+    return mapSemanticFailure(zfastq.validateRecord(
         record,
         .{ .alphabet = alphabet },
-    ) orelse return null;
+    ), offsets, record_index);
+}
+
+fn mapSemanticFailure(
+    maybe_error: ?zfastq.SemanticError,
+    offsets: zfastq.RecordOffsets,
+    record_index: u64,
+) ?CommandFailure {
+    const semantic_error = maybe_error orelse return null;
     const field_offset = switch (semantic_error.field) {
         .sequence => offsets.sequence,
         .quality => offsets.quality,
@@ -1052,6 +1060,8 @@ fn checkPairedSources(
         .{ .max_line_bytes = options.max_line_bytes },
     ) catch return pairCommandFailure(1, "out_of_memory", "out of memory", 3);
     defer reader2.deinit();
+    var validator1 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
+    var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
         var canonical_span1: ?[]const u8 = null;
@@ -1090,10 +1100,18 @@ fn checkPairedSources(
         const record_index2 = reader2.recordIndex() - 1;
         const offsets1 = reader1.currentRecordOffsets().?;
         const offsets2 = reader2.currentRecordOffsets().?;
-        if (validatePairRecord(record1.?, offsets1, record_index1, options)) |failure| {
+        if (mapSemanticFailure(
+            validator1.validate(record1.?),
+            offsets1,
+            record_index1,
+        )) |failure| {
             return .{ .command = .{ .input_index = 0, .details = failure } };
         }
-        if (validatePairRecord(record2.?, offsets2, record_index2, options)) |failure| {
+        if (mapSemanticFailure(
+            validator2.validate(record2.?),
+            offsets2,
+            record_index2,
+        )) |failure| {
             return .{ .command = .{ .input_index = 1, .details = failure } };
         }
 

@@ -687,12 +687,12 @@ test "[integration] - [paired exact sample]: gzip and exact-name fields match pl
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const r1 = "@same left opaque\r\nAC\r\n+left annotation\r\n!~\r\n";
-    const r2 = "@same right opaque\r\nGT\r\n+right annotation\r\n#$\r\n";
+    const r1 = "@same left opaque\r\nRY\r\n+left annotation\r\n!~\r\n";
+    const r2 = "@same right opaque\r\nKM\r\n+right annotation\r\n#$\r\n";
     const interleaved = r1 ++ r2;
     const expected =
-        "@same left opaque\nAC\n+left annotation\n!~\n" ++
-        "@same right opaque\nGT\n+right annotation\n#$\n";
+        "@same left opaque\nRY\n+left annotation\n!~\n" ++
+        "@same right opaque\nKM\n+right annotation\n#$\n";
     var gzip1: std.ArrayList(u8) = .empty;
     var gzip2: std.ArrayList(u8) = .empty;
     var gzip_interleaved: std.ArrayList(u8) = .empty;
