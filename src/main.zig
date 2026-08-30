@@ -899,10 +899,7 @@ fn runCheck(
 
     var exit_code: u8 = 0;
     for (inputs) |input| {
-        const failure = if (std.mem.eql(u8, input, "-"))
-            checkStdin(io, options)
-        else
-            checkFile(io, input, options);
+        const failure = checkInput(io, input, options);
         if (failure) |details| {
             printCommandFailure(io, input, details);
             exit_code = @max(exit_code, details.exit_code);
@@ -968,10 +965,7 @@ fn runCheckJson(
     beginJsonDocument(&json, "z-fastq/check-v1") catch return 3;
     var exit_code: u8 = 0;
     for (inputs) |input| {
-        const failure = if (std.mem.eql(u8, input, "-"))
-            checkStdin(io, options)
-        else
-            checkFile(io, input, options);
+        const failure = checkInput(io, input, options);
         writeCheckJsonResult(&json, input, failure) catch return 3;
         if (failure) |details| exit_code = @max(exit_code, details.exit_code);
     }
@@ -1350,33 +1344,13 @@ fn lastRecordIndex(reader: *const zfastq.Reader) ?u64 {
     return if (reader.recordIndex() == 0) null else reader.recordIndex() - 1;
 }
 
-fn checkFile(
+fn checkInput(
     io: std.Io,
-    path: []const u8,
-    options: CheckOptions,
-) ?CommandFailure {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return CommandFailure.plain("io_error", "file not found", 3),
-        else => return CommandFailure.plain("io_error", "failed to open file", 3),
-    };
-
-    var input: RecordInput = undefined;
-    input.init(io, file, true) catch {
-        file.close(io);
-        return CommandFailure.plain("io_error", "I/O error", 3);
-    };
-    defer input.deinit(io);
-    return checkSource(input.byteSource(), options);
-}
-
-fn checkStdin(
-    io: std.Io,
+    label: []const u8,
     options: CheckOptions,
 ) ?CommandFailure {
     var input: RecordInput = undefined;
-    input.init(io, .stdin(), false) catch {
-        return CommandFailure.plain("io_error", "I/O error", 3);
-    };
+    if (initRecordInput(&input, io, label)) |failure| return failure;
     defer input.deinit(io);
     return checkSource(input.byteSource(), options);
 }
@@ -1442,10 +1416,7 @@ fn runStats(
     var exit_code: u8 = 0;
     var printed_block = false;
     for (inputs) |input| {
-        const outcome = if (std.mem.eql(u8, input, "-"))
-            statsStdin(io, allocator, options)
-        else
-            statsFile(io, allocator, input, options);
+        const outcome = statsInput(io, allocator, input, options);
         const stats = switch (outcome) {
             .success => |stats| stats,
             .failure => |failure| {
@@ -1483,10 +1454,7 @@ fn runStatsJson(
     beginJsonDocument(&json, "z-fastq/stats-v1") catch return 3;
     var exit_code: u8 = 0;
     for (inputs) |input| {
-        const outcome = if (std.mem.eql(u8, input, "-"))
-            statsStdin(io, allocator, options)
-        else
-            statsFile(io, allocator, input, options);
+        const outcome = statsInput(io, allocator, input, options);
         writeStatsJsonResult(&json, input, outcome) catch return 3;
         switch (outcome) {
             .success => {},
@@ -1498,43 +1466,14 @@ fn runStatsJson(
     return exit_code;
 }
 
-fn statsFile(
+fn statsInput(
     io: std.Io,
     allocator: std.mem.Allocator,
-    path: []const u8,
-    options: InputOptions,
-) StatsOutcome {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return .{ .failure = CommandFailure.plain(
-            "io_error",
-            "file not found",
-            3,
-        ) },
-        else => return .{ .failure = CommandFailure.plain(
-            "io_error",
-            "failed to open file",
-            3,
-        ) },
-    };
-
-    var input: RecordInput = undefined;
-    input.init(io, file, true) catch {
-        file.close(io);
-        return .{ .failure = CommandFailure.plain("io_error", "I/O error", 3) };
-    };
-    defer input.deinit(io);
-    return collectStats(allocator, input.byteSource(), options);
-}
-
-fn statsStdin(
-    io: std.Io,
-    allocator: std.mem.Allocator,
+    label: []const u8,
     options: InputOptions,
 ) StatsOutcome {
     var input: RecordInput = undefined;
-    input.init(io, .stdin(), false) catch {
-        return .{ .failure = CommandFailure.plain("io_error", "I/O error", 3) };
-    };
+    if (initRecordInput(&input, io, label)) |failure| return .{ .failure = failure };
     defer input.deinit(io);
     return collectStats(allocator, input.byteSource(), options);
 }
@@ -1819,10 +1758,14 @@ fn runSample(
     const failure = (switch (mode) {
         .fraction => |fraction| blk: {
             var selector = sampling.Selector.init(fraction, options.seed);
-            break :blk if (std.mem.eql(u8, input, "-"))
-                sampleFractionStdin(io, allocator, &writer, &selector, options)
-            else
-                sampleFractionFile(io, allocator, input, &writer, &selector, options);
+            break :blk sampleFractionInput(
+                io,
+                allocator,
+                input,
+                &writer,
+                &selector,
+                options,
+            );
         },
         .count => |count| sampleExactFile(
             io,
@@ -2253,39 +2196,16 @@ fn sampleInterleavedSource(
     }
 }
 
-fn sampleFractionFile(
+fn sampleFractionInput(
     io: std.Io,
     allocator: std.mem.Allocator,
-    path: []const u8,
-    writer: *zfastq.Writer,
-    selector: *sampling.Selector,
-    options: SampleOptions,
-) error{WriteFailed}!?CommandFailure {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return CommandFailure.plain("io_error", "file not found", 3),
-        else => return CommandFailure.plain("io_error", "failed to open file", 3),
-    };
-
-    var input: RecordInput = undefined;
-    input.init(io, file, true) catch {
-        file.close(io);
-        return CommandFailure.plain("io_error", "I/O error", 3);
-    };
-    defer input.deinit(io);
-    return sampleFractionSource(allocator, input.byteSource(), writer, selector, options);
-}
-
-fn sampleFractionStdin(
-    io: std.Io,
-    allocator: std.mem.Allocator,
+    label: []const u8,
     writer: *zfastq.Writer,
     selector: *sampling.Selector,
     options: SampleOptions,
 ) error{WriteFailed}!?CommandFailure {
     var input: RecordInput = undefined;
-    input.init(io, .stdin(), false) catch {
-        return CommandFailure.plain("io_error", "I/O error", 3);
-    };
+    if (initRecordInput(&input, io, label)) |failure| return failure;
     defer input.deinit(io);
     return sampleFractionSource(allocator, input.byteSource(), writer, selector, options);
 }
