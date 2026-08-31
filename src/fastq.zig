@@ -930,7 +930,6 @@ pub const Reader = struct {
         const space = self.buf.len - self.fill_end;
         std.debug.assert(space > 0);
         const n = self.source.read(self.buf[self.fill_end..]) catch return error.Io;
-        if (n > space) return error.Io;
         self.fill_end += n;
         return n > 0;
     }

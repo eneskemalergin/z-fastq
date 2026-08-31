@@ -658,6 +658,15 @@ test "[failure] - [reader]: source read failure propagates" {
     try std.testing.expectError(zfastq.ReaderError.Io, reader.next());
 }
 
+test "[failure] - [byte source]: a callback count beyond its destination is rejected" {
+    var invalid_source = InvalidCountSource{};
+    const source = invalid_source.byteSource();
+    var output: [1]u8 = undefined;
+
+    try std.testing.expectError(error.ReadFailed, source.read(&output));
+    try std.testing.expectEqual(@as(usize, 1), invalid_source.read_count);
+}
+
 test "[failure] - [reader]: a source count beyond its destination is rejected" {
     var invalid_source = InvalidCountSource{};
     var reader = try zfastq.Reader.init(
@@ -1353,6 +1362,8 @@ const FailingSource = struct {
 };
 
 const InvalidCountSource = struct {
+    read_count: usize = 0,
+
     fn byteSource(self: *InvalidCountSource) zfastq.io.ByteSource {
         return .{ .vtable = &vtable, .ctx = self };
     }
@@ -1360,7 +1371,8 @@ const InvalidCountSource = struct {
     const vtable = zfastq.io.ByteSource.VTable{ .read = read };
 
     fn read(ctx: *anyopaque, dest: []u8) error{ReadFailed}!usize {
-        _ = ctx;
+        const self: *InvalidCountSource = @ptrCast(@alignCast(ctx));
+        self.read_count += 1;
         return dest.len + 1;
     }
 };

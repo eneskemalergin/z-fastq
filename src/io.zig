@@ -26,7 +26,8 @@ else
 const GZIP_OPTIONAL_HEADER_BYTES_MAX: usize = 64 * 1024;
 
 /// Copied pull interface whose adapter must remain at a stable address and outlive it.
-/// A read initializes the returned prefix; for a nonempty destination, zero reports EOF.
+/// A read initializes the returned prefix and rejects a count beyond the destination.
+/// For a nonempty destination, zero reports EOF.
 pub const ByteSource = struct {
     vtable: *const VTable,
     ctx: *anyopaque,
@@ -36,7 +37,9 @@ pub const ByteSource = struct {
     };
 
     pub fn read(self: *const ByteSource, dest: []u8) ReadError!usize {
-        return self.vtable.read(self.ctx, dest);
+        const count = try self.vtable.read(self.ctx, dest);
+        if (count > dest.len) return error.ReadFailed;
+        return count;
     }
 };
 
