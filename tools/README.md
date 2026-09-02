@@ -1,6 +1,6 @@
 # Benchmark tools
 
-Status: **Active** (last updated: 2026-08-24)
+Status: **Active** (last updated: 2026-09-01)
 
 `tools/` prepares the external commands used to check and compare z-fastq. It never installs system packages or changes your shell. Versions live in [`versions.sh`](versions.sh); build and runtime checks live in [`install.sh`](install.sh).
 
@@ -38,9 +38,9 @@ Sizes are the rounded retained sizes from the current Linux x86-64 installation.
 | Rasusa                           |                5.1.0 | 5.4 MiB | Paired probability and broader sampling peer                  |
 | fqkit                            |               0.4.14 | 5.8 MiB | Interleave, deinterleave, stats, sampling, and sharding       |
 | SeqKit                           |               2.13.0 |  19 MiB | Broad stats, sampling, pairing, and conversion peer           |
-| BBTools                          |                40.02 |  22 MiB | Interleaved sampling reference and read-pair repair           |
+| BBTools                          |                40.02 |  23 MiB | Sampling, pair validation, interleave, and deinterleave       |
 
-The complete generated tool area is about 64 MiB, plus a 96 KiB tools-only Python environment.
+The complete generated tool area is about 43 MiB, plus a 96 KiB tools-only Python environment.
 
 Fqtools needs [`patches/fqtools-gzfile-casts.patch`](patches/fqtools-gzfile-casts.patch) because its current source passes zlib `gzFile` handles with the wrong pointer depth. The patch changes fqtools, not zlib. Keeping this small patch visible is safer than rewriting downloaded source silently.
 

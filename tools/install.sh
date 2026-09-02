@@ -841,8 +841,9 @@ check_peer_smoke() {
                     overwrite=t \
                     threads=1 \
                     qin=33 \
-                    qout=33 >/dev/null 2>&1
-                cmp "$smoke_dir/interleaved.fastq" "$smoke_dir/reformat.fastq"
+                    qout=33 \
+                    changequality=f >/dev/null 2>&1 || return
+                cmp "$smoke_dir/interleaved.fastq" "$smoke_dir/reformat.fastq" || return
                 sed -n '1,4p' "$smoke_dir/interleaved.fastq" \
                     >"$smoke_dir/source-r1.fastq"
                 sed -n '5,8p' "$smoke_dir/interleaved.fastq" \
@@ -854,9 +855,9 @@ check_peer_smoke() {
                     out2="$smoke_dir/repaired-r2.fastq" \
                     overwrite=t \
                     threads=1 \
-                    qin=33 >/dev/null 2>&1
-                cmp "$smoke_dir/source-r1.fastq" "$smoke_dir/repaired-r1.fastq"
-                cmp "$smoke_dir/source-r2.fastq" "$smoke_dir/repaired-r2.fastq"
+                    qin=33 >/dev/null 2>&1 || return
+                cmp "$smoke_dir/source-r1.fastq" "$smoke_dir/repaired-r1.fastq" || return
+                cmp "$smoke_dir/source-r2.fastq" "$smoke_dir/repaired-r2.fastq" || return
                 ;;
         esac
     ) || {
@@ -885,7 +886,7 @@ check_peer() {
     fi
     local current
     current="$(peer_current_link "$name")"
-    check_peer_at "$name" "$current"
+    check_peer_at "$name" "$current" || return
     echo "ok: $name $(peer_version "$name")"
 }
 
@@ -1220,7 +1221,9 @@ build_bbtools() {
 
     mkdir -p "$stage/runtime"
     cp -a "$source/current" "$stage/runtime/current"
-    find "$stage/runtime/current" -type f ! -name '*.class' -delete
+    find "$stage/runtime/current" -type f -name '*.java' -delete
+    mkdir -p "$stage/runtime/resources"
+    install -m 644 "$source/resources/bbmerge.bbnet" "$stage/runtime/resources/bbmerge.bbnet"
     for script in bbversion.sh reformat.sh repair.sh javasetup.sh memdetect.sh; do
         install -m 755 "$source/$script" "$stage/runtime/$script"
     done
@@ -1326,7 +1329,7 @@ install_peer() {
     build_peer "$name" "$ACTIVE_STAGE"
     strip_peer "$name" "$ACTIVE_STAGE"
     write_peer_receipt "$name" "$ACTIVE_STAGE/receipt.tsv" "$BUILD_DESCRIPTION"
-    check_peer_at "$name" "$ACTIVE_STAGE"
+    check_peer_at "$name" "$ACTIVE_STAGE" || return
 
     local install_id
     install_id="install-$(date -u +%Y%m%dT%H%M%SZ)-$$"
