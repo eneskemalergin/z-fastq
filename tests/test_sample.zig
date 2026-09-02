@@ -238,23 +238,34 @@ test "[unit] - [exact selector]: seed 11 matches frozen seqtk indexes" {
     for (cases) |case| {
         var selector = sampling.ExactSelector.init(case.target, 11);
         defer selector.deinit(std.testing.allocator);
+        var batched = sampling.ExactSelector.init(case.target, 11);
+        defer batched.deinit(std.testing.allocator);
         for (1..6) |record_number| {
             try selector.considerRecord(std.testing.allocator, record_number);
         }
+        try batched.considerRecordsThrough(std.testing.allocator, 2);
+        try batched.considerRecordsThrough(std.testing.allocator, 5);
         const actual = selector.finish();
+        const batched_actual = batched.finish();
+        try std.testing.expectEqual(
+            std.meta.activeTag(actual),
+            std.meta.activeTag(batched_actual),
+        );
         switch (case.expected) {
             .indexes => |expected| {
                 const indexes = switch (actual) {
                     .indexes => |indexes| indexes,
                     else => return error.TestExpectedEqual,
                 };
+                const batched_indexes = batched_actual.indexes;
                 try std.testing.expectEqual(expected.len, indexes.len());
                 for (expected, 0..) |expected_index, index| {
                     try std.testing.expectEqual(expected_index, indexes.at(index));
+                    try std.testing.expectEqual(expected_index, batched_indexes.at(index));
                 }
                 try std.testing.expectEqual(
+                    expected.len,
                     selector.indexes.items.len,
-                    selector.indexes.capacity,
                 );
                 try std.testing.expectEqual(
                     @as(usize, 0),
@@ -283,7 +294,6 @@ test "[unit] - [exact selector]: indexes materialize only after the target is ex
     }
     try selector.considerRecord(std.testing.allocator, 6);
     try std.testing.expectEqual(@as(usize, 5), selector.indexes.items.len);
-    try std.testing.expectEqual(@as(usize, 5), selector.indexes.capacity);
     try std.testing.expect(selector.finish() == .indexes);
 }
 

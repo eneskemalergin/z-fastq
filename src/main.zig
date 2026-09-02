@@ -1669,17 +1669,6 @@ const ExactOutputCursor = struct {
     selected_cursor: usize = 0,
     unit_count: u64 = 0,
 
-    fn selectNext(self: *ExactOutputCursor) bool {
-        if (self.select_all) return true;
-        if (self.selected_cursor == self.indexes.len() or
-            self.indexes.at(self.selected_cursor) != self.unit_count + 1)
-        {
-            return false;
-        }
-        self.selected_cursor += 1;
-        return true;
-    }
-
     fn nextSelected(self: ExactOutputCursor) ?u64 {
         if (self.select_all or self.selected_cursor == self.indexes.len()) return null;
         return self.indexes.at(self.selected_cursor);
@@ -2408,11 +2397,8 @@ fn considerExactRecords(
     selector: *sampling.ExactSelector,
     completed_records: u64,
 ) ?CommandFailure {
-    while (selector.record_count < completed_records) {
-        selector.considerRecord(allocator, selector.record_count + 1) catch |err| {
-            return exactSelectionFailure(err);
-        };
-    }
+    selector.considerRecordsThrough(allocator, completed_records) catch |err|
+        return exactSelectionFailure(err);
     return null;
 }
 
@@ -2445,9 +2431,10 @@ fn sampleExactSecondPass(
         .select_all = select_all,
         .indexes = selected,
     };
+    var next_selected = cursor.nextSelected();
     var failure: ?CommandFailure = null;
     while (cursor.unit_count < expected_count) {
-        if (cursor.selectNext()) {
+        if (cursor.selectNextCached(&next_selected)) {
             var canonical_span: ?[]const u8 = null;
             const record = fastq.nextWithoutId(&reader, &canonical_span) catch |err| {
                 failure = mapReaderFailure(&reader, err);
@@ -4401,7 +4388,7 @@ test "[failure] - [exact sample]: final record-count change keeps a valid prefix
         std.testing.allocator,
         path,
         &writer,
-        .{ .low_words = &.{1}, .high_words = &.{} },
+        .{ .low_words = &.{1}, .middle_bytes = &.{0} },
         snapshot,
         2,
         .{
@@ -4435,7 +4422,7 @@ test "[failure] - [exact sample]: changed metadata stops the second pass before 
         std.testing.allocator,
         path,
         &writer,
-        .{ .low_words = &.{1}, .high_words = &.{} },
+        .{ .low_words = &.{1}, .middle_bytes = &.{0} },
         snapshot,
         5,
         .{
@@ -4468,7 +4455,7 @@ test "[integration] - [exact sample]: the output pass trusts first-pass semantic
         std.testing.allocator,
         path,
         &writer,
-        .{ .low_words = &.{1}, .high_words = &.{} },
+        .{ .low_words = &.{1}, .middle_bytes = &.{0} },
         snapshot,
         1,
         .{
