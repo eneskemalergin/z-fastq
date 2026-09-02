@@ -1680,6 +1680,21 @@ const ExactOutputCursor = struct {
         return true;
     }
 
+    fn nextSelected(self: ExactOutputCursor) ?u64 {
+        if (self.select_all or self.selected_cursor == self.indexes.len()) return null;
+        return self.indexes.at(self.selected_cursor);
+    }
+
+    fn selectNextCached(self: *ExactOutputCursor, next_selected: *?u64) bool {
+        if (self.select_all) return true;
+        const selected = next_selected.* orelse return false;
+        if (selected != self.unit_count + 1) return false;
+
+        self.selected_cursor += 1;
+        next_selected.* = self.nextSelected();
+        return true;
+    }
+
     fn completeUnit(self: *ExactOutputCursor) void {
         self.unit_count += 1;
     }
@@ -2748,9 +2763,10 @@ fn sampleExactPairedSecondPass(
         .select_all = select_all,
         .indexes = indexes,
     };
+    var next_selected = cursor.nextSelected();
     var failure: ?PairCommandFailure = null;
     while (cursor.unit_count < expected_count) {
-        const selected = cursor.selectNext();
+        const selected = cursor.selectNextCached(&next_selected);
         var canonical_span1: ?[]const u8 = null;
         var record1: ?zfastq.Record = null;
         const got1 = if (selected) selected_record: {
@@ -2887,9 +2903,10 @@ fn sampleExactInterleavedSecondPass(
         .select_all = select_all,
         .indexes = indexes,
     };
+    var next_selected = cursor.nextSelected();
     var failure: ?PairCommandFailure = null;
     while (cursor.unit_count < expected_count) {
-        const selected = cursor.selectNext();
+        const selected = cursor.selectNextCached(&next_selected);
         if (!selected) {
             const mate1 = reader.advance() catch |err| failed: {
                 failure = .{ .command = .{
