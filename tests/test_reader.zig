@@ -1488,9 +1488,26 @@ fn fuzzReaderScannerAgreement(_: void, smith: *std.testing.Smith) !void {
     var storage: [512]u8 = undefined;
     const data = storage[0..smith.slice(&storage)];
     const reader = try readerOutcome(data, 1);
+    try expectOutcomeBounds(data, reader);
 
-    try expectSameOutcome(reader, scannerOutcome(data, 1));
-    try expectSameOutcome(reader, scannerOutcome(data, 64));
+    const scanner_one = scannerOutcome(data, 1);
+    const scanner_block = scannerOutcome(data, 64);
+    try expectOutcomeBounds(data, scanner_one);
+    try expectOutcomeBounds(data, scanner_block);
+    try expectSameOutcome(reader, scanner_one);
+    try expectSameOutcome(reader, scanner_block);
+}
+
+fn expectOutcomeBounds(data: []const u8, outcome: ParseOutcome) !void {
+    const line_feeds = std.mem.count(u8, data, "\n");
+    try std.testing.expect(outcome.count <= (line_feeds + 1) / 4);
+    try std.testing.expectEqual(outcome.err != null, outcome.details != null);
+    if (outcome.details) |details| {
+        try std.testing.expectEqual(outcome.count, details.record_index);
+        try std.testing.expect(details.line_in_record >= 1);
+        try std.testing.expect(details.line_in_record <= 4);
+        try std.testing.expect(details.byte_offset <= data.len);
+    }
 }
 
 fn expectSameOutcome(expected: ParseOutcome, actual: ParseOutcome) !void {

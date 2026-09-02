@@ -80,30 +80,6 @@ fn appendSelectedPairs(
     }
 }
 
-fn appendExactSelectedPairs(
-    allocator: std.mem.Allocator,
-    output: *std.ArrayList(u8),
-    pair_count: u64,
-    target: u64,
-    seed: u64,
-) !void {
-    var selector = sampling.ExactSelector.init(target, seed);
-    defer selector.deinit(allocator);
-    var pair_number: u64 = 1;
-    while (pair_number <= pair_count) : (pair_number += 1) {
-        try selector.considerRecord(allocator, pair_number);
-    }
-    switch (selector.finish()) {
-        .none => {},
-        .all => for (0..pair_count) |pair_index| {
-            try appendSelectedPairs(allocator, output, &.{@intCast(pair_index)});
-        },
-        .indexes => |indexes| for (indexes) |selected| {
-            try appendSelectedPairs(allocator, output, &.{@intCast(selected - 1)});
-        },
-    }
-}
-
 test "[unit] - [MT19937-64]: scalar seed 5489 matches the published vector" {
     const expected = [_]u64{
         14514284786278117030,
@@ -612,41 +588,33 @@ test "[cli] - [paired exact sample]: pair indexes match the exact selector" {
         "interleaved.fastq",
     );
 
+    const all = &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     const cases = [_]struct {
         count: []const u8,
         seed: []const u8,
-        target: u64,
-        seed_value: u64,
+        indexes: []const u8,
     }{
-        .{ .count = "0", .seed = "11", .target = 0, .seed_value = 11 },
-        .{ .count = "1", .seed = "11", .target = 1, .seed_value = 11 },
-        .{ .count = "3", .seed = "11", .target = 3, .seed_value = 11 },
-        .{ .count = "16", .seed = "11", .target = 16, .seed_value = 11 },
-        .{ .count = "20", .seed = "11", .target = 20, .seed_value = 11 },
+        .{ .count = "0", .seed = "11", .indexes = &.{} },
+        .{ .count = "1", .seed = "11", .indexes = &.{4} },
+        .{ .count = "3", .seed = "11", .indexes = &.{ 4, 10, 11 } },
+        .{ .count = "16", .seed = "11", .indexes = all },
+        .{ .count = "20", .seed = "11", .indexes = all },
         .{
             .count = "2",
             .seed = "18446744073709551615",
-            .target = 2,
-            .seed_value = std.math.maxInt(u64),
+            .indexes = &.{ 8, 15 },
         },
         .{
             .count = "18446744073709551615",
             .seed = "11",
-            .target = std.math.maxInt(u64),
-            .seed_value = 11,
+            .indexes = all,
         },
     };
 
     var expected: std.ArrayList(u8) = .empty;
     for (cases) |case| {
         expected.clearRetainingCapacity();
-        try appendExactSelectedPairs(
-            allocator,
-            &expected,
-            16,
-            case.target,
-            case.seed_value,
-        );
+        try appendSelectedPairs(allocator, &expected, case.indexes);
         try expectResult(
             try cli.run(allocator, &.{
                 "sample",
@@ -1433,6 +1401,48 @@ test "[edge] - [paired sample]: refill-spanning 512 KiB mates preserve output" {
         0,
         second_large.items,
         "",
+    );
+}
+
+test "[cli] - [paired sample]: refill-spanning mismatch preserves both identities" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pairs_path = try tempPath(allocator, &tmp.sub_path, "pairs.fastq");
+
+    var input: std.ArrayList(u8) = .empty;
+    try input.appendSlice(allocator, "@large/1 ");
+    try input.appendNTimes(allocator, 'x', 512 * 1024);
+    try input.appendSlice(allocator, "\nA\n+first\n!\n");
+    const mate2_offset = input.items.len;
+    try input.appendSlice(allocator, "@other/2\nT\n+second\n#\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = input.items });
+
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "error: {s}: P001: paired identifiers or mate markers do not match (pair 0)\n" ++
+            "  R1: input={s}, record=0, offset=0, first_token=large/1 " ++
+            "[length=7, truncated=false], normalized_id=large " ++
+            "[length=5, truncated=false], mate_markers=1\n" ++
+            "  R2: input={s}, record=1, offset={d}, first_token=other/2 " ++
+            "[length=7, truncated=false], normalized_id=other " ++
+            "[length=5, truncated=false], mate_markers=2\n",
+        .{ pairs_path, pairs_path, pairs_path, mate2_offset },
+    );
+    try expectResult(
+        try cli.run(allocator, &.{
+            "sample",
+            "--interleaved",
+            "--fraction",
+            "0",
+            pairs_path,
+        }),
+        1,
+        "",
+        expected,
     );
 }
 
