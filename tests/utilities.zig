@@ -4,6 +4,7 @@ const std = @import("std");
 
 const ZFASTQ_BIN = "zig-out/bin/z-fastq";
 const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
+pub const PROCESS_TIMEOUT = std.Io.Duration.fromSeconds(30);
 
 pub const CommandResult = struct {
     exit_code: u8,
@@ -16,6 +17,97 @@ pub const GzipOptions = struct {
     name: ?[]const u8 = null,
     comment: ?[]const u8 = null,
     header_crc: bool = false,
+};
+
+pub const ProcessDeadline = struct {
+    io: std.Io,
+    process: *std.process.Child,
+    deadline: std.Io.Clock.Timestamp,
+    pid_file: std.Io.File,
+    finished: bool = false,
+
+    pub fn init(
+        io: std.Io,
+        process: *std.process.Child,
+        duration: std.Io.Duration,
+    ) !ProcessDeadline {
+        const raw_pid_fd = std.os.linux.pidfd_open(process.id.?, 0);
+        const pid_fd = switch (std.os.linux.errno(raw_pid_fd)) {
+            .SUCCESS => std.math.cast(std.posix.fd_t, raw_pid_fd) orelse
+                return error.ChildProcessControlFailed,
+            else => return error.ChildProcessControlFailed,
+        };
+        return .{
+            .io = io,
+            .process = process,
+            .deadline = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{
+                .raw = duration,
+                .clock = .awake,
+            }),
+            .pid_file = .{ .handle = pid_fd, .flags = .{ .nonblocking = false } },
+        };
+    }
+
+    pub fn deinit(self: *ProcessDeadline) void {
+        if (!self.finished) self.process.kill(self.io);
+        self.pid_file.close(self.io);
+        self.* = undefined;
+    }
+
+    pub fn timeout(self: *const ProcessDeadline) std.Io.Timeout {
+        return .{ .deadline = self.deadline };
+    }
+
+    pub fn expired(self: *const ProcessDeadline) bool {
+        return std.Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds >=
+            self.deadline.raw.nanoseconds;
+    }
+
+    pub fn waitForExit(self: *ProcessDeadline) !u8 {
+        var poll_fd = [1]std.posix.pollfd{.{
+            .fd = self.pid_file.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const timeout_ms = self.remainingMilliseconds() orelse return error.Timeout;
+        if (try std.posix.poll(&poll_fd, timeout_ms) == 0) return error.Timeout;
+        if (poll_fd[0].revents & std.posix.POLL.NVAL != 0) {
+            return error.ChildProcessControlFailed;
+        }
+
+        const termination = try self.process.wait(self.io);
+        self.finished = true;
+        return switch (termination) {
+            .exited => |code| code,
+            else => error.ChildProcessFailed,
+        };
+    }
+
+    pub fn failTimeout(
+        self: *ProcessDeadline,
+    ) error{ ChildProcessCleanupFailed, ChildProcessTimedOut } {
+        self.process.kill(self.io);
+        self.finished = true;
+        if (self.process.id != null or
+            self.process.stdin != null or
+            self.process.stdout != null or
+            self.process.stderr != null)
+        {
+            return error.ChildProcessCleanupFailed;
+        }
+        return error.ChildProcessTimedOut;
+    }
+
+    fn remainingMilliseconds(self: *const ProcessDeadline) ?i32 {
+        const now = std.Io.Clock.Timestamp.now(self.io, .awake);
+        const remaining_ns = self.deadline.raw.nanoseconds - now.raw.nanoseconds;
+        if (remaining_ns <= 0) return null;
+        const milliseconds = @divFloor(
+            remaining_ns + std.time.ns_per_ms - 1,
+            std.time.ns_per_ms,
+        );
+        return @intCast(@min(milliseconds, std.math.maxInt(i32)));
+    }
 };
 
 pub fn expectJsonObjectKeys(
@@ -183,48 +275,13 @@ pub fn runWithStdin(
     stdin_data: []const u8,
     chunk_len: usize,
 ) !CommandResult {
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, ZFASTQ_BIN);
-    try argv.appendSlice(allocator, command_args);
-
-    var proc = try std.process.spawn(io, .{
-        .argv = argv.items,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
-    defer proc.kill(io);
-
-    const child_stdin = proc.stdin.?;
-    proc.stdin = null;
-    var stdin_writer: StdinWriter = .{
-        .io = io,
-        .file = child_stdin,
-        .data = stdin_data,
-        .chunk_len = chunk_len,
-    };
-    var group: std.Io.Group = .init;
-    defer group.cancel(io);
-    group.async(io, writeChildStdin, .{&stdin_writer});
-
-    const output = try collectCommandOutput(allocator, io, &proc);
-    errdefer {
-        allocator.free(output.stdout);
-        allocator.free(output.stderr);
-    }
-    try group.await(io);
-    const exit_code = try waitForExit(io, &proc);
-    if (stdin_writer.err) |err| return err;
-    return .{
-        .exit_code = exit_code,
-        .stdout = output.stdout,
-        .stderr = output.stderr,
-    };
+    return runInstalled(
+        allocator,
+        command_args,
+        .{ .data = .{ .bytes = stdin_data, .chunk_len = chunk_len } },
+        .capture,
+        PROCESS_TIMEOUT,
+    );
 }
 
 pub fn runWithClosedStdout(
@@ -232,55 +289,97 @@ pub fn runWithClosedStdout(
     command_args: []const []const u8,
     stdin_data: []const u8,
 ) !CommandResult {
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, ZFASTQ_BIN);
-    try argv.appendSlice(allocator, command_args);
-
-    var proc = try std.process.spawn(io, .{
-        .argv = argv.items,
-        .stdin = .pipe,
-        .stdout = .close,
-        .stderr = .pipe,
-    });
-    defer proc.kill(io);
-
-    const child_stdin = proc.stdin.?;
-    proc.stdin = null;
-    var stdin_writer: StdinWriter = .{
-        .io = io,
-        .file = child_stdin,
-        .data = stdin_data,
-        .chunk_len = @max(stdin_data.len, 1),
-    };
-    var group: std.Io.Group = .init;
-    defer group.cancel(io);
-    group.async(io, writeChildStdin, .{&stdin_writer});
-
-    var stderr_buf: [4096]u8 = undefined;
-    var stderr_reader = proc.stderr.?.reader(io, &stderr_buf);
-    const stderr = try stderr_reader.interface.allocRemaining(
+    return runInstalled(
         allocator,
-        .limited(PROCESS_OUTPUT_LIMIT),
+        command_args,
+        .{ .data = .{
+            .bytes = stdin_data,
+            .chunk_len = @max(stdin_data.len, 1),
+        } },
+        .closed,
+        PROCESS_TIMEOUT,
     );
-    errdefer allocator.free(stderr);
-    try group.await(io);
-    const exit_code = try waitForExit(io, &proc);
-    if (stdin_writer.err) |err| return err;
-    return .{
-        .exit_code = exit_code,
-        .stdout = try allocator.alloc(u8, 0),
-        .stderr = stderr,
-    };
 }
 
 pub fn runWithClosedStdin(
     allocator: std.mem.Allocator,
     command_args: []const []const u8,
+) !CommandResult {
+    return runInstalled(
+        allocator,
+        command_args,
+        .closed,
+        .capture,
+        PROCESS_TIMEOUT,
+    );
+}
+
+pub fn runStalledStdinForTest(
+    allocator: std.mem.Allocator,
+    command_args: []const []const u8,
+    timeout: std.Io.Duration,
+) !void {
+    const result = try runInstalled(
+        allocator,
+        command_args,
+        .stalled,
+        .capture,
+        timeout,
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return error.ExpectedChildProcessTimeout;
+}
+
+pub fn finishSpawned(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    process: *std.process.Child,
+    process_deadline: *ProcessDeadline,
+) !CommandResult {
+    const output = collectCommandOutput(
+        allocator,
+        io,
+        process,
+        process_deadline.timeout(),
+    ) catch |err| switch (err) {
+        error.Timeout => return process_deadline.failTimeout(),
+        else => |other| return other,
+    };
+    errdefer {
+        allocator.free(output.stdout);
+        allocator.free(output.stderr);
+    }
+    return .{
+        .exit_code = process_deadline.waitForExit() catch |err| switch (err) {
+            error.Timeout => return process_deadline.failTimeout(),
+            else => |other| return other,
+        },
+        .stdout = output.stdout,
+        .stderr = output.stderr,
+    };
+}
+
+const StdinMode = union(enum) {
+    closed,
+    stalled,
+    data: struct {
+        bytes: []const u8,
+        chunk_len: usize,
+    },
+};
+
+const StdoutMode = enum {
+    capture,
+    closed,
+};
+
+fn runInstalled(
+    allocator: std.mem.Allocator,
+    command_args: []const []const u8,
+    stdin_mode: StdinMode,
+    stdout_mode: StdoutMode,
+    timeout: std.Io.Duration,
 ) !CommandResult {
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -293,19 +392,77 @@ pub fn runWithClosedStdin(
 
     var proc = try std.process.spawn(io, .{
         .argv = argv.items,
-        .stdin = .close,
-        .stdout = .pipe,
+        .stdin = switch (stdin_mode) {
+            .closed => .close,
+            .stalled, .data => .pipe,
+        },
+        .stdout = switch (stdout_mode) {
+            .capture => .pipe,
+            .closed => .close,
+        },
         .stderr = .pipe,
     });
     defer proc.kill(io);
 
-    const output = try collectCommandOutput(allocator, io, &proc);
+    var process_deadline = try ProcessDeadline.init(io, &proc, timeout);
+    defer process_deadline.deinit();
+
+    var stdin_writer: StdinWriter = undefined;
+    var stdin_group: std.Io.Group = .init;
+    defer stdin_group.cancel(io);
+    const has_stdin_writer = switch (stdin_mode) {
+        .closed, .stalled => false,
+        .data => |data| writer: {
+            const child_stdin = proc.stdin.?;
+            proc.stdin = null;
+            stdin_writer = .{
+                .io = io,
+                .file = child_stdin,
+                .data = data.bytes,
+                .chunk_len = data.chunk_len,
+            };
+            stdin_group.async(io, writeChildStdin, .{&stdin_writer});
+            break :writer true;
+        },
+    };
+
+    const output = switch (stdout_mode) {
+        .capture => collectCommandOutput(
+            allocator,
+            io,
+            &proc,
+            process_deadline.timeout(),
+        ),
+        .closed => collectCommandStderr(
+            allocator,
+            io,
+            &proc,
+            process_deadline.timeout(),
+        ),
+    } catch |err| switch (err) {
+        error.Timeout => {
+            stdin_group.cancel(io);
+            return process_deadline.failTimeout();
+        },
+        else => |other| return other,
+    };
     errdefer {
         allocator.free(output.stdout);
         allocator.free(output.stderr);
     }
+    const exit_code = process_deadline.waitForExit() catch |err| switch (err) {
+        error.Timeout => {
+            stdin_group.cancel(io);
+            return process_deadline.failTimeout();
+        },
+        else => |other| return other,
+    };
+    stdin_group.cancel(io);
+    if (has_stdin_writer) {
+        if (stdin_writer.err) |err| return err;
+    }
     return .{
-        .exit_code = try waitForExit(io, &proc),
+        .exit_code = exit_code,
         .stdout = output.stdout,
         .stderr = output.stderr,
     };
@@ -320,6 +477,7 @@ fn collectCommandOutput(
     allocator: std.mem.Allocator,
     io: std.Io,
     proc: *std.process.Child,
+    timeout: std.Io.Timeout,
 ) !CommandOutput {
     var buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
@@ -333,7 +491,7 @@ fn collectCommandOutput(
 
     const stdout_reader = multi_reader.reader(0);
     const stderr_reader = multi_reader.reader(1);
-    while (multi_reader.fill(4096, .none)) |_| {
+    while (multi_reader.fill(4096, timeout)) |_| {
         if (stdout_reader.buffered().len > PROCESS_OUTPUT_LIMIT or
             stderr_reader.buffered().len > PROCESS_OUTPUT_LIMIT)
         {
@@ -353,11 +511,38 @@ fn collectCommandOutput(
     return .{ .stdout = stdout, .stderr = stderr };
 }
 
-fn waitForExit(io: std.Io, proc: *std.process.Child) !u8 {
-    return switch (try proc.wait(io)) {
-        .exited => |code| @intCast(code),
-        else => return error.ChildProcessFailed,
-    };
+fn collectCommandStderr(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    proc: *std.process.Child,
+    timeout: std.Io.Timeout,
+) !CommandOutput {
+    var buffer: std.Io.File.MultiReader.Buffer(1) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(
+        allocator,
+        io,
+        buffer.toStreams(),
+        &.{proc.stderr.?},
+    );
+    defer multi_reader.deinit();
+
+    const stderr_reader = multi_reader.reader(0);
+    while (multi_reader.fill(4096, timeout)) |_| {
+        if (stderr_reader.buffered().len > PROCESS_OUTPUT_LIMIT) {
+            return error.StreamTooLong;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |other| return other,
+    }
+    try multi_reader.checkAnyError();
+
+    const stdout = try allocator.alloc(u8, 0);
+    errdefer allocator.free(stdout);
+    const stderr = try multi_reader.toOwnedSlice(0);
+    errdefer allocator.free(stderr);
+    return .{ .stdout = stdout, .stderr = stderr };
 }
 
 fn appendInt(
@@ -379,13 +564,14 @@ const StdinWriter = struct {
     err: ?std.Io.File.Writer.Error = null,
 };
 
-fn writeChildStdin(writer: *StdinWriter) void {
+fn writeChildStdin(writer: *StdinWriter) std.Io.Cancelable!void {
     writeAndCloseStdin(
         writer.io,
         writer.file,
         writer.data,
         writer.chunk_len,
     ) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
         writer.err = err;
     };
 }

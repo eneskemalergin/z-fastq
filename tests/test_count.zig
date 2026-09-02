@@ -598,6 +598,17 @@ test "[cli] - [count]: a closed stdin exits with I/O status" {
     try std.testing.expectEqualStrings("error: -: I/O error\n", result.stderr);
 }
 
+test "[cli] - [subprocess]: timeout kills and reaps a stalled installed command" {
+    try std.testing.expectError(
+        error.ChildProcessTimedOut,
+        cli.runStalledStdinForTest(
+            std.testing.allocator,
+            &.{ "count", "-" },
+            .fromMilliseconds(100),
+        ),
+    );
+}
+
 test "[cli] - [diagnostics]: untrusted command, option, and path bytes use escaped ASCII" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

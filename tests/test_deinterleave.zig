@@ -671,13 +671,18 @@ test "[cli] - [deinterleave]: failure does not delete replaced or created output
     });
     defer process.kill(child_io);
 
-    const deadline = std.Io.Clock.awake.now(child_io).addDuration(.fromSeconds(30));
+    var process_deadline = try cli.ProcessDeadline.init(
+        child_io,
+        &process,
+        cli.PROCESS_TIMEOUT,
+    );
+    defer process_deadline.deinit();
+
     while (true) {
         const out1_exists = try pathExists(child_io, out1_path);
         const out2_exists = try pathExists(child_io, out2_path);
         if (out1_exists and out2_exists) break;
-        if (std.Io.Clock.awake.now(child_io).nanoseconds >= deadline.nanoseconds)
-            return error.ChildProcessTimedOut;
+        if (process_deadline.expired()) return process_deadline.failTimeout();
         try std.Thread.yield();
     }
 
@@ -694,23 +699,18 @@ test "[cli] - [deinterleave]: failure does not delete replaced or created output
     process.stdin.?.close(child_io);
     process.stdin = null;
 
-    var stdout_buffer: [256]u8 = undefined;
-    var stdout_reader = process.stdout.?.reader(child_io, &stdout_buffer);
-    const stdout = try stdout_reader.interface.allocRemaining(allocator, .limited(4096));
-    var stderr_buffer: [4096]u8 = undefined;
-    var stderr_reader = process.stderr.?.reader(child_io, &stderr_buffer);
-    const stderr = try stderr_reader.interface.allocRemaining(allocator, .limited(4096));
-    const termination = try process.wait(child_io);
-    const exit_code = switch (termination) {
-        .exited => |code| code,
-        else => return error.ChildProcessFailed,
-    };
+    const result = try cli.finishSpawned(
+        allocator,
+        child_io,
+        &process,
+        &process_deadline,
+    );
     const expected_stderr = "error: -: S002: sequence byte is outside the selected alphabet " ++
         "(record 0, line 2, offset 7)\n";
 
-    try std.testing.expectEqual(@as(u8, 1), exit_code);
-    try std.testing.expectEqual(@as(usize, 0), stdout.len);
-    try std.testing.expectEqualStrings(expected_stderr, stderr);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+    try std.testing.expectEqualStrings(expected_stderr, result.stderr);
     try expectFile(allocator, out1_path, "replacement");
     try expectEmptyFile(out2_path);
 }
