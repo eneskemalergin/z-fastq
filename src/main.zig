@@ -1484,7 +1484,7 @@ const RecordInput = struct {
     read_buffer: [64 * 1024]u8,
     file_reader: std.Io.File.Reader,
     source: union(enum) {
-        plain: io_layer.ReaderSource,
+        plain: io_layer.PlainFileSource,
         gzip: io_layer.GzipSource,
     },
 
@@ -1507,7 +1507,7 @@ const RecordInput = struct {
                 return;
             }
         }
-        self.source = .{ .plain = io_layer.ReaderSource.init(&self.file_reader.interface) };
+        self.source = .{ .plain = io_layer.PlainFileSource.init(&self.file_reader) };
     }
 
     fn deinit(self: *RecordInput, io: std.Io) void {

@@ -119,6 +119,48 @@ fn readerRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return self.reader.readSliceShort(dest) catch error.ReadFailed;
 }
 
+pub const PlainFileSource = struct {
+    file_reader: *std.Io.File.Reader,
+
+    pub fn init(file_reader: *std.Io.File.Reader) PlainFileSource {
+        return .{ .file_reader = file_reader };
+    }
+
+    pub fn byteSource(self: *PlainFileSource) ByteSource {
+        return .{
+            .vtable = &PLAIN_FILE_VTABLE,
+            .ctx = self,
+        };
+    }
+};
+
+const PLAIN_FILE_VTABLE = ByteSource.VTable{
+    .read = plainFileRead,
+};
+
+fn plainFileRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
+    const self: *PlainFileSource = @ptrCast(@alignCast(ctx));
+    const reader = &self.file_reader.interface;
+    var written: usize = 0;
+
+    const buffered = reader.buffered();
+    if (buffered.len != 0) {
+        const copy_len = @min(buffered.len, dest.len);
+        @memcpy(dest[0..copy_len], buffered[0..copy_len]);
+        reader.toss(copy_len);
+        written = copy_len;
+    }
+    if (reader.bufferedLen() == 0) {
+        reader.buffer = &.{};
+        reader.seek = 0;
+        reader.end = 0;
+    }
+    if (written == dest.len) return written;
+
+    const direct = reader.readSliceShort(dest[written..]) catch return error.ReadFailed;
+    return written + direct;
+}
+
 /// Buffered pull adapter over a borrowed file handle and caller-owned buffer.
 pub const FileSource = struct {
     file_reader: std.Io.File.Reader,
