@@ -3297,24 +3297,9 @@ const DeinterleaveWriteError = error{
     Output2WriteFailed,
 };
 
-const OutputCleanupFailure = enum {
-    identity_unavailable,
-    inspect_failed,
-    replaced,
-    delete_failed,
-};
-
-const OutputCleanupPlan = union(enum) {
-    none,
-    remove,
-    failed: OutputCleanupFailure,
-};
-
 const DeinterleaveOutput = struct {
     path: []const u8,
     file: ?std.Io.File = null,
-    identity: ?std.Io.File.INode = null,
-    owns_path: bool = false,
     write_buffer: [64 * 1024]u8 = undefined,
     sink: io_layer.FileSink = undefined,
     writer: zfastq.Writer = undefined,
@@ -3331,12 +3316,6 @@ const DeinterleaveOutput = struct {
                 CommandFailure.plain("io_error", "failed to create output", 3);
         };
         self.file = file;
-        self.owns_path = true;
-
-        const stat = file.stat(io) catch {
-            return CommandFailure.plain("io_error", "failed to inspect created output", 3);
-        };
-        self.identity = stat.inode;
         self.sink = io_layer.FileSink.init(io, file, &self.write_buffer);
         self.writer = zfastq.Writer.init(self.sink.byteSink());
         return null;
@@ -3345,51 +3324,6 @@ const DeinterleaveOutput = struct {
     fn close(self: *DeinterleaveOutput, io: std.Io) void {
         if (self.file) |file| file.close(io);
         self.file = null;
-    }
-
-    fn releasePath(self: *DeinterleaveOutput) void {
-        self.owns_path = false;
-    }
-
-    fn planCleanup(self: *DeinterleaveOutput, io: std.Io) OutputCleanupPlan {
-        if (!self.owns_path) return .none;
-        const expected = self.identity orelse return .{ .failed = .identity_unavailable };
-        const stat = std.Io.Dir.cwd().statFile(
-            io,
-            self.path,
-            .{ .follow_symlinks = false },
-        ) catch |err| switch (err) {
-            error.FileNotFound => {
-                self.owns_path = false;
-                return .none;
-            },
-            else => return .{ .failed = .inspect_failed },
-        };
-        if (stat.kind != .file or stat.inode != expected) {
-            return .{ .failed = .replaced };
-        }
-        return .remove;
-    }
-
-    fn applyCleanup(
-        self: *DeinterleaveOutput,
-        io: std.Io,
-        plan: OutputCleanupPlan,
-    ) ?OutputCleanupFailure {
-        switch (plan) {
-            .none => return null,
-            .failed => |failure| return failure,
-            .remove => {},
-        }
-        std.Io.Dir.cwd().deleteFile(io, self.path) catch |err| switch (err) {
-            error.FileNotFound => {
-                self.owns_path = false;
-                return null;
-            },
-            else => return .delete_failed,
-        };
-        self.owns_path = false;
-        return null;
     }
 };
 
@@ -3433,18 +3367,18 @@ fn runDeinterleave(
     defer output2.close(io);
     if (output1.create(io)) |failure| {
         printCommandFailure(io, output1.path, failure);
-        return finishFailedDeinterleave(io, &output1, &output2, failure.exit_code);
+        return failure.exit_code;
     }
     if (output2.create(io)) |failure| {
         printCommandFailure(io, output2.path, failure);
-        return finishFailedDeinterleave(io, &output1, &output2, failure.exit_code);
+        return failure.exit_code;
     }
 
     var input: RecordInput = undefined;
     input.init(io, input_file, false) catch {
         const failure = CommandFailure.plain("io_error", "I/O error", 3);
         printCommandFailure(io, input_label, failure);
-        return finishFailedDeinterleave(io, &output1, &output2, failure.exit_code);
+        return failure.exit_code;
     };
     defer input.deinit(io);
 
@@ -3458,22 +3392,18 @@ fn runDeinterleave(
     ) catch |err| {
         const failed_output = if (err == error.Output1WriteFailed) &output1 else &output2;
         printPathError(io, failed_output.path, "I/O error");
-        return finishFailedDeinterleave(io, &output1, &output2, 3);
+        return 3;
     };
     if (failure) |details| {
         printPairCommandFailure(io, inputs, .interleaved, details);
-        return finishFailedDeinterleave(io, &output1, &output2, details.exitCode());
+        return details.exitCode();
     }
 
     flushDeinterleaveWriters(&output1.writer, &output2.writer) catch |err| {
         const failed_output = if (err == error.Output1WriteFailed) &output1 else &output2;
         printPathError(io, failed_output.path, "I/O error");
-        return finishFailedDeinterleave(io, &output1, &output2, 3);
+        return 3;
     };
-    output1.close(io);
-    output2.close(io);
-    output1.releasePath();
-    output2.releasePath();
     return 0;
 }
 
@@ -3725,43 +3655,6 @@ fn flushDeinterleaveWriters(
 ) DeinterleaveWriteError!void {
     writer1.flush() catch return error.Output1WriteFailed;
     writer2.flush() catch return error.Output2WriteFailed;
-}
-
-fn finishFailedDeinterleave(
-    io: std.Io,
-    output1: *DeinterleaveOutput,
-    output2: *DeinterleaveOutput,
-    primary_exit_code: u8,
-) u8 {
-    const cleanup1 = output1.planCleanup(io);
-    const cleanup2 = output2.planCleanup(io);
-    output1.close(io);
-    output2.close(io);
-
-    var cleanup_exit_code: u8 = 0;
-    if (output1.applyCleanup(io, cleanup1)) |failure| {
-        printOutputCleanupFailure(io, output1.path, failure);
-        cleanup_exit_code = 3;
-    }
-    if (output2.applyCleanup(io, cleanup2)) |failure| {
-        printOutputCleanupFailure(io, output2.path, failure);
-        cleanup_exit_code = 3;
-    }
-    return @max(primary_exit_code, cleanup_exit_code);
-}
-
-fn printOutputCleanupFailure(
-    io: std.Io,
-    path: []const u8,
-    failure: OutputCleanupFailure,
-) void {
-    const message = switch (failure) {
-        .identity_unavailable => "cleanup failed: output identity is unavailable",
-        .inspect_failed => "cleanup failed: could not inspect output path",
-        .replaced => "cleanup failed: output path was replaced",
-        .delete_failed => "cleanup failed: could not remove output path",
-    };
-    printPathError(io, path, message);
 }
 
 // --- Machine output ---
@@ -5291,47 +5184,4 @@ test "[failure] - [deinterleave]: retained storage is released when deferred sta
     try std.testing.expectEqualStrings("out_of_memory", command_failure.code);
     try std.testing.expectEqual(@as(usize, 0), sink1.length);
     try std.testing.expectEqual(@as(usize, 0), sink2.length);
-}
-
-test "[failure] - [deinterleave]: cleanup preserves a replacement and continues" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path1_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    var path2_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path1 = try std.fmt.bufPrint(
-        &path1_buffer,
-        ".zig-cache/tmp/{s}/r1.fastq",
-        .{tmp.sub_path},
-    );
-    const path2 = try std.fmt.bufPrint(
-        &path2_buffer,
-        ".zig-cache/tmp/{s}/r2.fastq",
-        .{tmp.sub_path},
-    );
-    var output1 = DeinterleaveOutput.init(path1);
-    defer output1.close(io);
-    var output2 = DeinterleaveOutput.init(path2);
-    defer output2.close(io);
-    try std.testing.expect(output1.create(io) == null);
-    try std.testing.expect(output2.create(io) == null);
-
-    try tmp.dir.deleteFile(io, "r1.fastq");
-    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "replacement" });
-
-    const cleanup1 = output1.planCleanup(io);
-    const cleanup2 = output2.planCleanup(io);
-    output1.close(io);
-    output2.close(io);
-    try std.testing.expectEqual(
-        OutputCleanupFailure.replaced,
-        output1.applyCleanup(io, cleanup1).?,
-    );
-    try std.testing.expect(output2.applyCleanup(io, cleanup2) == null);
-    var replacement: [32]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "replacement",
-        try tmp.dir.readFile(io, "r1.fastq", &replacement),
-    );
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "r2.fastq", .{}));
 }

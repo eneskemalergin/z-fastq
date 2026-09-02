@@ -169,8 +169,8 @@ test "[cli] - [deinterleave]: empty input creates two empty outputs" {
         "",
         "",
     );
-    try expectFile(allocator, empty_out1, "");
-    try expectFile(allocator, empty_out2, "");
+    try expectEmptyFile(empty_out1);
+    try expectEmptyFile(empty_out2);
 }
 
 test "[cli] - [deinterleave]: exact policy compares complete first tokens" {
@@ -213,8 +213,8 @@ test "[cli] - [deinterleave]: exact policy compares complete first tokens" {
         "",
         expected,
     );
-    try expectAbsent(paths[0]);
-    try expectAbsent(paths[1]);
+    try expectEmptyFile(paths[0]);
+    try expectEmptyFile(paths[1]);
 }
 
 test "[cli] - [deinterleave]: structural, semantic, pair, and odd-count precedence is exact" {
@@ -243,8 +243,8 @@ test "[cli] - [deinterleave]: structural, semantic, pair, and odd-count preceden
         "",
         structural_error,
     );
-    try expectAbsent(paths[0]);
-    try expectAbsent(paths[1]);
+    try expectEmptyFile(paths[0]);
+    try expectEmptyFile(paths[1]);
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "input.fastq",
@@ -268,8 +268,8 @@ test "[cli] - [deinterleave]: structural, semantic, pair, and odd-count preceden
         "",
         mismatch,
     );
-    try expectAbsent(paths[0]);
-    try expectAbsent(paths[1]);
+    try expectEmptyFile(paths[0]);
+    try expectEmptyFile(paths[1]);
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "input.fastq",
@@ -283,8 +283,8 @@ test "[cli] - [deinterleave]: structural, semantic, pair, and odd-count preceden
         .{input_path},
     );
     try expectResult(try runDeinterleave(allocator, input_path, paths), 1, "", odd);
-    try expectAbsent(paths[0]);
-    try expectAbsent(paths[1]);
+    try expectEmptyFile(paths[0]);
+    try expectEmptyFile(paths[1]);
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "input.fastq",
@@ -303,8 +303,8 @@ test "[cli] - [deinterleave]: structural, semantic, pair, and odd-count preceden
         "",
         odd_semantic,
     );
-    try expectAbsent(paths[0]);
-    try expectAbsent(paths[1]);
+    try expectEmptyFile(paths[0]);
+    try expectEmptyFile(paths[1]);
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "input.fastq",
@@ -323,11 +323,11 @@ test "[cli] - [deinterleave]: structural, semantic, pair, and odd-count preceden
         "",
         odd_structure,
     );
-    try expectAbsent(paths[0]);
-    try expectAbsent(paths[1]);
+    try expectEmptyFile(paths[0]);
+    try expectEmptyFile(paths[1]);
 }
 
-test "[cli] - [deinterleave]: failed input removes both outputs" {
+test "[cli] - [deinterleave]: failed input leaves command-created outputs" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -349,11 +349,11 @@ test "[cli] - [deinterleave]: failed input removes both outputs" {
         "",
         expected,
     );
-    try expectAbsent(paths[0]);
-    try expectAbsent(paths[1]);
+    try expectEmptyFile(paths[0]);
+    try expectEmptyFile(paths[1]);
 }
 
-test "[cli] - [deinterleave]: validation failures on either mate remove both outputs" {
+test "[cli] - [deinterleave]: validation failures leave empty outputs" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -411,8 +411,8 @@ test "[cli] - [deinterleave]: validation failures on either mate remove both out
             "",
             expected,
         );
-        try expectAbsent(paths[0]);
-        try expectAbsent(paths[1]);
+        try expectEmptyFile(paths[0]);
+        try expectEmptyFile(paths[1]);
     }
 }
 
@@ -440,7 +440,7 @@ test "[cli] - [deinterleave]: IUPAC alphabet accepts ambiguous bases in both mat
     try expectFile(allocator, iupac_paths[1], "@iupac/2\nY\n+\n#\n");
 }
 
-test "[cli] - [deinterleave]: ACGTN alphabet rejection removes both outputs" {
+test "[cli] - [deinterleave]: ACGTN alphabet rejection leaves empty outputs" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -476,11 +476,11 @@ test "[cli] - [deinterleave]: ACGTN alphabet rejection removes both outputs" {
         "",
         acgtn_error,
     );
-    try expectAbsent(acgtn_paths[0]);
-    try expectAbsent(acgtn_paths[1]);
+    try expectEmptyFile(acgtn_paths[0]);
+    try expectEmptyFile(acgtn_paths[1]);
 }
 
-test "[cli] - [deinterleave]: line limit failures on either mate remove both outputs" {
+test "[cli] - [deinterleave]: line limit failures leave empty outputs" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -525,12 +525,12 @@ test "[cli] - [deinterleave]: line limit failures on either mate remove both out
             "",
             line_error,
         );
-        try expectAbsent(line_paths[0]);
-        try expectAbsent(line_paths[1]);
+        try expectEmptyFile(line_paths[0]);
+        try expectEmptyFile(line_paths[1]);
     }
 }
 
-test "[cli] - [deinterleave]: output creation is exclusive and cleanup preserves prior paths" {
+test "[cli] - [deinterleave]: output creation is exclusive and preserves created paths" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -573,9 +573,10 @@ test "[cli] - [deinterleave]: output creation is exclusive and cleanup preserves
         "",
         second_error,
     );
-    try expectAbsent(out1_path);
+    try expectEmptyFile(out1_path);
     try expectFile(allocator, out2_path, "keep-two");
 
+    try tmp.dir.deleteFile(io, "out1.fastq");
     try tmp.dir.deleteFile(io, "out2.fastq");
     const alias_path = try tempPath(allocator, &tmp.sub_path, "./out1.fastq");
     const alias_error = try std.fmt.allocPrint(
@@ -589,7 +590,8 @@ test "[cli] - [deinterleave]: output creation is exclusive and cleanup preserves
         "",
         alias_error,
     );
-    try expectAbsent(out1_path);
+    try expectEmptyFile(out1_path);
+    try tmp.dir.deleteFile(io, "out1.fastq");
 
     const input_alias_error = try std.fmt.allocPrint(
         allocator,
@@ -615,12 +617,13 @@ test "[cli] - [deinterleave]: output creation is exclusive and cleanup preserves
         "",
         input_alias_error,
     );
-    try expectAbsent(out1_path);
+    try expectEmptyFile(out1_path);
     try expectFile(
         allocator,
         input_path,
         "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n",
     );
+    try tmp.dir.deleteFile(io, "out1.fastq");
 
     try tmp.dir.writeFile(io, .{ .sub_path = "sentinel", .data = "keep-target" });
     try tmp.dir.symLink(io, "sentinel", "out1.fastq", .{});
@@ -640,7 +643,7 @@ test "[cli] - [deinterleave]: output creation is exclusive and cleanup preserves
     try expectAbsent(out2_path);
 }
 
-test "[cli] - [deinterleave]: replacement cleanup keeps diagnostic order and exit precedence" {
+test "[cli] - [deinterleave]: failure does not delete replaced or created outputs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -702,19 +705,14 @@ test "[cli] - [deinterleave]: replacement cleanup keeps diagnostic order and exi
         .exited => |code| code,
         else => return error.ChildProcessFailed,
     };
-    const expected_stderr = try std.fmt.allocPrint(
-        allocator,
-        "error: -: S002: sequence byte is outside the selected alphabet " ++
-            "(record 0, line 2, offset 7)\n" ++
-            "error: {s}: cleanup failed: output path was replaced\n",
-        .{out1_path},
-    );
+    const expected_stderr = "error: -: S002: sequence byte is outside the selected alphabet " ++
+        "(record 0, line 2, offset 7)\n";
 
-    try std.testing.expectEqual(@as(u8, 3), exit_code);
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqual(@as(usize, 0), stdout.len);
     try std.testing.expectEqualStrings(expected_stderr, stderr);
     try expectFile(allocator, out1_path, "replacement");
-    try expectAbsent(out2_path);
+    try expectEmptyFile(out2_path);
 }
 
 test "[cli] - [deinterleave]: invalid arguments fail before output creation" {
@@ -939,6 +937,12 @@ fn expectResult(
     try std.testing.expectEqual(exit_code, result.exit_code);
     try std.testing.expectEqualStrings(stdout, result.stdout);
     try std.testing.expectEqualStrings(stderr, result.stderr);
+}
+
+fn expectEmptyFile(path: []const u8) !void {
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
+    try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
+    try std.testing.expectEqual(@as(u64, 0), stat.size);
 }
 
 fn expectFile(
