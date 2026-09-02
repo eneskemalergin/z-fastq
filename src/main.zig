@@ -489,6 +489,11 @@ fn runCount(
                 exit_code = @max(exit_code, 4);
                 continue;
             },
+            error.ArithmeticLimit => {
+                printPathError(io, input, "input location exceeds supported limit");
+                exit_code = @max(exit_code, 4);
+                continue;
+            },
             error.OutOfMemory => {
                 std.Io.File.writeStreamingAll(.stderr(), io, "error: out of memory\n") catch {};
                 return 3;
@@ -505,6 +510,7 @@ const CountError = error{
     Io,
     Format,
     Limit,
+    ArithmeticLimit,
     OutOfMemory,
 };
 
@@ -635,6 +641,7 @@ fn mapScanError(
             return error.Format;
         },
         error.LineTooLong => error.Limit,
+        error.ArithmeticLimit => error.ArithmeticLimit,
         error.OutOfMemory => error.OutOfMemory,
         error.Io => error.Io,
     };
@@ -1626,6 +1633,11 @@ fn mapReaderFailure(
             "line length limit exceeded",
             4,
         ),
+        error.ArithmeticLimit => CommandFailure.plain(
+            "arithmetic_limit",
+            "input location exceeds supported limit",
+            4,
+        ),
         error.OutOfMemory => CommandFailure.plain("out_of_memory", "out of memory", 3),
         error.Io => CommandFailure.plain("io_error", "I/O error", 3),
     };
@@ -1934,7 +1946,7 @@ fn nextAfterPreservingInterleavedMate1(
     record1: zfastq.Record,
     canonical_span1: ?[]const u8,
     staging_limit: usize,
-) (zfastq.ReaderError || error{ArithmeticLimit})!RefillSpanningMate {
+) (zfastq.ReaderError || error{RecordStagingLimit})!RefillSpanningMate {
     var canonical_span2: ?[]const u8 = null;
     var record2_requires_fallback = false;
     if (fastq.retainFallbackRecordStorage(reader, retained, record1)) {
@@ -2091,7 +2103,7 @@ fn sampleInterleavedSource(
                     "out of memory",
                     3,
                 ),
-                error.ArithmeticLimit => return pairCommandFailure(
+                error.RecordStagingLimit => return pairCommandFailure(
                     0,
                     "arithmetic_limit",
                     "record staging size exceeds supported limit",
@@ -2933,7 +2945,7 @@ fn sampleExactInterleavedSecondPass(
                 failure = .{ .command = .{
                     .input_index = 0,
                     .details = switch (err) {
-                        error.ArithmeticLimit => CommandFailure.plain(
+                        error.RecordStagingLimit => CommandFailure.plain(
                             "arithmetic_limit",
                             "record staging size exceeds supported limit",
                             4,
@@ -3597,7 +3609,7 @@ fn deinterleaveSource(
                     "out of memory",
                     3,
                 ),
-                error.ArithmeticLimit => return pairCommandFailure(
+                error.RecordStagingLimit => return pairCommandFailure(
                     0,
                     "arithmetic_limit",
                     "record staging size exceeds supported limit",
@@ -3677,18 +3689,18 @@ fn stageCanonicalRecord(
     record: zfastq.Record,
     canonical_span: ?[]const u8,
     staging_limit: usize,
-) error{ OutOfMemory, ArithmeticLimit }!void {
+) error{ OutOfMemory, RecordStagingLimit }!void {
     const required = if (canonical_span) |span|
         span.len
     else blk: {
         var total: usize = 6;
         inline for (&.{ record.header, record.sequence, record.plus, record.quality }) |field| {
             total = std.math.add(usize, total, field.len) catch
-                return error.ArithmeticLimit;
+                return error.RecordStagingLimit;
         }
         break :blk total;
     };
-    if (required > staging_limit) return error.ArithmeticLimit;
+    if (required > staging_limit) return error.RecordStagingLimit;
 
     staging.clearRetainingCapacity();
     staging.ensureTotalCapacityPrecise(allocator, required) catch return error.OutOfMemory;
@@ -4313,6 +4325,26 @@ test "[unit] - [machine output]: handled non-lint errors share one exact shape" 
         try std.testing.expect(failure.get("byte_offset").? == .null);
         try std.testing.expect(failure.get("line_in_record").? == .null);
     }
+}
+
+test "[unit] - [structural arithmetic]: Reader and count preserve the CLI limit class" {
+    var source = zfastq.io.plain.SliceSource.init("");
+    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
+    defer reader.deinit();
+
+    const reader_failure = mapReaderFailure(&reader, error.ArithmeticLimit);
+    try std.testing.expectEqualStrings("arithmetic_limit", reader_failure.code);
+    try std.testing.expectEqualStrings(
+        "input location exceeds supported limit",
+        reader_failure.message,
+    );
+    try std.testing.expectEqual(@as(u8, 4), reader_failure.exit_code);
+
+    var scanner = zfastq.count_scan.Scanner.init(.{});
+    try std.testing.expectEqual(
+        CountError.ArithmeticLimit,
+        mapScanError(std.testing.io, "-", &scanner, error.ArithmeticLimit),
+    );
 }
 
 test "[edge] - [stats-json]: preserves the maximum u64 counter" {

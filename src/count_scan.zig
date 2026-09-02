@@ -84,6 +84,11 @@ const StrideRun = struct {
     stride: usize = 0,
 };
 
+const FastProgress = struct {
+    bytes: usize = 0,
+    records: usize = 0,
+};
+
 /// Allocation-free scanner; only `record_index` and `byte_offset` are caller-readable state.
 pub const Scanner = struct {
     options: Options,
@@ -126,11 +131,17 @@ pub const Scanner = struct {
                 self.machine.expected == .header and
                 self.line_raw_len == 0)
             {
-                const advanced = try self.feedFast(data[pos..]);
-                if (advanced > 0) {
-                    self.byte_offset += @intCast(advanced);
-                    self.line_start_offset = self.byte_offset;
-                    pos += advanced;
+                const progress = try self.feedFast(data[pos..]);
+                if (progress.bytes > 0) {
+                    const next_offset = try progressAfter(self.byte_offset, progress.bytes);
+                    const next_record_index = try progressAfter(
+                        self.record_index,
+                        progress.records,
+                    );
+                    self.byte_offset = next_offset;
+                    self.line_start_offset = next_offset;
+                    self.record_index = next_record_index;
+                    pos += progress.bytes;
                     continue;
                 }
             }
@@ -155,8 +166,9 @@ pub const Scanner = struct {
         return error.S004TruncatedRecord;
     }
 
-    fn feedFast(self: *Scanner, data: []const u8) fastq.ReaderError!usize {
+    fn feedFast(self: *Scanner, data: []const u8) fastq.ReaderError!FastProgress {
         var cursor: usize = 0;
+        var records: usize = 0;
 
         while (cursor < data.len) {
             const remaining = data[cursor..];
@@ -164,7 +176,8 @@ pub const Scanner = struct {
                 if (self.layout) |active| {
                     const run = self.tryStrideBlock(remaining, active);
                     if (run.count > 0) {
-                        self.record_index += run.count;
+                        records = std.math.add(usize, records, run.count) catch
+                            return error.ArithmeticLimit;
                         cursor += run.count * run.stride;
                         continue;
                     }
@@ -173,11 +186,11 @@ pub const Scanner = struct {
             }
 
             const consumed = try self.tryFastRecord(remaining);
-            if (consumed == 0) return cursor;
-            self.record_index += 1;
+            if (consumed == 0) return .{ .bytes = cursor, .records = records };
+            records = std.math.add(usize, records, 1) catch return error.ArithmeticLimit;
             cursor += consumed;
         }
-        return cursor;
+        return .{ .bytes = cursor, .records = records };
     }
 
     fn tryStrideBlock(self: *Scanner, data: []const u8, layout: DenseLayout) StrideRun {
@@ -268,13 +281,13 @@ pub const Scanner = struct {
             const rel = std.mem.indexOfScalar(u8, data[pos..], '\n');
             if (rel == null) {
                 try self.consumeLineBytes(data[pos..]);
-                self.byte_offset += @intCast(data.len - pos);
+                self.byte_offset = try progressAfter(self.byte_offset, data.len - pos);
                 return data.len;
             }
 
             const segment = data[pos .. pos + rel.?];
             try self.consumeLineBytes(segment);
-            self.byte_offset += @intCast(segment.len + 1);
+            self.byte_offset = try progressAfter(self.byte_offset, segment.len + 1);
             pos += segment.len + 1;
             try self.finishLine(true);
 
@@ -356,11 +369,17 @@ pub const Scanner = struct {
 
         const first_byte = if (content_len == 0) null else self.line_first_byte;
         const second_byte = if (content_len < 2) null else self.line_second_byte;
-        const record_ready = self.machine.push(content_len, first_byte, second_byte) catch |err| {
+        var machine = self.machine;
+        const record_ready = machine.push(content_len, first_byte, second_byte) catch |err| {
             return self.structuralError(err, self.line_start_offset);
         };
+        const next_record_index = if (record_ready)
+            try progressAfter(self.record_index, 1)
+        else
+            self.record_index;
+        self.machine = machine;
         if (record_ready) {
-            self.record_index += 1;
+            self.record_index = next_record_index;
             if (self.current_record_dense_eligible and !had_cr) {
                 self.fast_path_enabled = true;
                 if (self.current_record_minimal_plus) {
@@ -405,6 +424,11 @@ pub const Scanner = struct {
         };
     }
 };
+
+fn progressAfter(current: u64, amount: usize) fastq.ReaderError!u64 {
+    const amount_u64 = std.math.cast(u64, amount) orelse return error.ArithmeticLimit;
+    return std.math.add(u64, current, amount_u64) catch error.ArithmeticLimit;
+}
 
 fn lineContentLen(line: []const u8) usize {
     if (line.len > 0 and line[line.len - 1] == '\r') return line.len - 1;
@@ -567,7 +591,45 @@ test "[unit] - [derived record]: annotated plus lines stay on the complete-recor
     var scanner = Scanner.init(.{ .max_line_bytes = 64 });
     scanner.fast_path_enabled = true;
 
-    try std.testing.expectEqual(data.len, try scanner.feedFast(data));
+    try std.testing.expectEqual(data.len, try scanner.feed(data));
     try std.testing.expectEqual(@as(u64, 2), scanner.record_index);
     try std.testing.expect(scanner.layout == null);
+}
+
+test "[edge] - [count scanner]: fast progress rejects maximum offset and record count" {
+    const data = "@r\nA\n+\n!\n";
+
+    var offset = Scanner.init(.{});
+    offset.fast_path_enabled = true;
+    offset.byte_offset = std.math.maxInt(u64);
+
+    try std.testing.expectError(error.ArithmeticLimit, offset.feed(data));
+    try std.testing.expectEqual(std.math.maxInt(u64), offset.byte_offset);
+    try std.testing.expectEqual(@as(u64, 0), offset.record_index);
+
+    var records = Scanner.init(.{});
+    records.fast_path_enabled = true;
+    records.record_index = std.math.maxInt(u64);
+
+    try std.testing.expectError(error.ArithmeticLimit, records.feed(data));
+    try std.testing.expectEqual(std.math.maxInt(u64), records.record_index);
+    try std.testing.expectEqual(@as(u64, 0), records.byte_offset);
+}
+
+test "[edge] - [count scanner]: incremental progress rejects maximum offset and record count" {
+    const data = "@r\nA\n+\n!\n";
+
+    var offset = Scanner.init(.{});
+    offset.byte_offset = std.math.maxInt(u64);
+
+    try std.testing.expectError(error.ArithmeticLimit, offset.feed(data));
+    try std.testing.expectEqual(std.math.maxInt(u64), offset.byte_offset);
+    try std.testing.expectEqual(@as(u64, 0), offset.record_index);
+
+    var records = Scanner.init(.{});
+    records.record_index = std.math.maxInt(u64);
+
+    try std.testing.expectError(error.ArithmeticLimit, records.feed(data));
+    try std.testing.expectEqual(std.math.maxInt(u64), records.record_index);
+    try std.testing.expectEqual(@as(u64, data.len), records.byte_offset);
 }

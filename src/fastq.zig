@@ -39,6 +39,7 @@ pub const ReaderError = error{
     S003InvalidHeader,
     S004TruncatedRecord,
     S005LengthMismatch,
+    ArithmeticLimit,
     LineTooLong,
     OutOfMemory,
     Io,
@@ -805,8 +806,9 @@ pub const Reader = struct {
             if (end - start > self.options.max_line_bytes) return error.LineTooLong;
 
             const start_offset = self.byte_offset;
+            const next_offset = try self.offsetAfter(raw_end + 1 - start);
             self.cursor = raw_end + 1;
-            self.byte_offset += @intCast(raw_end + 1 - start);
+            self.byte_offset = next_offset;
 
             const line_kind = self.machine.expected;
             const content = self.buf[start..end];
@@ -832,7 +834,8 @@ pub const Reader = struct {
             std.debug.assert(record_ready == (line_index == 3));
         }
 
-        self.record_index += 1;
+        self.record_index = std.math.add(u64, self.record_index, 1) catch
+            return error.ArithmeticLimit;
         return if (full_record)
             .{ .record = .{
                 .ranges = ranges,
@@ -879,7 +882,8 @@ pub const Reader = struct {
             },
         }
         if (record_ready) {
-            self.record_index += 1;
+            self.record_index = std.math.add(u64, self.record_index, 1) catch
+                return error.ArithmeticLimit;
             return .record_ready;
         }
         return .continue_;
@@ -945,8 +949,9 @@ pub const Reader = struct {
                 const haystack = self.buf[self.cursor..self.fill_end];
                 if (std.mem.indexOfScalar(u8, haystack, '\n')) |rel| {
                     try self.appendLineBytes(field_index, content_start, haystack[0..rel], true);
+                    const next_offset = try self.offsetAfter(rel + 1);
                     self.cursor += rel + 1;
-                    self.byte_offset += @intCast(rel + 1);
+                    self.byte_offset = next_offset;
                     self.stripLineCr(field_index, content_start);
                     return .{
                         .content = field.storage[0..field.len],
@@ -955,8 +960,9 @@ pub const Reader = struct {
                 }
 
                 try self.appendLineBytes(field_index, content_start, haystack, false);
+                const next_offset = try self.offsetAfter(haystack.len);
                 self.cursor = self.fill_end;
-                self.byte_offset += @intCast(haystack.len);
+                self.byte_offset = next_offset;
             }
 
             const got_data = try self.refill();
@@ -973,6 +979,11 @@ pub const Reader = struct {
                 return null;
             }
         }
+    }
+
+    fn offsetAfter(self: *const Reader, amount: usize) ReaderError!u64 {
+        const amount_u64 = std.math.cast(u64, amount) orelse return error.ArithmeticLimit;
+        return std.math.add(u64, self.byte_offset, amount_u64) catch error.ArithmeticLimit;
     }
 
     fn appendLineBytes(
@@ -2074,6 +2085,66 @@ test "[property] - [reader]: field projections preserve delivery and failures" {
     try expectPayloadProjection(valid, 4, 9, .{});
 }
 
+test "[edge] - [reader]: buffered progress rejects maximum offset and record count" {
+    const data = "@r\nA\n+\n!\n";
+
+    var offset_source = io_layer.SliceSource.init(data);
+    var offset_reader = try Reader.init(
+        std.testing.allocator,
+        offset_source.byteSource(),
+        .{},
+    );
+    defer offset_reader.deinit();
+    offset_reader.byte_offset = std.math.maxInt(u64);
+
+    try std.testing.expectError(error.ArithmeticLimit, offset_reader.next());
+    try std.testing.expectEqual(std.math.maxInt(u64), offset_reader.byte_offset);
+    try std.testing.expectEqual(@as(u64, 0), offset_reader.record_index);
+
+    var count_source = io_layer.SliceSource.init(data);
+    var count_reader = try Reader.init(
+        std.testing.allocator,
+        count_source.byteSource(),
+        .{},
+    );
+    defer count_reader.deinit();
+    count_reader.record_index = std.math.maxInt(u64);
+
+    try std.testing.expectError(error.ArithmeticLimit, count_reader.next());
+    try std.testing.expectEqual(std.math.maxInt(u64), count_reader.record_index);
+    try std.testing.expectEqual(@as(u64, data.len), count_reader.byte_offset);
+}
+
+test "[edge] - [reader]: fallback progress rejects maximum offset and record count" {
+    const data = "@r\nA\n+\n!\n";
+
+    var offset_source = ProjectionTestSource.init(data, 1, null);
+    var offset_reader = try Reader.init(
+        std.testing.allocator,
+        offset_source.byteSource(),
+        .{},
+    );
+    defer offset_reader.deinit();
+    offset_reader.byte_offset = std.math.maxInt(u64);
+
+    try std.testing.expectError(error.ArithmeticLimit, offset_reader.next());
+    try std.testing.expectEqual(std.math.maxInt(u64), offset_reader.byte_offset);
+    try std.testing.expectEqual(@as(u64, 0), offset_reader.record_index);
+
+    var count_source = ProjectionTestSource.init(data, 1, null);
+    var count_reader = try Reader.init(
+        std.testing.allocator,
+        count_source.byteSource(),
+        .{},
+    );
+    defer count_reader.deinit();
+    count_reader.record_index = std.math.maxInt(u64);
+
+    try std.testing.expectError(error.ArithmeticLimit, count_reader.next());
+    try std.testing.expectEqual(std.math.maxInt(u64), count_reader.record_index);
+    try std.testing.expectEqual(@as(u64, data.len), count_reader.byte_offset);
+}
+
 test "[failure] - [reader]: partial fallback ownership is released after allocation failure" {
     const input = try ReaderSpillFixture.init(
         std.testing.allocator,
@@ -2997,7 +3068,7 @@ fn referenceCheckOutcome(
         error.S005LengthMismatch,
         => .{ .parse_error = reader.takeLastError().? },
         error.LineTooLong => .line_too_long,
-        error.OutOfMemory, error.Io => return err,
+        error.ArithmeticLimit, error.OutOfMemory, error.Io => return err,
     }) |record| {
         const semantic_error = validateRecord(record, validation_options) orelse continue;
         const offsets = reader.currentRecordOffsets().?;
