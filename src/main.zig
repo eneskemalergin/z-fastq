@@ -1859,7 +1859,7 @@ fn runPairSampleCommand(
             var output_selector: PairOutputSelector = .{ .fraction = &selector };
             break :blk switch (options.pair_mode) {
                 .none => unreachable,
-                .paired => interleaveInputs(io, allocator, inputs, &writer, .{
+                .paired => interleaveInputs(io, allocator, inputs, &writer, null, .{
                     .max_line_bytes = options.max_line_bytes,
                     .alphabet = options.alphabet,
                     .pair_name_policy = options.pair_name_policy,
@@ -3101,7 +3101,14 @@ fn runInterleave(
     var sink_adapter = io_layer.WriterSink.init(&stdout_writer.interface);
     var writer = zfastq.Writer.init(sink_adapter.byteSink());
 
-    const failure = interleaveInputs(io, allocator, inputs, &writer, options) catch {
+    const failure = interleaveInputs(
+        io,
+        allocator,
+        inputs,
+        &writer,
+        &stdout_writer.interface,
+        options,
+    ) catch {
         writer.flush() catch {};
         printOutputFailure(io);
         return 3;
@@ -3143,6 +3150,7 @@ fn interleaveInputs(
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
     writer: *zfastq.Writer,
+    direct_writer: ?*std.Io.Writer,
     options: InterleaveOptions,
 ) error{WriteFailed}!?PairCommandFailure {
     var input1: RecordInput = undefined;
@@ -3163,6 +3171,7 @@ fn interleaveInputs(
         input1.byteSource(),
         input2.byteSource(),
         writer,
+        direct_writer,
         &selection,
         options,
     );
@@ -3173,6 +3182,7 @@ fn interleaveSources(
     source1: zfastq.io.ByteSource,
     source2: zfastq.io.ByteSource,
     writer: *zfastq.Writer,
+    direct_writer: ?*std.Io.Writer,
     selection: *PairOutputSelector,
     options: InterleaveOptions,
 ) error{WriteFailed}!?PairCommandFailure {
@@ -3264,12 +3274,20 @@ fn interleaveSources(
         if (!selection.selectPair()) continue;
 
         if (canonical_span1) |span| {
-            fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
+            if (direct_writer) |output| {
+                output.writeAll(span) catch return error.WriteFailed;
+            } else {
+                fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
+            }
         } else {
             fastq.writeValidatedRecord(writer, record1.?) catch return error.WriteFailed;
         }
         if (canonical_span2) |span| {
-            fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
+            if (direct_writer) |output| {
+                output.writeAll(span) catch return error.WriteFailed;
+            } else {
+                fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
+            }
         } else {
             fastq.writeValidatedRecord(writer, record2.?) catch return error.WriteFailed;
         }
