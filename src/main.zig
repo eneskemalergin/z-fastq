@@ -1665,14 +1665,14 @@ const SampleMode = union(enum) {
 
 const ExactOutputCursor = struct {
     select_all: bool,
-    indexes: []const u64,
+    indexes: sampling.ExactIndexes,
     selected_cursor: usize = 0,
     unit_count: u64 = 0,
 
     fn selectNext(self: *ExactOutputCursor) bool {
         if (self.select_all) return true;
-        if (self.selected_cursor == self.indexes.len or
-            self.indexes[self.selected_cursor] != self.unit_count + 1)
+        if (self.selected_cursor == self.indexes.len() or
+            self.indexes.at(self.selected_cursor) != self.unit_count + 1)
         {
             return false;
         }
@@ -1685,7 +1685,7 @@ const ExactOutputCursor = struct {
     }
 
     fn selectionComplete(self: ExactOutputCursor) bool {
-        return self.select_all or self.selected_cursor == self.indexes.len;
+        return self.select_all or self.selected_cursor == self.indexes.len();
     }
 };
 
@@ -2316,7 +2316,7 @@ fn sampleExactFile(
             allocator,
             path,
             writer,
-            &.{},
+            .empty,
             completed.snapshot,
             selector.record_count,
             options,
@@ -2407,7 +2407,7 @@ fn sampleExactSecondPass(
     allocator: std.mem.Allocator,
     path: []const u8,
     writer: *zfastq.Writer,
-    selected: []const u64,
+    selected: sampling.ExactIndexes,
     expected_snapshot: FileSnapshot,
     expected_count: u64,
     options: SampleOptions,
@@ -2540,7 +2540,7 @@ fn sampleExactPairs(
             allocator,
             inputs,
             writer,
-            &.{},
+            .empty,
             completed.snapshots,
             selector.record_count,
             options,
@@ -2675,7 +2675,7 @@ fn sampleExactPairSecondPass(
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
     writer: *zfastq.Writer,
-    indexes: []const u64,
+    indexes: sampling.ExactIndexes,
     snapshots: ExactPairSnapshots,
     expected_count: u64,
     options: SampleOptions,
@@ -2712,7 +2712,7 @@ fn sampleExactPairedSecondPass(
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
     writer: *zfastq.Writer,
-    indexes: []const u64,
+    indexes: sampling.ExactIndexes,
     snapshots: [2]FileSnapshot,
     expected_count: u64,
     options: SampleOptions,
@@ -2852,7 +2852,7 @@ fn sampleExactInterleavedSecondPass(
     allocator: std.mem.Allocator,
     path: []const u8,
     writer: *zfastq.Writer,
-    indexes: []const u64,
+    indexes: sampling.ExactIndexes,
     snapshot: FileSnapshot,
     expected_count: u64,
     options: SampleOptions,
@@ -4384,7 +4384,7 @@ test "[failure] - [exact sample]: final record-count change keeps a valid prefix
         std.testing.allocator,
         path,
         &writer,
-        &.{1},
+        .{ .low_words = &.{1}, .high_words = &.{} },
         snapshot,
         2,
         .{
@@ -4418,7 +4418,7 @@ test "[failure] - [exact sample]: changed metadata stops the second pass before 
         std.testing.allocator,
         path,
         &writer,
-        &.{1},
+        .{ .low_words = &.{1}, .high_words = &.{} },
         snapshot,
         5,
         .{
@@ -4451,7 +4451,7 @@ test "[integration] - [exact sample]: the output pass trusts first-pass semantic
         std.testing.allocator,
         path,
         &writer,
-        &.{1},
+        .{ .low_words = &.{1}, .high_words = &.{} },
         snapshot,
         1,
         .{
@@ -4528,7 +4528,7 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
             std.testing.allocator,
             &inputs,
             &writer,
-            &.{},
+            .empty,
             snapshots,
             1,
             options,
@@ -4553,7 +4553,7 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
         std.testing.allocator,
         pairs_path,
         &writer,
-        &.{},
+        .empty,
         changed_pair_snapshot,
         1,
         .{
@@ -4624,7 +4624,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         std.testing.allocator,
         &inputs,
         &paired_writer,
-        &.{},
+        .empty,
         .{ snapshot1, snapshot2 },
         2,
         paired_options,
@@ -4652,7 +4652,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         std.testing.allocator,
         pairs_path,
         &interleaved_writer,
-        &.{},
+        .empty,
         pair_snapshot,
         1,
         .{
@@ -4688,7 +4688,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         std.testing.allocator,
         &inputs,
         &mismatch_writer,
-        &.{},
+        .empty,
         .{ mismatch_snapshot1, mismatch_snapshot2 },
         1,
         paired_options,
@@ -4710,7 +4710,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         std.testing.allocator,
         pairs_path,
         &mismatch_pair_writer,
-        &.{},
+        .empty,
         mismatch_pair_snapshot,
         1,
         .{
@@ -4756,7 +4756,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
             std.testing.allocator,
             &inputs,
             &semantic_writer,
-            &.{},
+            .empty,
             .{ semantic_snapshot1, semantic_snapshot2 },
             1,
             paired_options,
@@ -4786,7 +4786,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         std.testing.allocator,
         &inputs,
         &structural_writer,
-        &.{},
+        .empty,
         .{ structural_snapshot1, structural_snapshot2 },
         1,
         paired_options,

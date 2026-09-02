@@ -89,7 +89,8 @@ pub const Selector = union(enum) {
 pub const ExactSelector = struct {
     target: u64,
     generator: Mt19937_64,
-    indexes: std.ArrayList(u64) = .empty,
+    indexes: std.ArrayList(u32) = .empty,
+    index_high_words: std.ArrayList(u32) = .empty,
     unordered: bool = false,
     record_count: u64 = 0,
 
@@ -102,6 +103,7 @@ pub const ExactSelector = struct {
 
     pub fn deinit(self: *ExactSelector, allocator: std.mem.Allocator) void {
         self.indexes.deinit(allocator);
+        self.index_high_words.deinit(allocator);
         self.* = undefined;
     }
 
@@ -121,12 +123,23 @@ pub const ExactSelector = struct {
         if (self.indexes.items.len == 0) {
             const target_len = std.math.cast(usize, self.target) orelse
                 return error.Overflow;
-            _ = std.math.mul(usize, target_len, @sizeOf(u64)) catch
+            _ = std.math.mul(usize, target_len, @sizeOf(u32)) catch
                 return error.Overflow;
             try self.indexes.ensureTotalCapacityPrecise(allocator, target_len);
             self.indexes.expandToCapacity();
+            if (self.target > std.math.maxInt(u32)) {
+                try self.index_high_words.ensureTotalCapacityPrecise(
+                    allocator,
+                    target_len,
+                );
+                self.index_high_words.expandToCapacity();
+            }
             for (self.indexes.items, 1..) |*index, initial_record| {
-                index.* = @intCast(initial_record);
+                index.* = @truncate(initial_record);
+                if (self.index_high_words.items.len != 0) {
+                    self.index_high_words.items[initial_record - 1] =
+                        @truncate(initial_record >> 32);
+                }
             }
         }
 
@@ -138,30 +151,125 @@ pub const ExactSelector = struct {
         if (candidate >= self.target) return;
 
         const slot = std.math.cast(usize, candidate) orelse return error.Overflow;
-        self.indexes.items[slot] = record_number;
+        try self.storeIndex(allocator, slot, record_number);
         self.unordered = self.unordered or slot + 1 != self.indexes.items.len;
+    }
+
+    fn storeIndex(
+        self: *ExactSelector,
+        allocator: std.mem.Allocator,
+        slot: usize,
+        record_number: u64,
+    ) std.mem.Allocator.Error!void {
+        const high_word: u32 = @truncate(record_number >> 32);
+        if (high_word != 0 and self.index_high_words.items.len == 0) {
+            try self.index_high_words.ensureTotalCapacityPrecise(
+                allocator,
+                self.indexes.items.len,
+            );
+            self.index_high_words.expandToCapacity();
+            @memset(self.index_high_words.items, 0);
+        }
+        self.indexes.items[slot] = @truncate(record_number);
+        if (self.index_high_words.items.len != 0) {
+            self.index_high_words.items[slot] = high_word;
+        }
     }
 
     pub fn finish(self: *ExactSelector) ExactSelection {
         if (self.target == 0 or self.record_count == 0) return .none;
         if (self.indexes.items.len == 0) return .all;
         if (self.unordered) {
-            std.mem.sortUnstable(
-                u64,
-                self.indexes.items,
-                {},
-                std.sort.asc(u64),
-            );
+            if (self.index_high_words.items.len == 0) {
+                std.mem.sortUnstable(
+                    u32,
+                    self.indexes.items,
+                    {},
+                    std.sort.asc(u32),
+                );
+            } else {
+                std.sort.pdqContext(0, self.indexes.items.len, IndexSortContext{
+                    .low_words = self.indexes.items,
+                    .high_words = self.index_high_words.items,
+                });
+            }
         }
-        return .{ .indexes = self.indexes.items };
+        return .{ .indexes = .{
+            .low_words = self.indexes.items,
+            .high_words = self.index_high_words.items,
+        } };
+    }
+
+    const IndexSortContext = struct {
+        low_words: []u32,
+        high_words: []u32,
+
+        pub fn lessThan(self: IndexSortContext, left: usize, right: usize) bool {
+            if (self.high_words[left] != self.high_words[right]) {
+                return self.high_words[left] < self.high_words[right];
+            }
+            return self.low_words[left] < self.low_words[right];
+        }
+
+        pub fn swap(self: IndexSortContext, left: usize, right: usize) void {
+            std.mem.swap(u32, &self.low_words[left], &self.low_words[right]);
+            std.mem.swap(u32, &self.high_words[left], &self.high_words[right]);
+        }
+    };
+};
+
+pub const ExactIndexes = struct {
+    low_words: []const u32,
+    high_words: []const u32,
+
+    pub const empty: ExactIndexes = .{ .low_words = &.{}, .high_words = &.{} };
+
+    pub fn len(self: ExactIndexes) usize {
+        return self.low_words.len;
+    }
+
+    pub fn at(self: ExactIndexes, index: usize) u64 {
+        const high_word = if (self.high_words.len == 0)
+            0
+        else
+            @as(u64, self.high_words[index]);
+        return high_word << 32 | @as(u64, self.low_words[index]);
     }
 };
 
 pub const ExactSelection = union(enum) {
     none,
     all,
-    indexes: []const u64,
+    indexes: ExactIndexes,
 };
+
+fn exerciseWideExactIndexes(allocator: std.mem.Allocator) !void {
+    var selector = ExactSelector.init(2, 11);
+    defer selector.deinit(allocator);
+    for (1..4) |record_number| {
+        try selector.considerRecord(allocator, record_number);
+    }
+    try selector.storeIndex(allocator, 0, @as(u64, std.math.maxInt(u32)) + 7);
+    try selector.storeIndex(allocator, 1, 4);
+    selector.unordered = true;
+
+    const selection = selector.finish();
+    try std.testing.expect(selection == .indexes);
+    try std.testing.expectEqual(@as(usize, 2), selection.indexes.len());
+    try std.testing.expectEqual(@as(u64, 4), selection.indexes.at(0));
+    try std.testing.expectEqual(
+        @as(u64, std.math.maxInt(u32)) + 7,
+        selection.indexes.at(1),
+    );
+}
+
+test "[unit] - [exact selector]: compact indexes retain wide record numbers" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseWideExactIndexes,
+        .{},
+    );
+}
 
 pub const Mt19937_64 = struct {
     state: [STATE_WORDS]u64,

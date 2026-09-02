@@ -248,10 +248,17 @@ test "[unit] - [exact selector]: seed 11 matches frozen seqtk indexes" {
                     .indexes => |indexes| indexes,
                     else => return error.TestExpectedEqual,
                 };
-                try std.testing.expectEqualSlices(u64, expected, indexes);
+                try std.testing.expectEqual(expected.len, indexes.len());
+                for (expected, 0..) |expected_index, index| {
+                    try std.testing.expectEqual(expected_index, indexes.at(index));
+                }
                 try std.testing.expectEqual(
                     selector.indexes.items.len,
                     selector.indexes.capacity,
+                );
+                try std.testing.expectEqual(
+                    @as(usize, 0),
+                    selector.index_high_words.items.len,
                 );
             },
             .none => {
@@ -288,7 +295,7 @@ fn exerciseExactSelectorAllocations(allocator: std.mem.Allocator) !void {
     }
     const selection = selector.finish();
     try std.testing.expect(selection == .indexes);
-    try std.testing.expectEqual(@as(usize, 37), selection.indexes.len);
+    try std.testing.expectEqual(@as(usize, 37), selection.indexes.len());
 }
 
 test "[failure] - [exact selector]: materialized index allocation is released" {
