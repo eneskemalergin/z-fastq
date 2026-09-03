@@ -463,7 +463,9 @@ const Range = struct {
 };
 
 const Line = struct {
-    content: []const u8,
+    content_len: usize,
+    first_byte: ?u8,
+    second_byte: ?u8,
     start_offset: u64,
 };
 
@@ -698,7 +700,7 @@ pub const Reader = struct {
     }
 
     fn nextFallback(self: *Reader, comptime derive_id: bool) ReaderError!?Record {
-        if (!try self.readFallbackRecord()) return null;
+        if (!try self.readFallbackRecord(0b1111)) return null;
         const header_field = &self.fallback_fields[0];
         const plus_field = &self.fallback_fields[2];
         const header_bytes = header_field.storage[0..header_field.len];
@@ -714,17 +716,17 @@ pub const Reader = struct {
     }
 
     fn nextFallbackPayload(self: *Reader) ReaderError!?RecordPayload {
-        if (!try self.readFallbackRecord()) return null;
+        if (!try self.readFallbackRecord(0b1010)) return null;
         return .{
             .sequence = self.fallback_fields[1].storage[0..self.fallback_fields[1].len],
             .quality = self.fallback_fields[3].storage[0..self.fallback_fields[3].len],
         };
     }
 
-    fn readFallbackRecord(self: *Reader) ReaderError!bool {
+    fn readFallbackRecord(self: *Reader, comptime retained_fields: u4) ReaderError!bool {
         self.beginFallbackRecord();
         while (true) {
-            const line = try self.readLine();
+            const line = try self.readFallbackLine(retained_fields);
             switch (try self.ingestLine(line)) {
                 .eof => return false,
                 .continue_ => {},
@@ -749,7 +751,7 @@ pub const Reader = struct {
     fn advanceFallback(self: *Reader) ReaderError!bool {
         self.beginFallbackRecord();
         while (true) {
-            const line = try self.readLine();
+            const line = try self.readFallbackLine(0);
             switch (try self.ingestLine(line)) {
                 .eof => return false,
                 .continue_ => {},
@@ -860,10 +862,11 @@ pub const Reader = struct {
             return error.S004TruncatedRecord;
         };
         const line_kind = self.machine.expected;
-        const content = actual_line.content;
-        const first_byte = if (content.len == 0) null else content[0];
-        const second_byte = if (content.len < 2) null else content[1];
-        const record_ready = self.machine.push(content.len, first_byte, second_byte) catch |err| {
+        const record_ready = self.machine.push(
+            actual_line.content_len,
+            actual_line.first_byte,
+            actual_line.second_byte,
+        ) catch |err| {
             return self.structuralError(err, actual_line.start_offset);
         };
 
@@ -938,28 +941,73 @@ pub const Reader = struct {
         return n > 0;
     }
 
-    fn readLine(self: *Reader) ReaderError!?Line {
+    fn readFallbackLine(self: *Reader, comptime retained_fields: u4) ReaderError!?Line {
+        return switch (self.machine.expected) {
+            .header => self.readLine(retained_fields & 0b0001 != 0),
+            .sequence => self.readLine(retained_fields & 0b0010 != 0),
+            .plus => self.readLine(retained_fields & 0b0100 != 0),
+            .quality => self.readLine(retained_fields & 0b1000 != 0),
+        };
+    }
+
+    fn readLine(self: *Reader, comptime retain: bool) ReaderError!?Line {
         const field_index = @intFromEnum(self.machine.expected);
         const field = &self.fallback_fields[field_index];
-        const content_start = field.len;
+        const content_start = if (retain) field.len else 0;
         const line_start_offset = self.byte_offset;
+        var discarded_len: usize = 0;
+        var first_byte: ?u8 = null;
+        var second_byte: ?u8 = null;
+        var last_byte: ?u8 = null;
 
         while (true) {
             if (self.cursor < self.fill_end) {
                 const haystack = self.buf[self.cursor..self.fill_end];
                 if (std.mem.indexOfScalar(u8, haystack, '\n')) |rel| {
-                    try self.appendLineBytes(field_index, content_start, haystack[0..rel], true);
+                    if (retain) {
+                        try self.appendLineBytes(field_index, content_start, haystack[0..rel], true);
+                    } else {
+                        try self.discardLineBytes(
+                            &discarded_len,
+                            &first_byte,
+                            &second_byte,
+                            &last_byte,
+                            haystack[0..rel],
+                        );
+                    }
                     const next_offset = try self.offsetAfter(rel + 1);
                     self.cursor += rel + 1;
                     self.byte_offset = next_offset;
-                    self.stripLineCr(field_index, content_start);
+                    if (retain) {
+                        self.stripLineCr(field_index, content_start);
+                        const content = field.storage[0..field.len];
+                        return .{
+                            .content_len = content.len,
+                            .first_byte = if (content.len == 0) null else content[0],
+                            .second_byte = if (content.len < 2) null else content[1],
+                            .start_offset = line_start_offset,
+                        };
+                    }
+                    if (last_byte == '\r') discarded_len -= 1;
                     return .{
-                        .content = field.storage[0..field.len],
+                        .content_len = discarded_len,
+                        .first_byte = if (discarded_len == 0) null else first_byte,
+                        .second_byte = if (discarded_len < 2) null else second_byte,
                         .start_offset = line_start_offset,
                     };
                 }
 
-                try self.appendLineBytes(field_index, content_start, haystack, false);
+                if (retain) {
+                    try self.appendLineBytes(field_index, content_start, haystack, false);
+                } else {
+                    try self.discardLineBytes(
+                        &discarded_len,
+                        &first_byte,
+                        &second_byte,
+                        &last_byte,
+                        haystack,
+                    );
+                }
                 const next_offset = try self.offsetAfter(haystack.len);
                 self.cursor = self.fill_end;
                 self.byte_offset = next_offset;
@@ -967,12 +1015,22 @@ pub const Reader = struct {
 
             const got_data = try self.refill();
             if (!got_data) {
-                if (field.len > content_start) {
-                    if (field.len - content_start > self.options.max_line_bytes) {
+                const content_len = if (retain) field.len - content_start else discarded_len;
+                if (content_len > 0) {
+                    if (content_len > self.options.max_line_bytes) {
                         return error.LineTooLong;
                     }
+                    if (!retain) return .{
+                        .content_len = content_len,
+                        .first_byte = first_byte,
+                        .second_byte = second_byte,
+                        .start_offset = line_start_offset,
+                    };
+                    const content = field.storage[0..field.len];
                     return .{
-                        .content = field.storage[0..field.len],
+                        .content_len = content.len,
+                        .first_byte = content[0],
+                        .second_byte = if (content.len < 2) null else content[1],
                         .start_offset = line_start_offset,
                     };
                 }
@@ -995,16 +1053,46 @@ pub const Reader = struct {
     ) ReaderError!void {
         if (chunk.len == 0) return;
         const field = &self.fallback_fields[field_index];
-        const new_len = std.math.add(usize, field.len, chunk.len) catch
+        const line_len = try self.lineLengthAfter(field.len - content_start, chunk);
+        const new_len = std.math.add(usize, content_start, line_len) catch
             return error.LineTooLong;
-        const line_len = new_len - content_start;
-        if (line_len > self.options.max_line_bytes) {
-            const excess = line_len - self.options.max_line_bytes;
-            if (excess > 1 or chunk[chunk.len - 1] != '\r') return error.LineTooLong;
-        }
         try self.ensureFieldCapacity(field_index, new_len, complete);
         @memcpy(field.storage[field.len..new_len], chunk);
         field.len = new_len;
+    }
+
+    fn discardLineBytes(
+        self: *const Reader,
+        line_len: *usize,
+        first_byte: *?u8,
+        second_byte: *?u8,
+        last_byte: *?u8,
+        chunk: []const u8,
+    ) ReaderError!void {
+        if (chunk.len == 0) return;
+        const old_len = line_len.*;
+        line_len.* = try self.lineLengthAfter(old_len, chunk);
+        if (old_len == 0) {
+            first_byte.* = chunk[0];
+            if (chunk.len > 1) second_byte.* = chunk[1];
+        } else if (old_len == 1) {
+            second_byte.* = chunk[0];
+        }
+        last_byte.* = chunk[chunk.len - 1];
+    }
+
+    fn lineLengthAfter(
+        self: *const Reader,
+        current_len: usize,
+        chunk: []const u8,
+    ) ReaderError!usize {
+        const new_len = std.math.add(usize, current_len, chunk.len) catch
+            return error.LineTooLong;
+        if (new_len > self.options.max_line_bytes) {
+            const excess = new_len - self.options.max_line_bytes;
+            if (excess > 1 or chunk[chunk.len - 1] != '\r') return error.LineTooLong;
+        }
+        return new_len;
     }
 
     fn stripLineCr(self: *Reader, field_index: usize, content_start: usize) void {
@@ -1951,15 +2039,26 @@ fn expectPayloadProjection(
     );
     defer record_reader.deinit();
 
+    var advance_source = ProjectionTestSource.init(input, split, fail_at);
+    var advance_reader = try Reader.init(
+        std.testing.allocator,
+        advance_source.byteSource(),
+        options,
+    );
+    defer advance_reader.deinit();
+
     while (true) {
         const full_result = full_reader.next();
         const payload_result = nextPayload(&payload_reader);
         const record_result = nextRecordWithoutId(&record_reader);
+        const advance_result = advance_reader.advance();
         if (full_result) |full_record| {
             const payload_record = try payload_result;
             const projected_record = try record_result;
+            const advanced = try advance_result;
             try std.testing.expectEqual(full_record == null, payload_record == null);
             try std.testing.expectEqual(full_record == null, projected_record == null);
+            try std.testing.expectEqual(full_record != null, advanced);
             if (full_record) |record| {
                 const payload = payload_record.?;
                 const projected = projected_record.?;
@@ -1983,10 +2082,13 @@ fn expectPayloadProjection(
                 full_reader.currentRecordOffsets(),
                 record_reader.currentRecordOffsets(),
             );
+            try std.testing.expectEqual(full_reader.recordIndex(), advance_reader.recordIndex());
+            try std.testing.expectEqual(full_reader.byteOffset(), advance_reader.byteOffset());
             if (full_record == null) return;
         } else |expected_error| {
             try std.testing.expectError(expected_error, payload_result);
             try std.testing.expectError(expected_error, record_result);
+            try std.testing.expectError(expected_error, advance_result);
             try std.testing.expectEqual(full_reader.recordIndex(), payload_reader.recordIndex());
             try std.testing.expectEqual(full_reader.byteOffset(), payload_reader.byteOffset());
             try std.testing.expectEqual(
@@ -2002,6 +2104,9 @@ fn expectPayloadProjection(
                 record_reader.currentRecordOffsets(),
             );
             try expectProjectionErrorEqual(full_error, record_reader.takeLastError());
+            try std.testing.expectEqual(full_reader.recordIndex(), advance_reader.recordIndex());
+            try std.testing.expectEqual(full_reader.byteOffset(), advance_reader.byteOffset());
+            try expectProjectionErrorEqual(full_error, advance_reader.takeLastError());
             return;
         }
     }
@@ -2062,6 +2167,16 @@ test "[property] - [reader]: field projections preserve delivery and failures" {
         try expectPayloadProjection(valid, split, null, .{});
     }
 
+    const exact_limit_crlf = "@r\r\nA\r\n+\r\n!\r\n";
+    for (0..exact_limit_crlf.len + 1) |split| {
+        try expectPayloadProjection(
+            exact_limit_crlf,
+            split,
+            null,
+            .{ .max_line_bytes = 2 },
+        );
+    }
+
     const malformed = [_]struct {
         input: []const u8,
         split: usize,
@@ -2076,6 +2191,11 @@ test "[property] - [reader]: field projections preserve delivery and failures" {
             .split = 4,
             .options = .{ .max_line_bytes = 4 },
         },
+        .{
+            .input = "@r\nA\n+\n!\r",
+            .split = 10,
+            .options = .{ .max_line_bytes = 1 },
+        },
     };
     for (malformed) |case| {
         try expectPayloadProjection(case.input, 0, null, case.options);
@@ -2083,6 +2203,51 @@ test "[property] - [reader]: field projections preserve delivery and failures" {
     }
 
     try expectPayloadProjection(valid, 4, 9, .{});
+}
+
+test "[edge] - [reader]: fallback projections retain only requested fields" {
+    const field_len = io_layer.DEFAULT_READER_BUFFER_BYTES + 17;
+    const input = try ReaderSpillFixture.init(
+        std.testing.allocator,
+        field_len,
+        field_len,
+        "\n",
+        true,
+    );
+    defer std.testing.allocator.free(input);
+
+    var advance_source = io_layer.SliceSource.init(input);
+    var advance_tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var advance_reader = try Reader.init(
+        advance_tracking.allocator(),
+        advance_source.byteSource(),
+        .{},
+    );
+    defer advance_reader.deinit();
+    const initial_allocations = advance_tracking.allocations;
+
+    try std.testing.expect(try advance_reader.advance());
+    try std.testing.expectEqual(initial_allocations, advance_tracking.allocations);
+    try std.testing.expectEqual(@as(u64, 1), advance_reader.recordIndex());
+    for (advance_reader.fallback_fields) |field| {
+        try std.testing.expectEqual(@as(usize, 0), field.len);
+    }
+
+    var payload_source = io_layer.SliceSource.init(input);
+    var payload_reader = try Reader.init(
+        std.testing.allocator,
+        payload_source.byteSource(),
+        .{},
+    );
+    defer payload_reader.deinit();
+
+    const payload = (try payload_reader.nextPayload()).?;
+    try std.testing.expectEqual(field_len, payload.sequence.len);
+    try std.testing.expectEqual(field_len, payload.quality.len);
+    try std.testing.expectEqual(@as(usize, 0), payload_reader.fallback_fields[0].len);
+    try std.testing.expectEqual(@as(usize, 0), payload_reader.fallback_fields[2].len);
+    try std.testing.expectEqual(@as(usize, 0), payload_reader.fallback_fields[0].storage.len);
+    try std.testing.expectEqual(@as(usize, 0), payload_reader.fallback_fields[2].storage.len);
 }
 
 test "[edge] - [reader]: buffered progress rejects maximum offset and record count" {
