@@ -1062,13 +1062,13 @@ fn checkPairedSources(
     var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        const record1 = fastq.nextRecordWithoutId(&reader1) catch |err| {
+        const record1 = fastq.nextValidatedHeader(&reader1, &validator1) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader1, err),
             } };
         };
-        const record2 = fastq.nextRecordWithoutId(&reader2) catch |err| {
+        const record2 = fastq.nextValidatedHeader(&reader2, &validator2) catch |err| {
             return .{ .command = .{
                 .input_index = 1,
                 .details = mapReaderFailure(&reader2, err),
@@ -1096,17 +1096,15 @@ fn checkPairedSources(
         const record_index2 = reader2.recordIndex() - 1;
         const offsets1 = reader1.currentRecordOffsets().?;
         const offsets2 = reader2.currentRecordOffsets().?;
-        if (validateCommandRecord(
-            &validator1,
-            record1.?,
+        if (mapSemanticFailure(
+            record1.?.semantic_error,
             offsets1,
             record_index1,
         )) |failure| {
             return .{ .command = .{ .input_index = 0, .details = failure } };
         }
-        if (validateCommandRecord(
-            &validator2,
-            record2.?,
+        if (mapSemanticFailure(
+            record2.?.semantic_error,
             offsets2,
             record_index2,
         )) |failure| {
@@ -1174,7 +1172,7 @@ fn checkInterleavedSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        const record1 = fastq.nextRecordWithoutId(&reader) catch |err| {
+        const record1 = fastq.nextValidatedHeader(&reader, &validator) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
@@ -1182,9 +1180,8 @@ fn checkInterleavedSource(
         } orelse return null;
         const record_index1 = reader.recordIndex() - 1;
         const offsets1 = reader.currentRecordOffsets().?;
-        const semantic1 = validateCommandRecord(
-            &validator,
-            record1,
+        const semantic1 = mapSemanticFailure(
+            record1.semantic_error,
             offsets1,
             record_index1,
         );
@@ -1199,7 +1196,11 @@ fn checkInterleavedSource(
             } };
         };
         const both_headers_borrowed = buffered_record2 != null;
-        const record2 = buffered_record2 orelse record: {
+        var semantic2: ?zfastq.SemanticError = null;
+        const header2 = if (buffered_record2) |record2| header: {
+            if (semantic1 == null) semantic2 = validator.validate(record2);
+            break :header record2.header;
+        } else header: {
             if (semantic1 == null) {
                 const name1 = pairing.parseName(record1.header, options.pair_name_policy);
                 normalized_id.clearRetainingCapacity();
@@ -1212,20 +1213,39 @@ fn checkInterleavedSource(
                 first_mate_marker = name1.first_mate_marker;
                 mate1_markers = name1.mate_markers;
             }
-            break :record fastq.nextRecordWithoutId(&reader) catch |err| {
+            if (semantic1) |failure| {
+                const record2 = fastq.nextRecordWithoutId(&reader) catch |err| {
+                    return .{ .command = .{
+                        .input_index = 0,
+                        .details = mapReaderFailure(&reader, err),
+                    } };
+                } orelse return .{ .pair = .{ .count_mismatch = .{
+                    .pair_index = record_index1 / 2,
+                    .remaining_side = 0,
+                    .record_indexes = .{
+                        record_index1,
+                        if (record_index1 == 0) null else record_index1 - 1,
+                    },
+                } } };
+                _ = record2;
+                return .{ .command = .{ .input_index = 0, .details = failure } };
+            }
+            const record2 = fastq.nextValidatedHeader(&reader, &validator) catch |err| {
                 return .{ .command = .{
                     .input_index = 0,
                     .details = mapReaderFailure(&reader, err),
                 } };
-            };
-        } orelse return .{ .pair = .{ .count_mismatch = .{
-            .pair_index = record_index1 / 2,
-            .remaining_side = 0,
-            .record_indexes = .{
-                record_index1,
-                if (record_index1 == 0) null else record_index1 - 1,
-            },
-        } } };
+            } orelse return .{ .pair = .{ .count_mismatch = .{
+                .pair_index = record_index1 / 2,
+                .remaining_side = 0,
+                .record_indexes = .{
+                    record_index1,
+                    if (record_index1 == 0) null else record_index1 - 1,
+                },
+            } } };
+            semantic2 = record2.semantic_error;
+            break :header record2.header;
+        };
 
         if (semantic1) |failure| {
             return .{ .command = .{ .input_index = 0, .details = failure } };
@@ -1233,9 +1253,8 @@ fn checkInterleavedSource(
 
         const record_index2 = reader.recordIndex() - 1;
         const offsets2 = reader.currentRecordOffsets().?;
-        if (validateCommandRecord(
-            &validator,
-            record2,
+        if (mapSemanticFailure(
+            semantic2,
             offsets2,
             record_index2,
         )) |failure| {
@@ -1243,7 +1262,7 @@ fn checkInterleavedSource(
         }
 
         const names_match = if (both_headers_borrowed)
-            pairing.headersMatch(record1.header, record2.header, options.pair_name_policy)
+            pairing.headersMatch(record1.header, header2, options.pair_name_policy)
         else blk: {
             const name1: pairing.Name = .{
                 .first_token = normalized_id.items,
@@ -1251,11 +1270,11 @@ fn checkInterleavedSource(
                 .mate_markers = mate1_markers,
                 .first_mate_marker = first_mate_marker,
             };
-            const name2 = pairing.parseName(record2.header, options.pair_name_policy);
+            const name2 = pairing.parseName(header2, options.pair_name_policy);
             break :blk pairing.namesMatch(name1, name2);
         };
         if (!names_match) {
-            const name2 = pairing.parseName(record2.header, options.pair_name_policy);
+            const name2 = pairing.parseName(header2, options.pair_name_policy);
             return .{ .pair = .{ .name_mismatch = .{
                 .pair_index = record_index1 / 2,
                 .records = .{
