@@ -753,8 +753,8 @@ pub const Reader = struct {
 
     /// Returns the next borrowed record, or null at a clean EOF boundary.
     pub fn next(self: *Reader) ReaderError!?Record {
-        var canonical_span: ?[]const u8 = null;
-        return self.nextWithCanonicalSpan(&canonical_span, true);
+        var unused_canonical_span: ?[]const u8 = null;
+        return self.nextRecord(&unused_canonical_span, true, false);
     }
 
     fn nextWithCanonicalSpan(
