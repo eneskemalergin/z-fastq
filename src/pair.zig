@@ -111,16 +111,60 @@ fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
     if (header1.len < 3 or header1.len != header2.len) return false;
     if (header1[header1.len - 2] != '/' or header2[header2.len - 2] != '/') return false;
     if (header1[header1.len - 1] != '1' or header2[header2.len - 1] != '2') return false;
-    if (!std.mem.eql(u8, header1[0 .. header1.len - 1], header2[0 .. header2.len - 1])) {
-        return false;
+
+    const prefix_len = header1.len - 1;
+    var separator_plus_one: usize = 0;
+    var offset: usize = 0;
+    while (prefix_len - offset >= token_lanes) : (offset += token_lanes) {
+        const bytes1: TokenVector = header1[offset..][0..token_lanes].*;
+        const bytes2: TokenVector = header2[offset..][0..token_lanes].*;
+        const spaces: TokenVector = @splat(' ');
+        const tabs: TokenVector = @splat('\t');
+        if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return false;
+
+        const space_mask: u16 = @bitCast(bytes1 == spaces);
+        if (space_mask != 0) {
+            if (separator_plus_one != 0 or space_mask & (space_mask - 1) != 0) return false;
+            separator_plus_one = offset + @as(usize, @intCast(@ctz(space_mask))) + 1;
+        }
     }
 
-    const first_token = header1[0..firstTokenEnd(header1)];
-    if (first_token.len == header1.len) return true;
+    inline for (.{ 8, 4 }) |lanes| {
+        if (prefix_len - offset >= lanes) {
+            const Vector = @Vector(lanes, u8);
+            const Mask = @Int(.unsigned, lanes);
+            const bytes1: Vector = header1[offset..][0..lanes].*;
+            const bytes2: Vector = header2[offset..][0..lanes].*;
+            const spaces: Vector = @splat(' ');
+            const tabs: Vector = @splat('\t');
+            if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return false;
+
+            const space_mask: Mask = @bitCast(bytes1 == spaces);
+            if (space_mask != 0) {
+                if (separator_plus_one != 0 or space_mask & (space_mask - 1) != 0) {
+                    return false;
+                }
+                separator_plus_one = offset + @as(usize, @intCast(@ctz(space_mask))) + 1;
+            }
+            offset += lanes;
+        }
+    }
+    while (offset < prefix_len) : (offset += 1) {
+        if (header1[offset] != header2[offset] or header1[offset] == '\t') return false;
+        if (header1[offset] == ' ') {
+            if (separator_plus_one != 0) return false;
+            separator_plus_one = offset + 1;
+        }
+    }
+
+    if (separator_plus_one == 0) return true;
+    const separator = separator_plus_one - 1;
+    if (separator == 0) return false;
+
+    const first_token = header1[0..separator];
     if (terminalMateMarker(first_token) != null) return false;
 
-    const second_token = nextToken(header1, first_token.len);
-    return second_token.ends_header and leadingMateMarker(second_token.bytes) == null;
+    return leadingMateMarker(header1[separator_plus_one..]) == null;
 }
 
 fn leadingMateMarker(token: []const u8) ?u2 {
@@ -204,4 +248,48 @@ test "[property] - [paired names]: token finder matches scalar boundaries" {
             }
         }
     }
+}
+
+test "[property] - [paired names]: combined terminal proof covers vector boundaries" {
+    const lengths = [_]usize{ 3, 4, 15, 16, 17, 31, 32, 33, 63, 64, 65 };
+    var header1: [65]u8 = undefined;
+    var header2: [65]u8 = undefined;
+
+    for (lengths) |length| {
+        @memset(header1[0..length], 'x');
+        @memset(header2[0..length], 'x');
+        header1[length - 2] = '/';
+        header2[length - 2] = '/';
+        header1[length - 1] = '1';
+        header2[length - 1] = '2';
+        try std.testing.expect(terminalPairHeadersMatch(
+            header1[0..length],
+            header2[0..length],
+        ));
+
+        for (1..length - 2) |separator| {
+            header1[separator] = ' ';
+            header2[separator] = ' ';
+            try std.testing.expect(terminalPairHeadersMatch(
+                header1[0..length],
+                header2[0..length],
+            ));
+            header1[separator] = 'x';
+            header2[separator] = 'x';
+        }
+    }
+
+    const fallback_pairs = [_][2][]const u8{
+        .{ "cluster  lane/1", "cluster  lane/2" },
+        .{ "cluster\tlane/1", "cluster\tlane/2" },
+        .{ "cluster left/1", "cluster right/2" },
+        .{ "cluster/1 lane/1", "cluster/2 lane/2" },
+    };
+    for (fallback_pairs) |headers| {
+        try std.testing.expect(!terminalPairHeadersMatch(headers[0], headers[1]));
+        try std.testing.expect(headersMatch(headers[0], headers[1], .illumina));
+    }
+
+    try std.testing.expect(!terminalPairHeadersMatch(" 1:N:0/1", " 1:N:0/2"));
+    try std.testing.expect(!terminalPairHeadersMatch("cluster 1:N:0/1", "cluster 1:N:0/2"));
 }
