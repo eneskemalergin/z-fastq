@@ -252,8 +252,8 @@ test "[property] - [paired names]: token finder matches scalar boundaries" {
 
 test "[property] - [paired names]: combined terminal proof covers vector boundaries" {
     const lengths = [_]usize{ 3, 4, 15, 16, 17, 31, 32, 33, 63, 64, 65 };
-    var header1: [65]u8 = undefined;
-    var header2: [65]u8 = undefined;
+    var header1 = [_]u8{'x'} ** 65;
+    var header2 = [_]u8{'x'} ** 65;
 
     for (lengths) |length| {
         @memset(header1[0..length], 'x');
