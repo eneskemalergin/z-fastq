@@ -158,6 +158,25 @@ fn validateRecordVector(
     var sequence_invalid: Mask = @splat(false);
     var quality_invalid: Mask = @splat(false);
     var byte_index: usize = 0;
+    while (record.sequence.len - byte_index >= 4 * vector_len) : (byte_index += 4 * vector_len) {
+        const sequence0: Bytes = record.sequence[byte_index..][0..vector_len].*;
+        const sequence1: Bytes = record.sequence[byte_index + vector_len ..][0..vector_len].*;
+        const sequence2: Bytes = record.sequence[byte_index + 2 * vector_len ..][0..vector_len].*;
+        const sequence3: Bytes = record.sequence[byte_index + 3 * vector_len ..][0..vector_len].*;
+        sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence0) |
+            invalidSequenceVector(vector_len, alphabet, sequence1) |
+            invalidSequenceVector(vector_len, alphabet, sequence2) |
+            invalidSequenceVector(vector_len, alphabet, sequence3);
+
+        const quality0: Bytes = record.quality[byte_index..][0..vector_len].*;
+        const quality1: Bytes = record.quality[byte_index + vector_len ..][0..vector_len].*;
+        const quality2: Bytes = record.quality[byte_index + 2 * vector_len ..][0..vector_len].*;
+        const quality3: Bytes = record.quality[byte_index + 3 * vector_len ..][0..vector_len].*;
+        quality_invalid |= invalidQualityVector(vector_len, quality0) |
+            invalidQualityVector(vector_len, quality1) |
+            invalidQualityVector(vector_len, quality2) |
+            invalidQualityVector(vector_len, quality3);
+    }
     while (record.sequence.len - byte_index >= 2 * vector_len) : (byte_index += 2 * vector_len) {
         const sequence0: Bytes = record.sequence[byte_index..][0..vector_len].*;
         const sequence1: Bytes = record.sequence[byte_index + vector_len ..][0..vector_len].*;
@@ -3852,7 +3871,7 @@ test "[property] - [record validation]: adaptive IUPAC state preserves byte poli
 
 test "[property] - [record validation]: fused vectors preserve field precedence" {
     const vector_len = std.simd.suggestVectorLength(u8) orelse return;
-    const length = 4 * vector_len - 1;
+    const length = 8 * vector_len - 1;
     const sequence = try std.testing.allocator.alloc(u8, length);
     defer std.testing.allocator.free(sequence);
     const quality = try std.testing.allocator.alloc(u8, length);
@@ -3867,27 +3886,30 @@ test "[property] - [record validation]: fused vectors preserve field precedence"
         .plus = "",
         .quality = quality,
     };
-    for (0..length + 1) |field_len| {
-        const current = Record{
-            .header = record.header,
-            .id = record.id,
-            .sequence = record.sequence[0..field_len],
-            .plus = record.plus,
-            .quality = record.quality[0..field_len],
-        };
-        try std.testing.expect(validateRecord(current, .{}) == null);
-        if (field_len == 0) continue;
+    for ([_]Alphabet{ .iupac, .acgtn }) |alphabet| {
+        for (0..length + 1) |field_len| {
+            const current = Record{
+                .header = record.header,
+                .id = record.id,
+                .sequence = record.sequence[0..field_len],
+                .plus = record.plus,
+                .quality = record.quality[0..field_len],
+            };
+            const options: ValidationOptions = .{ .alphabet = alphabet };
+            try std.testing.expect(validateRecord(current, options) == null);
+            if (field_len == 0) continue;
 
-        quality[0] = 32;
-        sequence[field_len - 1] = '.';
-        const sequence_error = validateRecord(current, .{}).?;
-        try std.testing.expectEqual(SemanticField.sequence, sequence_error.field);
-        try std.testing.expectEqual(field_len - 1, sequence_error.byte_index);
+            quality[0] = 32;
+            sequence[field_len - 1] = '.';
+            const sequence_error = validateRecord(current, options).?;
+            try std.testing.expectEqual(SemanticField.sequence, sequence_error.field);
+            try std.testing.expectEqual(field_len - 1, sequence_error.byte_index);
 
-        sequence[field_len - 1] = 'A';
-        const quality_error = validateRecord(current, .{}).?;
-        try std.testing.expectEqual(SemanticField.quality, quality_error.field);
-        try std.testing.expectEqual(@as(usize, 0), quality_error.byte_index);
-        quality[0] = '!';
+            sequence[field_len - 1] = 'A';
+            const quality_error = validateRecord(current, options).?;
+            try std.testing.expectEqual(SemanticField.quality, quality_error.field);
+            try std.testing.expectEqual(@as(usize, 0), quality_error.byte_index);
+            quality[0] = '!';
+        }
     }
 }

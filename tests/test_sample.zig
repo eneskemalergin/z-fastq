@@ -1191,7 +1191,7 @@ test "[cli] - [paired sample]: failing pairs leave only earlier complete pairs" 
     });
     try tmp.dir.writeFile(io, .{
         .sub_path = "r2.fastq",
-        .data = "@bad/2\nA\n+\n!\n",
+        .data = "@bad/2\nA\n+\n \n",
     });
     const mate1_semantic = try std.fmt.allocPrint(
         allocator,
