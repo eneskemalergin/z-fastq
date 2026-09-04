@@ -69,8 +69,23 @@ const HeaderToken = struct {
     ends_header: bool,
 };
 
+const token_lanes = 16;
+const TokenVector = @Vector(token_lanes, u8);
+
 fn firstTokenEnd(header: []const u8) usize {
-    var end: usize = 0;
+    return tokenEnd(header, 0);
+}
+
+fn tokenEnd(header: []const u8, start: usize) usize {
+    const spaces: TokenVector = @splat(' ');
+    const tabs: TokenVector = @splat('\t');
+
+    var end = start;
+    while (header.len - end >= token_lanes) : (end += token_lanes) {
+        const bytes: TokenVector = header[end..][0..token_lanes].*;
+        const mask: u16 = @bitCast((bytes == spaces) | (bytes == tabs));
+        if (mask != 0) return end + @as(usize, @intCast(@ctz(mask)));
+    }
     while (end < header.len and header[end] != ' ' and header[end] != '\t') {
         end += 1;
     }
@@ -82,10 +97,7 @@ fn nextToken(header: []const u8, previous_end: usize) HeaderToken {
     while (start < header.len and (header[start] == ' ' or header[start] == '\t')) {
         start += 1;
     }
-    var end = start;
-    while (end < header.len and header[end] != ' ' and header[end] != '\t') {
-        end += 1;
-    }
+    const end = tokenEnd(header, start);
     return .{ .bytes = header[start..end], .ends_header = end == header.len };
 }
 
@@ -96,7 +108,7 @@ noinline fn illuminaHeadersMatch(header1: []const u8, header2: []const u8) bool 
 }
 
 fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
-    if (header1.len < 2 or header1.len != header2.len) return false;
+    if (header1.len < 3 or header1.len != header2.len) return false;
     if (header1[header1.len - 2] != '/' or header2[header2.len - 2] != '/') return false;
     if (header1[header1.len - 1] != '1' or header2[header2.len - 1] != '2') return false;
     if (!std.mem.eql(u8, header1[0 .. header1.len - 1], header2[0 .. header2.len - 1])) {
@@ -152,6 +164,8 @@ test "[property] - [paired names]: success-first matching preserves established 
         "cluster description note/2",
         "other/1",
         "other/2",
+        "/1",
+        "/2",
         "",
     };
     const policies = [_]NamePolicy{ .illumina, .exact };
@@ -167,6 +181,26 @@ test "[property] - [paired names]: success-first matching preserves established 
                     expected,
                     headersMatch(header1, header2, policy),
                 );
+            }
+        }
+    }
+}
+
+test "[property] - [paired names]: token finder matches scalar boundaries" {
+    const lengths = [_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 65 };
+    var bytes: [65]u8 = undefined;
+
+    for (lengths) |length| {
+        for (0..length + 1) |start| {
+            @memset(bytes[0..length], 'x');
+            try std.testing.expectEqual(length, tokenEnd(bytes[0..length], start));
+
+            for (start..length) |stop| {
+                for (" \t") |delimiter| {
+                    @memset(bytes[0..length], 'x');
+                    bytes[stop] = delimiter;
+                    try std.testing.expectEqual(stop, tokenEnd(bytes[0..length], start));
+                }
             }
         }
     }

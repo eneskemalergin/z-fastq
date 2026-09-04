@@ -932,6 +932,7 @@ test "[cli] - [paired check]: P001 diagnostics retain exact bounded identity fie
         .{ .header1 = "cluster/1", .header2 = "cluster" },
         .{ .header1 = "cluster/1 2:N:0:index", .header2 = "cluster/2" },
         .{ .header1 = "cluster 1/2", .header2 = "cluster 1/1" },
+        .{ .header1 = "/1", .header2 = "/2" },
         .{
             .header1 = "instrument:run:flowcell:1:2:3:4:UMI-A 1:N:0:index",
             .header2 = "instrument:run:flowcell:1:2:3:4:UMI-B 2:N:0:index",
