@@ -97,7 +97,7 @@ The README stays intentionally short. The detailed reference will cover:
 - benchmark methods and results;
 - the Zig module API.
 
-See the [project Wiki](https://github.com/eneskemalergin/z-fastq/wiki) for the evolving documentation. Development notes and local benchmark tooling are kept in [`plan/`](plan/) and [`tools/`](tools/).
+See the [project Wiki](https://github.com/eneskemalergin/z-fastq/wiki) for the evolving user documentation.
 
 ## Performance
 
