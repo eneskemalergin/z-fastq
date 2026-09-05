@@ -1,72 +1,139 @@
-# z-fastq
+<!-- markdownlint-disable MD033 MD041 -->
 
-Fast, single-core Zig CLI for streaming FASTQ work.
+<h1 align="center">Z-FASTQ</h1>
 
-## Build
+<p align="center">
+  <strong>Fast, bounded-memory FASTQ work in one Zig executable.</strong>
+</p>
 
-Requires Zig 0.16.0 available as `zig` on `PATH`.
+<p align="center">
+  <a href="https://github.com/eneskemalergin/z-fastq/releases"><img src="https://img.shields.io/badge/version-v0.0.15-2563eb?style=flat-square" alt="Version v0.0.15"></a>
+  <a href="https://github.com/eneskemalergin/z-fastq"><img src="https://img.shields.io/badge/status-polishing-eab308?style=flat-square" alt="Status: polishing"></a>
+  <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
+  <img src="https://img.shields.io/badge/platform-Linux%20x86--64-64748b?style=flat-square" alt="Supported platform: Linux x86-64">
+  <img src="https://img.shields.io/badge/license-not%20selected-94a3b8?style=flat-square" alt="License not selected yet">
+</p>
+
+---
+
+z-fastq is a single-core command-line toolkit for working with plain and gzip-compressed FASTQ. It is designed around predictable streaming, bounded memory use, explicit validation, and useful behavior on real sequencing data.
+
+## What it does
+
+- Count FASTQ records from files or standard input.
+- Calculate read-length, base-composition, GC, and quality statistics.
+- Validate structure, sequence alphabets, quality bytes, and paired-read names.
+- Sample records by fraction or exact count, including paired and interleaved input.
+- Interleave and deinterleave paired FASTQ.
+- Read plain FASTQ and gzip input through the same streaming interface.
+- Emit machine-readable JSON for selected statistics and validation workflows.
+
+The CLI is the primary product. A small Zig module is also exported for applications that need the reader, writer, validation, statistics, and I/O building blocks directly.
+
+## Why it exists
+
+I am building z-fastq around a simple constraint: bioinformatics tools should remain practical on ordinary hardware. That means a small executable, bounded streaming memory, and a predictable cost per process.
+
+The current CLI is single-threaded by design. That keeps one invocation easy to reason about and leaves multi-file scheduling to the workflow layer. My ambition is to make z-fastq one of the fastest general-purpose FASTQ toolkits without requiring server-class hardware. The long-term goal is to process several files at once without hiding a second layer of threads or multiplying memory use inside every worker.
+
+## A few honest boundaries
+
+The supported release target is currently **Linux x86-64**. Native Windows and other targets are not supported yet.
+
+The accelerated build uses vendored ISA-L for gzip and CRC work and requires NASM when built from source. The ISA-L-disabled build uses the Zig implementation and retains a portable CRC fallback:
+
+```bash
+zig build -Disa-l=false
+```
+
+The release path is intended to be static. More detailed format guarantees, limits, error codes, JSON schemas, and compatibility notes belong in the project documentation rather than this overview.
+
+## Start
+
+Build with [Zig 0.16.0](https://ziglang.org/download/):
 
 ```bash
 zig build
 zig build test
-zig build test -Dstatic=true -Doptimize=ReleaseSafe
+zig build -Dstatic=true -Doptimize=ReleaseSafe
 zig build -Dstatic=true -Doptimize=ReleaseFast
 ```
 
-`zig build` defaults to Debug. Use ReleaseSafe to check the optimized static release path with runtime safety, then ReleaseFast for the final single-threaded, static, stripped binary. `-Dstatic=true` states the required release configuration explicitly.
-
-The supported Linux x86-64 build uses the vendored ISA-L 2.32.1 stateful inflate and CRC path by default. Building this path from source requires NASM 2.14.01 or newer. Use `-Disa-l=false` to exclude ISA-L, NASM, and its C linkage from the build. The Zig path runtime-selects PCLMUL CRC-32 on supported x86-64 processors and retains a portable fallback. Both paths stream through bounded storage and validate the same project-owned gzip framing, CRC-32, ISIZE, and concatenated-member behavior.
-
-### Dependency and portability boundary
-
-The project as a whole is not dependency-free. The accelerated build compiles vendored BSD-licensed ISA-L C and x86-64 assembly and needs NASM when built from source. The static release includes ISA-L and its C runtime support in the executable, so users do not install either separately. The ISA-L-disabled path needs no external compression library, C runtime linkage, or assembler beyond the Zig toolchain. No other build target is currently supported.
-
-## Usage
+Try the main workflows:
 
 ```bash
-./zig-out/bin/z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
-./zig-out/bin/z-fastq stats [--json] [--max-line-bytes N] <path|-> [<path|-> ...]
-./zig-out/bin/z-fastq check [--json] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|-> [<path|-> ...]
-./zig-out/bin/z-fastq check --paired [--json] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
-./zig-out/bin/z-fastq check --interleaved [--json] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
-./zig-out/bin/z-fastq sample --fraction P [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
-./zig-out/bin/z-fastq sample --count K [--seed S] [--alphabet iupac|acgtn] [--max-line-bytes N] <path>
-./zig-out/bin/z-fastq sample --paired --fraction P [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
-./zig-out/bin/z-fastq sample --interleaved --fraction P [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <path|->
-./zig-out/bin/z-fastq sample --paired --count K [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1-path> <R2-path>
-./zig-out/bin/z-fastq sample --interleaved --count K [--seed S] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <path>
-./zig-out/bin/z-fastq interleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] <R1|-> <R2|->
-./zig-out/bin/z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
+./zig-out/bin/z-fastq count reads.fastq.gz
+./zig-out/bin/z-fastq stats reads.fastq.gz
+./zig-out/bin/z-fastq check --alphabet iupac reads.fastq.gz
+./zig-out/bin/z-fastq sample --fraction 0.10 --seed 11 reads.fastq.gz > sample.fastq
+./zig-out/bin/z-fastq interleave reads_R1.fastq.gz reads_R2.fastq.gz > interleaved.fastq
 ```
 
-`count` prints one record count for each successfully parsed plain or gzip path, or explicit `-` for standard input. Input bytes select gzip independently of the path suffix. Standard input may appear once and is never selected implicitly. Non-zero exit status indicates an error; parse failures include record index, line number, and byte offset on stderr.
+Use `z-fastq --help` for the complete command and option reference.
 
-`stats` reports aggregate read lengths, case-insensitive base composition, GC fraction as `(G+C)/(A+C+G+T)`, and Phred+33 mean, Q20, and Q30 metrics. Undefined values print as `-`. Quality bytes outside ASCII 33 through 126 fail with S006 rather than entering the result.
+## Commands
 
-`check` validates FASTQ structure, sequence symbols, and Phred+33 byte range. Every header must start with `@` followed immediately by a nonempty identifier token; spaces or tabs may follow that token. Its default alphabet accepts upper- and lowercase IUPAC nucleotide symbols; `--alphabet acgtn` selects the narrower A, C, G, T, and N policy. Successful validation is silent. The first failure in each input reports an S001 through S006 code with its zero-based record index and byte offset plus its one-based record line.
+| Command        | Purpose                                                    |
+| -------------- | ---------------------------------------------------------- |
+| `count`        | Count successfully parsed records.                         |
+| `stats`        | Report lengths, composition, GC, and quality metrics.      |
+| `check`        | Validate FASTQ structure, symbols, qualities, and pairing. |
+| `sample`       | Select records or read pairs by fraction or exact count.   |
+| `interleave`   | Combine R1 and R2 into a validated interleaved stream.     |
+| `deinterleave` | Split validated interleaved reads into two output files.   |
 
-`check --paired` validates two inputs in lock step, and `check --interleaved` validates consecutive records as R1 and R2. The default Illumina name policy recognizes modern second-token mate fields, legacy first-token `/1` and `/2`, and terminal mate suffixes on the second token. Equal unmarked first tokens also pass. `--pair-names exact` instead requires complete first-token equality. P001 reports name or mate-direction disagreement; P002 reports unequal two-file counts or an odd interleaved record. Paired mode accepts standard input on at most one side.
+All commands report errors with non-zero exit status. Validation and parsing failures identify the affected record and source location where available.
 
-`sample --fraction` selects complete records independently with probability P and writes plain FASTQ with LF endings. P uses the exact decimal grammar documented by `--help`, and the seed is an unsigned 64-bit decimal value that defaults to 11. Selected indexes and output bytes match `seqtk sample` on the screened subset with LF endings, nonempty records, bare plus lines, printable ASCII headers, a signed 64-bit seed, and a P that seqtk also interprets as a fraction. Every record is validated before selection, so fraction 0 cannot hide invalid input. Values that parse to fraction 0 or fraction 1 avoid random-number work.
+## Documentation
 
-Paired and interleaved sampling treat each validated pair as one selection unit and write selected pairs as mate 1 then mate 2 on stdout. Both forms validate every mate and pair relationship even when the pair is not selected. Fraction mode is one pass, and the two-file form permits standard input on one side.
+The README stays intentionally short. The detailed reference will cover:
 
-`sample --count` selects exactly `min(K, N)` records, or `min(K, M)` pairs in paired modes, from regular plain or gzip paths. It uses a bounded index reservoir compatible with `seqtk sample -2`, then reopens and validates every input before writing selected units in input order. K is an unsigned 64-bit decimal value. Standard input is rejected because exact mode requires two passes. Each path is checked independently for file identity, size, modification time, and final unit count. This is a best-effort change guard, and concurrent modification that preserves those signals is unsupported. Output is not transactional and may contain a valid prefix if the second pass fails.
+- command options and examples;
+- FASTQ and gzip behavior;
+- paired-read name policies;
+- sampling compatibility and reproducibility;
+- JSON schemas and exit statuses;
+- resource limits and portability;
+- benchmark methods and results;
+- the Zig module API.
 
-`interleave` reads R1 and R2 in lock step, validates both records and their paired names, then writes R1 followed by R2 as plain LF-terminated FASTQ. Plain and gzip inputs may be mixed, and standard input may appear on at most one side. A validation or input failure can leave complete earlier pairs on stdout, while an output failure may leave an arbitrary byte prefix because stdout is not transactional.
+See the [project Wiki](https://github.com/eneskemalergin/z-fastq/wiki) for the evolving documentation. Development notes and local benchmark tooling are kept in [`plan/`](plan/) and [`tools/`](tools/).
 
-`deinterleave` validates consecutive records as one pair and writes canonical LF-terminated R1 and R2 records to two required plain FASTQ paths. The input may be plain, gzip, or standard input. Both outputs are created exclusively after a path input opens, so existing paths are never truncated. A handled validation, input, write, or flush failure removes outputs still owned by the command. An observed replacement is preserved and reported. Direct outputs remain visible while the command runs, and a crash or replacement after the ownership check can leave partial files because the command is not a filesystem transaction.
+## Performance
 
-`stats --json` and `check --json` emit one provisional versioned JSON document with results in input order. The schema identifiers are `z-fastq/stats-v1` and `z-fastq/check-v1`. The top-level fields are `schema`, `tool`, `byte_strings`, and `results`. Ordinary results contain `input`; two-file paired results contain the ordered `inputs` array. Successful stats results add the human-mode aggregate fields, successful check results add no payload, and failed results add an error. Single-record S errors retain nullable record locations. P001 contains both record positions, 128-byte bounded first-token and normalized-ID prefixes, original lengths, truncation flags, and recognized mate-marker arrays. P002 contains the remaining side and last known record indexes. Counters remain JSON integers in the unsigned 64-bit range from 0 through 18,446,744,073,709,551,615, while undefined numeric values are null. Consumers backed only by IEEE-754 doubles cannot preserve every integer above 9,007,199,254,740,991 and need arbitrary-precision number handling when such values are possible. Handled input and validation failures stay inside the result array, while invalid command usage remains on stderr. Input labels and identifier prefixes use the reversible `escaped-bytes-v1` representation rather than assuming UTF-8.
+Performance work is central to the project. The goal is not only to finish a FASTQ job quickly, but to do it with a small enough process footprint that several jobs can share a consumer machine.
 
-Exit status 1 reports invalid FASTQ, 2 reports command-line usage, 3 reports I/O or unexpected allocation failure, and 4 reports configured or arithmetic limits. Untrusted command, option, and path bytes are displayed using printable ASCII, doubled backslashes, and uppercase `\xHH` escapes for all other bytes.
+### Early signal, not a final benchmark
 
-## Optional Zig module
+The project is still in polishing. Internals, defaults, and hot paths change often enough that final benchmark tables and public methodology are still being developed. I prefer to share the direction without presenting unfinished numbers as a permanent leaderboard.
 
-The CLI is the primary product. The tertiary Zig surface is exported from `src/root.zig` and registered as the `z-fastq` package module. It provides `Reader`, `Writer`, borrowed `Record`, `OwnedRecord`, structural and semantic diagnostics, allocation-free record validation with `validateRecord()`, `count_scan`, the checked allocation-free `Stats` accumulator, plain and gzip `io` adapters, shared `limits`, and `VERSION`.
+Early local comparisons suggest that z-fastq is often **about 1.5x to 5x faster** than selected peers, while using **roughly 2x to 5x less peak RSS** in comparable runs. The latest audited static ReleaseFast binary is under 1 MB, at about 744 kB.
 
-Records returned by `Reader.next()` borrow reader storage until the next reader advance or deinitialization. Use `toOwned()` and later `OwnedRecord.deinit()` when a record must outlive that boundary. Byte-source and byte-sink wrappers are copied, but their referenced adapters must outlive the reader or writer. `io.gzip.ReaderSource` validates RFC 1952 headers, DEFLATE payloads, trailers, and concatenated members while borrowing a `std.Io.Reader` with at least ten buffer bytes.
+Those ranges vary with the command, plain versus gzip input, read length, pairing mode, sampling mode, and comparison tool. Sampling and output-heavy workflows are still being tuned, so these figures are signals of direction rather than a universal ranking. The aim is a fast, small process that can be scheduled across several files without every worker consuming more of the machine than necessary.
+
+The peer set is deliberately mixed. It includes familiar baseline tools such as `seqtk`, `fqtools`, `BBTools`, `SeqFu`, and `FastQValidator`, alongside newer native implementations, including Rust-based tools such as `Needletail`, `Helicase`, `fq`, `Fasten`, `fqkit`, and `Rasusa`. The familiar tools anchor common practice. The newer native tools are closer to z-fastq's low-level design and give a more useful comparison for throughput and memory. I only compare overlapping work, and keep differences in validation rules, RNGs, output behavior, and child-process accounting visible.
+
+For perspective, a few large-input scale probes looked like this:
+
+| Workload         | Input on disk | FASTQ bytes processed | Observed wall time |  Peak RSS |
+| ---------------- | ------------: | --------------------: | -----------------: | --------: |
+| `count`          |  1.4 GB plain |          1.4 GB plain |             212 ms |   896 KiB |
+| `count`          |   793 MB gzip |       6.14 GB decoded |             3.55 s |   896 KiB |
+| `stats`          |  6.1 GB plain |          6.1 GB plain |             2.26 s |   896 KiB |
+| `stats`          |   793 MB gzip |       6.14 GB decoded |             4.62 s |   896 KiB |
+| `interleave`     |   1.0 GB gzip |       3.58 GB decoded |             5.72 s | 1,048 KiB |
+| `check --paired` |   1.0 GB gzip |       3.58 GB decoded |             5.50 s | 1,336 KiB |
+
+Peak RSS here means resident memory measured for the z-fastq process itself. These single-run scale probes are useful for showing the shape of the system, not for making a final cross-platform promise.
+
+Final benchmark documentation will include the measurement method, peer scope, correctness checks, and raw reports when the implementation settles.
 
 ## License
 
-The project license is not yet selected. The vendored ISA-L subset retains its [BSD-3-Clause license](vendor/ISA-L/LICENSE.md), which must accompany binary distributions that contain that code.
+The project license is still being selected. The vendored ISA-L subset retains its [BSD-3-Clause license](vendor/ISA-L/LICENSE.md), which must accompany binary distributions that contain that code.
+
+---
+
+<p align="center"><em>Four lines hold a life,<br>
+Each base travels through the night,<br>
+Reads emerge as light.</em></p>
