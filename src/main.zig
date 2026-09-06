@@ -1371,11 +1371,11 @@ fn checkInput(
     var input: RecordInput = undefined;
     if (initRecordInput(&input, io, label)) |failure| return failure;
     defer input.deinit(io);
-    return checkSource(input.byteSource(), options);
+    return checkRecordInput(&input, options);
 }
 
-fn checkSource(
-    source: zfastq.io.ByteSource,
+fn checkRecordInput(
+    input: *RecordInput,
     options: CheckOptions,
 ) ?CommandFailure {
     var scanner = fastq.CheckScanner.init(
@@ -1384,11 +1384,10 @@ fn checkSource(
     );
     var buf: [zfastq.limits.COUNT_READ_BUFFER_BYTES]u8 = undefined;
     while (true) {
-        const n = source.read(&buf) catch {
+        const chunk = input.readScannerChunk(&buf) catch
             return CommandFailure.plain("io_error", "I/O error", 3);
-        };
-        if (n == 0) break;
-        _ = scanner.feed(buf[0..n]) catch |err| {
+        const decoded = chunk orelse break;
+        _ = scanner.feed(decoded) catch |err| {
             return mapCheckScannerFailure(&scanner, err);
         };
     }
@@ -1538,6 +1537,17 @@ const RecordInput = struct {
         return switch (self.source) {
             .plain => |*source| source.byteSource(),
             .gzip => |*source| source.byteSource(),
+        };
+    }
+
+    fn readScannerChunk(self: *RecordInput, buffer: []u8) error{Io}!?[]const u8 {
+        return switch (self.source) {
+            .plain => |*source| plain: {
+                const byte_source = source.byteSource();
+                const count = byte_source.read(buffer) catch return error.Io;
+                break :plain if (count == 0) null else buffer[0..count];
+            },
+            .gzip => |*source| io_layer.readGzipChunk(source, buffer) catch return error.Io,
         };
     }
 };
@@ -2377,15 +2387,14 @@ fn sampleExactFirstPass(
         .{ .max_line_bytes = options.max_line_bytes },
         .{ .alphabet = options.alphabet },
     );
-    const source = input.byteSource();
     var buf: [SAMPLE_SCAN_BUFFER_BYTES]u8 = undefined;
     while (true) {
-        const n = source.read(&buf) catch {
+        const chunk = input.readScannerChunk(&buf) catch {
             failure = CommandFailure.plain("io_error", "I/O error", 3);
             break;
         };
-        if (n == 0) break;
-        _ = scanner.feed(buf[0..n]) catch |err| {
+        const decoded = chunk orelse break;
+        _ = scanner.feed(decoded) catch |err| {
             failure = considerExactRecords(allocator, selector, scanner.record_index);
             if (failure == null) failure = mapCheckScannerFailure(&scanner, err);
             break;
