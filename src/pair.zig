@@ -50,7 +50,7 @@ pub fn parseName(header: []const u8, policy: NamePolicy) Name {
 
 pub fn headersMatch(header1: []const u8, header2: []const u8, policy: NamePolicy) bool {
     return switch (policy) {
-        .exact => namesMatch(parseName(header1, policy), parseName(header2, policy)),
+        .exact => exactHeadersMatch(header1, header2),
         .illumina => illuminaHeadersMatch(header1, header2),
     };
 }
@@ -71,6 +71,42 @@ const HeaderToken = struct {
 
 const token_lanes = 16;
 const TokenVector = @Vector(token_lanes, u8);
+
+fn exactHeadersMatch(header1: []const u8, header2: []const u8) bool {
+    const common_len = @min(header1.len, header2.len);
+    const spaces: TokenVector = @splat(' ');
+    const tabs: TokenVector = @splat('\t');
+
+    var offset: usize = 0;
+    while (common_len - offset >= token_lanes) : (offset += token_lanes) {
+        const bytes1: TokenVector = header1[offset..][0..token_lanes].*;
+        const bytes2: TokenVector = header2[offset..][0..token_lanes].*;
+        const stop1: u16 = @bitCast((bytes1 == spaces) | (bytes1 == tabs));
+        const stop2: u16 = @bitCast((bytes2 == spaces) | (bytes2 == tabs));
+        const mismatch: u16 = @bitCast(bytes1 != bytes2);
+        const event = stop1 | stop2 | mismatch;
+        if (event != 0) {
+            const lane = @as(usize, @intCast(@ctz(event)));
+            const bit = @as(u16, 1) << @intCast(lane);
+            const token_end1 = stop1 & bit != 0;
+            const token_end2 = stop2 & bit != 0;
+            return offset + lane != 0 and token_end1 and token_end2;
+        }
+    }
+    while (offset < common_len) : (offset += 1) {
+        const token_end1 = header1[offset] == ' ' or header1[offset] == '\t';
+        const token_end2 = header2[offset] == ' ' or header2[offset] == '\t';
+        if (token_end1 or token_end2) {
+            return offset != 0 and token_end1 and token_end2;
+        }
+        if (header1[offset] != header2[offset]) return false;
+    }
+
+    if (common_len == 0) return false;
+    if (header1.len == header2.len) return true;
+    const longer = if (header1.len > header2.len) header1 else header2;
+    return longer[common_len] == ' ' or longer[common_len] == '\t';
+}
 
 fn firstTokenEnd(header: []const u8) usize {
     return tokenEnd(header, 0);
@@ -248,6 +284,53 @@ test "[property] - [paired names]: token finder matches scalar boundaries" {
             }
         }
     }
+}
+
+test "[property] - [paired names]: exact comparison preserves parsed token equality" {
+    const lengths = [_]usize{ 1, 15, 16, 17, 31, 32, 33, 63, 64, 65 };
+    var header1 = [_]u8{'x'} ** 68;
+    var header2 = [_]u8{'x'} ** 68;
+
+    for (lengths) |length| {
+        @memset(&header1, 'x');
+        @memset(&header2, 'x');
+        try std.testing.expectEqual(
+            namesMatch(parseName(header1[0..length], .exact), parseName(header2[0..length], .exact)),
+            exactHeadersMatch(header1[0..length], header2[0..length]),
+        );
+
+        header1[length] = ' ';
+        header2[length] = '\t';
+        header1[length + 1] = 'a';
+        header2[length + 1] = 'b';
+        try std.testing.expectEqual(
+            namesMatch(parseName(header1[0 .. length + 2], .exact), parseName(header2[0 .. length + 2], .exact)),
+            exactHeadersMatch(header1[0 .. length + 2], header2[0 .. length + 2]),
+        );
+        try std.testing.expectEqual(
+            namesMatch(parseName(header1[0..length], .exact), parseName(header2[0 .. length + 2], .exact)),
+            exactHeadersMatch(header1[0..length], header2[0 .. length + 2]),
+        );
+
+        header1[length] = 'x';
+        header2[length] = 'x';
+        try std.testing.expectEqual(
+            namesMatch(parseName(header1[0..length], .exact), parseName(header2[0 .. length + 1], .exact)),
+            exactHeadersMatch(header1[0..length], header2[0 .. length + 1]),
+        );
+
+        for (0..length) |mismatch| {
+            header2[mismatch] = 'y';
+            try std.testing.expectEqual(
+                namesMatch(parseName(header1[0..length], .exact), parseName(header2[0..length], .exact)),
+                exactHeadersMatch(header1[0..length], header2[0..length]),
+            );
+            header2[mismatch] = 'x';
+        }
+    }
+
+    try std.testing.expect(!exactHeadersMatch("", ""));
+    try std.testing.expect(!exactHeadersMatch("", " value"));
 }
 
 test "[property] - [paired names]: combined terminal proof covers vector boundaries" {
