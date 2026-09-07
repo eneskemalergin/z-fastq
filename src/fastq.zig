@@ -713,6 +713,8 @@ pub const Reader = struct {
     last_error: ?ParseError,
     record_offsets: RecordOffsets = undefined,
     current_record_offsets: ?RecordOffsets = null,
+    transport_storage: []u8,
+    borrowed_gzip: ?*io_layer.GzipSource,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -726,6 +728,8 @@ pub const Reader = struct {
             .allocator = allocator,
             .source = source,
             .buf = buf,
+            .transport_storage = buf,
+            .borrowed_gzip = null,
             .fill_end = 0,
             .cursor = 0,
             .fallback_fields = .{
@@ -746,7 +750,7 @@ pub const Reader = struct {
         for (self.fallback_fields) |field| {
             if (field.storage.len != 0) self.allocator.free(field.storage);
         }
-        self.allocator.free(self.buf);
+        if (self.transport_storage.len != 0) self.allocator.free(self.transport_storage);
         self.* = undefined;
     }
 
@@ -1107,6 +1111,12 @@ pub const Reader = struct {
     }
 
     fn compactIfNeeded(self: *Reader) void {
+        if (self.borrowed_gzip != null) {
+            std.debug.assert(self.cursor == self.fill_end);
+            self.cursor = 0;
+            self.fill_end = 0;
+            return;
+        }
         if (self.cursor >= self.fill_end) {
             self.cursor = 0;
             self.fill_end = 0;
@@ -1122,6 +1132,18 @@ pub const Reader = struct {
 
     fn refill(self: *Reader) ReaderError!bool {
         self.compactIfNeeded();
+        if (self.borrowed_gzip) |source| {
+            const decoded = io_layer.readGzipChunk(
+                source,
+                &source.decompressor_buffer,
+            ) catch return error.Io;
+            self.buf = if (decoded) |bytes|
+                @constCast(bytes)
+            else
+                source.decompressor_buffer[0..0];
+            self.fill_end = self.buf.len;
+            return self.fill_end != 0;
+        }
         const space = self.buf.len - self.fill_end;
         std.debug.assert(space > 0);
         const n = self.source.read(self.buf[self.fill_end..]) catch return error.Io;
@@ -1348,6 +1370,35 @@ pub const Reader = struct {
     }
 };
 
+pub fn initBorrowedGzipReader(
+    allocator: std.mem.Allocator,
+    source: *io_layer.GzipSource,
+    options: Options,
+) !Reader {
+    std.debug.assert(source.decompressor_buffer.len != 0);
+    const fallback_sequence = try allocator.alloc(u8, io_layer.DEFAULT_READER_BUFFER_BYTES);
+    return .{
+        .allocator = allocator,
+        .source = source.byteSource(),
+        .buf = source.decompressor_buffer[0..0],
+        .transport_storage = source.decompressor_buffer[0..0],
+        .borrowed_gzip = source,
+        .fill_end = 0,
+        .cursor = 0,
+        .fallback_fields = .{
+            .{},
+            .{ .storage = fallback_sequence },
+            .{},
+            .{},
+        },
+        .record_index = 0,
+        .byte_offset = 0,
+        .options = options,
+        .machine = .{},
+        .last_error = null,
+    };
+}
+
 fn fieldStorageLimit(max_line_bytes: usize) usize {
     return std.math.add(usize, max_line_bytes, 1) catch std.math.maxInt(usize);
 }
@@ -1442,6 +1493,7 @@ pub fn nextBufferedAfterFallbackTransfer(
 ) ReaderError!?Record {
     canonical_span.* = null;
     reader.beginRecord();
+    if (reader.borrowed_gzip != null) return null;
     if (reader.cursor == 0 and reader.fill_end == reader.buf.len) {
         return null;
     }

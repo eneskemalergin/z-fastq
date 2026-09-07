@@ -439,6 +439,10 @@ pub fn readGzipChunk(
                     self.payload_crc.update(decoded);
                     self.size +%= @truncate(decoded.len);
                     reader.toss(decoded.len);
+                    if (self.decompressor.finishRawIfReady()) {
+                        self.finishMember() catch return error.ReadFailed;
+                        self.state = .between_members;
+                    }
                     return decoded;
                 }
 

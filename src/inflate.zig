@@ -241,6 +241,18 @@ pub fn init(input: *Reader, container: Container, buffer: []u8) Decompress {
     };
 }
 
+/// Completes a raw stream whose final decoded bytes are already buffered.
+pub fn finishRawIfReady(d: *Decompress) bool {
+    if (d.state != .protocol_footer) return false;
+    switch (d.container_metadata) {
+        .raw => {},
+        else => return false,
+    }
+    d.alignBitsForward();
+    d.state = .end;
+    return true;
+}
+
 fn rebaseFallible(r: *Reader, capacity: usize) Reader.RebaseError!void {
     rebase(r, capacity);
 }

@@ -1,6 +1,7 @@
 //! CLI entry and subcommand dispatcher for z-fastq.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const zfastq = @import("root.zig");
 const fastq = @import("fastq.zig");
 const io_layer = @import("io.zig");
@@ -1537,6 +1538,20 @@ const RecordInput = struct {
         return switch (self.source) {
             .plain => |*source| source.byteSource(),
             .gzip => |*source| source.byteSource(),
+        };
+    }
+
+    fn initReader(
+        self: *RecordInput,
+        allocator: std.mem.Allocator,
+        options: fastq.Options,
+    ) !zfastq.Reader {
+        return switch (self.source) {
+            .plain => |*source| zfastq.Reader.init(allocator, source.byteSource(), options),
+            .gzip => |*source| if (build_options.use_isa_l)
+                zfastq.Reader.init(allocator, source.byteSource(), options)
+            else
+                fastq.initBorrowedGzipReader(allocator, source, options),
         };
     }
 
@@ -3198,10 +3213,21 @@ fn interleaveInputs(
     defer input2.deinit(io);
 
     var selection = options.selection;
+    if (comptime build_options.use_isa_l) {
+        return interleaveSources(
+            allocator,
+            input1.byteSource(),
+            input2.byteSource(),
+            writer,
+            direct_writer,
+            &selection,
+            options,
+        );
+    }
     return interleaveSources(
         allocator,
-        input1.byteSource(),
-        input2.byteSource(),
+        &input1,
+        &input2,
         writer,
         direct_writer,
         &selection,
@@ -3211,24 +3237,25 @@ fn interleaveInputs(
 
 fn interleaveSources(
     allocator: std.mem.Allocator,
-    source1: zfastq.io.ByteSource,
-    source2: zfastq.io.ByteSource,
+    source1: anytype,
+    source2: @TypeOf(source1),
     writer: *zfastq.Writer,
     direct_writer: ?*std.Io.Writer,
     selection: *PairOutputSelector,
     options: InterleaveOptions,
 ) error{WriteFailed}!?PairCommandFailure {
-    var reader1 = zfastq.Reader.init(
-        allocator,
-        source1,
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
+    const reader_options: fastq.Options = .{ .max_line_bytes = options.max_line_bytes };
+    var reader1 = (if (comptime @TypeOf(source1) == zfastq.io.ByteSource)
+        zfastq.Reader.init(allocator, source1, reader_options)
+    else
+        source1.initReader(allocator, reader_options)) catch
+        return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
     defer reader1.deinit();
-    var reader2 = zfastq.Reader.init(
-        allocator,
-        source2,
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return pairCommandFailure(1, "out_of_memory", "out of memory", 3);
+    var reader2 = (if (comptime @TypeOf(source2) == zfastq.io.ByteSource)
+        zfastq.Reader.init(allocator, source2, reader_options)
+    else
+        source2.initReader(allocator, reader_options)) catch
+        return pairCommandFailure(1, "out_of_memory", "out of memory", 3);
     defer reader2.deinit();
     var validator1 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
     var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
