@@ -1924,13 +1924,10 @@ pub const CheckScanner = struct {
         const header = data[0..header_end];
         if (header.len > self.max_line_bytes or
             (header.len != 0 and header[header.len - 1] == '\r')) return null;
-
-        var machine = self.machine;
-        if (machine.push(
-            header.len,
+        if (!headerPrefixIsValid(
             if (header.len == 0) null else header[0],
             if (header.len < 2) null else header[1],
-        ) catch return null) return null;
+        )) return null;
 
         const sequence_start = header_end + 1;
         var use_full_iupac = self.use_full_iupac;
@@ -1940,18 +1937,13 @@ pub const CheckScanner = struct {
             &use_full_iupac,
         ) orelse return null;
         if (sequence_len > self.max_line_bytes) return null;
-        if (machine.push(sequence_len, null, null) catch return null) return null;
 
         const plus_start = sequence_start + sequence_len + 1;
         const plus_len = firstLineFeed(data[plus_start..]) orelse return null;
         const plus = data[plus_start..][0..plus_len];
         if (plus.len > self.max_line_bytes or
             (plus.len != 0 and plus[plus.len - 1] == '\r')) return null;
-        if (machine.push(
-            plus.len,
-            if (plus.len == 0) null else plus[0],
-            if (plus.len < 2) null else plus[1],
-        ) catch return null) return null;
+        if (plus.len == 0 or plus[0] != '+') return null;
 
         const quality_start = plus_start + plus_len + 1;
         if (sequence_len >= data.len - quality_start) return null;
@@ -1959,28 +1951,14 @@ pub const CheckScanner = struct {
         if (data[quality_end] != '\n') return null;
         const quality = data[quality_start..quality_end];
         if (firstInvalidQuality(quality) != null) return null;
-        if (!(machine.push(quality.len, null, null) catch return null)) return null;
 
         const record_len = quality_end + 1;
         const record_len_u64 = std.math.cast(u64, record_len) orelse return null;
         const next_offset = std.math.add(u64, self.byte_offset, record_len_u64) catch
             return null;
-        const sequence_offset = std.math.add(
-            u64,
-            self.byte_offset,
-            std.math.cast(u64, sequence_start) orelse return null,
-        ) catch return null;
-        const quality_offset = std.math.add(
-            u64,
-            self.byte_offset,
-            std.math.cast(u64, quality_start) orelse return null,
-        ) catch return null;
         const next_record_index = std.math.add(u64, self.record_index, 1) catch return null;
 
-        self.machine = machine;
         self.use_full_iupac = use_full_iupac;
-        self.sequence_start_offset = sequence_offset;
-        self.quality_start_offset = quality_offset;
         self.record_index = next_record_index;
         self.byte_offset = next_offset;
         self.line_start_offset = next_offset;
