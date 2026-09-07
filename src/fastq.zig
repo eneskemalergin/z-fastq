@@ -1907,18 +1907,25 @@ pub const CheckScanner = struct {
 
     pub fn feed(self: *CheckScanner, data: []const u8) CheckScannerError!usize {
         var consumed: usize = 0;
+        var boundary_proved = false;
         while (consumed < data.len) {
-            if (self.consumeCompleteRecord(data[consumed..])) |record_len| {
+            if (self.consumeCompleteRecord(data[consumed..], boundary_proved)) |record_len| {
+                boundary_proved = true;
                 consumed += record_len;
                 continue;
             }
+            boundary_proved = false;
             consumed += try self.consumeIncrementalRecord(data[consumed..]);
         }
         return data.len;
     }
 
-    fn consumeCompleteRecord(self: *CheckScanner, data: []const u8) ?usize {
-        if (!self.atRecordBoundary()) return null;
+    fn consumeCompleteRecord(
+        self: *CheckScanner,
+        data: []const u8,
+        boundary_proved: bool,
+    ) ?usize {
+        if (!boundary_proved and !self.atRecordBoundary()) return null;
 
         const header_end = firstLineFeed(data) orelse return null;
         const header = data[0..header_end];
@@ -3255,12 +3262,12 @@ test "[unit] - [check scanner]: complete record path commits only proved records
     const input = record1 ++ record2;
     var scanner = CheckScanner.init(.{}, .{});
 
-    try std.testing.expectEqual(record1.len, scanner.consumeCompleteRecord(input).?);
+    try std.testing.expectEqual(record1.len, scanner.consumeCompleteRecord(input, false).?);
     try std.testing.expectEqual(@as(u64, 1), scanner.record_index);
     try std.testing.expectEqual(@as(u64, record1.len), scanner.byte_offset);
     try std.testing.expectEqual(
         record2.len,
-        scanner.consumeCompleteRecord(input[record1.len..]).?,
+        scanner.consumeCompleteRecord(input[record1.len..], false).?,
     );
     try std.testing.expectEqual(@as(u64, 2), scanner.record_index);
     try std.testing.expectEqual(@as(u64, input.len), scanner.byte_offset);
@@ -3276,17 +3283,17 @@ test "[unit] - [check scanner]: complete record path commits only proved records
     }) |data| {
         var fallback = CheckScanner.init(.{}, .{});
         const before = fallback;
-        try std.testing.expect(fallback.consumeCompleteRecord(data) == null);
+        try std.testing.expect(fallback.consumeCompleteRecord(data, false) == null);
         try std.testing.expectEqualDeep(before, fallback);
     }
 
     var limited = CheckScanner.init(.{ .max_line_bytes = 1 }, .{});
     const before = limited;
-    try std.testing.expect(limited.consumeCompleteRecord("@r\nA\n+\n!\n") == null);
+    try std.testing.expect(limited.consumeCompleteRecord("@r\nA\n+\n!\n", false) == null);
     try std.testing.expectEqualDeep(before, limited);
 
     var wide = CheckScanner.init(.{}, .{});
-    try std.testing.expect(wide.consumeCompleteRecord("@r\nR\n+\n!\n") != null);
+    try std.testing.expect(wide.consumeCompleteRecord("@r\nR\n+\n!\n", false) != null);
     try std.testing.expect(wide.use_full_iupac);
 }
 
