@@ -2021,7 +2021,6 @@ fn nextAfterPreservingInterleavedMate1(
     staging_limit: usize,
 ) (zfastq.ReaderError || error{RecordStagingLimit})!RefillSpanningMate {
     var canonical_span2: ?[]const u8 = null;
-    var record2_requires_fallback = false;
     if (fastq.retainFallbackRecordStorage(reader, retained, record1)) {
         const transferred_record2 = try fastq.nextBufferedAfterFallbackTransfer(
             reader,
@@ -2032,7 +2031,18 @@ fn nextAfterPreservingInterleavedMate1(
             .canonical_span = canonical_span2,
             .first_storage = .retained,
         };
-        record2_requires_fallback = true;
+        // Reader's four line limits cover CLI staging limits, including markers.
+        // Internal callers can supply a smaller limit and still need its error.
+        if (staging_limit < 4 or (staging_limit - 4) / 4 < reader.options.max_line_bytes) {
+            if (try canonicalRecordSize(record1, canonical_span1) > staging_limit) {
+                return error.RecordStagingLimit;
+            }
+        }
+        return .{
+            .record = try fastq.nextFallbackWithoutId(reader, &canonical_span2),
+            .canonical_span = canonical_span2,
+            .first_storage = .retained,
+        };
     }
 
     try stageCanonicalRecord(
@@ -2042,13 +2052,7 @@ fn nextAfterPreservingInterleavedMate1(
         canonical_span1,
         staging_limit,
     );
-    if (record2_requires_fallback) {
-        fastq.restoreFallbackRecordStorage(reader, retained);
-    }
-    const record2 = if (record2_requires_fallback)
-        try fastq.nextFallbackWithoutId(reader, &canonical_span2)
-    else
-        try fastq.nextWithoutId(reader, &canonical_span2);
+    const record2 = try fastq.nextWithoutId(reader, &canonical_span2);
     return .{
         .record = record2,
         .canonical_span = canonical_span2,
@@ -3718,14 +3722,11 @@ fn deinterleaveSource(
     }
 }
 
-fn stageCanonicalRecord(
-    allocator: std.mem.Allocator,
-    staging: *std.ArrayList(u8),
+fn canonicalRecordSize(
     record: zfastq.Record,
     canonical_span: ?[]const u8,
-    staging_limit: usize,
-) error{ OutOfMemory, RecordStagingLimit }!void {
-    const required = if (canonical_span) |span|
+) error{RecordStagingLimit}!usize {
+    return if (canonical_span) |span|
         span.len
     else blk: {
         var total: usize = 6;
@@ -3735,6 +3736,16 @@ fn stageCanonicalRecord(
         }
         break :blk total;
     };
+}
+
+fn stageCanonicalRecord(
+    allocator: std.mem.Allocator,
+    staging: *std.ArrayList(u8),
+    record: zfastq.Record,
+    canonical_span: ?[]const u8,
+    staging_limit: usize,
+) error{ OutOfMemory, RecordStagingLimit }!void {
+    const required = try canonicalRecordSize(record, canonical_span);
     if (required > staging_limit) return error.RecordStagingLimit;
 
     if (staging.capacity > required and
@@ -5273,7 +5284,7 @@ test "[failure] - [deinterleave]: staging allocation failure emits no output" {
     try std.testing.expectEqual(@as(usize, 0), sink2.length);
 }
 
-test "[failure] - [deinterleave]: retained storage is released when deferred staging fails" {
+test "[failure] - [deinterleave]: both fallback owners survive allocation and output failures" {
     const first_field_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES - 7;
     const second_field_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES;
     var input: std.ArrayList(u8) = .empty;
@@ -5288,35 +5299,142 @@ test "[failure] - [deinterleave]: retained storage is released when deferred sta
     try input.appendNTimes(std.testing.allocator, '#', second_field_len);
     try input.append(std.testing.allocator, '\n');
 
-    var source = io_layer.SliceSource.init(input.items);
-    var sink1 = DeinterleaveTestSink{};
-    var sink2 = DeinterleaveTestSink{};
-    var writer1 = zfastq.Writer.init(sink1.byteSink());
-    var writer2 = zfastq.Writer.init(sink2.byteSink());
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = 5,
-    });
+    {
+        var source = io_layer.SliceSource.init(input.items);
+        var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
+        var retained: fastq.RetainedRecordStorage = .{};
+        defer retained.deinit(std.testing.allocator);
+        var staging: std.ArrayList(u8) = .empty;
+        defer staging.deinit(std.testing.allocator);
+        var span: ?[]const u8 = null;
+        const record1 = (try fastq.nextWithoutId(&reader, &span)).?;
+        try std.testing.expect((try fastq.nextBufferedWithoutId(&reader, &span)) == null);
+        const next = try nextAfterPreservingInterleavedMate1(
+            std.testing.allocator,
+            &reader,
+            &retained,
+            &staging,
+            record1,
+            null,
+            try deinterleaveStagingLimit(reader.options.max_line_bytes),
+        );
+        try std.testing.expect(next.first_storage == .retained);
+        try std.testing.expectEqual(@as(usize, 0), staging.capacity);
+        try std.testing.expect(std.mem.allEqual(u8, record1.sequence, 'A'));
+        try std.testing.expectEqual(second_field_len, next.record.?.sequence.len);
+        try std.testing.expect(std.mem.allEqual(u8, next.record.?.sequence, 'T'));
+    }
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseRetainedPairAllocations,
+        .{input.items},
+    );
+
+    const output = try std.testing.allocator.alloc(u8, input.items.len);
+    defer std.testing.allocator.free(output);
     const options = DeinterleaveOptions{
         .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
         .alphabet = .iupac,
         .pair_name_policy = .illumina,
     };
 
-    const failure = (try deinterleaveSource(
-        failing.allocator(),
+    for (0..3) |failure_mode| {
+        var source = io_layer.SliceSource.init(input.items);
+        var sink1 = io_layer.SliceSink.init(if (failure_mode == 0) output[0..0] else output);
+        var sink2 = io_layer.SliceSink.init(output[0..0]);
+        var writer1 = zfastq.Writer.init(sink1.byteSink());
+        var writer2 = zfastq.Writer.init(sink2.byteSink());
+        const result = deinterleaveSource(
+            std.testing.allocator,
+            source.byteSource(),
+            &writer1,
+            &writer2,
+            if (failure_mode == 2) 1 else try deinterleaveStagingLimit(options.max_line_bytes),
+            options,
+        );
+        if (failure_mode < 2) {
+            try std.testing.expectError(
+                if (failure_mode == 0) error.Output1WriteFailed else error.Output2WriteFailed,
+                result,
+            );
+            if (failure_mode == 0) try std.testing.expectEqual(@as(usize, 0), sink2.written().len);
+            if (failure_mode == 1) {
+                try std.testing.expectEqualStrings(input.items[0 .. 2 * first_field_len + 12], sink1.written());
+            }
+        } else {
+            const failure = (try result).?;
+            try std.testing.expectEqualStrings("arithmetic_limit", failure.command.details.code);
+            try std.testing.expectEqual(@as(usize, 0), sink1.written().len);
+            try std.testing.expectEqual(@as(usize, 0), sink2.written().len);
+        }
+    }
+
+    const split = std.mem.indexOf(u8, input.items, "@pair/2").?;
+    for (0..5) |failure_mode| {
+        if (failure_mode == 1) input.items[input.items.len - 2] = ' ';
+        if (failure_mode == 2) input.items[split + 1] = 'x';
+        if (failure_mode == 4) input.items["@pair/1\n".len] = '.';
+        const end = switch (failure_mode) {
+            0, 4 => input.items.len - 2,
+            3 => split,
+            else => input.items.len,
+        };
+        var source = io_layer.SliceSource.init(input.items[0..end]);
+        var sink1 = DeinterleaveTestSink{};
+        var sink2 = DeinterleaveTestSink{};
+        var writer1 = zfastq.Writer.init(sink1.byteSink());
+        var writer2 = zfastq.Writer.init(sink2.byteSink());
+        const failure = (try deinterleaveSource(
+            std.testing.allocator,
+            source.byteSource(),
+            &writer1,
+            &writer2,
+            try deinterleaveStagingLimit(options.max_line_bytes),
+            options,
+        )).?;
+        switch (failure_mode) {
+            0, 4 => try std.testing.expectEqualStrings("S005", failure.command.details.code),
+            1 => try std.testing.expectEqualStrings("S006", failure.command.details.code),
+            2 => try std.testing.expect(failure.pair == .name_mismatch),
+            3 => try std.testing.expect(failure.pair == .count_mismatch),
+            else => unreachable,
+        }
+        try std.testing.expectEqual(@as(usize, 0), sink1.length);
+        try std.testing.expectEqual(@as(usize, 0), sink2.length);
+        input.items[input.items.len - 2] = '#';
+        input.items[split + 1] = 'p';
+        input.items["@pair/1\n".len] = 'A';
+    }
+}
+
+fn exerciseRetainedPairAllocations(allocator: std.mem.Allocator, input: []const u8) !void {
+    const output = try std.testing.allocator.alloc(u8, input.len);
+    defer std.testing.allocator.free(output);
+    const split = std.mem.indexOf(u8, input, "@pair/2").?;
+    var source = io_layer.SliceSource.init(input);
+    var sink1 = io_layer.SliceSink.init(output[0..split]);
+    var sink2 = io_layer.SliceSink.init(output[split..]);
+    var writer1 = zfastq.Writer.init(sink1.byteSink());
+    var writer2 = zfastq.Writer.init(sink2.byteSink());
+    const options = DeinterleaveOptions{
+        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+        .alphabet = .iupac,
+        .pair_name_policy = .illumina,
+    };
+    if (try deinterleaveSource(
+        allocator,
         source.byteSource(),
         &writer1,
         &writer2,
-        try deinterleaveStagingLimit(options.max_line_bytes),
+        split,
         options,
-    )).?;
-
-    try std.testing.expect(failing.has_induced_failure);
-    const command_failure = switch (failure) {
-        .command => |command| command.details,
-        .pair => return error.ExpectedCommandFailure,
-    };
-    try std.testing.expectEqualStrings("out_of_memory", command_failure.code);
-    try std.testing.expectEqual(@as(usize, 0), sink1.length);
-    try std.testing.expectEqual(@as(usize, 0), sink2.length);
+    )) |failure| {
+        try std.testing.expectEqual(@as(usize, 0), sink1.written().len);
+        try std.testing.expectEqual(@as(usize, 0), sink2.written().len);
+        return pairAllocationFailure(failure);
+    }
+    try std.testing.expectEqualStrings(input[0..split], sink1.written());
+    try std.testing.expectEqualStrings(input[split..], sink2.written());
 }

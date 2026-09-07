@@ -1350,7 +1350,7 @@ test "[edge] - [paired sample]: refill-spanning 512 KiB mates preserve output" {
     try first_large.appendSlice(allocator, "@large/1 ");
     try first_large.appendNTimes(allocator, 'x', 512 * 1024);
     try first_large.appendSlice(allocator, "\nA\n+first\n!\n@large/2 ");
-    try first_large.appendNTimes(allocator, 'y', 70 * 1024);
+    try first_large.appendNTimes(allocator, 'y', 300 * 1024);
     try first_large.appendSlice(allocator, "\nT\n+second\n#\n");
     try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = first_large.items });
     try expectResult(

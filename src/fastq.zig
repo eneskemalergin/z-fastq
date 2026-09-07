@@ -3064,55 +3064,66 @@ test "[property] - [record delivery]: omits identifiers and preserves buffered c
 }
 
 test "[integration] - [record delivery]: retained fallback storage survives a refill" {
-    const field_len = io_layer.DEFAULT_READER_BUFFER_BYTES - 7;
-    var input: std.ArrayList(u8) = .empty;
-    defer input.deinit(std.testing.allocator);
-    try input.appendSlice(std.testing.allocator, "@pair/1\n");
-    try input.appendNTimes(std.testing.allocator, 'A', field_len);
-    try input.appendSlice(std.testing.allocator, "\n+\n");
-    try input.appendNTimes(std.testing.allocator, '!', field_len);
-    try input.appendSlice(std.testing.allocator, "\n@pair/2\nTT\n+right\n##\n");
+    for ([_]usize{ 2, io_layer.DEFAULT_READER_BUFFER_BYTES }) |mate2_len| {
+        const field_len = io_layer.DEFAULT_READER_BUFFER_BYTES - 7;
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(std.testing.allocator);
+        try input.appendSlice(std.testing.allocator, "@pair/1\n");
+        try input.appendNTimes(std.testing.allocator, 'A', field_len);
+        try input.appendSlice(std.testing.allocator, "\n+\n");
+        try input.appendNTimes(std.testing.allocator, '!', field_len);
+        try input.appendSlice(std.testing.allocator, "\n@pair/2\n");
+        try input.appendNTimes(std.testing.allocator, 'T', mate2_len);
+        try input.appendSlice(std.testing.allocator, "\n+right\n");
+        try input.appendNTimes(std.testing.allocator, '#', mate2_len);
+        try input.append(std.testing.allocator, '\n');
 
-    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    {
-        var source = io_layer.SliceSource.init(input.items);
-        var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{});
-        defer reader.deinit();
-        var retained: RetainedRecordStorage = .{};
-        defer retained.deinit(tracking.allocator());
+        var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        {
+            var source = io_layer.SliceSource.init(input.items);
+            var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{});
+            defer reader.deinit();
+            var retained: RetainedRecordStorage = .{};
+            defer retained.deinit(tracking.allocator());
 
-        var canonical_span1: ?[]const u8 = null;
-        const record1 = (try nextWithoutId(&reader, &canonical_span1)).?;
-        try std.testing.expect(canonical_span1 == null);
-        try std.testing.expectEqual(field_len, record1.sequence.len);
-        try std.testing.expectEqual(field_len, record1.quality.len);
+            var canonical_span1: ?[]const u8 = null;
+            const record1 = (try nextWithoutId(&reader, &canonical_span1)).?;
+            try std.testing.expect(canonical_span1 == null);
+            try std.testing.expectEqual(field_len, record1.sequence.len);
+            try std.testing.expectEqual(field_len, record1.quality.len);
 
-        var canonical_span2: ?[]const u8 = null;
-        try std.testing.expect(
-            (try nextBufferedWithoutId(&reader, &canonical_span2)) == null,
-        );
-        const sequence_ptr = record1.sequence.ptr;
-        try std.testing.expect(retainFallbackRecordStorage(&reader, &retained, record1));
-        const allocations_before_refill = tracking.allocations;
+            var canonical_span2: ?[]const u8 = null;
+            try std.testing.expect(
+                (try nextBufferedWithoutId(&reader, &canonical_span2)) == null,
+            );
+            const sequence_ptr = record1.sequence.ptr;
+            try std.testing.expect(retainFallbackRecordStorage(&reader, &retained, record1));
+            const allocations_before_refill = tracking.allocations;
 
-        const record2 = (try nextBufferedAfterFallbackTransfer(
-            &reader,
-            &canonical_span2,
-        )).?;
-        try std.testing.expectEqual(allocations_before_refill, tracking.allocations);
-        try std.testing.expectEqualStrings("pair/1", record1.header);
-        try std.testing.expect(std.mem.allEqual(u8, record1.sequence, 'A'));
-        try std.testing.expect(std.mem.allEqual(u8, record1.quality, '!'));
-        try std.testing.expectEqualStrings("pair/2", record2.header);
-        try std.testing.expectEqualStrings("TT", record2.sequence);
-        try std.testing.expectEqualStrings("right", record2.plus);
-        try std.testing.expectEqualStrings("##", record2.quality);
+            const buffered2 = try nextBufferedAfterFallbackTransfer(
+                &reader,
+                &canonical_span2,
+            );
+            const record2 = buffered2 orelse (try nextFallbackWithoutId(&reader, &canonical_span2)).?;
+            if (mate2_len == 2) try std.testing.expectEqual(allocations_before_refill, tracking.allocations);
+            try std.testing.expectEqualStrings("pair/1", record1.header);
+            try std.testing.expect(std.mem.allEqual(u8, record1.sequence, 'A'));
+            try std.testing.expect(std.mem.allEqual(u8, record1.quality, '!'));
+            try std.testing.expectEqualStrings("pair/2", record2.header);
+            try std.testing.expectEqual(mate2_len, record2.sequence.len);
+            try std.testing.expect(std.mem.allEqual(u8, record2.sequence, 'T'));
+            try std.testing.expectEqualStrings("right", record2.plus);
+            try std.testing.expect(std.mem.allEqual(u8, record2.quality, '#'));
 
-        restoreFallbackRecordStorage(&reader, &retained);
-        try std.testing.expectEqual(sequence_ptr, reader.fallback_fields[1].storage.ptr);
-        try std.testing.expect((try nextWithoutId(&reader, &canonical_span2)) == null);
+            restoreFallbackRecordStorage(&reader, &retained);
+            try std.testing.expectEqual(sequence_ptr, reader.fallback_fields[1].storage.ptr);
+            try std.testing.expectEqualStrings("pair/2", record2.header);
+            try std.testing.expect(std.mem.allEqual(u8, record2.sequence, 'T'));
+            try std.testing.expect(std.mem.allEqual(u8, record2.quality, '#'));
+            try std.testing.expect((try nextWithoutId(&reader, &canonical_span2)) == null);
+        }
+        try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
     }
-    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
 }
 
 test "[integration] - [writer]: trusted Reader records match checked serialization" {

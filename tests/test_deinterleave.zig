@@ -874,26 +874,42 @@ test "[cli] - [deinterleave]: refill-spanning records on both sides remain exact
     const allocator = arena.allocator();
     const input_path = try tempPath(allocator, &tmp.sub_path, "input.fastq");
     const paths = try outputPaths(allocator, &tmp.sub_path, "large");
-    const field_len = 512 * 1024;
-
     var r1: std.ArrayList(u8) = .empty;
     var r2: std.ArrayList(u8) = .empty;
-    try appendRecord(allocator, &r1, "large-a/1", 'A', '!', field_len);
-    try appendRecord(allocator, &r2, "large-a/2", 'T', '#', field_len);
-    try appendRecord(allocator, &r1, "large-b/1", 'C', '$', 1);
-    try appendRecord(allocator, &r2, "large-b/2", 'G', '%', 1);
-
     var interleaved: std.ArrayList(u8) = .empty;
-    const first_record_len = field_len * 2 + "@large-a/1\n\n+\n\n".len;
-    try interleaved.appendSlice(allocator, r1.items[0..first_record_len]);
-    try interleaved.appendSlice(allocator, r2.items[0..first_record_len]);
-    try interleaved.appendSlice(allocator, r1.items[first_record_len..]);
-    try interleaved.appendSlice(allocator, r2.items[first_record_len..]);
+    const lengths = [_][2]usize{
+        .{ 512 * 1024, 512 * 1024 },
+        .{ 1, 1 },
+        .{ 512 * 1024, 1 },
+        .{ 1, 512 * 1024 },
+        .{ 256 * 1024 - 7, 256 * 1024 },
+    };
+    for (lengths) |pair_lengths| {
+        const start1 = r1.items.len;
+        const start2 = r2.items.len;
+        try appendRecord(allocator, &r1, "large/1", 'A', '!', pair_lengths[0]);
+        try appendRecord(allocator, &r2, "large/2", 'T', '#', pair_lengths[1]);
+        try interleaved.appendSlice(allocator, r1.items[start1..]);
+        try interleaved.appendSlice(allocator, r2.items[start2..]);
+    }
     try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = interleaved.items });
 
     try expectResult(try runDeinterleave(allocator, input_path, paths), 0, "", "");
     try expectFile(allocator, paths[0], r1.items);
     try expectFile(allocator, paths[1], r2.items);
+
+    var gzip: std.ArrayList(u8) = .empty;
+    var offset: usize = 0;
+    while (offset < interleaved.items.len) {
+        const end = @min(offset + 60 * 1024, interleaved.items.len);
+        try cli.appendGzipMember(allocator, &gzip, interleaved.items[offset..end], .{});
+        offset = end;
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = gzip.items });
+    const gzip_paths = try outputPaths(allocator, &tmp.sub_path, "gzip-large");
+    try expectResult(try runDeinterleave(allocator, input_path, gzip_paths), 0, "", "");
+    try expectFile(allocator, gzip_paths[0], r1.items);
+    try expectFile(allocator, gzip_paths[1], r2.items);
 }
 
 fn runDeinterleave(
