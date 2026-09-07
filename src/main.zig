@@ -687,6 +687,21 @@ fn validateCommandRecord(
     return mapSemanticFailure(validator.validate(record), offsets, record_index);
 }
 
+fn validateCurrentCommandRecord(
+    validator: *fastq.AdaptiveRecordValidator,
+    reader: *const zfastq.Reader,
+    record: zfastq.Record,
+    record_index: u64,
+) ?CommandFailure {
+    const semantic_error = validator.validate(record) orelse return null;
+    const offsets = reader.currentRecordOffsets() orelse return CommandFailure.plain(
+        "io_error",
+        "record location is unavailable",
+        3,
+    );
+    return mapSemanticFailure(semantic_error, offsets, record_index);
+}
+
 fn mapSemanticFailure(
     maybe_error: ?zfastq.SemanticError,
     offsets: zfastq.RecordOffsets,
@@ -2326,11 +2341,10 @@ fn nextValidatedSampleRecord(
     const record = fastq.nextWithoutId(reader, &canonical_span) catch |err| {
         return .{ .failure = mapReaderFailure(reader, err) };
     } orelse return .done;
-    const offsets = reader.currentRecordOffsets() orelse return .{ .failure = CommandFailure.plain("io_error", "record location is unavailable", 3) };
-    if (validateCommandRecord(
+    if (validateCurrentCommandRecord(
         validator,
+        reader,
         record,
-        offsets,
         reader.recordIndex() - 1,
     )) |failure| {
         return .{ .failure = failure };
