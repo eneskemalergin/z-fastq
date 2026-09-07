@@ -1031,10 +1031,19 @@ fn checkPaired(
     }
     defer input2.deinit(io);
 
+    if (comptime build_options.use_isa_l) {
+        return checkPairedSources(
+            allocator,
+            input1.byteSource(),
+            input2.byteSource(),
+            options,
+            null,
+        );
+    }
     return checkPairedSources(
         allocator,
-        input1.byteSource(),
-        input2.byteSource(),
+        &input1,
+        &input2,
         options,
         null,
     );
@@ -1042,22 +1051,23 @@ fn checkPaired(
 
 fn checkPairedSources(
     allocator: std.mem.Allocator,
-    source1: zfastq.io.ByteSource,
-    source2: zfastq.io.ByteSource,
+    source1: anytype,
+    source2: @TypeOf(source1),
     options: PairedCheckOptions,
     exact_selector: ?*sampling.ExactSelector,
 ) ?PairCommandFailure {
-    var reader1 = zfastq.Reader.init(
-        allocator,
-        source1,
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
+    const reader_options: fastq.Options = .{ .max_line_bytes = options.max_line_bytes };
+    var reader1 = (if (comptime @TypeOf(source1) == zfastq.io.ByteSource)
+        zfastq.Reader.init(allocator, source1, reader_options)
+    else
+        source1.initReader(allocator, reader_options)) catch
+        return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
     defer reader1.deinit();
-    var reader2 = zfastq.Reader.init(
-        allocator,
-        source2,
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return pairCommandFailure(1, "out_of_memory", "out of memory", 3);
+    var reader2 = (if (comptime @TypeOf(source2) == zfastq.io.ByteSource)
+        zfastq.Reader.init(allocator, source2, reader_options)
+    else
+        source2.initReader(allocator, reader_options)) catch
+        return pairCommandFailure(1, "out_of_memory", "out of memory", 3);
     defer reader2.deinit();
     var validator1 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
     var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
