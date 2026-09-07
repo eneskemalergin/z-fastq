@@ -2270,21 +2270,25 @@ fn sampleFractionInput(
     var input: RecordInput = undefined;
     if (initRecordInput(&input, io, label)) |failure| return failure;
     defer input.deinit(io);
-    return sampleFractionSource(allocator, input.byteSource(), writer, selector, options);
+    if (comptime build_options.use_isa_l) {
+        return sampleFractionSource(allocator, input.byteSource(), writer, selector, options);
+    }
+    return sampleFractionSource(allocator, &input, writer, selector, options);
 }
 
 fn sampleFractionSource(
     allocator: std.mem.Allocator,
-    source: zfastq.io.ByteSource,
+    source: anytype,
     writer: *zfastq.Writer,
     selector: *sampling.Selector,
     options: SampleOptions,
 ) error{WriteFailed}!?CommandFailure {
-    var reader = zfastq.Reader.init(
-        allocator,
-        source,
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return CommandFailure.plain("out_of_memory", "out of memory", 3);
+    const reader_options: fastq.Options = .{ .max_line_bytes = options.max_line_bytes };
+    var reader = (if (comptime @TypeOf(source) == zfastq.io.ByteSource)
+        zfastq.Reader.init(allocator, source, reader_options)
+    else
+        source.initReader(allocator, reader_options)) catch
+        return CommandFailure.plain("out_of_memory", "out of memory", 3);
     defer reader.deinit();
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
