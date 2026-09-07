@@ -1363,6 +1363,28 @@ pub const Reader = struct {
                 return error.LineTooLong;
             if (quality_capacity >= needed) grown_len = quality_capacity;
         }
+        if (needed > io_layer.DEFAULT_READER_BUFFER_BYTES) {
+            var available: ?*FallbackField = null;
+            for (&self.fallback_fields) |*donor| {
+                if (donor == field or donor.len > field.storage.len or donor.storage.len < grown_len or
+                    donor.storage.len > storage_limit) continue;
+                if (available == null or donor.len < available.?.len) available = donor;
+            }
+            if (available) |donor| {
+                // No field slices escape before this fallback record is complete.
+                const shared = @min(field.len, donor.len);
+                for (field.storage[0..shared], donor.storage[0..shared]) |*a, *b| {
+                    std.mem.swap(u8, a, b);
+                }
+                if (field.len > shared) {
+                    @memcpy(donor.storage[shared..field.len], field.storage[shared..field.len]);
+                } else {
+                    @memcpy(field.storage[shared..donor.len], donor.storage[shared..donor.len]);
+                }
+                std.mem.swap([]u8, &field.storage, &donor.storage);
+                return;
+            }
+        }
         field.storage = if (field.storage.len == 0)
             self.allocator.alloc(u8, grown_len) catch return error.OutOfMemory
         else
@@ -2788,6 +2810,39 @@ test "[edge] - [reader]: field storage limit saturates after checked overflow" {
     try std.testing.expectEqual(max, fieldStorageLimit(max));
 }
 
+test "[unit] - [reader]: field storage exchanges preserve both live prefixes" {
+    const window = io_layer.DEFAULT_READER_BUFFER_BYTES;
+    var source = io_layer.SliceSource.init("");
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{});
+    defer reader.deinit();
+    reader.machine.expected = .sequence;
+    reader.fallback_fields[1].len = window;
+    @memset(reader.fallback_fields[1].storage, 'A');
+    reader.fallback_fields[2].storage = try tracking.allocator().alloc(u8, 2 * window);
+    const donor_pointer = reader.fallback_fields[2].storage.ptr;
+    const old_pointer = reader.fallback_fields[1].storage.ptr;
+    const allocations = tracking.allocations;
+
+    try reader.ensureFieldCapacity(1, window + 1, false);
+
+    try std.testing.expectEqual(allocations, tracking.allocations);
+    try std.testing.expectEqual(donor_pointer, reader.fallback_fields[1].storage.ptr);
+    try std.testing.expectEqual(old_pointer, reader.fallback_fields[2].storage.ptr);
+    try std.testing.expectEqual(window, reader.fallback_fields[1].len);
+    try std.testing.expect(std.mem.allEqual(u8, reader.fallback_fields[1].storage[0..window], 'A'));
+    try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[2].len);
+
+    reader.fallback_fields[3].storage = try tracking.allocator().alloc(u8, 4 * window);
+    reader.fallback_fields[3].len = 1;
+    reader.fallback_fields[3].storage[0] = '!';
+    const live_pointer = reader.fallback_fields[3].storage.ptr;
+    try reader.ensureFieldCapacity(1, 2 * window + 1, false);
+    try std.testing.expectEqual(live_pointer, reader.fallback_fields[1].storage.ptr);
+    try std.testing.expectEqual(@as(u8, '!'), reader.fallback_fields[3].storage[0]);
+    try std.testing.expect(std.mem.allEqual(u8, reader.fallback_fields[1].storage[0..window], 'A'));
+}
+
 test "[failure] - [reader]: failed spill growth preserves owned storage" {
     var source = io_layer.SliceSource.init("");
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
@@ -2806,6 +2861,91 @@ test "[failure] - [reader]: failed spill growth preserves owned storage" {
         reader.ensureFieldCapacity(0, 1, false),
     );
     try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[0].storage.len);
+}
+
+test "[property] - [reader]: storage exchange preserves unequal prefixes" {
+    const window = io_layer.DEFAULT_READER_BUFFER_BYTES;
+    for ([_]usize{ 0, 1, window }) |live| {
+        for ([_]usize{ 0, 1, window }) |other_live| {
+            var source = io_layer.SliceSource.init("");
+            var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+            defer reader.deinit();
+            const field = &reader.fallback_fields[1];
+            const donor = &reader.fallback_fields[0];
+            field.len = live;
+            @memset(field.storage[0..live], 'A');
+            donor.storage = try std.testing.allocator.alloc(u8, 2 * window);
+            donor.len = other_live;
+            @memset(donor.storage[0..other_live], 'h');
+            const pointer = donor.storage.ptr;
+
+            try reader.ensureFieldCapacity(1, window + 1, false);
+
+            try std.testing.expectEqual(pointer, field.storage.ptr);
+            try std.testing.expectEqual(live, field.len);
+            try std.testing.expectEqual(other_live, donor.len);
+            try std.testing.expect(std.mem.allEqual(u8, field.storage[0..live], 'A'));
+            try std.testing.expect(std.mem.allEqual(u8, donor.storage[0..other_live], 'h'));
+        }
+    }
+}
+
+test "[failure] - [reader]: heterogeneous storage reuse cleans up every allocation failure" {
+    const large = io_layer.DEFAULT_READER_BUFFER_BYTES * 2 + 17;
+    const geometry = [_][4]usize{
+        .{ large, 151, large, 151 },
+        .{ large, 151, large, 151 },
+        .{ 8, large, 8, large },
+        .{ 8, large, 8, large },
+        .{ large, large, large, large },
+        .{ large, large, large, large },
+    };
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+    for (geometry, 0..) |lengths, index| {
+        for (lengths, "hApI", 0..) |length, byte, field| {
+            if (field == 0 or field == 2) {
+                try input.append(std.testing.allocator, if (field == 0) '@' else '+');
+            }
+            try input.appendNTimes(std.testing.allocator, byte, length);
+            if (index % 2 == 1) try input.append(std.testing.allocator, '\r');
+            try input.append(std.testing.allocator, '\n');
+        }
+    }
+    const Exercise = struct {
+        fn check(record: Record, lengths: [4]usize) !void {
+            for ([_][]const u8{ record.header, record.sequence, record.plus, record.quality }, lengths, "hApI") |bytes, length, fill| {
+                try std.testing.expectEqual(length, bytes.len);
+                try std.testing.expect(std.mem.allEqual(u8, bytes, fill));
+            }
+        }
+
+        fn run(allocator: std.mem.Allocator, bytes: []const u8, retain: bool) !void {
+            var source = io_layer.SliceSource.init(bytes);
+            var reader = try Reader.init(allocator, source.byteSource(), .{});
+            defer reader.deinit();
+            var retained: RetainedRecordStorage = .{};
+            defer retained.deinit(allocator);
+            var index: usize = 0;
+            while (try reader.next()) |first| {
+                try check(first, geometry[index]);
+                index += 1;
+                if (retain) {
+                    try std.testing.expect(retainFallbackRecordStorage(&reader, &retained, first));
+                    const second = (try reader.next()).?;
+                    try check(first, geometry[index - 1]);
+                    try check(second, geometry[index]);
+                    restoreFallbackRecordStorage(&reader, &retained);
+                    try check(second, geometry[index]);
+                    index += 1;
+                }
+            }
+            try std.testing.expectEqual(geometry.len, index);
+        }
+    };
+    for ([_]bool{ false, true }) |retain| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ input.items, retain });
+    }
 }
 
 test "[edge] - [reader]: quality spill reserves only its valid tail" {
