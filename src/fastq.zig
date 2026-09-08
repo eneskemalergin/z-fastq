@@ -636,11 +636,17 @@ const BufferedPayload = struct {
     quality: Range,
 };
 
-fn BufferedRecordResult(comptime full_record: bool) type {
+const BufferedProjection = enum { full, payload, validated_header };
+
+fn BufferedRecordResult(comptime projection: BufferedProjection) type {
     return union(enum) {
         incomplete,
         eof,
-        record: if (full_record) BufferedRecord else BufferedPayload,
+        record: switch (projection) {
+            .full => BufferedRecord,
+            .payload => BufferedPayload,
+            .validated_header => struct { header: Range, payload: BufferedPayload },
+        },
     };
 }
 
@@ -796,7 +802,7 @@ pub const Reader = struct {
     ) ReaderError!?Record {
         canonical_span.* = null;
         self.beginRecord();
-        switch (try self.readBufferedRecord(true, include_canonical_span)) {
+        switch (try self.readBufferedRecord(.full, include_canonical_span)) {
             .incomplete => return self.nextFallback(derive_id),
             .eof => return null,
             .record => |buffered| return self.finishBufferedRecord(
@@ -831,7 +837,7 @@ pub const Reader = struct {
 
     fn nextPayload(self: *Reader) ReaderError!?RecordPayload {
         self.beginRecord();
-        switch (try self.readBufferedRecord(false, false)) {
+        switch (try self.readBufferedRecord(.payload, false)) {
             .incomplete => return self.nextFallbackPayload(),
             .eof => return null,
             .record => |buffered| {
@@ -849,19 +855,20 @@ pub const Reader = struct {
         validator: *AdaptiveRecordValidator,
     ) ReaderError!?ValidatedHeader {
         self.beginRecord();
-        switch (try self.readBufferedRecord(true, false)) {
+        switch (try self.readBufferedRecord(.validated_header, false)) {
             .incomplete => return self.nextFallbackValidatedHeader(validator),
             .eof => return null,
             .record => |buffered| {
-                var unused_canonical_span: ?[]const u8 = null;
-                const record = self.finishBufferedRecord(
-                    buffered,
-                    &unused_canonical_span,
-                    false,
-                );
+                self.current_record_offsets = self.record_offsets;
                 return .{
-                    .header = record.header,
-                    .semantic_error = validator.validate(record),
+                    .header = self.buf[buffered.header.start + 1 .. buffered.header.end],
+                    .semantic_error = validator.validate(.{
+                        .header = "",
+                        .id = "",
+                        .sequence = buffered.payload.sequence.slice(self.buf),
+                        .plus = "",
+                        .quality = buffered.payload.quality.slice(self.buf),
+                    }),
                 };
             },
         }
@@ -933,7 +940,7 @@ pub const Reader = struct {
     /// Consumes one record without returning its fields, or returns false at clean EOF.
     pub fn advance(self: *Reader) ReaderError!bool {
         self.beginRecord();
-        switch (try self.readBufferedRecord(true, false)) {
+        switch (try self.readBufferedRecord(.full, false)) {
             .incomplete => return self.advanceFallback(),
             .eof => return false,
             .record => return true,
@@ -971,9 +978,9 @@ pub const Reader = struct {
 
     fn readBufferedRecord(
         self: *Reader,
-        comptime full_record: bool,
+        comptime projection: BufferedProjection,
         comptime include_canonical_span: bool,
-    ) ReaderError!BufferedRecordResult(full_record) {
+    ) ReaderError!BufferedRecordResult(projection) {
         if (self.machine.expected != .header) return .incomplete;
         if (self.cursor == self.fill_end and !try self.refill()) return .eof;
 
@@ -983,6 +990,7 @@ pub const Reader = struct {
         }
 
         var ranges: [4]Range = undefined;
+        var header: Range = undefined;
         var payload: BufferedPayload = undefined;
         var canonical = true;
         const record_start = self.cursor;
@@ -1012,17 +1020,20 @@ pub const Reader = struct {
                 return self.structuralError(err, start_offset);
             };
             const range: Range = .{ .start = start, .end = end };
-            if (full_record) ranges[line_index] = range;
+            if (projection == .full) ranges[line_index] = range;
             switch (line_kind) {
-                .header => self.record_offsets.header = start_offset,
+                .header => {
+                    self.record_offsets.header = start_offset;
+                    if (projection == .validated_header) header = range;
+                },
                 .sequence => {
                     self.record_offsets.sequence = start_offset;
-                    if (!full_record) payload.sequence = range;
+                    if (projection != .full) payload.sequence = range;
                 },
                 .plus => self.record_offsets.plus = start_offset,
                 .quality => {
                     self.record_offsets.quality = start_offset;
-                    if (!full_record) payload.quality = range;
+                    if (projection != .full) payload.quality = range;
                 },
             }
             std.debug.assert(record_ready == (line_index == 3));
@@ -1030,7 +1041,7 @@ pub const Reader = struct {
 
         self.record_index = std.math.add(u64, self.record_index, 1) catch
             return error.ArithmeticLimit;
-        return if (full_record)
+        return if (projection == .full)
             .{ .record = .{
                 .ranges = ranges,
                 .canonical_range = if (include_canonical_span and canonical)
@@ -1038,6 +1049,8 @@ pub const Reader = struct {
                 else
                     null,
             } }
+        else if (projection == .validated_header)
+            .{ .record = .{ .header = header, .payload = payload } }
         else
             .{ .record = payload };
     }
@@ -1468,7 +1481,7 @@ fn nextBufferedRecord(
     canonical_span.* = null;
     reader.beginRecord();
     if (reader.cursor == reader.fill_end) return null;
-    return switch (try reader.readBufferedRecord(true, include_canonical_span)) {
+    return switch (try reader.readBufferedRecord(.full, include_canonical_span)) {
         .incomplete => null,
         .eof => unreachable,
         .record => |buffered| reader.finishBufferedRecord(
@@ -1521,7 +1534,7 @@ pub fn nextBufferedAfterFallbackTransfer(
     }
     const got_data = try reader.refill();
     if (!got_data and reader.cursor == reader.fill_end) return null;
-    return switch (try reader.readBufferedRecord(true, true)) {
+    return switch (try reader.readBufferedRecord(.full, true)) {
         .incomplete => null,
         .eof => null,
         .record => |buffered| reader.finishBufferedRecord(
@@ -2530,6 +2543,7 @@ test "[property] - [reader]: structural masks match scalar line boundaries" {
 test "[property] - [reader]: field projections preserve delivery and failures" {
     const valid =
         "@first description\nACGT\n+annotated\n!!!!\n" ++
+        "@opaque\tmetadata /1\r\nacgtn\r\n+different annotation\r\n!#~AB\r\n" ++
         "@empty\r\n\r\n+\r\n\r\n" ++
         "@tail\nN\n+\n#";
     for (0..valid.len + 1) |split| {
@@ -2542,6 +2556,8 @@ test "[property] - [reader]: field projections preserve delivery and failures" {
         "@wider-iupac\nARYN\n+\n!!!!\n@next\nACGT\n+\n!!!!\n",
         "@embedded-cr\nAC\rGT\n+\n!!!!!\n",
         "@quality-cr\nACGT\n+\n!!\r!!\n",
+        "@valid\nAC\n+annotation\n!!\n@bad-both\nA?\n+other\n!\x1f\n",
+        "@valid\nAC\n+\n!!\n@bad-structure\nA?\n-\n!\x1f\n",
     };
     for (semantic_cases) |input| {
         for (0..input.len + 1) |split| {
