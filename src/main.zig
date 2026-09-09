@@ -3124,7 +3124,13 @@ fn initExactInput(
     path: []const u8,
     expected_snapshot: ?FileSnapshot,
 ) ExactInput {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
+    // A FIFO must reach the descriptor type check without waiting for a writer.
+    const handle = std.posix.openat(std.Io.Dir.cwd().handle, path, .{
+        .ACCMODE = .RDONLY,
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+        .NOCTTY = true,
+    }, 0) catch |err| {
         return .{ .failure = if (expected_snapshot != null and err == error.FileNotFound)
             inputChangedFailure()
         else if (expected_snapshot != null)
@@ -3134,6 +3140,7 @@ fn initExactInput(
         else
             CommandFailure.plain("io_error", "failed to open file", 3) };
     };
+    const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = true } };
     const snapshot = fileSnapshot(file, io) catch |err| {
         file.close(io);
         return .{ .failure = if (expected_snapshot != null and err == error.NotRegularFile)
@@ -4605,6 +4612,52 @@ test "[failure] - [exact sample]: changed metadata stops the second pass before 
     try std.testing.expectEqualStrings("input_changed", failure.code);
     try std.testing.expectEqual(@as(u8, 3), failure.exit_code);
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
+}
+
+test "[failure] - [exact sample]: a FIFO replacement reports input changed on reopen" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const name = "record.fastq";
+    try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "@one\nA\n+\n!\n" });
+    const snapshot = snapshot: {
+        const file = try tmp.dir.openFile(io, name, .{});
+        defer file.close(io);
+        break :snapshot try fileSnapshot(file, io);
+    };
+    try tmp.dir.deleteFile(io, name);
+    try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.mknodat(
+        tmp.dir.handle,
+        name,
+        std.os.linux.S.IFIFO | 0o600,
+        0,
+    )));
+    // A connected FIFO keeps a blocking-open regression from hanging this in-process test.
+    const keeper: std.Io.File = .{
+        .handle = try std.posix.openat(tmp.dir.handle, name, .{
+            .ACCMODE = .RDWR,
+            .NONBLOCK = true,
+            .CLOEXEC = true,
+        }, 0),
+        .flags = .{ .nonblocking = true },
+    };
+    defer keeper.close(io);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        ".zig-cache/tmp/{s}/{s}",
+        .{ tmp.sub_path, name },
+    );
+    var input: RecordInput = undefined;
+    const failure = switch (initExactInput(&input, io, path, snapshot)) {
+        .failure => |failure| failure,
+        .success => {
+            input.deinit(io);
+            return error.ExpectedFailure;
+        },
+    };
+    try std.testing.expectEqualStrings("input_changed", failure.code);
+    try std.testing.expectEqual(@as(u8, 3), failure.exit_code);
 }
 
 test "[integration] - [exact sample]: the output pass trusts first-pass semantics" {

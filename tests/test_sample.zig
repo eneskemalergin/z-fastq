@@ -451,6 +451,76 @@ test "[cli] - [interleaved sample]: input failures precede unwritable fields acr
     }
 }
 
+test "[cli] - [exact sample]: rejects FIFOs without waiting for a writer" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.mknodat(
+        tmp.dir.handle,
+        "input.fifo",
+        std.os.linux.S.IFIFO | 0o600,
+        0,
+    )));
+    try tmp.dir.symLink(io, "input.fifo", "link.fastq", .{});
+
+    for ([_][]const u8{ "input.fifo", "link.fastq" }) |name| {
+        const path = try tempPath(allocator, &tmp.sub_path, name);
+        const diagnostic = try std.fmt.allocPrint(
+            allocator,
+            "error: {s}: exact-count sampling requires a regular file\n",
+            .{path},
+        );
+        for ([_][]const u8{ "0", "1" }) |count| {
+            const cases = [_][]const []const u8{
+                &.{ "sample", "--count", count, path },
+                &.{ "sample", "--interleaved", "--count", count, path },
+                &.{ "sample", "--paired", "--count", count, path, BASIC_PATH },
+                &.{ "sample", "--paired", "--count", count, BASIC_PATH, path },
+            };
+            for (cases) |args| {
+                try expectResult(try cli.run(allocator, args), 3, "", diagnostic);
+            }
+        }
+    }
+}
+
+test "[cli] - [exact sample]: follows regular-file symlinks in both passes" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const mate1 = "@p/1\nA\n+\n!\n";
+    const mate2 = "@p/2\nT\n+\n#\n";
+    const files = [_]struct { name: []const u8, link: []const u8, bytes: []const u8 }{
+        .{ .name = "r1.fastq", .link = "r1.link", .bytes = mate1 },
+        .{ .name = "r2.fastq", .link = "r2.link", .bytes = mate2 },
+        .{ .name = "pairs.fastq", .link = "pairs.link", .bytes = mate1 ++ mate2 },
+    };
+    var paths: [files.len][]const u8 = undefined;
+    for (files, &paths) |file, *path| {
+        try tmp.dir.symLink(io, file.name, file.link, .{});
+        path.* = try tempPath(allocator, &tmp.sub_path, file.link);
+    }
+    for ([_]bool{ false, true }) |gzip| {
+        for (files) |file| {
+            var compressed: std.ArrayList(u8) = .empty;
+            if (gzip) try cli.appendGzipMember(allocator, &compressed, file.bytes, .{});
+            try tmp.dir.writeFile(io, .{
+                .sub_path = file.name,
+                .data = if (gzip) compressed.items else file.bytes,
+            });
+        }
+        try expectResult(try cli.run(allocator, &.{ "sample", "--count", "1", paths[0] }), 0, mate1, "");
+        try expectResult(try cli.run(allocator, &.{ "sample", "--paired", "--count", "1", paths[0], paths[1] }), 0, mate1 ++ mate2, "");
+        try expectResult(try cli.run(allocator, &.{ "sample", "--interleaved", "--count", "1", paths[2] }), 0, mate1 ++ mate2, "");
+    }
+}
+
 test "[cli] - [exact sample]: count boundaries preserve records in input order" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
