@@ -527,14 +527,6 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
     try std.testing.expectEqualStrings(version.stdout, short_version.stdout);
     try std.testing.expectEqual(@as(usize, 0), short_version.stderr.len);
 
-    const invalid = try runCli(allocator, &.{ "count", "--max-line-bytes", "nope" });
-    try std.testing.expectEqual(@as(u8, 2), invalid.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), invalid.stdout.len);
-    try std.testing.expectEqualStrings(
-        "error: invalid --max-line-bytes value\n",
-        invalid.stderr,
-    );
-
     const missing_command = try runCli(allocator, &.{});
     try std.testing.expectEqual(@as(u8, 2), missing_command.exit_code);
     try std.testing.expectEqual(@as(usize, 0), missing_command.stdout.len);
@@ -563,18 +555,67 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
         "error: --max-line-bytes requires a value\n",
         missing_limit.stderr,
     );
+}
 
-    const overflow = try runCli(allocator, &.{
-        "count",
-        "--max-line-bytes",
-        "340282366920938463463374607431768211456",
-    });
-    try std.testing.expectEqual(@as(u8, 4), overflow.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), overflow.stdout.len);
-    try std.testing.expectEqualStrings(
-        "error: --max-line-bytes exceeds supported limit\n",
-        overflow.stderr,
-    );
+test "[cli] - [arguments]: line-limit grammar errors differ from overflow for every command" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cases = [_]struct { value: []const u8, exit_code: u8 = 2 }{
+        .{ .value = "+16" },
+        .{ .value = "1_6" },
+        .{ .value = "-0" },
+        .{ .value = "-1" },
+        .{ .value = "+0" },
+        .{ .value = "" },
+        .{ .value = "nope" },
+        .{ .value = " 16" },
+        .{ .value = "16 " },
+        .{ .value = "1\t6" },
+        .{ .value = "16\n" },
+        .{ .value = "0x10" },
+        .{ .value = "16.0" },
+        .{ .value = "184467440737095516160x" },
+        .{ .value = "18446744073709551616", .exit_code = 4 },
+        .{ .value = "00018446744073709551616", .exit_code = 4 },
+        .{ .value = "340282366920938463463374607431768211456", .exit_code = 4 },
+    };
+    for ([_][]const u8{ "count", "stats", "check", "sample", "interleave", "deinterleave" }) |command| {
+        for (cases) |case| {
+            const result = try runCli(allocator, &.{ command, "--max-line-bytes", case.value, "-" });
+            try std.testing.expectEqual(case.exit_code, result.exit_code);
+            try std.testing.expectEqualStrings("", result.stdout);
+            try std.testing.expectEqualStrings(if (case.exit_code == 4)
+                "error: --max-line-bytes exceeds supported limit\n"
+            else
+                "error: invalid --max-line-bytes value\n", result.stderr);
+        }
+    }
+}
+
+test "[cli] - [arguments]: decimal line limits preserve zero, leading zeros, and usize maximum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for ([_][]const u8{ "0", "000" }) |value| {
+        const result = try runCli(allocator, &.{ "count", "--max-line-bytes", value, "-" });
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expectEqualStrings("0\n", result.stdout);
+        try std.testing.expectEqualStrings("", result.stderr);
+    }
+    const record = "@r\nA\n+\n!\n";
+    for ([_][]const u8{
+        "2", "0002", "00016", "18446744073709551615", "00018446744073709551615", "0" ** 128 ++ "2",
+    }) |value| {
+        const result = try runCliWithStdin(allocator, &.{ "count", "--max-line-bytes", value, "-" }, record, 1);
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expectEqualStrings("1\n", result.stdout);
+        try std.testing.expectEqualStrings("", result.stderr);
+    }
+    const limited = try runCliWithStdin(allocator, &.{ "count", "--max-line-bytes", "0001", "-" }, record, 1);
+    try std.testing.expectEqual(@as(u8, 4), limited.exit_code);
+    try std.testing.expectEqualStrings("", limited.stdout);
+    try std.testing.expectEqualStrings("error: -: line length limit exceeded\n", limited.stderr);
 }
 
 test "[cli] - [output]: a closed stdout exits with I/O status" {

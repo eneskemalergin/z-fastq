@@ -153,7 +153,7 @@ pub fn main(init: std.process.Init) !void {
                 ) catch {};
                 std.process.exit(2);
             };
-            max_line_bytes = std.fmt.parseInt(usize, value, 10) catch |err| switch (err) {
+            max_line_bytes = parseMaxLineBytes(value) catch |err| switch (err) {
                 error.Overflow => {
                     std.Io.File.writeStreamingAll(
                         .stderr(),
@@ -418,6 +418,14 @@ pub fn main(init: std.process.Init) !void {
 }
 
 const Command = enum { count, stats, check, sample, interleave, deinterleave };
+
+fn parseMaxLineBytes(value: []const u8) std.fmt.ParseIntError!usize {
+    if (value.len == 0) return error.InvalidCharacter;
+    for (value) |byte| {
+        if (byte < '0' or byte > '9') return error.InvalidCharacter;
+    }
+    return std.fmt.parseInt(usize, value, 10);
+}
 
 fn printUsageAndExit(io: std.Io) noreturn {
     std.Io.File.writeStreamingAll(.stderr(), io, USAGE) catch {};
