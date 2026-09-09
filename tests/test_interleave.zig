@@ -63,6 +63,27 @@ test "[cli] - [interleave]: fields, order, line endings, and name policies are e
     );
 }
 
+test "[cli] - [interleave]: terminal CR fields reject the pair before either mate is written" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const paths = [_][]const u8{
+        try tempPath(allocator, &tmp.sub_path, "r1.fastq"),
+        try tempPath(allocator, &tmp.sub_path, "r2.fastq"),
+    };
+    for (0..2) |bad_mate| {
+        const r1 = if (bad_mate == 0) "@pair/1 x\r\r\nA\n+\n!\n" else "@pair/1\nA\n+\n!\n";
+        const r2 = if (bad_mate == 1) "@pair/2\nT\n+\r\r\n#\n" else "@pair/2\nT\n+\n#\n";
+        try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = r1 });
+        try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = r2 });
+        const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: record fields ending in CR cannot be written with LF endings\n", .{paths[bad_mate]});
+        try expectResult(try cli.run(allocator, &.{ "interleave", paths[0], paths[1] }), 1, "", diagnostic);
+    }
+}
+
 test "[cli] - [interleave]: canonical and refill-spanning mates preserve exact output" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

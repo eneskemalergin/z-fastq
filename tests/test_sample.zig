@@ -359,6 +359,98 @@ test "[cli] - [sample]: boundary fractions preserve fields and canonicalize LF" 
     );
 }
 
+test "[cli] - [sample]: selected terminal CR fields fail before output" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = try tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: record fields ending in CR cannot be written with LF endings\n", .{path});
+    const inputs = [_][]const u8{
+        "@r\r\r\nA\n+\n!\n",
+        "@r\nA\n+\r\r\n!\n",
+        "@\r\r\nA\n+\n!\n",
+    };
+    for (inputs) |input| {
+        var gzip: std.ArrayList(u8) = .empty;
+        try cli.appendGzipMember(allocator, &gzip, input, .{});
+        for ([_][]const u8{ input, gzip.items }) |bytes| {
+            try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = bytes });
+            try expectResult(try cli.run(allocator, &.{ "check", path }), 0, "", "");
+            for ([_][]const u8{ "--fraction", "--count" }) |mode| {
+                try expectResult(try cli.run(allocator, &.{ "sample", mode, "1", path }), 1, "", diagnostic);
+                try expectResult(try cli.run(allocator, &.{ "sample", mode, "0", path }), 0, "", "");
+            }
+        }
+    }
+}
+
+test "[cli] - [paired sample]: terminal CR rejection preserves complete earlier pairs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const r1_path = try tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const r2_path = try tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    const pair_path = try tempPath(allocator, &tmp.sub_path, "pair.fastq");
+    const first1 = "@ok/1\nA\n+\n!\n";
+    const first2 = "@ok/2\nT\n+\n#\n";
+    const padding = try allocator.alloc(u8, 256 * 1024);
+    @memset(padding, 'x');
+
+    const shapes = [_][2]usize{ .{ 0, 0 }, .{ padding.len, 0 }, .{ 0, padding.len }, .{ padding.len, padding.len } };
+    for (shapes) |shape| {
+        for (0..2) |bad_mate| {
+            const mate1 = try std.fmt.allocPrint(allocator, "@pair/1 {s}\nA\n+{s}\n!\n", .{
+                padding[0..shape[0]], if (bad_mate == 0) "\r\r" else "",
+            });
+            const mate2 = try std.fmt.allocPrint(allocator, "@pair/2 {s}\nT\n+{s}\n#\n", .{
+                padding[0..shape[1]], if (bad_mate == 1) "\r\r" else "",
+            });
+            const r1 = try std.mem.concat(allocator, u8, &.{ first1, mate1 });
+            const r2 = try std.mem.concat(allocator, u8, &.{ first2, mate2 });
+            const pairs = try std.mem.concat(allocator, u8, &.{ first1, first2, mate1, mate2 });
+            try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = r1 });
+            try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = r2 });
+            try tmp.dir.writeFile(io, .{ .sub_path = "pair.fastq", .data = pairs });
+            for ([_][]const u8{ "--fraction", "--count" }) |mode| {
+                const amount = if (std.mem.eql(u8, mode, "--fraction")) "1" else "2";
+                const paired_error = try std.fmt.allocPrint(allocator, "error: {s}: record fields ending in CR cannot be written with LF endings\n", .{if (bad_mate == 0) r1_path else r2_path});
+                const interleaved_error = try std.fmt.allocPrint(allocator, "error: {s}: record fields ending in CR cannot be written with LF endings\n", .{pair_path});
+                try expectResult(try cli.run(allocator, &.{ "sample", "--paired", mode, amount, r1_path, r2_path }), 1, first1 ++ first2, paired_error);
+                try expectResult(try cli.run(allocator, &.{ "sample", "--interleaved", mode, amount, pair_path }), 1, first1 ++ first2, interleaved_error);
+            }
+        }
+    }
+}
+
+test "[cli] - [interleaved sample]: input failures precede unwritable fields across member seams" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const first = "@p/1 x\r\r\nA\n+\n!\n";
+    const cases = [_]struct { second: []const u8, diagnostic: []const u8 }{
+        .{ .second = "bad\nT\n+\n#\n", .diagnostic = "error: -: S003: header line must start with '@' and contain a nonempty identifier (record 1, line 1, offset 15)\n" },
+        .{ .second = "@p/2\nT\n+\n \n", .diagnostic = "error: -: S006: quality byte must be ASCII 33 through 126 (record 1, line 4, offset 24)\n" },
+        .{ .second = "", .diagnostic = "error: -: P002: paired input is missing a mate (pair 0, remaining R1, last R1 record 0, last R2 record none)\n" },
+    };
+    for (cases) |case| {
+        const input = try std.mem.concat(allocator, u8, &.{ first, case.second });
+        for (0..input.len + 1) |split| {
+            var gzip: std.ArrayList(u8) = .empty;
+            try cli.appendGzipMember(allocator, &gzip, input[0..split], .{});
+            try cli.appendGzipMember(allocator, &gzip, input[split..], .{});
+            for ([_][]const u8{ "0", "1" }) |fraction| {
+                try expectResult(try cli.runWithStdin(allocator, &.{ "sample", "--interleaved", "--fraction", fraction, "-" }, gzip.items, gzip.items.len), 1, "", case.diagnostic);
+            }
+        }
+    }
+}
+
 test "[cli] - [exact sample]: count boundaries preserve records in input order" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

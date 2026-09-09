@@ -687,6 +687,18 @@ fn validateCommandRecord(
     return mapSemanticFailure(validator.validate(record), offsets, record_index);
 }
 
+fn recordHasUnwritableEnding(record: zfastq.Record, canonical_span: ?[]const u8) bool {
+    return canonical_span == null and fastq.recordHasTerminalCr(record);
+}
+
+fn unwritableRecordFailure() CommandFailure {
+    return CommandFailure.plain(
+        "unwritable_record",
+        "record fields ending in CR cannot be written with LF endings",
+        1,
+    );
+}
+
 fn validateCurrentCommandRecord(
     validator: *fastq.AdaptiveRecordValidator,
     reader: *const zfastq.Reader,
@@ -2074,7 +2086,7 @@ fn writePreservedInterleavedMate1(
         .reader, .retained => if (canonical_span) |span| {
             try fastq.writeCanonicalRecordSpan(writer, span);
         } else {
-            try fastq.writeValidatedRecord(writer, record);
+            fastq.writeValidatedRecord(writer, record) catch return error.WriteFailed;
         },
         .staged => try fastq.writeCanonicalRecordSpan(writer, staged),
     }
@@ -2126,6 +2138,7 @@ fn sampleInterleavedSource(
         var first_mate_marker: ?u2 = null;
         var mate1_markers: u2 = 0;
         const selected = semantic1 == null and selection.selectPair();
+        const unwritable1 = selected and recordHasUnwritableEnding(record1, canonical_span1);
 
         var canonical_span2: ?[]const u8 = null;
         var record1_storage: InterleavedFirstRecordStorage = .unused;
@@ -2260,6 +2273,9 @@ fn sampleInterleavedSource(
             }
         }
         if (!selected) continue;
+        if (unwritable1 or recordHasUnwritableEnding(record2, canonical_span2)) {
+            return .{ .command = .{ .input_index = 0, .details = unwritableRecordFailure() } };
+        }
 
         try writePreservedInterleavedMate1(
             writer,
@@ -2319,6 +2335,7 @@ fn sampleFractionSource(
             if (validated.canonical_span) |span| {
                 fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
             } else {
+                if (recordHasUnwritableEnding(validated.record, null)) return unwritableRecordFailure();
                 fastq.writeValidatedRecord(writer, validated.record) catch
                     return error.WriteFailed;
             }
@@ -2518,6 +2535,10 @@ fn sampleExactSecondPass(
             if (canonical_span) |span| {
                 fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
             } else {
+                if (recordHasUnwritableEnding(record, null)) {
+                    failure = unwritableRecordFailure();
+                    break;
+                }
                 fastq.writeValidatedRecord(writer, record) catch
                     return error.WriteFailed;
             }
@@ -2877,6 +2898,14 @@ fn sampleExactPairedSecondPass(
             break;
         }
         if (selected) {
+            if (recordHasUnwritableEnding(record1.?, canonical_span1)) {
+                failure = .{ .command = .{ .input_index = 0, .details = unwritableRecordFailure() } };
+                break;
+            }
+            if (recordHasUnwritableEnding(record2.?, canonical_span2)) {
+                failure = .{ .command = .{ .input_index = 1, .details = unwritableRecordFailure() } };
+                break;
+            }
             if (canonical_span1) |span| {
                 fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
             } else {
@@ -2999,6 +3028,7 @@ fn sampleExactInterleavedSecondPass(
             break :failed null;
         } orelse break;
 
+        const unwritable1 = recordHasUnwritableEnding(record1, canonical_span1);
         var canonical_span2: ?[]const u8 = null;
         var record1_storage: InterleavedFirstRecordStorage = .reader;
         const buffered_record2 = fastq.nextBufferedWithoutId(
@@ -3040,6 +3070,10 @@ fn sampleExactInterleavedSecondPass(
             break :record preserved.?.record;
         } orelse break;
 
+        if (unwritable1 or recordHasUnwritableEnding(record2, canonical_span2)) {
+            failure = .{ .command = .{ .input_index = 0, .details = unwritableRecordFailure() } };
+            break;
+        }
         try writePreservedInterleavedMate1(
             writer,
             &reader,
@@ -3363,6 +3397,12 @@ fn interleaveSources(
         }
 
         if (!selection.selectPair()) continue;
+        if (recordHasUnwritableEnding(record1.?, canonical_span1)) {
+            return .{ .command = .{ .input_index = 0, .details = unwritableRecordFailure() } };
+        }
+        if (recordHasUnwritableEnding(record2.?, canonical_span2)) {
+            return .{ .command = .{ .input_index = 1, .details = unwritableRecordFailure() } };
+        }
 
         if (canonical_span1) |span| {
             if (direct_writer) |output| {
@@ -3601,6 +3641,7 @@ fn deinterleaveSource(
             record_index1,
         );
 
+        const unwritable1 = recordHasUnwritableEnding(record1, canonical_span1);
         var canonical_span2: ?[]const u8 = null;
         var record1_storage: InterleavedFirstRecordStorage = .reader;
         const buffered_record2 = fastq.nextBufferedWithoutId(
@@ -3703,6 +3744,9 @@ fn deinterleaveSource(
             } } };
         }
 
+        if (unwritable1 or recordHasUnwritableEnding(record2, canonical_span2)) {
+            return .{ .command = .{ .input_index = 0, .details = unwritableRecordFailure() } };
+        }
         writePreservedInterleavedMate1(
             writer1,
             &reader,

@@ -71,6 +71,28 @@ test "[cli] - [deinterleave]: fields, order, line endings, and round trip are ex
     );
 }
 
+test "[cli] - [deinterleave]: terminal CR fields leave both outputs empty" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for (0..2) |bad_mate| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const input_path = try tempPath(allocator, &tmp.sub_path, "input.fastq");
+        const out1 = try tempPath(allocator, &tmp.sub_path, "r1.fastq");
+        const out2 = try tempPath(allocator, &tmp.sub_path, "r2.fastq");
+        const r1 = if (bad_mate == 0) "@pair/1 x\r\r\nA\n+\n!\n" else "@pair/1\nA\n+\n!\n";
+        const r2 = if (bad_mate == 1) "@pair/2\nT\n+\r\r\n#\n" else "@pair/2\nT\n+\n#\n";
+        const input = try std.mem.concat(allocator, u8, &.{ r1, r2 });
+        try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = input });
+        const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: record fields ending in CR cannot be written with LF endings\n", .{input_path});
+        try expectResult(try cli.run(allocator, &.{ "deinterleave", "--out1", out1, "--out2", out2, input_path }), 1, "", diagnostic);
+        try expectFile(allocator, out1, "");
+        try expectFile(allocator, out2, "");
+    }
+}
+
 test "[cli] - [deinterleave]: gzip preserves exact-policy fields" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

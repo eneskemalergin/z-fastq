@@ -1587,7 +1587,15 @@ pub const Writer = struct {
     }
 };
 
-pub fn writeValidatedRecord(writer: *Writer, record: Record) WriteError!void {
+pub fn recordHasTerminalCr(record: Record) bool {
+    inline for (.{ record.header, record.sequence, record.plus, record.quality }) |field| {
+        if (std.mem.endsWith(u8, field, "\r")) return true;
+    }
+    return false;
+}
+
+pub fn writeValidatedRecord(writer: *Writer, record: Record) WriterError!void {
+    if (recordHasTerminalCr(record)) return error.InvalidRecord;
     return writeRecordFields(writer, record);
 }
 
@@ -3283,26 +3291,40 @@ test "[integration] - [record delivery]: retained fallback storage survives a re
 }
 
 test "[integration] - [writer]: trusted Reader records match checked serialization" {
-    const input = "@r\rdesc\r\nACGT\r\n+note\rx\r\n!#$%\r\n";
-    const expected = "@r\rdesc\nACGT\n+note\rx\n!#$%\n";
-    var source = io_layer.SliceSource.init(input);
-    var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-    const record = (try reader.next()).?;
-    try std.testing.expect(validateRecord(record, .{}) == null);
+    const cases = [_]struct { input: []const u8, expected: ?[]const u8 }{
+        .{
+            .input = "@r\rdesc\r\nACGT\r\n+note\rx\r\n!#$%\r\n",
+            .expected = "@r\rdesc\nACGT\n+note\rx\n!#$%\n",
+        },
+        .{ .input = "@r\r\r\nA\n+\n!\n", .expected = null },
+        .{ .input = "@r\nA\n+\r\r\n!\n", .expected = null },
+        .{ .input = "@\r\r\nA\n+\n!\n", .expected = null },
+    };
+    for (cases) |case| {
+        var source = io_layer.SliceSource.init(case.input);
+        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
+        const record = (try reader.next()).?;
+        try std.testing.expect(validateRecord(record, .{}) == null);
 
-    var checked_bytes: [64]u8 = undefined;
-    var checked_sink = io_layer.SliceSink.init(&checked_bytes);
-    var checked_writer = Writer.init(checked_sink.byteSink());
-    try checked_writer.writeRecord(record);
+        var checked_bytes: [64]u8 = undefined;
+        var checked_sink = io_layer.SliceSink.init(&checked_bytes);
+        var checked_writer = Writer.init(checked_sink.byteSink());
 
-    var trusted_bytes: [64]u8 = undefined;
-    var trusted_sink = io_layer.SliceSink.init(&trusted_bytes);
-    var trusted_writer = Writer.init(trusted_sink.byteSink());
-    try writeValidatedRecord(&trusted_writer, record);
-
-    try std.testing.expectEqualStrings(expected, checked_sink.written());
-    try std.testing.expectEqualStrings(checked_sink.written(), trusted_sink.written());
+        var trusted_bytes: [64]u8 = undefined;
+        var trusted_sink = io_layer.SliceSink.init(&trusted_bytes);
+        var trusted_writer = Writer.init(trusted_sink.byteSink());
+        if (case.expected) |expected| {
+            try checked_writer.writeRecord(record);
+            try writeValidatedRecord(&trusted_writer, record);
+            try std.testing.expectEqualStrings(expected, checked_sink.written());
+        } else {
+            try std.testing.expectError(error.InvalidRecord, checked_writer.writeRecord(record));
+            try std.testing.expectError(error.InvalidRecord, writeValidatedRecord(&trusted_writer, record));
+            try std.testing.expectEqualStrings("", trusted_sink.written());
+        }
+        try std.testing.expectEqualStrings(checked_sink.written(), trusted_sink.written());
+    }
 }
 
 test "[unit] - [check scanner]: state remains fixed-size" {
