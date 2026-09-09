@@ -214,6 +214,30 @@ test "[cli] - [count]: bytes select plain or chained gzip independently of suffi
     try std.testing.expectEqual(@as(usize, 0), plain_result.stderr.len);
 }
 
+test "[cli] - [count]: empty CRLF identifiers fail after dense warmup across gzip members" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const data = "@a\nA\n+\n!\n" ** 2 ++ "@\r\nA\n+\n!\n";
+    var whole: std.ArrayList(u8) = .empty;
+    var split: std.ArrayList(u8) = .empty;
+    try appendGzipMember(allocator, &whole, data, .{});
+    try appendGzipMember(allocator, &split, data[0..19], .{});
+    try appendGzipMember(allocator, &split, data[19..], .{});
+
+    for ([_][]const u8{ data, whole.items, split.items }) |input| {
+        const result = try runCliWithStdin(allocator, &.{ "count", "-" }, input, input.len);
+
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+        try std.testing.expectEqualStrings("", result.stdout);
+        try std.testing.expectEqualStrings(
+            "error: -: S003: header line must start with '@' and contain a nonempty identifier " ++
+                "(record 2, line 1, offset 18)\n",
+            result.stderr,
+        );
+    }
+}
+
 test "[cli] - [count]: damaged gzip framing and member data exit as I/O" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -1186,6 +1186,40 @@ test "[property] - [count scanner]: dense exits preserve every truncated and spl
     }
 }
 
+test "[property] - [count scanner]: dense headers retain an identifier after CRLF normalization" {
+    const prefix = "@a\nA\n+\n!\n" ** 2;
+    const cases = [_]struct { header: []const u8, valid: bool }{
+        .{ .header = "@\r", .valid = false },
+        .{ .header = "@", .valid = false },
+        .{ .header = "@ ", .valid = false },
+        .{ .header = "@\t", .valid = false },
+        .{ .header = "@b", .valid = true },
+        .{ .header = "@b\r", .valid = true },
+        .{ .header = "@\r\r", .valid = true },
+        .{ .header = "@\x00", .valid = true },
+    };
+
+    for (cases) |case| {
+        var storage: [32]u8 = undefined;
+        var output = std.Io.Writer.fixed(&storage);
+        try output.writeAll(prefix);
+        try output.writeAll(case.header);
+        try output.writeAll("\nA\n+\n!\n");
+        const data = output.buffered();
+        const expected = try readerOutcome(data, 1);
+
+        try std.testing.expectEqual(@as(u64, if (case.valid) 3 else 2), expected.count);
+        try std.testing.expectEqual(
+            @as(?zfastq.ReaderError, if (case.valid) null else error.S003InvalidHeader),
+            expected.err,
+        );
+        if (!case.valid) try expectDetails(expected.details.?, .s003_invalid_header, 2, 1, prefix.len);
+        for (1..data.len + 1) |chunk_len| {
+            try expectSameOutcome(expected, scannerOutcome(data, chunk_len));
+        }
+    }
+}
+
 test "[property] - [count scanner]: complete mixed endings match Reader at every seam and EOF" {
     const cases = [_][4][]const u8{
         .{ "@r", "AC", "+note", "!!" },

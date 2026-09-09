@@ -53,12 +53,13 @@ const DenseLayout = struct {
         const header = record[0 .. layout.sequence_start - 1];
         const sequence = record[layout.sequence_start..layout.sequence_end];
         const quality = record[layout.quality_start..layout.quality_end];
+        const header_len = lineContentLen(header);
         const sequence_len = lineContentLen(sequence);
         const quality_len = lineContentLen(quality);
-        return fastq.headerPrefixIsValid(record[0], record[1]) and
+        return header_len >= 2 and fastq.headerPrefixIsValid(record[0], record[1]) and
             record[layout.sequence_start - 1] == '\n' and
             !@call(.always_inline, containsNewline, .{header}) and
-            lineContentLen(header) <= max_line_bytes and
+            header_len <= max_line_bytes and
             record[layout.sequence_end] == '\n' and
             !@call(.always_inline, containsNewlinePair, .{ sequence, quality }) and
             sequence_len <= max_line_bytes and
