@@ -1009,11 +1009,11 @@ fn runCheckJson(
     var exit_code: u8 = 0;
     for (inputs) |input| {
         const failure = checkInput(io, input, options);
-        writeCheckJsonResult(&json, input, failure) catch return 3;
         if (failure) |details| exit_code = @max(exit_code, details.exit_code);
+        writeCheckJsonResult(&json, input, failure) catch return @max(exit_code, 3);
     }
-    finishJsonDocument(&json) catch return 3;
-    stdout_writer.interface.flush() catch return 3;
+    finishJsonDocument(&json) catch return @max(exit_code, 3);
+    stdout_writer.interface.flush() catch return @max(exit_code, 3);
     return exit_code;
 }
 
@@ -1029,10 +1029,12 @@ fn runPairedCheckJson(
 
     beginJsonDocument(&json, "z-fastq/check-v1") catch return 3;
     const failure = checkPairMode(io, allocator, inputs, options);
-    writePairedCheckJsonResult(&json, inputs, options.pair_mode, failure) catch return 3;
-    finishJsonDocument(&json) catch return 3;
-    stdout_writer.interface.flush() catch return 3;
-    return if (failure) |details| details.exitCode() else 0;
+    const exit_code = if (failure) |details| details.exitCode() else 0;
+    writePairedCheckJsonResult(&json, inputs, options.pair_mode, failure) catch
+        return @max(exit_code, 3);
+    finishJsonDocument(&json) catch return @max(exit_code, 3);
+    stdout_writer.interface.flush() catch return @max(exit_code, 3);
+    return exit_code;
 }
 
 fn checkPairMode(
@@ -1519,14 +1521,14 @@ fn runStatsJson(
     var exit_code: u8 = 0;
     for (inputs) |input| {
         const outcome = statsInput(io, allocator, input, options);
-        writeStatsJsonResult(&json, input, outcome) catch return 3;
         switch (outcome) {
             .success => {},
             .failure => |failure| exit_code = @max(exit_code, failure.exit_code),
         }
+        writeStatsJsonResult(&json, input, outcome) catch return @max(exit_code, 3);
     }
-    finishJsonDocument(&json) catch return 3;
-    stdout_writer.interface.flush() catch return 3;
+    finishJsonDocument(&json) catch return @max(exit_code, 3);
+    stdout_writer.interface.flush() catch return @max(exit_code, 3);
     return exit_code;
 }
 

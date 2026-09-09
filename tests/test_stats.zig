@@ -599,6 +599,45 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
     try expectCommand(closed_stdin, 3, "", "error: -: I/O error\n");
 }
 
+test "[cli] - [stats]: output failure preserves an observed limit status" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const long_directory = ("\x01" ** 200 ++ "/") ** 17;
+    try tmp.dir.createDirPath(io, long_directory);
+    try tmp.dir.writeFile(io, .{ .sub_path = "valid.fastq", .data = "@a\nA\n+\n!\n" });
+    const valid = try tempPath(allocator, &tmp, "valid.fastq");
+
+    for ([_][]const u8{ "limit.fastq", long_directory ++ "limit.fastq" }) |name| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "@abcde\nA\n+\n!\n" });
+        const path = try tempPath(allocator, &tmp, name);
+        const args: []const []const u8 = &.{ "stats", "--json", "--max-line-bytes", "4", path, valid };
+        const captured = try cli.run(allocator, args);
+        try std.testing.expectEqual(@as(u8, 4), captured.exit_code);
+        try std.testing.expectEqualStrings("", captured.stderr);
+        try std.testing.expectEqual(name.len > 200, captured.stdout.len > 16 * 1024);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, captured.stdout, .{});
+        defer parsed.deinit();
+        const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
+        try std.testing.expectEqual(@as(usize, 2), results.len);
+        try cli.expectJsonString(results[0].object.get("error").?.object.get("code"), "line_limit");
+        try cli.expectJsonString(results[1].object.get("status"), "ok");
+        try expectCommand(try runCliWithClosedStdout(allocator, args, ""), 4, "", "");
+    }
+
+    const path = try tempPath(allocator, &tmp, "limit.fastq");
+    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: line length limit exceeded\n", .{path});
+    try expectCommand(
+        try runCliWithClosedStdout(allocator, &.{ "stats", "--max-line-bytes", "4", path, valid }, ""),
+        4,
+        "",
+        diagnostic,
+    );
+}
+
 test "[cli] - [stats-json]: mixed results preserve order, variants, and stream separation" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

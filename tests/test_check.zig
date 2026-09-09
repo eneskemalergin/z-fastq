@@ -631,6 +631,41 @@ test "[cli] - [check-json]: options, stdin, escaped bytes, and output failure co
     try std.testing.expectEqual(@as(usize, 0), closed.stderr.len);
 }
 
+test "[cli] - [check-json]: output failure preserves an observed limit status in every mode" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const long_directory = ("\x01" ** 200 ++ "/") ** 17;
+    try tmp.dir.createDirPath(io, long_directory);
+    const empty = FIXTURE_DIR ++ "/empty_valid.fastq";
+
+    for ([_][]const u8{ "limit.fastq", long_directory ++ "limit.fastq" }) |name| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "@abcde\nA\n+\n!\n" });
+        const path = try tempPath(allocator, &tmp.sub_path, name);
+        for ([_][]const []const u8{
+            &.{ "check", "--json", "--max-line-bytes", "4", path, empty },
+            &.{ "check", "--paired", "--json", "--max-line-bytes", "4", path, empty },
+            &.{ "check", "--interleaved", "--json", "--max-line-bytes", "4", path },
+        }) |args| {
+            const captured = try cli.run(allocator, args);
+            try std.testing.expectEqual(@as(u8, 4), captured.exit_code);
+            try std.testing.expectEqualStrings("", captured.stderr);
+            try std.testing.expectEqual(name.len > 200, captured.stdout.len > 16 * 1024);
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, captured.stdout, .{});
+            defer parsed.deinit();
+            const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/check-v1");
+            try cli.expectJsonString(results[0].object.get("error").?.object.get("code"), "line_limit");
+            const failed = try cli.runWithClosedStdout(allocator, args, "");
+            try std.testing.expectEqual(@as(u8, 4), failed.exit_code);
+            try std.testing.expectEqualStrings("", failed.stdout);
+            try std.testing.expectEqualStrings("", failed.stderr);
+        }
+    }
+}
+
 test "[cli] - [paired check]: documented name forms and input transports pass" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
