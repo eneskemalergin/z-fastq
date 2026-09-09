@@ -1486,14 +1486,6 @@ fn runStats(
         const stats = switch (outcome) {
             .success => |stats| stats,
             .failure => |failure| {
-                if (std.mem.eql(u8, failure.code, "out_of_memory")) {
-                    std.Io.File.writeStreamingAll(
-                        .stderr(),
-                        io,
-                        "error: out of memory\n",
-                    ) catch {};
-                    return 3;
-                }
                 printCommandFailure(io, input, failure);
                 exit_code = @max(exit_code, failure.exit_code);
                 continue;
@@ -4484,6 +4476,139 @@ test "[failure] - [stats command]: reader allocation failure becomes a handled r
     try std.testing.expect(failure.record_index == null);
     try std.testing.expect(failure.byte_offset == null);
     try std.testing.expect(failure.line_in_record == null);
+}
+
+test "[integration] - [stats command]: allocation failure preserves later results and exit precedence" {
+    const Capture = struct {
+        dir: std.Io.Dir,
+        stdout: std.Io.Writer,
+        stderr: std.Io.Writer,
+        opened: usize = 0,
+        closed: usize = 0,
+
+        fn openFile(
+            ctx: ?*anyopaque,
+            _: std.Io.Dir,
+            path: []const u8,
+            options: std.Io.Dir.OpenFileOptions,
+        ) std.Io.File.OpenError!std.Io.File {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const file = try self.dir.openFile(std.testing.io, path, options);
+            self.opened += 1;
+            return file;
+        }
+
+        fn closeFiles(ctx: ?*anyopaque, files: []const std.Io.File) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            for (files) |file| file.close(std.testing.io);
+            self.closed += files.len;
+        }
+
+        fn operate(ctx: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (operation == .file_write_streaming) {
+                const write = operation.file_write_streaming;
+                const writer = if (write.file.handle == std.Io.File.stdout().handle)
+                    &self.stdout
+                else if (write.file.handle == std.Io.File.stderr().handle)
+                    &self.stderr
+                else
+                    return std.testing.io.operate(operation);
+                return .{ .file_write_streaming = writer.writeSplatHeader(
+                    write.header,
+                    write.data,
+                    write.splat,
+                ) catch error.NoSpaceLeft };
+            }
+            return std.testing.io.operate(operation);
+        }
+    };
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const window = io_layer.DEFAULT_READER_BUFFER_BYTES;
+    const long_line = try std.testing.allocator.alloc(u8, window + 2);
+    defer std.testing.allocator.free(long_line);
+    try tmp.dir.writeFile(io, .{ .sub_path = "small.fastq", .data = "@r\nA\n+\n!\n" });
+    {
+        const file = try tmp.dir.createFile(io, "large.fastq", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "@r\nA\n+\n!\n@long\n");
+        @memset(long_line, 'A');
+        try file.writeStreamingAll(io, long_line[0 .. window + 1]);
+        try file.writeStreamingAll(io, "\n+\n");
+        @memset(long_line, '!');
+        try file.writeStreamingAll(io, long_line[0 .. window + 1]);
+        try file.writeStreamingAll(io, "\n");
+    }
+    @memset(long_line, 'x');
+    long_line[0] = '@';
+    try tmp.dir.writeFile(io, .{ .sub_path = "limit.fastq", .data = long_line });
+
+    // Both Reader buffers fit; growing a retained field fails without exhausting the host.
+    const storage = try std.testing.allocator.alloc(u8, 2 * window);
+    defer std.testing.allocator.free(storage);
+    const block = "input: small.fastq\n" ++
+        "reads: 1\nbases: 1\nmin_length: 1\nmax_length: 1\nmean_length: 1.000000\n" ++
+        "a: 1\nc: 0\ng: 0\nt: 0\nn: 0\nother_bases: 0\ngc_fraction: 0.000000\n" ++
+        "quality_sum: 0\nmean_quality: 0.000000\nq20_bases: 0\nq20_fraction: 0.000000\n" ++
+        "q30_bases: 0\nq30_fraction: 0.000000\n";
+    const cases = [_]struct {
+        inputs: []const []const u8,
+        stdout: []const u8,
+        stderr: []const u8,
+        status: u8,
+    }{
+        .{
+            .inputs = &.{ "large.fastq", "small.fastq" },
+            .stdout = block,
+            .stderr = "error: large.fastq: out of memory\n",
+            .status = 3,
+        },
+        .{
+            .inputs = &.{ "limit.fastq", "large.fastq", "small.fastq" },
+            .stdout = block,
+            .stderr = "error: limit.fastq: line length limit exceeded\n" ++
+                "error: large.fastq: out of memory\n",
+            .status = 4,
+        },
+        .{
+            .inputs = &.{ "small.fastq", "large.fastq", "small.fastq" },
+            .stdout = block ++ "\n" ++ block,
+            .stderr = "error: large.fastq: out of memory\n",
+            .status = 3,
+        },
+    };
+    var vtable = std.Io.failing.vtable.*;
+    vtable.dirOpenFile = Capture.openFile;
+    vtable.fileClose = Capture.closeFiles;
+    vtable.operate = Capture.operate;
+    for (cases) |case| {
+        var stdout_buffer: [1024]u8 = undefined;
+        var stderr_buffer: [256]u8 = undefined;
+        var capture: Capture = .{
+            .dir = tmp.dir,
+            .stdout = .fixed(&stdout_buffer),
+            .stderr = .fixed(&stderr_buffer),
+        };
+        var bounded = std.heap.FixedBufferAllocator.init(storage);
+
+        const status = runStats(
+            .{ .userdata = &capture, .vtable = &vtable },
+            bounded.allocator(),
+            case.inputs,
+            .{ .max_line_bytes = window + 1 },
+            false,
+        );
+
+        try std.testing.expectEqual(case.status, status);
+        try std.testing.expectEqualStrings(case.stdout, capture.stdout.buffered());
+        try std.testing.expectEqualStrings(case.stderr, capture.stderr.buffered());
+        try std.testing.expectEqual(case.inputs.len, capture.opened);
+        try std.testing.expectEqual(capture.opened, capture.closed);
+        try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
+    }
 }
 
 test "[unit] - [exact sample]: every retained file-change signal is compared" {
