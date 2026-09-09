@@ -1003,63 +1003,6 @@ test "[property] - [parser]: structural details agree across chunk sizes" {
     }
 }
 
-test "[property] - [count scanner]: dense validation checks every field region" {
-    const valid = "@r1\nAAAA\n+\n!!!!\n";
-    const cases = [_]struct {
-        malformed_record: []const u8,
-        expected_error: zfastq.ReaderError,
-        code: zfastq.LintCode,
-        line: u3,
-        offset: u64,
-    }{
-        .{
-            .malformed_record = "@\nx\nAAAA\n+\n!!!!\n",
-            .expected_error = error.S003InvalidHeader,
-            .code = .s003_invalid_header,
-            .line = 1,
-            .offset = 16,
-        },
-        .{
-            .malformed_record = "@r2\nA\nAA\n+\n!!!!\n",
-            .expected_error = error.S001InvalidPlusLine,
-            .code = .s001_invalid_plus_line,
-            .line = 3,
-            .offset = 22,
-        },
-        .{
-            .malformed_record = "@r2\nAAAA\n+\n!\n!!\n",
-            .expected_error = error.S005LengthMismatch,
-            .code = .s005_length_mismatch,
-            .line = 4,
-            .offset = 27,
-        },
-    };
-
-    for (cases) |case| {
-        var data: [32]u8 = undefined;
-        @memcpy(data[0..valid.len], valid);
-        @memcpy(data[valid.len..], case.malformed_record);
-
-        for (1..data.len + 1) |chunk_len| {
-            var scan = zfastq.count_scan.Scanner.init(.{});
-            var pos: usize = 0;
-            var found_error: ?zfastq.ReaderError = null;
-            while (pos < data.len) {
-                const end = @min(data.len, pos + chunk_len);
-                if (scan.feed(data[pos..end])) |_| {
-                    pos = end;
-                } else |err| {
-                    found_error = err;
-                    break;
-                }
-            }
-            try std.testing.expectEqual(case.expected_error, found_error.?);
-            const details = scan.takeLastError().?;
-            try expectDetails(details, case.code, 1, case.line, case.offset);
-        }
-    }
-}
-
 test "[edge] - [count scanner]: lines span chunks while retaining the limit" {
     const data = "@r\nAAAAAAAA\n+\n!!!!!!!!";
     var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 8 });

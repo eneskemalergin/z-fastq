@@ -581,6 +581,83 @@ test "[failure] - [dense layout]: construction rejects impossible geometry" {
     try std.testing.expect(DenseLayout.fromRecordEnd(max, max) == null);
 }
 
+test "[property] - [count scanner]: dense validation checks every field region" {
+    const valid = "@r1\nAAAA\n+\n!!!!\n";
+    const prefix = valid ** 2;
+    const cases = [_]struct {
+        malformed_record: []const u8,
+        expected_error: fastq.ReaderError,
+        code: fastq.LintCode,
+        line: u3,
+        offset: u64,
+    }{
+        .{
+            .malformed_record = "@\nx\nAAAA\n+\n!!!!\n",
+            .expected_error = error.S003InvalidHeader,
+            .code = .s003_invalid_header,
+            .line = 1,
+            .offset = 0,
+        },
+        .{
+            .malformed_record = "@r2\nA\nAA\n+\n!!!!\n",
+            .expected_error = error.S001InvalidPlusLine,
+            .code = .s001_invalid_plus_line,
+            .line = 3,
+            .offset = 6,
+        },
+        .{
+            .malformed_record = "@r2\nAAAA\n-\n!!!!\n",
+            .expected_error = error.S001InvalidPlusLine,
+            .code = .s001_invalid_plus_line,
+            .line = 3,
+            .offset = 9,
+        },
+        .{
+            .malformed_record = "@r2\nAAAA\n+\n!\n!!\n",
+            .expected_error = error.S005LengthMismatch,
+            .code = .s005_length_mismatch,
+            .line = 4,
+            .offset = 11,
+        },
+    };
+
+    var warmed = Scanner.init(.{});
+    try std.testing.expectEqual(prefix.len, try warmed.feed(prefix));
+    try std.testing.expect(warmed.fast_path_enabled);
+    try std.testing.expect(warmed.layout_confirmed);
+    const layout = warmed.layout.?;
+    try std.testing.expectEqual(valid.len, layout.record_stride);
+    try std.testing.expectEqual(@as(usize, 1), warmed.tryStrideBlock(valid, layout).count);
+
+    for (cases) |case| {
+        try std.testing.expectEqual(layout.record_stride, case.malformed_record.len);
+        try std.testing.expectEqual(@as(usize, 0), warmed.tryStrideBlock(case.malformed_record, layout).count);
+
+        for (1..case.malformed_record.len + 1) |chunk_len| {
+            var scan = warmed;
+            var pos: usize = 0;
+            var found_error: ?fastq.ReaderError = null;
+            while (pos < case.malformed_record.len) {
+                const end = @min(case.malformed_record.len, pos + chunk_len);
+                if (scan.feed(case.malformed_record[pos..end])) |consumed| {
+                    try std.testing.expectEqual(end - pos, consumed);
+                    pos = end;
+                } else |err| {
+                    found_error = err;
+                    break;
+                }
+            }
+            try std.testing.expectEqual(case.expected_error, found_error.?);
+            try std.testing.expectEqual(@as(u64, 2), scan.record_index);
+            const details = scan.takeLastError().?;
+            try std.testing.expectEqual(case.code, details.code);
+            try std.testing.expectEqual(@as(u64, 2), details.record_index);
+            try std.testing.expectEqual(case.line, details.line_in_record);
+            try std.testing.expectEqual(prefix.len + case.offset, details.byte_offset);
+        }
+    }
+}
+
 test "[edge] - [record newline scan]: vector boundaries and incomplete input are exact" {
     const cases = [_][4]usize{
         .{ 14, 15, 30, 31 },
