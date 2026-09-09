@@ -171,7 +171,7 @@ pub const Scanner = struct {
         var records: usize = 0;
 
         while (cursor < data.len) {
-            const remaining = data[cursor..];
+            var remaining = data[cursor..];
             if (self.layout_confirmed) {
                 if (self.layout) |active| {
                     const run = self.tryStrideBlock(remaining, active);
@@ -179,8 +179,10 @@ pub const Scanner = struct {
                         records = std.math.add(usize, records, run.count) catch
                             return error.ArithmeticLimit;
                         cursor += run.count * run.stride;
-                        continue;
+                        remaining = data[cursor..];
+                        if (remaining.len < active.record_stride) continue;
                     }
+                    // A full remaining stride has already failed this layout proof.
                     if (remaining.len >= active.record_stride) self.observeDenseLayout(null);
                 }
             }
@@ -614,6 +616,60 @@ test "[edge] - [count scanner]: fast progress rejects maximum offset and record 
     try std.testing.expectError(error.ArithmeticLimit, records.feed(data));
     try std.testing.expectEqual(std.math.maxInt(u64), records.record_index);
     try std.testing.expectEqual(@as(u64, 0), records.byte_offset);
+}
+
+test "[property] - [dense exit]: short tails preserve prediction and changed records relearn" {
+    const record = "@r1\nAAAA\n+\n!!!!\n";
+    const longer = "@longer-id\nAA\n+\n!!\n";
+    const data = record ** 3 ++ longer ++ longer;
+    for (0..longer.len + 1) |tail_len| {
+        var scanner = Scanner.init(.{});
+        _ = try scanner.feed(record ** 2);
+        const old_layout = scanner.layout.?;
+
+        const progress = try scanner.feedFast(data[record.len * 2 .. record.len * 3 + tail_len]);
+        const complete_tail = tail_len == longer.len;
+        try std.testing.expectEqual(record.len + (if (complete_tail) longer.len else @as(usize, 0)), progress.bytes);
+        try std.testing.expectEqual(@as(usize, if (complete_tail) 2 else 1), progress.records);
+        if (tail_len < old_layout.record_stride) {
+            try std.testing.expect(scanner.layout_confirmed);
+            try std.testing.expect(old_layout.eql(scanner.layout.?));
+        } else if (!complete_tail) {
+            try std.testing.expect(scanner.layout == null);
+            try std.testing.expect(!scanner.layout_confirmed);
+        } else {
+            try std.testing.expect(!scanner.layout_confirmed);
+            try std.testing.expect(!old_layout.eql(scanner.layout.?));
+            try std.testing.expectEqual(longer.len, try scanner.tryFastRecord(longer));
+            try std.testing.expect(scanner.layout_confirmed);
+        }
+    }
+}
+
+test "[edge] - [dense exit]: checked progress and line-limit commit boundaries stay intact" {
+    const record = "@r1\nAAAA\n+\n!!!!\n";
+    const changed = "@longer\nAA\n+\n!!\n";
+    for ([_]bool{ false, true }) |overflow_offset| {
+        var scanner = Scanner.init(.{});
+        _ = try scanner.feed(record ** 2);
+        if (overflow_offset) {
+            scanner.byte_offset = std.math.maxInt(u64) - record.len;
+        } else {
+            scanner.record_index = std.math.maxInt(u64) - 1;
+        }
+        const before_offset = scanner.byte_offset;
+        const before_count = scanner.record_index;
+
+        try std.testing.expectError(error.ArithmeticLimit, scanner.feed(record ++ changed));
+        try std.testing.expectEqual(before_offset, scanner.byte_offset);
+        try std.testing.expectEqual(before_count, scanner.record_index);
+    }
+
+    var limited = Scanner.init(.{ .max_line_bytes = 4 });
+    _ = try limited.feed(record ** 2);
+    try std.testing.expectError(error.LineTooLong, limited.feed(record ++ changed));
+    try std.testing.expectEqual(@as(u64, 2), limited.record_index);
+    try std.testing.expectEqual(@as(u64, record.len * 2), limited.byte_offset);
 }
 
 test "[edge] - [count scanner]: incremental progress rejects maximum offset and record count" {

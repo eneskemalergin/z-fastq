@@ -1128,6 +1128,64 @@ test "[unit] - [count scanner]: dense batching waits for two matching records" {
     try std.testing.expect(scan.layout_confirmed);
 }
 
+test "[property] - [count scanner]: dense exits preserve every truncated and split outcome" {
+    const prefix = "@r1\nAAAA\n+\n!!!!\n" ** 3;
+    const tails = [_][]const u8{
+        "@longer\nAAAA\n+\n!!!!\n",
+        "@r2\nAA\n+\n!!\n",
+        "@r2\nAAAAAA\n+\n!!!!!!\n",
+        "@r2\nAAAA\n+note\n!!!!\n",
+        "@r2\r\nAAAA\r\n+\r\n!!!!\r\n",
+        "@r2\nAAAA\r\n+\n!!!!\n",
+        "@\nAAAA\n+\n!!!!\n",
+        "@r2\nA\nAA\n+\n!!!!\n",
+        "@r2\nAAAA\n-\n!!!!\n",
+        "@r2\nAAAA\n+\n!\n!!\n",
+        "@r2\n\n+\n\n",
+    };
+    for (tails) |tail| {
+        var storage: [256]u8 = undefined;
+        var output = std.Io.Writer.fixed(&storage);
+        try output.writeAll(prefix);
+        try output.writeAll(tail);
+        try output.writeAll(tail);
+        try output.writeAll(prefix);
+        const complete = output.buffered();
+
+        for (prefix.len..complete.len + 1) |length| {
+            const data = complete[0..length];
+            const expected = try readerOutcome(data, 1);
+            for (0..data.len + 1) |split| {
+                var scan = zfastq.count_scan.Scanner.init(.{});
+                var failure: ?zfastq.ReaderError = null;
+                for ([_][]const u8{ data[0..split], data[split..] }) |chunk| {
+                    const consumed = scan.feed(chunk) catch |err| {
+                        failure = err;
+                        break;
+                    };
+                    try std.testing.expectEqual(chunk.len, consumed);
+                }
+                if (failure == null) scan.finishEof() catch |err| {
+                    failure = err;
+                };
+                try expectSameOutcome(expected, .{
+                    .count = scan.record_index,
+                    .err = failure,
+                    .details = scan.takeLastError(),
+                });
+                if (failure == null) {
+                    try std.testing.expectEqual(@as(u64, data.len), scan.byte_offset);
+                } else if (expected.details) |details| {
+                    const line_start: usize = @intCast(details.byte_offset);
+                    const line_end = std.mem.findScalarPos(u8, data, line_start, '\n');
+                    const consumed = if (line_end) |end| end + 1 else data.len;
+                    try std.testing.expectEqual(@as(u64, consumed), scan.byte_offset);
+                }
+            }
+        }
+    }
+}
+
 test "[property] - [count scanner]: record strides may alternate" {
     const hdr_a = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/1\n";
     const hdr_b = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/12\n";
