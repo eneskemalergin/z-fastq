@@ -46,7 +46,7 @@ The accelerated build uses vendored ISA-L for gzip and CRC work and requires NAS
 zig build -Disa-l=false
 ```
 
-The release path is intended to be static. More detailed format guarantees, limits, error codes, JSON schemas, and compatibility notes belong in the project documentation rather than this overview.
+The release path is intended to be static. More detailed format guarantees, limits, error codes, machine-readable output, and compatibility notes belong in the project documentation rather than this overview.
 
 ## Start
 
@@ -92,7 +92,7 @@ The README stays intentionally short. The detailed reference will cover:
 - FASTQ and gzip behavior;
 - paired-read name policies;
 - sampling compatibility and reproducibility;
-- JSON schemas and exit statuses;
+- machine-readable output and exit statuses;
 - resource limits and portability;
 - benchmark methods and results;
 - the Zig module API.
@@ -107,13 +107,13 @@ Performance work is central to the project. The goal is not only to finish a FAS
 
 The project is still in polishing. Internals, defaults, and hot paths change often enough that final benchmark tables and public methodology are still being developed. I prefer to share the direction without presenting unfinished numbers as a permanent leaderboard.
 
-Early local comparisons suggest that z-fastq is often **about 1.5x to 5x faster** than selected peers, while using **roughly 2x to 5x less peak RSS** in comparable runs. The latest audited static ReleaseFast binary is under 1 MB, at about 744 kB.
+Early local comparisons suggest that z-fastq is often **about 1.5x to 5x faster** than selected peers, while using **roughly 2x to 5x less peak RSS** in comparable runs. The latest audited static ReleaseFast binary is 744,000 bytes, under 1 MB.
 
 Those ranges vary with the command, plain versus gzip input, read length, pairing mode, sampling mode, and comparison tool. Sampling and output-heavy workflows are still being tuned, so these figures are signals of direction rather than a universal ranking. The aim is a fast, small process that can be scheduled across several files without every worker consuming more of the machine than necessary.
 
 The peer set is deliberately mixed. It includes familiar baseline tools such as `seqtk`, `fqtools`, `BBTools`, `SeqFu`, and `FastQValidator`, alongside newer native implementations, including Rust-based tools such as `Needletail`, `Helicase`, `fq`, `Fasten`, `fqkit`, and `Rasusa`. The familiar tools anchor common practice. The newer native tools are closer to z-fastq's low-level design and give a more useful comparison for throughput and memory. I only compare overlapping work, and keep differences in validation rules, RNGs, output behavior, and child-process accounting visible.
 
-For perspective, a few large-input scale probes looked like this:
+The snapshot below uses the static ReleaseFast build with the default vendored ISA-L path on Linux x86-64. For perspective, a few large-input scale probes looked like this:
 
 | Workload         | Input on disk | FASTQ bytes processed | Observed wall time |  Peak RSS |
 | ---------------- | ------------: | --------------------: | -----------------: | --------: |

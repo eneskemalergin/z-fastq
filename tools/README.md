@@ -16,7 +16,7 @@ The scripts prepare the tools needed by local comparison workflows. They do not 
 
 ## Current tools
 
-The following sizes are rounded retained executable sizes from the current Linux x86-64 installation. They show the scale of the comparison set; they exclude temporary source and build trees.
+The following sizes are rounded retained executable sizes from the current Linux x86-64 installation. They show the scale of the comparison set; each row is the executable itself.
 
 | Tool                             |              Version |    Size | Use here                                                      |
 | -------------------------------- | -------------------: | ------: | ------------------------------------------------------------- |
@@ -42,8 +42,6 @@ The table is descriptive local comparison context, not a universal ranking.
 - `versions.sh` owns the selected tool versions.
 - `patches/` contains small source fixes required by pinned external recipes.
 - `wrappers/` contains adapters for tools that need a common comparison interface.
-
-Generated downloads, builds, environments, and command links are local state. They are not source files, release artifacts, or part of the z-fastq CLI contract.
 
 ## Scope of the comparisons
 
