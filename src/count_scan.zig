@@ -246,7 +246,20 @@ pub const Scanner = struct {
             (plus_len > 0 and data[plus_end - 1] == '\r') or
             (quality_len > 0 and data[quality_end - 1] == '\r'))
         {
-            return 0;
+            const header_len = lineContentLen(data[0..header_end]);
+            const sequence_content_len = lineContentLen(data[sequence_start..sequence_end]);
+            const plus_content_len = lineContentLen(data[plus_start..plus_end]);
+            const quality_content_len = lineContentLen(data[quality_start..quality_end]);
+            // Failed normalized proofs keep line-limit and structural error order in the fallback.
+            if (header_len < 2 or !fastq.headerPrefixIsValid(data[0], data[1]) or
+                header_len > self.options.max_line_bytes or
+                sequence_content_len > self.options.max_line_bytes or
+                plus_content_len == 0 or data[plus_start] != '+' or
+                plus_content_len > self.options.max_line_bytes or
+                quality_content_len > self.options.max_line_bytes or
+                quality_content_len != sequence_content_len) return 0;
+            self.observeDenseLayout(null);
+            return quality_end + 1;
         }
         if (header_end < 2 or !fastq.headerPrefixIsValid(data[0], data[1])) {
             self.disableFast();
@@ -382,8 +395,8 @@ pub const Scanner = struct {
         self.machine = machine;
         if (record_ready) {
             self.record_index = next_record_index;
+            self.fast_path_enabled = true;
             if (self.current_record_dense_eligible and !had_cr) {
-                self.fast_path_enabled = true;
                 if (self.current_record_minimal_plus) {
                     self.learnDenseLayout(self.machine.sequence_len, self.last_header_line_bytes);
                 } else {
@@ -596,6 +609,50 @@ test "[unit] - [derived record]: annotated plus lines stay on the complete-recor
     try std.testing.expectEqual(data.len, try scanner.feed(data));
     try std.testing.expectEqual(@as(u64, 2), scanner.record_index);
     try std.testing.expect(scanner.layout == null);
+}
+
+test "[property] - [derived record]: normalized records enable fast parsing without LF geometry" {
+    const fields = [_][]const u8{ "@r", "AC", "+", "!!" };
+    for (1..16) |endings| {
+        var storage: [32]u8 = undefined;
+        var output = std.Io.Writer.fixed(&storage);
+        for (fields, 0..) |field, index| {
+            try output.writeAll(field);
+            if (endings & (@as(usize, 1) << @intCast(index)) != 0) try output.writeByte('\r');
+            try output.writeByte('\n');
+        }
+        const data = output.buffered();
+        var scanner = Scanner.init(.{ .max_line_bytes = 2 });
+        _ = try scanner.feed(data);
+        try std.testing.expect(scanner.fast_path_enabled);
+        try std.testing.expect(scanner.layout == null);
+        const progress = try scanner.feedFast(data);
+        try std.testing.expectEqual(data.len, progress.bytes);
+        try std.testing.expectEqual(@as(usize, 1), progress.records);
+        try std.testing.expect(scanner.layout == null);
+
+        scanner.options.max_line_bytes = 1;
+        try std.testing.expectEqual(@as(usize, 0), try scanner.tryFastRecord(data));
+        try std.testing.expectError(error.LineTooLong, scanner.feed(data));
+    }
+
+    var scanner = Scanner.init(.{});
+    _ = try scanner.feed("@r\r\nA\r\n+\r\n!\r\n");
+    for ([_][]const u8{ "@\r\nA\n+\n!\n", "@r\r\nA\n\r\n!\n", "@r\r\nA\n+\n!!\n" }) |data| {
+        try std.testing.expectEqual(@as(usize, 0), try scanner.tryFastRecord(data));
+    }
+    for ([_][]const u8{
+        "@long\r\nA\n+\n!\n",
+        "@r\r\nAAAAA\n+\n!!!!!\n",
+        "@r\r\nA\n+long\n!\n",
+        "@r\r\nA\n+\n!!!!!\n",
+    }) |data| {
+        var limited = Scanner.init(.{ .max_line_bytes = 4 });
+        _ = try limited.feed("@r\r\nA\r\n+\r\n!\r\n");
+        try std.testing.expectEqual(@as(usize, 0), try limited.tryFastRecord(data));
+        try std.testing.expectError(error.LineTooLong, limited.feed(data));
+        try std.testing.expectEqual(@as(u64, 1), limited.record_index);
+    }
 }
 
 test "[edge] - [count scanner]: fast progress rejects maximum offset and record count" {

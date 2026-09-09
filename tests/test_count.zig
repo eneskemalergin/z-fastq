@@ -183,13 +183,13 @@ test "[cli] - [count]: bytes select plain or chained gzip independently of suffi
     var gzip: std.ArrayList(u8) = .empty;
 
     try appendGzipMember(allocator, &gzip, "", .{});
-    try appendGzipMember(allocator, &gzip, "@a\nA\n", .{
+    try appendGzipMember(allocator, &gzip, "@a\r\nA\r", .{
         .extra = "xy",
         .name = "reads.fastq",
         .comment = "fixture",
         .header_crc = true,
     });
-    try appendGzipMember(allocator, &gzip, "+\n!\n@b\nTT\n+name\n##\n", .{});
+    try appendGzipMember(allocator, &gzip, "\n+\r\n!\r\n@b\r\nTT\n+name\r\n##\r\n@c\nA\n+\n!\n", .{});
 
     const file_result = try runCountBytes(allocator, "reads.bin", gzip.items);
     const plain_result = try runCountBytes(
@@ -206,7 +206,7 @@ test "[cli] - [count]: bytes select plain or chained gzip independently of suffi
 
     for ([_]CommandResult{ file_result, stdin_result }) |result| {
         try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-        try std.testing.expectEqualStrings("2\n", result.stdout);
+        try std.testing.expectEqualStrings("3\n", result.stdout);
         try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
     }
     try std.testing.expectEqual(@as(u8, 0), plain_result.exit_code);
