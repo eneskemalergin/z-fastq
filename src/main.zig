@@ -4104,46 +4104,50 @@ fn printStats(
     try std.Io.File.writeStreamingAll(.stdout(), io, "input: ");
     try writeEscapedAll(.stdout(), io, label);
     try std.Io.File.writeStreamingAll(.stdout(), io, "\n");
-    try writeUnsignedField(io, "reads", result.reads);
-    try writeUnsignedField(io, "bases", result.bases);
-    try writeOptionalUnsignedField(io, "min_length", result.min_length);
-    try writeOptionalUnsignedField(io, "max_length", result.max_length);
-    try writeRatioField(io, "mean_length", result.bases, result.reads);
-    try writeUnsignedField(io, "a", result.a);
-    try writeUnsignedField(io, "c", result.c);
-    try writeUnsignedField(io, "g", result.g);
-    try writeUnsignedField(io, "t", result.t);
-    try writeUnsignedField(io, "n", result.n);
-    try writeUnsignedField(io, "other_bases", result.other_bases);
+    var buffer: [1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &buffer);
+    const output = &stdout_writer.interface;
+    try writeUnsignedField(output, "reads", result.reads);
+    try writeUnsignedField(output, "bases", result.bases);
+    try writeOptionalUnsignedField(output, "min_length", result.min_length);
+    try writeOptionalUnsignedField(output, "max_length", result.max_length);
+    try writeRatioField(output, "mean_length", result.bases, result.reads);
+    try writeUnsignedField(output, "a", result.a);
+    try writeUnsignedField(output, "c", result.c);
+    try writeUnsignedField(output, "g", result.g);
+    try writeUnsignedField(output, "t", result.t);
+    try writeUnsignedField(output, "n", result.n);
+    try writeUnsignedField(output, "other_bases", result.other_bases);
     try writeRatioField(
-        io,
+        output,
         "gc_fraction",
         @as(u128, result.g) + result.c,
         @as(u128, result.a) + result.c + result.g + result.t,
     );
-    try writeUnsignedField(io, "quality_sum", result.quality_sum);
-    try writeRatioField(io, "mean_quality", result.quality_sum, result.bases);
-    try writeUnsignedField(io, "q20_bases", result.q20_bases);
-    try writeRatioField(io, "q20_fraction", result.q20_bases, result.bases);
-    try writeUnsignedField(io, "q30_bases", result.q30_bases);
-    try writeRatioField(io, "q30_fraction", result.q30_bases, result.bases);
+    try writeUnsignedField(output, "quality_sum", result.quality_sum);
+    try writeRatioField(output, "mean_quality", result.quality_sum, result.bases);
+    try writeUnsignedField(output, "q20_bases", result.q20_bases);
+    try writeRatioField(output, "q20_fraction", result.q20_bases, result.bases);
+    try writeUnsignedField(output, "q30_bases", result.q30_bases);
+    try writeRatioField(output, "q30_fraction", result.q30_bases, result.bases);
+    try output.flush();
 }
 
-fn writeUnsignedField(io: std.Io, name: []const u8, value: u64) !void {
+fn writeUnsignedField(output: *std.Io.Writer, name: []const u8, value: u64) !void {
     var buf: [96]u8 = undefined;
     const line = try std.fmt.bufPrint(&buf, "{s}: {d}\n", .{ name, value });
-    try std.Io.File.writeStreamingAll(.stdout(), io, line);
+    try output.writeAll(line);
 }
 
-fn writeOptionalUnsignedField(io: std.Io, name: []const u8, value: ?u64) !void {
-    if (value) |number| return writeUnsignedField(io, name, number);
+fn writeOptionalUnsignedField(output: *std.Io.Writer, name: []const u8, value: ?u64) !void {
+    if (value) |number| return writeUnsignedField(output, name, number);
     var buf: [64]u8 = undefined;
     const line = try std.fmt.bufPrint(&buf, "{s}: -\n", .{name});
-    try std.Io.File.writeStreamingAll(.stdout(), io, line);
+    try output.writeAll(line);
 }
 
 fn writeRatioField(
-    io: std.Io,
+    output: *std.Io.Writer,
     name: []const u8,
     numerator: u128,
     denominator: u128,
@@ -4151,7 +4155,7 @@ fn writeRatioField(
     var buf: [96]u8 = undefined;
     if (denominator == 0) {
         const line = try std.fmt.bufPrint(&buf, "{s}: -\n", .{name});
-        return std.Io.File.writeStreamingAll(.stdout(), io, line);
+        return output.writeAll(line);
     }
     const scale = 1_000_000;
     const rounded = (numerator * scale + denominator / 2) / denominator;
@@ -4160,7 +4164,7 @@ fn writeRatioField(
         "{s}: {d}.{d:0>6}\n",
         .{ name, rounded / scale, rounded % scale },
     );
-    try std.Io.File.writeStreamingAll(.stdout(), io, line);
+    try output.writeAll(line);
 }
 
 fn printPathError(io: std.Io, path: []const u8, message: []const u8) void {
@@ -4478,7 +4482,7 @@ test "[failure] - [stats command]: reader allocation failure becomes a handled r
     try std.testing.expect(failure.line_in_record == null);
 }
 
-test "[integration] - [stats command]: allocation failure preserves later results and exit precedence" {
+test "[integration] - [stats command]: handled failures preserve input order and exit precedence" {
     const Capture = struct {
         dir: std.Io.Dir,
         stdout: std.Io.Writer,
@@ -4554,17 +4558,21 @@ test "[integration] - [stats command]: allocation failure preserves later result
         "a: 1\nc: 0\ng: 0\nt: 0\nn: 0\nother_bases: 0\ngc_fraction: 0.000000\n" ++
         "quality_sum: 0\nmean_quality: 0.000000\nq20_bases: 0\nq20_fraction: 0.000000\n" ++
         "q30_bases: 0\nq30_fraction: 0.000000\n";
+    const partial = block ++ "\ninput: small.fastq\n";
     const cases = [_]struct {
         inputs: []const []const u8,
         stdout: []const u8,
         stderr: []const u8,
         status: u8,
+        opened: usize,
+        stdout_capacity: usize = 1024,
     }{
         .{
             .inputs = &.{ "large.fastq", "small.fastq" },
             .stdout = block,
             .stderr = "error: large.fastq: out of memory\n",
             .status = 3,
+            .opened = 2,
         },
         .{
             .inputs = &.{ "limit.fastq", "large.fastq", "small.fastq" },
@@ -4572,12 +4580,22 @@ test "[integration] - [stats command]: allocation failure preserves later result
             .stderr = "error: limit.fastq: line length limit exceeded\n" ++
                 "error: large.fastq: out of memory\n",
             .status = 4,
+            .opened = 3,
         },
         .{
             .inputs = &.{ "small.fastq", "large.fastq", "small.fastq" },
             .stdout = block ++ "\n" ++ block,
             .stderr = "error: large.fastq: out of memory\n",
             .status = 3,
+            .opened = 3,
+        },
+        .{
+            .inputs = &.{ "small.fastq", "limit.fastq", "small.fastq", "small.fastq" },
+            .stdout = partial,
+            .stderr = "error: limit.fastq: line length limit exceeded\n",
+            .status = 4,
+            .opened = 3,
+            .stdout_capacity = partial.len,
         },
     };
     var vtable = std.Io.failing.vtable.*;
@@ -4589,7 +4607,7 @@ test "[integration] - [stats command]: allocation failure preserves later result
         var stderr_buffer: [256]u8 = undefined;
         var capture: Capture = .{
             .dir = tmp.dir,
-            .stdout = .fixed(&stdout_buffer),
+            .stdout = .fixed(stdout_buffer[0..case.stdout_capacity]),
             .stderr = .fixed(&stderr_buffer),
         };
         var bounded = std.heap.FixedBufferAllocator.init(storage);
@@ -4605,7 +4623,7 @@ test "[integration] - [stats command]: allocation failure preserves later result
         try std.testing.expectEqual(case.status, status);
         try std.testing.expectEqualStrings(case.stdout, capture.stdout.buffered());
         try std.testing.expectEqualStrings(case.stderr, capture.stderr.buffered());
-        try std.testing.expectEqual(case.inputs.len, capture.opened);
+        try std.testing.expectEqual(case.opened, capture.opened);
         try std.testing.expectEqual(capture.opened, capture.closed);
         try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
     }
