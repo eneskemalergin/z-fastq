@@ -3824,30 +3824,6 @@ fn stageCanonicalRecord(
     staging.appendAssumeCapacity('\n');
 }
 
-test "[unit] - [interleaved staging]: releases oversized slack before a smaller mate" {
-    var staging: std.ArrayList(u8) = .empty;
-    defer staging.deinit(std.testing.allocator);
-    const old_capacity = zfastq.limits.DEFAULT_READER_BUFFER_BYTES * 2;
-    try staging.ensureTotalCapacityPrecise(std.testing.allocator, old_capacity);
-
-    try stageCanonicalRecord(
-        std.testing.allocator,
-        &staging,
-        .{
-            .header = "pair/1",
-            .id = "pair/1",
-            .sequence = "A",
-            .plus = "",
-            .quality = "!",
-        },
-        null,
-        old_capacity,
-    );
-
-    try std.testing.expectEqualStrings("@pair/1\nA\n+\n!\n", staging.items);
-    try std.testing.expect(staging.capacity < old_capacity);
-}
-
 fn flushDeinterleaveWriters(
     writer1: *zfastq.Writer,
     writer2: *zfastq.Writer,
@@ -4379,6 +4355,30 @@ fn writeEscapedAll(file: std.Io.File, io: std.Io, bytes: []const u8) !void {
         run_start = index + 1;
     }
     try std.Io.File.writeStreamingAll(file, io, bytes[run_start..]);
+}
+
+test "[unit] - [interleaved staging]: releases oversized slack before a smaller mate" {
+    var staging: std.ArrayList(u8) = .empty;
+    defer staging.deinit(std.testing.allocator);
+    const old_capacity = zfastq.limits.DEFAULT_READER_BUFFER_BYTES * 2;
+    try staging.ensureTotalCapacityPrecise(std.testing.allocator, old_capacity);
+
+    try stageCanonicalRecord(
+        std.testing.allocator,
+        &staging,
+        .{
+            .header = "pair/1",
+            .id = "pair/1",
+            .sequence = "A",
+            .plus = "",
+            .quality = "!",
+        },
+        null,
+        old_capacity,
+    );
+
+    try std.testing.expectEqualStrings("@pair/1\nA\n+\n!\n", staging.items);
+    try std.testing.expect(staging.capacity < old_capacity);
 }
 
 test "[unit] - [machine output]: handled non-lint errors share one exact shape" {

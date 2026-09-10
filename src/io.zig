@@ -7,11 +7,11 @@ const build_options = @import("build_options");
 const flate = std.compress.flate;
 const crc32 = @import("crc32.zig");
 const Inflate = @import("inflate.zig");
-const use_isa_l = build_options.use_isa_l;
-const isal = if (use_isa_l) @cImport({
+const USE_ISA_L = build_options.use_isa_l;
+const isal = if (USE_ISA_L) @cImport({
     @cInclude("igzip_lib.h");
 }) else struct {};
-const PayloadCrc32 = if (use_isa_l) void else crc32.Crc32;
+const PayloadCrc32 = if (USE_ISA_L) void else crc32.Crc32;
 
 const ReadError = error{ReadFailed};
 pub const WriteError = error{WriteFailed};
@@ -19,7 +19,7 @@ pub const WriteError = error{WriteFailed};
 pub const DEFAULT_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_READER_BUFFER_BYTES: usize = 256 * 1024;
 pub const COUNT_READ_BUFFER_BYTES: usize = DEFAULT_READER_BUFFER_BYTES;
-pub const COUNT_DECOMPRESS_BUFFER_BYTES: usize = if (use_isa_l)
+pub const COUNT_DECOMPRESS_BUFFER_BYTES: usize = if (USE_ISA_L)
     COUNT_READ_BUFFER_BYTES
 else
     flate.history_len + COUNT_READ_BUFFER_BYTES;
@@ -236,14 +236,14 @@ const IsalInflate = struct {
     }
 };
 
-const GzipInflate = if (use_isa_l) IsalInflate else Inflate;
+const GzipInflate = if (USE_ISA_L) IsalInflate else Inflate;
 
 /// Streams and validates complete RFC 1952 member sequences from a borrowed reader.
 /// The reader needs at least ten buffer bytes and must share this adapter's stable lifetime.
 pub const GzipSource = struct {
     input: *std.Io.Reader,
-    decompressor: GzipInflate = if (use_isa_l) .{} else undefined,
-    decompressor_buffer: [if (use_isa_l) 0 else flate.max_window_len]u8 = undefined,
+    decompressor: GzipInflate = if (USE_ISA_L) .{} else undefined,
+    decompressor_buffer: [if (USE_ISA_L) 0 else flate.max_window_len]u8 = undefined,
     payload_crc: PayloadCrc32,
     size: u32 = 0,
     state: State = .between_members,
@@ -258,7 +258,7 @@ pub const GzipSource = struct {
     pub fn init(input: *std.Io.Reader) GzipSource {
         return .{
             .input = input,
-            .payload_crc = if (use_isa_l) {} else crc32.Crc32.init(),
+            .payload_crc = if (USE_ISA_L) {} else crc32.Crc32.init(),
         };
     }
 
@@ -285,7 +285,7 @@ pub const GzipSource = struct {
                     };
                 },
                 .payload => {
-                    if (!use_isa_l) {
+                    if (!USE_ISA_L) {
                         const n = self.decompressor.reader.readSliceShort(dest[written..]) catch
                             return error.ReadFailed;
                         const decoded = dest[written..][0..n];
@@ -327,12 +327,12 @@ pub const GzipSource = struct {
         _ = self.input.peekByte() catch |err| return err;
         self.parseHeader() catch return error.ReadFailed;
 
-        if (use_isa_l) {
+        if (USE_ISA_L) {
             self.decompressor.init();
         } else {
             self.decompressor = .init(self.input, .raw, decompressor_buffer);
         }
-        if (!use_isa_l) self.payload_crc.reset();
+        if (!USE_ISA_L) self.payload_crc.reset();
         self.size = 0;
         self.state = .payload;
         self.member_seen = true;
@@ -399,7 +399,7 @@ pub const GzipSource = struct {
     }
 
     fn finishMember(self: *GzipSource) std.Io.Reader.Error!void {
-        if (use_isa_l) return;
+        if (USE_ISA_L) return;
         const expected_crc = try self.input.takeInt(u32, .little);
         const expected_size = try self.input.takeInt(u32, .little);
         if (expected_crc != self.payload_crc.final() or expected_size != self.size) {
@@ -426,7 +426,7 @@ pub fn readGzipChunk(
                 };
             },
             .payload => {
-                if (!use_isa_l) {
+                if (!USE_ISA_L) {
                     const reader = &self.decompressor.reader;
                     const decoded = reader.peekGreedy(1) catch |err| switch (err) {
                         error.EndOfStream => {

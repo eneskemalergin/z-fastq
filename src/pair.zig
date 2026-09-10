@@ -64,8 +64,8 @@ pub fn namesMatch(name1: Name, name2: Name) bool {
     return name1.mate_markers == 0b01 and name2.mate_markers == 0b10;
 }
 
-const token_lanes = 16;
-const TokenVector = @Vector(token_lanes, u8);
+const TOKEN_LANES = 16;
+const TokenVector = @Vector(TOKEN_LANES, u8);
 
 fn exactHeadersMatch(header1: []const u8, header2: []const u8) bool {
     const common_len = @min(header1.len, header2.len);
@@ -73,9 +73,9 @@ fn exactHeadersMatch(header1: []const u8, header2: []const u8) bool {
     const tabs: TokenVector = @splat('\t');
 
     var offset: usize = 0;
-    while (common_len - offset >= token_lanes) : (offset += token_lanes) {
-        const bytes1: TokenVector = header1[offset..][0..token_lanes].*;
-        const bytes2: TokenVector = header2[offset..][0..token_lanes].*;
+    while (common_len - offset >= TOKEN_LANES) : (offset += TOKEN_LANES) {
+        const bytes1: TokenVector = header1[offset..][0..TOKEN_LANES].*;
+        const bytes2: TokenVector = header2[offset..][0..TOKEN_LANES].*;
         const stop1: u16 = @bitCast((bytes1 == spaces) | (bytes1 == tabs));
         const stop2: u16 = @bitCast((bytes2 == spaces) | (bytes2 == tabs));
         const mismatch: u16 = @bitCast(bytes1 != bytes2);
@@ -112,8 +112,8 @@ fn tokenEnd(header: []const u8, start: usize) usize {
     const tabs: TokenVector = @splat('\t');
 
     var end = start;
-    while (header.len - end >= token_lanes) : (end += token_lanes) {
-        const bytes: TokenVector = header[end..][0..token_lanes].*;
+    while (header.len - end >= TOKEN_LANES) : (end += TOKEN_LANES) {
+        const bytes: TokenVector = header[end..][0..TOKEN_LANES].*;
         const mask: u16 = @bitCast((bytes == spaces) | (bytes == tabs));
         if (mask != 0) return end + @as(usize, @intCast(@ctz(mask)));
     }
@@ -146,9 +146,9 @@ fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
     const prefix_len = header1.len - 1;
     var separator_plus_one: usize = 0;
     var offset: usize = 0;
-    while (prefix_len - offset >= token_lanes) : (offset += token_lanes) {
-        const bytes1: TokenVector = header1[offset..][0..token_lanes].*;
-        const bytes2: TokenVector = header2[offset..][0..token_lanes].*;
+    while (prefix_len - offset >= TOKEN_LANES) : (offset += TOKEN_LANES) {
+        const bytes1: TokenVector = header1[offset..][0..TOKEN_LANES].*;
+        const bytes2: TokenVector = header2[offset..][0..TOKEN_LANES].*;
         const spaces: TokenVector = @splat(' ');
         const tabs: TokenVector = @splat('\t');
         if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return false;

@@ -205,14 +205,14 @@ pub const Error = Container.Error || error{
     EndOfStream,
 };
 
-const direct_vtable: Reader.VTable = .{
+const DIRECT_VTABLE: Reader.VTable = .{
     .stream = streamDirect,
     .rebase = rebaseFallible,
     .discard = discardDirect,
     .readVec = readVec,
 };
 
-const indirect_vtable: Reader.VTable = .{
+const INDIRECT_VTABLE: Reader.VTable = .{
     .stream = streamIndirect,
     .rebase = rebaseFallible,
     .discard = discardIndirect,
@@ -224,7 +224,7 @@ pub fn init(input: *Reader, container: Container, buffer: []u8) Decompress {
     if (buffer.len != 0) assert(buffer.len >= flate.max_window_len);
     return .{
         .reader = .{
-            .vtable = if (buffer.len == 0) &direct_vtable else &indirect_vtable,
+            .vtable = if (buffer.len == 0) &DIRECT_VTABLE else &INDIRECT_VTABLE,
             .buffer = buffer,
             .seek = 0,
             .end = 0,

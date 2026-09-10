@@ -741,30 +741,6 @@ fn exerciseUpperBitIndexSort(allocator: std.mem.Allocator) !void {
     }
 }
 
-test "[unit] - [exact selector]: compact indexes retain wide record numbers" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseWideExactIndexes,
-        .{},
-    );
-}
-
-test "[unit] - [exact selector]: split indexes sort upper planes" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseUpperBitIndexSort,
-        .{},
-    );
-}
-
-test "[unit] - [exact selector]: batched records preserve an upper-bit boundary" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseBatchedUpperBoundary,
-        .{},
-    );
-}
-
 pub const Mt19937_64 = struct {
     state: [STATE_WORDS]u64,
     index: usize,
@@ -828,3 +804,27 @@ pub const Mt19937_64 = struct {
         return if (value & 1 == 0) 0 else MATRIX_A;
     }
 };
+
+test "[unit] - [exact selector]: compact indexes retain wide record numbers" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseWideExactIndexes,
+        .{},
+    );
+}
+
+test "[unit] - [exact selector]: split indexes sort upper planes" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseUpperBitIndexSort,
+        .{},
+    );
+}
+
+test "[unit] - [exact selector]: batched records preserve an upper-bit boundary" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseBatchedUpperBoundary,
+        .{},
+    );
+}
