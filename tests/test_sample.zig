@@ -989,7 +989,7 @@ test "[cli] - [paired fraction sample]: fields, exact names, empty input, and LF
     );
 }
 
-test "[integration] - [paired fraction sample]: gzip, stdin layouts, and source chunks agree" {
+test "[cli] - [paired fraction sample]: gzip and stdin layouts preserve selected pairs" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1085,7 +1085,7 @@ test "[integration] - [paired fraction sample]: gzip, stdin layouts, and source 
         expected.items,
         "",
     );
-    for (1..interleaved.items.len + 1) |chunk_len| {
+    for ([_]usize{ 1, 7, interleaved.items.len }) |chunk_len| {
         try cli.expectResult(
             try cli.runWithStdin(
                 allocator,

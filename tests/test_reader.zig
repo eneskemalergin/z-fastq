@@ -1284,36 +1284,6 @@ test "[property] - [parser]: header lookup boundaries are chunk invariant" {
     }
 }
 
-test "[edge] - [count scanner]: a non-minimal plus record does not disable fast scanning" {
-    const data =
-        \\@read3
-        \\AAAA
-        \\+repeat_id
-        \\!!!!
-        \\@dense
-        \\CCCC
-        \\+
-        \\####
-        \\
-    ;
-    var scan = zfastq.count_scan.Scanner.init(.{});
-    const n = try zfastq.count_scan.countSlice(data, .{}, &scan);
-    try std.testing.expectEqual(@as(u64, 2), n);
-}
-
-test "[edge] - [count scanner]: an annotated plus line stays on the complete-record path" {
-    const data =
-        \\@read3
-        \\AAAA
-        \\+repeat_id
-        \\!!!!
-        \\
-    ;
-    var scan = zfastq.count_scan.Scanner.init(.{});
-    const n = try zfastq.count_scan.countSlice(data, .{}, &scan);
-    try std.testing.expectEqual(@as(u64, 1), n);
-}
-
 test "[property] - [reader]: advance and next produce the same record count" {
     const data =
         \\@read1

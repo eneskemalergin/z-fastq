@@ -5298,6 +5298,57 @@ test "[failure] - [paired exact sample]: a read failure follows complete earlier
     try std.testing.expectEqual(@as(u64, 1), selector.record_count);
 }
 
+test "[property] - [interleaved fraction sample]: source chunks preserve selected pairs" {
+    const ChunkedSource = struct {
+        data: []const u8,
+        chunk_len: usize,
+        position: usize = 0,
+
+        fn read(ctx: *anyopaque, dest: []u8) error{ReadFailed}!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const amount = @min(dest.len, self.chunk_len, self.data.len - self.position);
+            @memcpy(dest[0..amount], self.data[self.position..][0..amount]);
+            self.position += amount;
+            return amount;
+        }
+    };
+    const data = "@a/1 left\r\nAC\r\n+left\r\n!#\r\n@a/2 right\nGT\n+right\n$%\n" ++
+        "@b/1\nG\n+\n&\n@b/2\nC\n+\n'\n" ++
+        "@c/1\nTTA\n+one\n()*\n@c/2\nAAT\n+two\n+,-";
+    // Seed 11 at one half selects pair indexes 0 and 2 in the frozen CLI vectors.
+    const expected = "@a/1 left\nAC\n+left\n!#\n@a/2 right\nGT\n+right\n$%\n" ++
+        "@c/1\nTTA\n+one\n()*\n@c/2\nAAT\n+two\n+,-\n";
+    for (1..data.len + 1) |chunk_len| {
+        var source: ChunkedSource = .{ .data = data, .chunk_len = chunk_len };
+        var output: [expected.len]u8 = undefined;
+        var sink = io_layer.SliceSink.init(&output);
+        var writer = zfastq.Writer.init(sink.byteSink());
+        var selector = sampling.Selector.init(.{ .probability = 0.5 }, 11);
+        var selection: PairOutputSelector = .{ .fraction = &selector };
+
+        const failure = try sampleInterleavedSource(
+            std.testing.allocator,
+            .{ .ctx = &source, .vtable = &.{ .read = ChunkedSource.read } },
+            &writer,
+            &selection,
+            1024,
+            .{
+                .max_line_bytes = 128,
+                .alphabet = .iupac,
+                .fraction = .{ .probability = 0.5 },
+                .count = null,
+                .seed = 11,
+                .pair_mode = .interleaved,
+            },
+        );
+        try writer.flush();
+
+        try std.testing.expect(failure == null);
+        try std.testing.expectEqual(data.len, source.position);
+        try std.testing.expectEqualStrings(expected, sink.written());
+    }
+}
+
 test "[edge] - [paired fraction sample]: fraction zero keeps buffered mate one borrowed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

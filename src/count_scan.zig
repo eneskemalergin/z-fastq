@@ -679,14 +679,19 @@ test "[edge] - [record newline scan]: vector boundaries and incomplete input are
     }
 }
 
-test "[unit] - [derived record]: annotated plus lines stay on the complete-record path" {
-    const data = "@a\nAC\n+first\n!!\n@longer\nG\n+second note\n#\n";
+test "[unit] - [derived record]: annotated plus lines keep complete-record parsing enabled" {
+    const first = "@a\nAC\n+first\n!!\n";
+    const second = "@longer\nG\n+second note\n#\n";
+    const bare_plus = "@dense\nCCCC\n+\n####\n";
     var scanner = Scanner.init(.{ .max_line_bytes = 64 });
-    scanner.fast_path_enabled = true;
 
-    try std.testing.expectEqual(data.len, try scanner.feed(data));
-    try std.testing.expectEqual(@as(u64, 2), scanner.record_index);
+    try std.testing.expectEqual(first.len, try scanner.feed(first));
+    try std.testing.expect(scanner.fast_path_enabled);
+    try std.testing.expectEqual(second.len, try scanner.tryFastRecord(second));
+    try std.testing.expect(scanner.fast_path_enabled);
     try std.testing.expect(scanner.layout == null);
+    try std.testing.expectEqual(bare_plus.len, try scanner.tryFastRecord(bare_plus));
+    try std.testing.expect(scanner.fast_path_enabled);
 }
 
 test "[property] - [derived record]: normalized records enable fast parsing without LF geometry" {
