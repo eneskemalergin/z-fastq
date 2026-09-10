@@ -12,6 +12,25 @@ pub const CommandResult = struct {
     stderr: []u8,
 };
 
+pub fn expectResult(
+    result: CommandResult,
+    exit_code: u8,
+    stdout: []const u8,
+    stderr: []const u8,
+) !void {
+    try std.testing.expectEqual(exit_code, result.exit_code);
+    try std.testing.expectEqualStrings(stdout, result.stdout);
+    try std.testing.expectEqualStrings(stderr, result.stderr);
+}
+
+pub fn tempPath(
+    allocator: std.mem.Allocator,
+    sub_path: []const u8,
+    name: []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ sub_path, name });
+}
+
 pub const GzipOptions = struct {
     extra: []const u8 = "",
     name: ?[]const u8 = null,

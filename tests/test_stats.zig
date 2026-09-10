@@ -203,8 +203,8 @@ test "[cli] - [stats]: plain, gzip, and fragmented stdin print identical fields"
 
     try writeTempFile(io, &tmp, "reads.fastq.gz", SAMPLE_FASTQ);
     try writeTempFile(io, &tmp, "reads.bin", &SAMPLE_GZIP);
-    const plain_path = try tempPath(allocator, &tmp, "reads.fastq.gz");
-    const gzip_path = try tempPath(allocator, &tmp, "reads.bin");
+    const plain_path = try cli.tempPath(allocator, &tmp.sub_path, "reads.fastq.gz");
+    const gzip_path = try cli.tempPath(allocator, &tmp.sub_path, "reads.bin");
 
     const plain = try runCli(allocator, &.{ "stats", plain_path }, "", 1);
     const gzip = try runCli(allocator, &.{ "stats", gzip_path }, "", 1);
@@ -390,9 +390,9 @@ test "[cli] - [stats]: successful blocks survive independent higher-class failur
 
     try writeTempFile(io, &tmp, "valid.fastq", SAMPLE_FASTQ);
     try writeTempFile(io, &tmp, "invalid.fastq", "@bad\nA\n+\n \n");
-    const valid_path = try tempPath(allocator, &tmp, "valid.fastq");
-    const invalid_path = try tempPath(allocator, &tmp, "invalid.fastq");
-    const missing_path = try tempPath(allocator, &tmp, "missing.fastq");
+    const valid_path = try cli.tempPath(allocator, &tmp.sub_path, "valid.fastq");
+    const invalid_path = try cli.tempPath(allocator, &tmp.sub_path, "invalid.fastq");
+    const missing_path = try cli.tempPath(allocator, &tmp.sub_path, "missing.fastq");
 
     const result = try runCli(
         allocator,
@@ -428,7 +428,7 @@ test "[cli] - [stats]: input labels use escaped ASCII" {
 
     const name = "unsafe\n\\.fastq";
     try writeTempFile(io, &tmp, name, SAMPLE_FASTQ);
-    const path = try tempPath(allocator, &tmp, name);
+    const path = try cli.tempPath(allocator, &tmp.sub_path, name);
     const result = try runCli(allocator, &.{ "stats", path }, "", 1);
     const escaped_path = try std.mem.replaceOwned(
         u8,
@@ -467,10 +467,10 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
     const allocator = arena.allocator();
 
     const missing = try runCli(allocator, &.{"stats"}, "", 1);
-    try expectCommand(missing, 2, "", "error: stats requires at least one input\n");
+    try cli.expectResult(missing, 2, "", "error: stats requires at least one input\n");
 
     const duplicate_stdin = try runCli(allocator, &.{ "stats", "-", "-" }, "", 1);
-    try expectCommand(
+    try cli.expectResult(
         duplicate_stdin,
         2,
         "",
@@ -483,7 +483,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
         "",
         1,
     );
-    try expectCommand(
+    try cli.expectResult(
         json_duplicate_stdin,
         2,
         "",
@@ -491,7 +491,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
     );
 
     const json_without_input = try runCli(allocator, &.{ "stats", "--json" }, "", 1);
-    try expectCommand(
+    try cli.expectResult(
         json_without_input,
         2,
         "",
@@ -504,10 +504,10 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
         "@r\nAA\n+\n!!\n",
         1,
     );
-    try expectCommand(line_limit, 4, "", "error: -: line length limit exceeded\n");
+    try cli.expectResult(line_limit, 4, "", "error: -: line length limit exceeded\n");
 
     const structural = try runCli(allocator, &.{ "stats", "-" }, "@r\nAA\n+\n!\n", 1);
-    try expectCommand(
+    try cli.expectResult(
         structural,
         1,
         "",
@@ -521,7 +521,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
         "@r\nAA\n+\n \n",
         1,
     );
-    try expectCommand(
+    try cli.expectResult(
         mismatch_and_invalid,
         1,
         "",
@@ -530,7 +530,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
     );
 
     const one_byte = try runCli(allocator, &.{ "stats", "-" }, "x", 1);
-    try expectCommand(
+    try cli.expectResult(
         one_byte,
         1,
         "",
@@ -544,7 +544,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
         "@ description\nA\n+\n!\n",
         1,
     );
-    try expectCommand(
+    try cli.expectResult(
         empty_identifier,
         1,
         "",
@@ -555,7 +555,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
     var damaged = SAMPLE_GZIP;
     damaged[damaged.len - 8] ^= 1;
     const corrupt = try runCli(allocator, &.{ "stats", "-" }, &damaged, 1);
-    try expectCommand(corrupt, 3, "", "error: -: I/O error\n");
+    try cli.expectResult(corrupt, 3, "", "error: -: I/O error\n");
 
     const corrupt_json = try runCli(allocator, &.{ "stats", "--json", "-" }, &damaged, 1);
     try std.testing.expectEqual(@as(u8, 3), corrupt_json.exit_code);
@@ -596,7 +596,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
     try std.testing.expectEqual(@as(usize, 0), json_closed.stderr.len);
 
     const closed_stdin = try runCliWithClosedStdin(allocator, &.{ "stats", "-" });
-    try expectCommand(closed_stdin, 3, "", "error: -: I/O error\n");
+    try cli.expectResult(closed_stdin, 3, "", "error: -: I/O error\n");
 }
 
 test "[cli] - [stats]: output failure preserves an observed limit status" {
@@ -609,11 +609,11 @@ test "[cli] - [stats]: output failure preserves an observed limit status" {
     const long_directory = ("\x01" ** 200 ++ "/") ** 17;
     try tmp.dir.createDirPath(io, long_directory);
     try tmp.dir.writeFile(io, .{ .sub_path = "valid.fastq", .data = "@a\nA\n+\n!\n" });
-    const valid = try tempPath(allocator, &tmp, "valid.fastq");
+    const valid = try cli.tempPath(allocator, &tmp.sub_path, "valid.fastq");
 
     for ([_][]const u8{ "limit.fastq", long_directory ++ "limit.fastq" }) |name| {
         try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "@abcde\nA\n+\n!\n" });
-        const path = try tempPath(allocator, &tmp, name);
+        const path = try cli.tempPath(allocator, &tmp.sub_path, name);
         const args: []const []const u8 = &.{ "stats", "--json", "--max-line-bytes", "4", path, valid };
         const captured = try cli.run(allocator, args);
         try std.testing.expectEqual(@as(u8, 4), captured.exit_code);
@@ -625,12 +625,12 @@ test "[cli] - [stats]: output failure preserves an observed limit status" {
         try std.testing.expectEqual(@as(usize, 2), results.len);
         try cli.expectJsonString(results[0].object.get("error").?.object.get("code"), "line_limit");
         try cli.expectJsonString(results[1].object.get("status"), "ok");
-        try expectCommand(try runCliWithClosedStdout(allocator, args, ""), 4, "", "");
+        try cli.expectResult(try runCliWithClosedStdout(allocator, args, ""), 4, "", "");
     }
 
-    const path = try tempPath(allocator, &tmp, "limit.fastq");
+    const path = try cli.tempPath(allocator, &tmp.sub_path, "limit.fastq");
     const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: line length limit exceeded\n", .{path});
-    try expectCommand(
+    try cli.expectResult(
         try runCliWithClosedStdout(allocator, &.{ "stats", "--max-line-bytes", "4", path, valid }, ""),
         4,
         "",
@@ -649,10 +649,10 @@ test "[cli] - [stats-json]: mixed results preserve order, variants, and stream s
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const valid = try tempPath(allocator, &tmp, "valid.fastq");
-    const invalid = try tempPath(allocator, &tmp, "invalid.fastq");
-    const long = try tempPath(allocator, &tmp, "long.fastq");
-    const missing = try tempPath(allocator, &tmp, "missing.fastq");
+    const valid = try cli.tempPath(allocator, &tmp.sub_path, "valid.fastq");
+    const invalid = try cli.tempPath(allocator, &tmp.sub_path, "invalid.fastq");
+    const long = try cli.tempPath(allocator, &tmp.sub_path, "long.fastq");
+    const missing = try cli.tempPath(allocator, &tmp.sub_path, "missing.fastq");
 
     const result = try runCli(
         allocator,
@@ -713,31 +713,8 @@ fn writeTempFile(
     try std.Io.File.writeStreamingAll(file, io, bytes);
 }
 
-fn tempPath(
-    allocator: std.mem.Allocator,
-    tmp: *const std.testing.TmpDir,
-    name: []const u8,
-) ![]const u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        ".zig-cache/tmp/{s}/{s}",
-        .{ tmp.sub_path, name },
-    );
-}
-
 fn expectedStats(allocator: std.mem.Allocator, label: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "input: {s}\n{s}", .{ label, SAMPLE_FIELDS });
-}
-
-fn expectCommand(
-    result: CommandResult,
-    exit_code: u8,
-    stdout: []const u8,
-    stderr: []const u8,
-) !void {
-    try std.testing.expectEqual(exit_code, result.exit_code);
-    try std.testing.expectEqualStrings(stdout, result.stdout);
-    try std.testing.expectEqualStrings(stderr, result.stderr);
 }
 
 const STATS_RESULT_KEYS = [_][]const u8{

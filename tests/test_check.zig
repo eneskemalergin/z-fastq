@@ -104,18 +104,18 @@ test "[cli] - [check]: files and fragmented stdin produce exact fixture results"
                 fixture.line,
                 fixture.offset,
             );
-            try expectResult(file_result, 1, "", file_error);
-            try expectResult(stdin_result, 1, "", stdin_error);
+            try cli.expectResult(file_result, 1, "", file_error);
+            try cli.expectResult(stdin_result, 1, "", stdin_error);
             try expectCheckJsonResult(allocator, json_result, path, fixture);
         } else {
-            try expectResult(file_result, 0, "", "");
-            try expectResult(stdin_result, 0, "", "");
+            try cli.expectResult(file_result, 0, "", "");
+            try cli.expectResult(stdin_result, 0, "", "");
             try expectCheckJsonResult(allocator, json_result, path, fixture);
         }
     }
 
     const empty_input = try cli.run(allocator, &.{ "check", "-" });
-    try expectResult(empty_input, 0, "", "");
+    try cli.expectResult(empty_input, 0, "", "");
 }
 
 test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
@@ -129,7 +129,7 @@ test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
         "iupac",
         "tests/data/synthetic/iupac_valid.fastq",
     });
-    try expectResult(explicit_iupac, 0, "", "");
+    try cli.expectResult(explicit_iupac, 0, "", "");
 
     const narrow_valid = try cli.run(allocator, &.{
         "check",
@@ -137,7 +137,7 @@ test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
         "acgtn",
         "tests/data/synthetic/acgtn_valid.fastq",
     });
-    try expectResult(narrow_valid, 0, "", "");
+    try cli.expectResult(narrow_valid, 0, "", "");
 
     const narrow = try cli.run(allocator, &.{
         "check",
@@ -145,7 +145,7 @@ test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
         "acgtn",
         "tests/data/synthetic/iupac_valid.fastq",
     });
-    try expectResult(
+    try cli.expectResult(
         narrow,
         1,
         "",
@@ -160,7 +160,7 @@ test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
         "@r\n.\nx\n \n",
         1,
     );
-    try expectResult(
+    try cli.expectResult(
         structural,
         1,
         "",
@@ -174,7 +174,7 @@ test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
         "@ description\nA\n+\n!\n",
         1,
     );
-    try expectResult(
+    try cli.expectResult(
         empty_identifier,
         1,
         "",
@@ -188,7 +188,7 @@ test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
         "@r\n.\n+\n\x7f\n",
         2,
     );
-    try expectResult(
+    try cli.expectResult(
         semantic,
         1,
         "",
@@ -202,7 +202,7 @@ test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
         "@r\n.\n+\n",
         1,
     );
-    try expectResult(
+    try cli.expectResult(
         truncated,
         1,
         "",
@@ -216,7 +216,7 @@ test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
         "@r\n.\n+\n!!\n",
         1,
     );
-    try expectResult(
+    try cli.expectResult(
         mismatch,
         1,
         "",
@@ -249,7 +249,7 @@ test "[cli] - [check]: semantic locations survive every field position and line 
             2,
             3 + invalid_index,
         );
-        try expectResult(sequence_result, 1, "", sequence_error);
+        try cli.expectResult(sequence_result, 1, "", sequence_error);
 
         const quality_data = try allocator.dupe(u8, original);
         quality_data[10 + invalid_index] = if (invalid_index % 2 == 0) 32 else 127;
@@ -268,7 +268,7 @@ test "[cli] - [check]: semantic locations survive every field position and line 
             4,
             10 + invalid_index,
         );
-        try expectResult(quality_result, 1, "", quality_error);
+        try cli.expectResult(quality_result, 1, "", quality_error);
     }
 
     const crlf = try cli.runWithStdin(
@@ -277,7 +277,7 @@ test "[cli] - [check]: semantic locations survive every field position and line 
         "@r\r\nAC.\r\n+\r\n!!!\r\n",
         3,
     );
-    try expectResult(
+    try cli.expectResult(
         crlf,
         1,
         "",
@@ -291,7 +291,7 @@ test "[cli] - [check]: semantic locations survive every field position and line 
         "@r\nAC\n+\n!~\n",
         1,
     );
-    try expectResult(quality_boundaries, 0, "", "");
+    try cli.expectResult(quality_boundaries, 0, "", "");
 
     const later_record = try cli.runWithStdin(
         allocator,
@@ -299,7 +299,7 @@ test "[cli] - [check]: semantic locations survive every field position and line 
         "@ok\nA\n+\n!\n@bad\n.\n+\n!\n",
         1,
     );
-    try expectResult(
+    try cli.expectResult(
         later_record,
         1,
         "",
@@ -317,7 +317,7 @@ test "[cli] - [check]: gzip members validate and corrupt trailers exit as I/O" {
     try cli.appendGzipMember(allocator, &gzip, "@one\nAC\n+\n!!\n", .{});
     try cli.appendGzipMember(allocator, &gzip, "@two\nGT\n+\n!~\n", .{});
     const valid = try cli.runWithStdin(allocator, &.{ "check", "-" }, gzip.items, 1);
-    try expectResult(valid, 0, "", "");
+    try cli.expectResult(valid, 0, "", "");
 
     const valid_json = try cli.runWithStdin(
         allocator,
@@ -350,7 +350,7 @@ test "[cli] - [check]: gzip members validate and corrupt trailers exit as I/O" {
         semantic_gzip.items,
         1,
     );
-    try expectResult(
+    try cli.expectResult(
         semantic,
         1,
         "",
@@ -361,7 +361,7 @@ test "[cli] - [check]: gzip members validate and corrupt trailers exit as I/O" {
     const corrupt = try allocator.dupe(u8, gzip.items);
     corrupt[corrupt.len - 8] ^= 1;
     const damaged = try cli.runWithStdin(allocator, &.{ "check", "-" }, corrupt, 7);
-    try expectResult(damaged, 3, "", "error: -: I/O error\n");
+    try cli.expectResult(damaged, 3, "", "error: -: I/O error\n");
 
     const damaged_json = try cli.runWithStdin(
         allocator,
@@ -463,11 +463,11 @@ test "[cli] - [check]: argument failures occur before input is consumed" {
     };
     for (cases) |case| {
         const result = try cli.runWithStdin(allocator, case.args, "@r\nA\n+\n!\n", 1);
-        try expectResult(result, 2, "", case.stderr);
+        try cli.expectResult(result, 2, "", case.stderr);
     }
 
     const double_dash = try cli.run(allocator, &.{ "check", "--", "--alphabet" });
-    try expectResult(
+    try cli.expectResult(
         double_dash,
         3,
         "",
@@ -475,7 +475,7 @@ test "[cli] - [check]: argument failures occur before input is consumed" {
     );
 
     const json_without_input = try cli.run(allocator, &.{ "check", "--json" });
-    try expectResult(
+    try cli.expectResult(
         json_without_input,
         2,
         "",
@@ -494,10 +494,10 @@ test "[cli] - [check]: independent inputs continue and highest exit class wins" 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const valid = try tempPath(allocator, &tmp.sub_path, "valid.fastq");
-    const semantic = try tempPath(allocator, &tmp.sub_path, "semantic.fastq");
-    const long = try tempPath(allocator, &tmp.sub_path, "long.fastq");
-    const missing = try tempPath(allocator, &tmp.sub_path, "missing.fastq");
+    const valid = try cli.tempPath(allocator, &tmp.sub_path, "valid.fastq");
+    const semantic = try cli.tempPath(allocator, &tmp.sub_path, "semantic.fastq");
+    const long = try cli.tempPath(allocator, &tmp.sub_path, "long.fastq");
+    const missing = try cli.tempPath(allocator, &tmp.sub_path, "missing.fastq");
 
     const result = try cli.run(allocator, &.{
         "check",
@@ -520,7 +520,7 @@ test "[cli] - [check]: independent inputs continue and highest exit class wins" 
             "(record 0, line 2, offset 3)\n",
         .{ semantic, missing, long, semantic },
     );
-    try expectResult(result, 4, "", expected);
+    try cli.expectResult(result, 4, "", expected);
 
     const json_result = try cli.run(allocator, &.{
         "check",
@@ -644,7 +644,7 @@ test "[cli] - [check-json]: output failure preserves an observed limit status in
 
     for ([_][]const u8{ "limit.fastq", long_directory ++ "limit.fastq" }) |name| {
         try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "@abcde\nA\n+\n!\n" });
-        const path = try tempPath(allocator, &tmp.sub_path, name);
+        const path = try cli.tempPath(allocator, &tmp.sub_path, name);
         for ([_][]const []const u8{
             &.{ "check", "--json", "--max-line-bytes", "4", path, empty },
             &.{ "check", "--paired", "--json", "--max-line-bytes", "4", path, empty },
@@ -673,8 +673,8 @@ test "[cli] - [paired check]: documented name forms and input transports pass" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const r1_path = try tempPath(allocator, &tmp.sub_path, "r1.fastq");
-    const r2_path = try tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    const r1_path = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
 
     const cases = [_]struct {
         header1: []const u8,
@@ -720,19 +720,19 @@ test "[cli] - [paired check]: documented name forms and input transports pass" {
             })
         else
             try cli.run(allocator, &.{ "check", "--paired", r1_path, r2_path });
-        try expectResult(result, 0, "", "");
+        try cli.expectResult(result, 0, "", "");
     }
 
     const double_dash = try cli.run(
         allocator,
         &.{ "check", "--paired", "--", r1_path, r2_path },
     );
-    try expectResult(double_dash, 0, "", "");
+    try cli.expectResult(double_dash, 0, "", "");
 
     try writeFastqPayload(&tmp, io, "r1.fastq", "");
     try writeFastqPayload(&tmp, io, "r2.fastq", "");
     const empty_pair = try cli.run(allocator, &.{ "check", "--paired", r1_path, r2_path });
-    try expectResult(empty_pair, 0, "", "");
+    try cli.expectResult(empty_pair, 0, "", "");
 
     const empty_interleaved = try cli.runWithStdin(
         allocator,
@@ -740,7 +740,7 @@ test "[cli] - [paired check]: documented name forms and input transports pass" {
         "",
         1,
     );
-    try expectResult(empty_interleaved, 0, "", "");
+    try cli.expectResult(empty_interleaved, 0, "", "");
 
     const interleaved =
         "@cluster 1:N:0:index\r\nAC\r\n+\r\n!!\r\n" ++
@@ -751,7 +751,7 @@ test "[cli] - [paired check]: documented name forms and input transports pass" {
         interleaved,
         1,
     );
-    try expectResult(stdin_result, 0, "", "");
+    try cli.expectResult(stdin_result, 0, "", "");
 
     const interleaved_json = try cli.runWithStdin(
         allocator,
@@ -780,7 +780,7 @@ test "[cli] - [paired check]: documented name forms and input transports pass" {
         interleaved,
         5,
     );
-    try expectResult(exact_interleaved, 0, "", "");
+    try cli.expectResult(exact_interleaved, 0, "", "");
 
     try writeFastq(&tmp, io, allocator, "r2.fastq", &.{"stdin/2"});
     const stdin_r1 = try cli.runWithStdin(
@@ -789,7 +789,7 @@ test "[cli] - [paired check]: documented name forms and input transports pass" {
         "@stdin/1\nA\n+\n!\n",
         1,
     );
-    try expectResult(stdin_r1, 0, "", "");
+    try cli.expectResult(stdin_r1, 0, "", "");
     try writeFastq(&tmp, io, allocator, "r1.fastq", &.{"stdin/1"});
     const stdin_r2 = try cli.runWithStdin(
         allocator,
@@ -797,7 +797,7 @@ test "[cli] - [paired check]: documented name forms and input transports pass" {
         "@stdin/2\nA\n+\n!\n",
         1,
     );
-    try expectResult(stdin_r2, 0, "", "");
+    try cli.expectResult(stdin_r2, 0, "", "");
 
     var gzip1: std.ArrayList(u8) = .empty;
     var gzip2: std.ArrayList(u8) = .empty;
@@ -806,7 +806,7 @@ test "[cli] - [paired check]: documented name forms and input transports pass" {
     try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = gzip1.items });
     try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = gzip2.items });
     const gzip_result = try cli.run(allocator, &.{ "check", "--paired", r1_path, r2_path });
-    try expectResult(gzip_result, 0, "", "");
+    try cli.expectResult(gzip_result, 0, "", "");
 
     var interleaved_gzip: std.ArrayList(u8) = .empty;
     try cli.appendGzipMember(allocator, &interleaved_gzip, "@gzip/1\nAC\n+\n!!\n", .{});
@@ -817,7 +817,7 @@ test "[cli] - [paired check]: documented name forms and input transports pass" {
         interleaved_gzip.items,
         3,
     );
-    try expectResult(gzip_interleaved, 0, "", "");
+    try cli.expectResult(gzip_interleaved, 0, "", "");
 
     const corrupt_interleaved = try allocator.dupe(u8, interleaved_gzip.items);
     corrupt_interleaved[corrupt_interleaved.len - 8] ^= 1;
@@ -877,7 +877,7 @@ test "[cli] - [paired check]: documented name forms and input transports pass" {
         "error: {s}: I/O error\n",
         .{r2_path},
     );
-    try expectResult(damaged_pair, 3, "", damaged_pair_error);
+    try cli.expectResult(damaged_pair, 3, "", damaged_pair_error);
 
     const damaged_pair_json = try cli.run(allocator, &.{
         "check",
@@ -920,8 +920,8 @@ test "[cli] - [paired check]: P001 diagnostics retain exact bounded identity fie
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const r1_path = try tempPath(allocator, &tmp.sub_path, "r1.fastq");
-    const r2_path = try tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    const r1_path = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
     try writeFastq(&tmp, io, allocator, "r1.fastq", &.{"cluster/1"});
     try writeFastq(&tmp, io, allocator, "r2.fastq", &.{"other/2"});
 
@@ -937,7 +937,7 @@ test "[cli] - [paired check]: P001 diagnostics retain exact bounded identity fie
             "[length=5, truncated=false], mate_markers=2\n",
         .{ r1_path, r2_path, r1_path, r2_path },
     );
-    try expectResult(human, 1, "", expected);
+    try cli.expectResult(human, 1, "", expected);
 
     const json_result = try cli.run(allocator, &.{
         "check",
@@ -1041,7 +1041,7 @@ test "[cli] - [paired check]: P001 diagnostics retain exact bounded identity fie
         interleaved_payload,
         1,
     );
-    try expectResult(
+    try cli.expectResult(
         interleaved,
         1,
         "",
@@ -1172,8 +1172,8 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const r1_path = try tempPath(allocator, &tmp.sub_path, "r1.fastq");
-    const r2_path = try tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    const r1_path = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
     try writeFastq(&tmp, io, allocator, "r1.fastq", &.{ "first/1", "second/1" });
     try writeFastq(&tmp, io, allocator, "r2.fastq", &.{"first/2"});
 
@@ -1184,7 +1184,7 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
             "(pair 1, remaining R1, last R1 record 1, last R2 record 0)\n",
         .{ r1_path, r2_path },
     );
-    try expectResult(count, 1, "", count_error);
+    try cli.expectResult(count, 1, "", count_error);
 
     const count_json = try cli.run(allocator, &.{
         "check",
@@ -1225,7 +1225,7 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
             "(pair 0, remaining R2, last R1 record none, last R2 record 0)\n",
         .{ r1_path, r2_path },
     );
-    try expectResult(r2_remaining, 1, "", r2_remaining_error);
+    try cli.expectResult(r2_remaining, 1, "", r2_remaining_error);
 
     const odd = try cli.runWithStdin(
         allocator,
@@ -1233,7 +1233,7 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
         "@odd/1\n.\n+\n!\n",
         1,
     );
-    try expectResult(
+    try cli.expectResult(
         odd,
         1,
         "",
@@ -1268,7 +1268,7 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
         "@a/1\nA\n+\n!\n@a/2\nA\n+\n!\n@b/1\nA\n+\n!\n",
         3,
     );
-    try expectResult(
+    try cli.expectResult(
         later_odd,
         1,
         "",
@@ -1288,14 +1288,14 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
         2,
         5,
     );
-    try expectResult(r1_semantic, 1, "", r1_error);
+    try cli.expectResult(r1_semantic, 1, "", r1_error);
 
     try writeFastqPayload(&tmp, io, "r2.fastq", "@b/2\n.\n+\n!\n");
     const both_semantic = try cli.run(
         allocator,
         &.{ "check", "--paired", r1_path, r2_path },
     );
-    try expectResult(both_semantic, 1, "", r1_error);
+    try cli.expectResult(both_semantic, 1, "", r1_error);
 
     try writeFastqPayload(&tmp, io, "r1.fastq", "@a/1\nR\n+\n!\n");
     try writeFastqPayload(&tmp, io, "r2.fastq", "@a/2\nA\n+\n!\n");
@@ -1316,7 +1316,7 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
         2,
         5,
     );
-    try expectResult(alphabet, 1, "", alphabet_error);
+    try cli.expectResult(alphabet, 1, "", alphabet_error);
 
     const line_limit = try cli.run(allocator, &.{
         "check",
@@ -1331,7 +1331,7 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
         "error: {s}: line length limit exceeded\n",
         .{r1_path},
     );
-    try expectResult(line_limit, 4, "", line_error);
+    try cli.expectResult(line_limit, 4, "", line_error);
 
     try writeFastqPayload(&tmp, io, "r1.fastq", "@a/1\nA\n+\n!\n");
     try writeFastqPayload(&tmp, io, "r2.fastq", "@b/2\n.\n+\n!\n");
@@ -1345,7 +1345,7 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
         2,
         5,
     );
-    try expectResult(r2_semantic, 1, "", r2_error);
+    try cli.expectResult(r2_semantic, 1, "", r2_error);
 
     const r2_semantic_json = try cli.run(allocator, &.{
         "check",
@@ -1396,7 +1396,7 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
         4,
         9,
     );
-    try expectResult(r2_truncated, 1, "", r2_truncated_error);
+    try cli.expectResult(r2_truncated, 1, "", r2_truncated_error);
 
     const structural = try cli.runWithStdin(
         allocator,
@@ -1404,7 +1404,7 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
         "@a/1\n.\n+\n!\n@a/2\nA\nx\n!\n",
         1,
     );
-    try expectResult(
+    try cli.expectResult(
         structural,
         1,
         "",
@@ -1418,7 +1418,7 @@ test "[cli] - [paired check]: P002 and semantic precedence are exact" {
         "@ description\nA\n+\n!\n@ unrelated\nT\n+\n#\n",
         1,
     );
-    try expectResult(
+    try cli.expectResult(
         empty_identifier,
         1,
         "",
@@ -1628,23 +1628,4 @@ fn expectCheckFailureWithoutLocation(
     const error_object = try cli.expectJsonError(value, input, code);
     try cli.expectJsonString(error_object.get("message"), message);
     try cli.expectJsonNullErrorLocation(error_object);
-}
-
-fn expectResult(
-    result: cli.CommandResult,
-    exit_code: u8,
-    stdout: []const u8,
-    stderr: []const u8,
-) !void {
-    try std.testing.expectEqual(exit_code, result.exit_code);
-    try std.testing.expectEqualStrings(stdout, result.stdout);
-    try std.testing.expectEqualStrings(stderr, result.stderr);
-}
-
-fn tempPath(
-    allocator: std.mem.Allocator,
-    sub_path: []const u8,
-    name: []const u8,
-) ![]const u8 {
-    return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ sub_path, name });
 }
