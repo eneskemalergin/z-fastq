@@ -205,13 +205,6 @@ pub const Error = Container.Error || error{
     EndOfStream,
 };
 
-const DIRECT_VTABLE: Reader.VTable = .{
-    .stream = streamDirect,
-    .rebase = rebaseFallible,
-    .discard = discardDirect,
-    .readVec = readVec,
-};
-
 const INDIRECT_VTABLE: Reader.VTable = .{
     .stream = streamIndirect,
     .rebase = rebaseFallible,
@@ -219,12 +212,12 @@ const INDIRECT_VTABLE: Reader.VTable = .{
     .readVec = readVec,
 };
 
-/// Initializes a decoder borrowing `input`; a nonempty history buffer must hold one DEFLATE window.
+/// Initializes a decoder borrowing `input` and at least `flate.max_window_len` buffer bytes.
 pub fn init(input: *Reader, container: Container, buffer: []u8) Decompress {
-    if (buffer.len != 0) assert(buffer.len >= flate.max_window_len);
+    assert(buffer.len >= flate.max_window_len);
     return .{
         .reader = .{
-            .vtable = if (buffer.len == 0) &DIRECT_VTABLE else &INDIRECT_VTABLE,
+            .vtable = &INDIRECT_VTABLE,
             .buffer = buffer,
             .seek = 0,
             .end = 0,
@@ -265,30 +258,6 @@ fn rebase(r: *Reader, capacity: usize) void {
     @memmove(r.buffer[0..keep.len], keep);
     r.end = keep.len;
     r.seek -= discard_n;
-}
-
-fn discardDirect(r: *Reader, limit: std.Io.Limit) Reader.Error!usize {
-    if (r.end + flate.history_len > r.buffer.len) rebase(r, flate.history_len);
-    var writer: Writer = .{
-        .vtable = &.{
-            .drain = std.Io.Writer.Discarding.drain,
-            .sendFile = std.Io.Writer.Discarding.sendFile,
-        },
-        .buffer = r.buffer,
-        .end = r.end,
-    };
-    defer {
-        assert(writer.end != 0);
-        r.end = writer.end;
-        r.seek = r.end;
-    }
-    const n = r.stream(&writer, limit) catch |err| switch (err) {
-        error.WriteFailed => unreachable,
-        error.ReadFailed => return error.ReadFailed,
-        error.EndOfStream => return error.EndOfStream,
-    };
-    assert(n <= @intFromEnum(limit));
-    return n;
 }
 
 fn discardIndirect(r: *Reader, limit: std.Io.Limit) Reader.Error!usize {
@@ -374,11 +343,6 @@ fn dynamicCodeLength(self: *Decompress, code: u16, lens: []u4, pos: usize) !usiz
         18 => return @as(u8, try self.takeIntBits(u7)) + 11,
         else => return error.InvalidDynamicBlockHeader,
     }
-}
-
-fn streamDirect(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
-    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
-    return streamFallible(d, w, limit);
 }
 
 fn streamIndirect(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
@@ -1094,7 +1058,8 @@ fn testFailure(container: Container, in: []const u8, expected_err: anyerror) !vo
     var aw: Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
 
-    var decompress: Decompress = .init(&reader, container, &.{});
+    var history: [flate.max_window_len]u8 = undefined;
+    var decompress: Decompress = .init(&reader, container, &history);
     try testing.expectError(error.ReadFailed, decompress.reader.streamRemaining(&aw.writer));
     try testing.expectEqual(expected_err, decompress.err orelse return error.TestFailed);
 }
@@ -1104,7 +1069,8 @@ fn testDecompress(container: Container, compressed: []const u8, expected_plain: 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
 
-    var decompress: Decompress = .init(&in, container, &.{});
+    var history: [flate.max_window_len]u8 = undefined;
+    var decompress: Decompress = .init(&in, container, &history);
     const decompressed_len = try decompress.reader.streamRemaining(&aw.writer);
     try testing.expectEqual(expected_plain.len, decompressed_len);
     try testing.expectEqualSlices(u8, expected_plain, aw.written());
@@ -1388,7 +1354,8 @@ test "[unit] - [dynamic fast loop]: decodes through the bounded path" {
         0x16, 0x96, 0x5c, 0x1e, 0x94, 0xcb, 0x6d, 0x01,
     } ++ [_]u8{0} ** 64;
     var input: Reader = .fixed(&compressed);
-    var decompressor: Decompress = .init(&input, .raw, &.{});
+    var history: [flate.max_window_len]u8 = undefined;
+    var decompressor: Decompress = .init(&input, .raw, &history);
     var output: [512]u8 = undefined;
     var writer: Writer = .fixed(&output);
 
@@ -1404,7 +1371,8 @@ test "[unit] - [dynamic fast loop]: resumes across fragmented input" {
     var input_buffer: [64]u8 = undefined;
     var input = testing.Reader.init(&input_buffer, &.{.{ .buffer = &DYNAMIC_FAST_FRAGMENTED }});
     input.artificial_limit = .limited(40);
-    var decompressor: Decompress = .init(&input.interface, .raw, &.{});
+    var history: [flate.max_window_len]u8 = undefined;
+    var decompressor: Decompress = .init(&input.interface, .raw, &history);
     var output: [4096]u8 = undefined;
     var writer: Writer = .fixed(&output);
 
@@ -1420,7 +1388,8 @@ test "[unit] - [dynamic fast loop]: resumes across fragmented input" {
 test "[property] - [inflate dynamic stream]: every truncation fails without a panic" {
     for (0..DYNAMIC_FAST_FRAGMENTED.len) |end| {
         var input: Reader = .fixed(DYNAMIC_FAST_FRAGMENTED[0..end]);
-        var decompressor: Decompress = .init(&input, .raw, &.{});
+        var history: [flate.max_window_len]u8 = undefined;
+        var decompressor: Decompress = .init(&input, .raw, &history);
         var output: [4096]u8 = undefined;
         var writer: Writer = .fixed(&output);
 
@@ -1493,7 +1462,8 @@ test "[edge] - [inflate raw stream]: accepts an empty destination" {
         'd',         0x0a,
     };
     var in: Reader = .fixed(input);
-    var decomp: Decompress = .init(&in, .raw, &.{});
+    var history: [flate.max_window_len]u8 = undefined;
+    var decomp: Decompress = .init(&in, .raw, &history);
     const r = &decomp.reader;
     var bufs: [1][]u8 = .{&.{}};
     try testing.expectEqual(0, try r.readVec(&bufs));
