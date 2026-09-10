@@ -2308,6 +2308,12 @@ fn sampleFractionInput(
     if (initRecordInput(&input, io, label)) |failure| return failure;
     defer input.deinit(io);
     if (comptime build_options.use_isa_l) {
+        if (selector.* == .none) {
+            return checkRecordInput(&input, .{
+                .max_line_bytes = options.max_line_bytes,
+                .alphabet = options.alphabet,
+            });
+        }
         return sampleFractionSource(allocator, input.byteSource(), writer, selector, options);
     }
     return sampleFractionSource(allocator, &input, writer, selector, options);
@@ -5346,6 +5352,58 @@ test "[property] - [interleaved fraction sample]: source chunks preserve selecte
         try std.testing.expect(failure == null);
         try std.testing.expectEqual(data.len, source.position);
         try std.testing.expectEqualStrings(expected, sink.written());
+    }
+}
+
+test "[edge] - [single fraction sample]: fraction zero avoids allocation in the default backend" {
+    if (!build_options.use_isa_l) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+    try input.appendSlice(std.testing.allocator, "@large ");
+    try input.appendNTimes(std.testing.allocator, 'x', io_layer.DEFAULT_READER_BUFFER_BYTES + 1);
+    const header_len = input.items.len;
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        ".zig-cache/tmp/{s}/input.fastq",
+        .{tmp.sub_path},
+    );
+
+    for ([_][]const u8{ "\nA\n+\n!\n", "\nA\n+\n!!\n" }, 0..) |suffix, case_index| {
+        input.shrinkRetainingCapacity(header_len);
+        try input.appendSlice(std.testing.allocator, suffix);
+        try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = input.items });
+        var output: [1]u8 = undefined;
+        var sink = io_layer.SliceSink.init(&output);
+        var writer = zfastq.Writer.init(sink.byteSink());
+        var selector = sampling.Selector.init(.none, 11);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = 0,
+        });
+
+        const failure = try sampleFractionInput(io, failing.allocator(), path, &writer, &selector, .{
+            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+            .alphabet = .iupac,
+            .fraction = .none,
+            .count = null,
+            .seed = 11,
+        });
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), sink.written().len);
+        if (case_index == 0) {
+            try std.testing.expect(failure == null);
+        } else {
+            const details = failure orelse return error.ExpectedFailure;
+            try std.testing.expectEqualStrings("S005", details.code);
+            try std.testing.expectEqualStrings("sequence and quality lengths differ", details.message);
+            try std.testing.expectEqual(@as(u8, 1), details.exit_code);
+            try std.testing.expectEqual(@as(?u64, 0), details.record_index);
+            try std.testing.expectEqual(@as(?u64, header_len + 5), details.byte_offset);
+            try std.testing.expectEqual(@as(?u3, 4), details.line_in_record);
+        }
     }
 }
 
