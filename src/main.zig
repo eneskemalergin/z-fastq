@@ -4629,6 +4629,12 @@ test "[integration] - [stats command]: handled failures preserve input order and
     }
 }
 
+fn snapshotTestFile(io: std.Io, path: []const u8) !FileSnapshot {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    return fileSnapshot(file, io);
+}
+
 test "[unit] - [exact sample]: every retained file-change signal is compared" {
     const baseline = FileSnapshot{
         .inode = 17,
@@ -4703,9 +4709,7 @@ test "[failure] - [exact sample]: final record-count change keeps a valid prefix
         ".zig-cache/tmp/{s}/{s}",
         .{ tmp.sub_path, name },
     );
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    const snapshot = try fileSnapshot(file, io);
-    file.close(io);
+    const snapshot = try snapshotTestFile(io, path);
 
     var output: [64]u8 = undefined;
     var sink = io_layer.SliceSink.init(&output);
@@ -4736,9 +4740,7 @@ test "[failure] - [exact sample]: final record-count change keeps a valid prefix
 test "[failure] - [exact sample]: changed metadata stops the second pass before output" {
     const io = std.testing.io;
     const path = "tests/data/synthetic/basic_valid.fastq";
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    var snapshot = try fileSnapshot(file, io);
-    file.close(io);
+    var snapshot = try snapshotTestFile(io, path);
     snapshot.size += 1;
 
     var output: [64]u8 = undefined;
@@ -4816,9 +4818,7 @@ test "[failure] - [exact sample]: a FIFO replacement reports input changed on re
 test "[integration] - [exact sample]: the output pass trusts first-pass semantics" {
     const io = std.testing.io;
     const path = "tests/data/synthetic/bad_alphabet.fastq";
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    const snapshot = try fileSnapshot(file, io);
-    file.close(io);
+    const snapshot = try snapshotTestFile(io, path);
 
     var output: [64]u8 = undefined;
     var sink = io_layer.SliceSink.init(&output);
@@ -4876,15 +4876,9 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
     );
     const inputs = [_][]const u8{ path1, path2 };
 
-    const file1 = try std.Io.Dir.cwd().openFile(io, path1, .{});
-    const snapshot1 = try fileSnapshot(file1, io);
-    file1.close(io);
-    const file2 = try std.Io.Dir.cwd().openFile(io, path2, .{});
-    const snapshot2 = try fileSnapshot(file2, io);
-    file2.close(io);
-    const pair_file = try std.Io.Dir.cwd().openFile(io, pairs_path, .{});
-    const pair_snapshot = try fileSnapshot(pair_file, io);
-    pair_file.close(io);
+    const snapshot1 = try snapshotTestFile(io, path1);
+    const snapshot2 = try snapshotTestFile(io, path2);
+    const pair_snapshot = try snapshotTestFile(io, pairs_path);
     const options = SampleOptions{
         .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
         .alphabet = .iupac,
@@ -4986,12 +4980,8 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
 
     try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "@a/1\nA\n+\n!\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "@a/2\nT\n+\n#\n" });
-    const file1 = try std.Io.Dir.cwd().openFile(io, path1, .{});
-    const snapshot1 = try fileSnapshot(file1, io);
-    file1.close(io);
-    const file2 = try std.Io.Dir.cwd().openFile(io, path2, .{});
-    const snapshot2 = try fileSnapshot(file2, io);
-    file2.close(io);
+    const snapshot1 = try snapshotTestFile(io, path1);
+    const snapshot2 = try snapshotTestFile(io, path2);
 
     var paired_output: [64]u8 = undefined;
     var paired_sink = io_layer.SliceSink.init(&paired_output);
@@ -5018,9 +5008,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         .sub_path = "pairs.fastq",
         .data = first_pair ++ "@odd/1\nC\n+\n$\n",
     });
-    const pair_file = try std.Io.Dir.cwd().openFile(io, pairs_path, .{});
-    const pair_snapshot = try fileSnapshot(pair_file, io);
-    pair_file.close(io);
+    const pair_snapshot = try snapshotTestFile(io, pairs_path);
     var interleaved_output: [64]u8 = undefined;
     var interleaved_sink = io_layer.SliceSink.init(&interleaved_output);
     var interleaved_writer = zfastq.Writer.init(interleaved_sink.byteSink());
@@ -5051,12 +5039,8 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
 
     try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "@left/1\nA\n+\n!\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "@right/2\nT\n+\n#\n" });
-    const mismatch_file1 = try std.Io.Dir.cwd().openFile(io, path1, .{});
-    const mismatch_snapshot1 = try fileSnapshot(mismatch_file1, io);
-    mismatch_file1.close(io);
-    const mismatch_file2 = try std.Io.Dir.cwd().openFile(io, path2, .{});
-    const mismatch_snapshot2 = try fileSnapshot(mismatch_file2, io);
-    mismatch_file2.close(io);
+    const mismatch_snapshot1 = try snapshotTestFile(io, path1);
+    const mismatch_snapshot2 = try snapshotTestFile(io, path2);
     var mismatch_output: [64]u8 = undefined;
     var mismatch_sink = io_layer.SliceSink.init(&mismatch_output);
     var mismatch_writer = zfastq.Writer.init(mismatch_sink.byteSink());
@@ -5076,9 +5060,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
     try std.testing.expectEqualStrings(mismatched_pair, mismatch_sink.written());
 
     try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = mismatched_pair });
-    const mismatch_pair_file = try std.Io.Dir.cwd().openFile(io, pairs_path, .{});
-    const mismatch_pair_snapshot = try fileSnapshot(mismatch_pair_file, io);
-    mismatch_pair_file.close(io);
+    const mismatch_pair_snapshot = try snapshotTestFile(io, pairs_path);
     var mismatch_pair_output: [64]u8 = undefined;
     var mismatch_pair_sink = io_layer.SliceSink.init(&mismatch_pair_output);
     var mismatch_pair_writer = zfastq.Writer.init(mismatch_pair_sink.byteSink());
@@ -5119,12 +5101,8 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
     for (semantic_cases) |case| {
         try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = case.r1 });
         try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = case.r2 });
-        const semantic_file1 = try std.Io.Dir.cwd().openFile(io, path1, .{});
-        const semantic_snapshot1 = try fileSnapshot(semantic_file1, io);
-        semantic_file1.close(io);
-        const semantic_file2 = try std.Io.Dir.cwd().openFile(io, path2, .{});
-        const semantic_snapshot2 = try fileSnapshot(semantic_file2, io);
-        semantic_file2.close(io);
+        const semantic_snapshot1 = try snapshotTestFile(io, path1);
+        const semantic_snapshot2 = try snapshotTestFile(io, path2);
         var semantic_output: [64]u8 = undefined;
         var semantic_sink = io_layer.SliceSink.init(&semantic_output);
         var semantic_writer = zfastq.Writer.init(semantic_sink.byteSink());
@@ -5149,12 +5127,8 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
     const structural_r2 = "@bad/2\nT\nx\n#\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = structural_r1 });
     try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = structural_r2 });
-    const structural_file1 = try std.Io.Dir.cwd().openFile(io, path1, .{});
-    const structural_snapshot1 = try fileSnapshot(structural_file1, io);
-    structural_file1.close(io);
-    const structural_file2 = try std.Io.Dir.cwd().openFile(io, path2, .{});
-    const structural_snapshot2 = try fileSnapshot(structural_file2, io);
-    structural_file2.close(io);
+    const structural_snapshot1 = try snapshotTestFile(io, path1);
+    const structural_snapshot2 = try snapshotTestFile(io, path2);
     var structural_output: [64]u8 = undefined;
     var structural_sink = io_layer.SliceSink.init(&structural_output);
     var structural_writer = zfastq.Writer.init(structural_sink.byteSink());
