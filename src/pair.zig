@@ -33,7 +33,7 @@ pub fn parseName(header: []const u8, policy: NamePolicy) Name {
         normalized_id = first_token[0 .. first_token.len - 2];
     }
 
-    const second_token = nextToken(header, first_token.len).bytes;
+    const second_token = nextToken(header, first_token.len);
     if (leadingMateMarker(second_token)) |mate| {
         mate_markers |= mateMask(mate);
     }
@@ -63,11 +63,6 @@ pub fn namesMatch(name1: Name, name2: Name) bool {
     if (name1.mate_markers == 0) return true;
     return name1.mate_markers == 0b01 and name2.mate_markers == 0b10;
 }
-
-const HeaderToken = struct {
-    bytes: []const u8,
-    ends_header: bool,
-};
 
 const token_lanes = 16;
 const TokenVector = @Vector(token_lanes, u8);
@@ -128,13 +123,13 @@ fn tokenEnd(header: []const u8, start: usize) usize {
     return end;
 }
 
-fn nextToken(header: []const u8, previous_end: usize) HeaderToken {
+fn nextToken(header: []const u8, previous_end: usize) []const u8 {
     var start = previous_end;
     while (start < header.len and (header[start] == ' ' or header[start] == '\t')) {
         start += 1;
     }
     const end = tokenEnd(header, start);
-    return .{ .bytes = header[start..end], .ends_header = end == header.len };
+    return header[start..end];
 }
 
 // Keep the full matcher shared across paired command paths to avoid code growth.
