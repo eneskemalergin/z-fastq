@@ -2793,7 +2793,10 @@ test "[edge] - [reader]: spill field capacities stop at the line limit" {
         }
         try std.testing.expectEqual(input.len, offset);
 
-        var source = io_layer.SliceSource.init(input);
+        var repeated: std.ArrayList(u8) = .empty;
+        defer repeated.deinit(std.testing.allocator);
+        for (0..4) |_| try repeated.appendSlice(std.testing.allocator, input);
+        var source = io_layer.SliceSource.init(repeated.items);
         var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
         var reader = try Reader.init(
             tracking.allocator(),
@@ -2823,6 +2826,59 @@ test "[edge] - [reader]: spill field capacities stop at the line limit" {
             ReaderError.LineTooLong,
             reader.ensureFieldCapacity(0, storage_limit + 1, false),
         );
+        const warm_allocated = tracking.allocated_bytes;
+        var count: usize = 1;
+        while (try reader.next()) |next| {
+            try std.testing.expectEqual(max_line_bytes - 1, next.header.len);
+            try std.testing.expectEqual(max_line_bytes - 1, next.plus.len);
+            try std.testing.expectEqual(max_line_bytes, next.sequence.len);
+            try std.testing.expectEqual(max_line_bytes, next.quality.len);
+            try std.testing.expect(std.mem.allEqual(u8, next.sequence, 'A'));
+            try std.testing.expect(std.mem.allEqual(u8, next.quality, 'I'));
+            for (reader.fallback_fields, 0..) |field, field_index| {
+                try std.testing.expect(field.storage.len <= if (field_index == 1)
+                    @max(io_layer.DEFAULT_READER_BUFFER_BYTES, storage_limit)
+                else
+                    storage_limit);
+            }
+            try std.testing.expect(tracking.allocated_bytes - tracking.freed_bytes <=
+                2 * io_layer.DEFAULT_READER_BUFFER_BYTES + 3 * storage_limit);
+            if (crlf) try std.testing.expectEqual(warm_allocated, tracking.allocated_bytes);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 4), count);
+    }
+}
+
+test "[property] - [reader]: repeated initialization releases both source modes at boundary line limits" {
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator, limit: usize, borrowed: bool) !void {
+            var empty = std.Io.Reader.fixed("");
+            var gzip = io_layer.GzipSource.init(&empty);
+            var source = io_layer.SliceSource.init("");
+            var reader = if (borrowed)
+                try initBorrowedGzipReader(allocator, &gzip, .{ .max_line_bytes = limit })
+            else
+                try Reader.init(allocator, source.byteSource(), .{ .max_line_bytes = limit });
+            defer reader.deinit();
+
+            try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.fallback_fields[1].storage.len);
+            try std.testing.expectEqual(
+                @as(usize, if (borrowed) 0 else io_layer.DEFAULT_READER_BUFFER_BYTES),
+                reader.transport_storage.len,
+            );
+        }
+    };
+    for ([_]usize{ 0, 8192, 80 * 1024, io_layer.DEFAULT_READER_BUFFER_BYTES - 1, io_layer.DEFAULT_READER_BUFFER_BYTES, std.math.maxInt(usize) }) |limit| {
+        for ([_]bool{ false, true }) |borrowed| {
+            if (borrowed and @sizeOf(@FieldType(io_layer.GzipSource, "decompressor_buffer")) == 0) continue;
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ limit, borrowed });
+            var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            for (0..3) |_| {
+                try Exercise.run(tracking.allocator(), limit, borrowed);
+                try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+            }
+        }
     }
 }
 

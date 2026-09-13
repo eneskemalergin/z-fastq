@@ -1251,12 +1251,11 @@ fn checkInterleavedSource(
         } else header: {
             if (semantic1 == null) {
                 const name1 = pairing.parseName(record1.header, options.pair_name_policy);
-                normalized_id.clearRetainingCapacity();
-                normalized_id.ensureTotalCapacityPrecise(
+                storeNormalizedId(
                     allocator,
-                    name1.normalized_id.len,
+                    &normalized_id,
+                    name1.normalized_id,
                 ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
-                normalized_id.appendSliceAssumeCapacity(name1.normalized_id);
                 first_token_len = name1.first_token.len;
                 first_mate_marker = name1.first_mate_marker;
                 mate1_markers = name1.mate_markers;
@@ -1359,6 +1358,16 @@ fn exactPairSelectionFailure(err: sampling.ReservoirError) PairCommandFailure {
         .input_index = 0,
         .details = exactSelectionFailure(err),
     } };
+}
+
+fn storeNormalizedId(
+    allocator: std.mem.Allocator,
+    storage: *std.ArrayList(u8),
+    normalized_id: []const u8,
+) std.mem.Allocator.Error!void {
+    storage.clearRetainingCapacity();
+    try storage.ensureTotalCapacityPrecise(allocator, normalized_id.len);
+    storage.appendSliceAssumeCapacity(normalized_id);
 }
 
 fn exactSelectionFailure(err: sampling.ReservoirError) CommandFailure {
@@ -2160,12 +2169,11 @@ fn sampleInterleavedSource(
         } else record: {
             if (semantic1 == null) {
                 const name1 = pairing.parseName(record1.header, options.pair_name_policy);
-                normalized_id.clearRetainingCapacity();
-                normalized_id.ensureTotalCapacityPrecise(
+                storeNormalizedId(
                     allocator,
-                    name1.normalized_id.len,
+                    &normalized_id,
+                    name1.normalized_id,
                 ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
-                normalized_id.appendSliceAssumeCapacity(name1.normalized_id);
                 first_token_len = name1.first_token.len;
                 first_mate_marker = name1.first_mate_marker;
                 mate1_markers = name1.mate_markers;
@@ -5158,52 +5166,154 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
     try std.testing.expectEqual(@as(usize, 0), structural_sink.written().len);
 }
 
-fn exerciseExactPairAllocations(allocator: std.mem.Allocator) !void {
+test "[property] - [paired identifiers]: storage reuses its largest allocation and releases failures" {
+    const bytes = try std.testing.allocator.alloc(u8, 256 * 1024 + 1);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'r');
+    bytes[bytes.len - 1] = 'z';
+    const Exercise = struct {
+        fn run(allocator: std.mem.Allocator, name: []const u8) !void {
+            var tracking = std.testing.FailingAllocator.init(allocator, .{});
+            {
+                var storage: std.ArrayList(u8) = .empty;
+                defer storage.deinit(tracking.allocator());
+                try storeNormalizedId(tracking.allocator(), &storage, name[0..3]);
+                try storeNormalizedId(tracking.allocator(), &storage, name);
+                const allocated = tracking.allocated_bytes;
+                for ([_]usize{ 7, name.len, 0, name.len }) |len| {
+                    try storeNormalizedId(tracking.allocator(), &storage, name[0..len]);
+                    try std.testing.expectEqualStrings(name[0..len], storage.items);
+                    try std.testing.expectEqual(name.len, storage.capacity);
+                    try std.testing.expectEqual(allocated, tracking.allocated_bytes);
+                }
+            }
+            try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{bytes});
+}
+
+fn exerciseExactAllocations(allocator: std.mem.Allocator) !void {
     const r1 = "@a/1\nA\n+\n!\n@b/1\nC\n+\n#\n@c/1\nG\n+\n$\n";
     const r2 = "@a/2\nT\n+\n!\n@b/2\nG\n+\n#\n@c/2\nC\n+\n$\n";
     const interleaved =
         "@a/1\nA\n+\n!\n@a/2\nT\n+\n!\n" ++
         "@b/1\nC\n+\n#\n@b/2\nG\n+\n#\n" ++
         "@c/1\nG\n+\n$\n@c/2\nC\n+\n$\n";
-    const options = PairedCheckOptions{
-        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-        .alphabet = .iupac,
-        .pair_mode = .paired,
-        .pair_name_policy = .illumina,
-    };
-
-    {
-        var source1 = io_layer.SliceSource.init(r1);
-        var source2 = io_layer.SliceSource.init(r2);
-        var selector = sampling.ExactSelector.init(1, 11);
-        defer selector.deinit(allocator);
-        if (checkPairedSources(
-            allocator,
-            source1.byteSource(),
-            source2.byteSource(),
-            options,
-            &selector,
-        )) |failure| {
-            return pairAllocationFailure(failure);
-        }
-        try std.testing.expect(selector.finish() == .indexes);
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const names = [_][]const u8{ "r1.fastq", "r2.fastq", "interleaved.fastq" };
+    var paths: [3][]const u8 = undefined;
+    var path_count: usize = 0;
+    defer for (paths[0..path_count]) |path| std.testing.allocator.free(path);
+    for (names, [_][]const u8{ r1, r2, interleaved }, 0..) |name, bytes, index| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+        paths[index] = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+        path_count += 1;
     }
 
-    {
-        var source = io_layer.SliceSource.init(interleaved);
-        var selector = sampling.ExactSelector.init(1, 11);
-        defer selector.deinit(allocator);
-        var interleaved_options = options;
-        interleaved_options.pair_mode = .interleaved;
-        if (checkInterleavedSource(
-            allocator,
-            source.byteSource(),
-            interleaved_options,
-            &selector,
-        )) |failure| {
-            return pairAllocationFailure(failure);
+    const descriptors = try openDescriptorCount();
+    for ([_]PairMode{ .none, .paired, .interleaved }) |mode| {
+        for ([_]u64{ 0, 1, 2, 3, 4 }) |count| {
+            var output: [128]u8 = undefined;
+            var sink = io_layer.SliceSink.init(&output);
+            var writer = zfastq.Writer.init(sink.byteSink());
+            const options = SampleOptions{
+                .max_line_bytes = 8192,
+                .alphabet = .iupac,
+                .fraction = null,
+                .count = count,
+                .seed = 11,
+                .pair_mode = mode,
+            };
+            if (mode == .none) {
+                if (try sampleExactFile(io, allocator, paths[0], &writer, count, options)) |failure| {
+                    try std.testing.expectEqual(descriptors, try openDescriptorCount());
+                    return pairAllocationFailure(.{ .command = .{ .input_index = 0, .details = failure } });
+                }
+            } else {
+                const inputs = if (mode == .paired) paths[0..2] else paths[2..3];
+                if (try sampleExactPairs(io, allocator, inputs, &writer, count, options)) |failure| {
+                    try std.testing.expectEqual(descriptors, try openDescriptorCount());
+                    return pairAllocationFailure(failure);
+                }
+            }
+            try std.testing.expectEqual(descriptors, try openDescriptorCount());
+            const copies: usize = if (mode == .none) 1 else 2;
+            try std.testing.expectEqual(@as(usize, @intCast(@min(count, 3))) * copies * (r1.len / 3), sink.written().len);
+            if (count >= 3) try std.testing.expectEqualStrings(if (mode == .none) r1 else interleaved, sink.written());
         }
-        try std.testing.expect(selector.finish() == .indexes);
+    }
+}
+
+fn openDescriptorCount() !usize {
+    const io = std.testing.io;
+    var directory = try std.Io.Dir.openDirAbsolute(io, "/proc/self/fd", .{ .iterate = true });
+    defer directory.close(io);
+    var entries = directory.iterate();
+    var count: usize = 0;
+    while (try entries.next(io)) |_| count += 1;
+    return count;
+}
+
+test "[integration] - [input resources]: repeated failures close owned files and preserve borrowed files" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1", .data = "@a/1\nA\n+\n!\n" });
+    try tmp.dir.createDir(io, "directory", .default_dir);
+    const base = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(base);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/r1", .{base});
+    defer std.testing.allocator.free(path);
+    const directory = try std.fmt.allocPrint(std.testing.allocator, "{s}/directory", .{base});
+    defer std.testing.allocator.free(directory);
+    const missing = try std.fmt.allocPrint(std.testing.allocator, "{s}/missing", .{base});
+    defer std.testing.allocator.free(missing);
+    const output_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/out1", .{base});
+    defer std.testing.allocator.free(output_path);
+    var changed = try snapshotTestFile(io, path);
+    changed.size += 1;
+
+    const descriptors = try openDescriptorCount();
+    for (0..8) |_| {
+        var input: RecordInput = undefined;
+        try std.testing.expect(initRecordInput(&input, io, path) == null);
+        input.deinit(io);
+        try std.testing.expectEqualStrings("io_error", initRecordInput(&input, io, directory).?.code);
+        try std.testing.expectEqualStrings("io_error", initExactInput(&input, io, directory, null).failure.code);
+        try std.testing.expectEqualStrings("input_changed", initExactInput(&input, io, path, changed).failure.code);
+        try std.testing.expectEqualStrings("input_changed", initExactInput(&input, io, missing, changed).failure.code);
+        try std.testing.expectEqual(descriptors, try openDescriptorCount());
+
+        {
+            const borrowed = try tmp.dir.openFile(io, "r1", .{});
+            defer borrowed.close(io);
+            try input.init(io, borrowed, false);
+            input.deinit(io);
+            try std.testing.expectEqual(@as(u64, "@a/1\nA\n+\n!\n".len), (try borrowed.stat(io)).size);
+        }
+        var output: [64]u8 = undefined;
+        var sink = io_layer.SliceSink.init(&output);
+        var writer = zfastq.Writer.init(sink.byteSink());
+        const inputs = [_][]const u8{ path, missing };
+        const failure = (try interleaveInputs(io, std.testing.allocator, &inputs, &writer, null, .{
+            .max_line_bytes = 8192,
+            .alphabet = .iupac,
+            .pair_name_policy = .illumina,
+        })).?;
+        try std.testing.expectEqual(@as(u1, 1), failure.command.input_index);
+        try std.testing.expectEqualStrings("io_error", failure.command.details.code);
+        try std.testing.expectEqual(@as(usize, 0), sink.written().len);
+        try std.testing.expectEqual(@as(u8, 3), runDeinterleave(io, std.testing.allocator, &.{path}, output_path, path, .{
+            .max_line_bytes = 8192,
+            .alphabet = .iupac,
+            .pair_name_policy = .illumina,
+        }));
+        try std.testing.expectEqual(descriptors, try openDescriptorCount());
+        try std.testing.expectEqual(@as(u64, 0), (try snapshotTestFile(io, output_path)).size);
+        try tmp.dir.deleteFile(io, "out1");
     }
 }
 
@@ -5217,10 +5327,10 @@ fn pairAllocationFailure(failure: PairCommandFailure) error{ OutOfMemory, Unexpe
     };
 }
 
-test "[failure] - [paired exact sample]: allocation failures release all state" {
+test "[failure] - [exact sample]: allocation failures in both passes release memory and descriptors" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
-        exerciseExactPairAllocations,
+        exerciseExactAllocations,
         .{},
     );
 }
