@@ -516,11 +516,7 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
     }
 
     const version = try runCli(allocator, &.{"--version"});
-    try std.testing.expectEqual(@as(u8, 0), version.exit_code);
-    try std.testing.expect(std.mem.startsWith(u8, version.stdout, "z-fastq "));
-    try std.testing.expect(std.mem.endsWith(u8, version.stdout, "\n"));
-    _ = try std.SemanticVersion.parse(version.stdout["z-fastq ".len .. version.stdout.len - 1]);
-    try std.testing.expectEqual(@as(usize, 0), version.stderr.len);
+    try cli.expectResult(version, 0, "z-fastq " ++ cli.EXPECTED_VERSION ++ "\n", "");
 
     const short_version = try runCli(allocator, &.{"-V"});
     try std.testing.expectEqual(@as(u8, 0), short_version.exit_code);
@@ -672,6 +668,62 @@ test "[cli] - [subprocess]: timeout kills and reaps a stalled installed command"
             .fromMilliseconds(100),
         ),
     );
+}
+
+test "[cli] - [subprocess]: output limits reject excess bytes and leave no child" {
+    const allocator = std.testing.allocator;
+    const record = "@record01\nA\n+\n!\n";
+    const limit = 1024 * 1024;
+    const input = try allocator.alloc(u8, limit + record.len);
+    defer allocator.free(input);
+    for (0..input.len / record.len) |index| {
+        @memcpy(input[index * record.len ..][0..record.len], record);
+    }
+
+    {
+        const result = try runCliWithStdin(
+            allocator,
+            &.{ "sample", "--fraction", "1", "-" },
+            input[0..limit],
+            4096,
+        );
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try cli.expectResult(result, 0, input[0..limit], "");
+    }
+
+    var missing_paths: [258][]const u8 = undefined;
+    missing_paths[0] = "count";
+    @memset(missing_paths[1..], "x" ** 4096);
+    const cases = [_]struct {
+        args: []const []const u8,
+        stdin: []const u8 = "",
+        closed_stdout: bool = false,
+    }{
+        .{ .args = &.{ "sample", "--fraction", "1", "-" }, .stdin = input },
+        .{ .args = &missing_paths },
+        .{ .args = &missing_paths, .closed_stdout = true },
+    };
+    for (cases) |case| {
+        const result = if (case.closed_stdout)
+            runCliWithClosedStdout(allocator, case.args, case.stdin)
+        else
+            runCliWithStdin(allocator, case.args, case.stdin, 4096);
+        if (result) |unexpected| {
+            defer allocator.free(unexpected.stdout);
+            defer allocator.free(unexpected.stderr);
+            return error.ExpectedOutputLimit;
+        } else |err| {
+            try std.testing.expectEqual(error.StreamTooLong, err);
+        }
+
+        var children: [128]u8 = undefined;
+        try std.testing.expectEqualStrings("", try std.Io.Dir.cwd().readFile(
+            std.testing.io,
+            "/proc/thread-self/children",
+            &children,
+        ));
+    }
 }
 
 test "[cli] - [diagnostics]: untrusted command, option, and path bytes use escaped ASCII" {

@@ -117,6 +117,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &import_lib,
     });
+    const reader_test_options = b.addOptions();
+    reader_test_options.addOption([]const u8, "package_version", @import("build.zig.zon").version);
+    reader_test_module.addOptions("test_options", reader_test_options);
 
     const writer_test_module = b.createModule(.{
         .root_source_file = b.path("tests/test_writer.zig"),

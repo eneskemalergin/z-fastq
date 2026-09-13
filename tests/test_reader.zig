@@ -14,8 +14,10 @@ test "[unit] - [root]: every exported declaration is analyzable" {
     std.testing.refAllDecls(zfastq);
 }
 
-test "[unit] - [root]: version exposes the current internal checkpoint" {
-    _ = try std.SemanticVersion.parse(zfastq.VERSION);
+test "[unit] - [root]: library and package versions match the current checkpoint" {
+    const expected = @import("utilities.zig").EXPECTED_VERSION;
+    try std.testing.expectEqualStrings(expected, zfastq.VERSION);
+    try std.testing.expectEqualStrings(expected, @import("test_options").package_version);
 }
 
 test "[property] - [gzip source]: optional member chains decode at every input chunk size" {
@@ -371,51 +373,6 @@ test "[unit] - [reader]: supported record forms parse exactly" {
     }
 }
 
-test "[failure] - [reader]: unequal sequence and quality lengths report S005" {
-    const data =
-        \\@bad
-        \\ACGT
-        \\+
-        \\III
-        \\
-    ;
-    var source = zfastq.io.plain.SliceSource.init(data);
-    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-    try std.testing.expectError(zfastq.ReaderError.S005LengthMismatch, reader.next());
-}
-
-test "[failure] - [reader]: a header without at-sign reports S003" {
-    const data = "not_a_header\nACGT\n+\n!!!!\n";
-    var source = zfastq.io.plain.SliceSource.init(data);
-    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-    try std.testing.expectError(zfastq.ReaderError.S003InvalidHeader, reader.next());
-}
-
-test "[failure] - [reader]: a truncated record at EOF reports S004" {
-    const data = "@truncated\nACGT\n+";
-    var source = zfastq.io.plain.SliceSource.init(data);
-    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-    try std.testing.expectError(zfastq.ReaderError.S004TruncatedRecord, reader.next());
-}
-
-test "[failure] - [reader]: an invalid plus line reports S001 at its start" {
-    const data = "@bad\nACGT\nnot-plus\n!!!!\n";
-    var source = zfastq.io.plain.SliceSource.init(data);
-    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-
-    try std.testing.expectError(zfastq.ReaderError.S001InvalidPlusLine, reader.next());
-    const details = reader.takeLastError().?;
-    try std.testing.expectEqual(zfastq.LintCode.s001_invalid_plus_line, details.code);
-    try std.testing.expectEqual(@as(u64, 0), details.record_index);
-    try std.testing.expectEqual(@as(u3, 3), details.line_in_record);
-    try std.testing.expectEqual(@as(u64, 10), details.byte_offset);
-    try std.testing.expect(reader.takeLastError() == null);
-}
-
 test "[property] - [reader]: borrowed fields survive every fixed short-read size" {
     const data = "@read1 comment\nACGT\n+repeat\n!!!!\n";
     for (1..data.len + 1) |chunk_len| {
@@ -649,13 +606,29 @@ test "[failure] - [owned record]: conversion releases partial allocations" {
     );
 }
 
-test "[failure] - [reader]: source read failure propagates" {
-    var failing_source = FailingSource{};
-    const source = failing_source.byteSource();
-    var reader = try zfastq.Reader.init(std.testing.allocator, source, .{});
-    defer reader.deinit();
+test "[failure] - [reader]: read failures at every byte retain complete earlier records" {
+    const record = "@r\nA\n+\n!\n";
+    const data = record ++ record;
+    for (0..data.len + 1) |fail_at| {
+        errdefer std.debug.print("read failure after {d} bytes\n", .{fail_at});
+        var failing_source = FailingSource{ .data = data[0..fail_at] };
+        var reader = try zfastq.Reader.init(
+            std.testing.allocator,
+            failing_source.byteSource(),
+            .{},
+        );
+        defer reader.deinit();
 
-    try std.testing.expectError(zfastq.ReaderError.Io, reader.next());
+        for (0..fail_at / record.len) |_| {
+            const parsed = (try reader.next()).?;
+            try std.testing.expectEqualStrings("r", parsed.id);
+            try std.testing.expectEqualStrings("A", parsed.sequence);
+            try std.testing.expectEqualStrings("!", parsed.quality);
+        }
+        try std.testing.expectError(zfastq.ReaderError.Io, reader.next());
+        try std.testing.expectEqual(@as(u64, fail_at / record.len), reader.recordIndex());
+        try std.testing.expect(reader.takeLastError() == null);
+    }
 }
 
 test "[failure] - [byte source]: a callback count beyond its destination is rejected" {
@@ -800,6 +773,29 @@ test "[failure] - [count scanner]: a length mismatch reports S005" {
     try std.testing.expectError(zfastq.ReaderError.S005LengthMismatch, scan.feed(data));
 }
 
+test "[unit] - [count slice]: reuse replaces progress, options, and old diagnostics" {
+    var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 0 });
+    try std.testing.expectError(
+        error.S001InvalidPlusLine,
+        zfastq.count_scan.countSlice("@r\nA\nx\n!\n", .{}, &scan),
+    );
+
+    const valid = "@r\nA\n+\n!\n";
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        try zfastq.count_scan.countSlice(valid, .{ .max_line_bytes = 2 }, &scan),
+    );
+    try std.testing.expectEqual(@as(u64, valid.len), scan.byte_offset);
+    try std.testing.expect(scan.takeLastError() == null);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        try zfastq.count_scan.countSlice("", .{ .max_line_bytes = 0 }, &scan),
+    );
+    try std.testing.expectEqual(@as(u64, 0), scan.byte_offset);
+    try std.testing.expect(scan.takeLastError() == null);
+    try std.testing.expectError(error.LineTooLong, scan.feed(valid));
+}
+
 test "[property] - [count scanner]: result and details are chunk invariant" {
     const valid = "@r1\nAAAA\n+\n!!!!\n@r2\nCC\n+note\n##\n";
     for (1..valid.len + 1) |chunk_len| {
@@ -844,7 +840,11 @@ test "[property] - [parser]: generated mutations keep Reader and scanner in agre
     const random = prng.random();
     const mutations = [_]u8{ '\n', '\r', '@', '+', 0, 'A', '!' };
 
-    for (0..96) |_| {
+    for (0..96) |case_index| {
+        errdefer std.debug.print(
+            "parser seed=0x6a09e667f3bcc909 runner_seed=0x{x} case={d}\n",
+            .{ std.testing.random_seed, case_index },
+        );
         var storage: [8192]u8 = undefined;
         var output = std.Io.Writer.fixed(&storage);
         const record_count = random.intRangeAtMost(usize, 1, 16);
@@ -918,6 +918,34 @@ test "[property] - [parser]: structural details agree across chunk sizes" {
             .code = .s003_invalid_header,
             .line = 1,
             .offset = 0,
+        },
+        .{
+            .data = "not_a_header\nACGT\n+\n!!!!\n",
+            .expected_error = error.S003InvalidHeader,
+            .code = .s003_invalid_header,
+            .line = 1,
+            .offset = 0,
+        },
+        .{
+            .data = "@bad\nACGT\nnot-plus\n!!!!\n",
+            .expected_error = error.S001InvalidPlusLine,
+            .code = .s001_invalid_plus_line,
+            .line = 3,
+            .offset = 10,
+        },
+        .{
+            .data = "@truncated\nACGT\n+",
+            .expected_error = error.S004TruncatedRecord,
+            .code = .s004_truncated_record,
+            .line = 4,
+            .offset = 17,
+        },
+        .{
+            .data = "@bad\nACGT\n+\nIII\n",
+            .expected_error = error.S005LengthMismatch,
+            .code = .s005_length_mismatch,
+            .line = 4,
+            .offset = 12,
         },
         .{
             .data = "@\nA\n+\n!\n",
@@ -1410,6 +1438,8 @@ const FragmentReader = struct {
 };
 
 const FailingSource = struct {
+    data: []const u8,
+
     fn byteSource(self: *FailingSource) zfastq.io.ByteSource {
         return .{ .vtable = &vtable, .ctx = self };
     }
@@ -1417,9 +1447,12 @@ const FailingSource = struct {
     const vtable = zfastq.io.ByteSource.VTable{ .read = read };
 
     fn read(ctx: *anyopaque, dest: []u8) error{ReadFailed}!usize {
-        _ = ctx;
-        _ = dest;
-        return error.ReadFailed;
+        const self: *FailingSource = @ptrCast(@alignCast(ctx));
+        if (self.data.len == 0) return error.ReadFailed;
+        const n = @min(self.data.len, dest.len);
+        @memcpy(dest[0..n], self.data[0..n]);
+        self.data = self.data[n..];
+        return n;
     }
 };
 

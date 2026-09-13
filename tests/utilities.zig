@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+pub const EXPECTED_VERSION = "0.0.18";
 const ZFASTQ_BIN = "zig-out/bin/z-fastq";
 const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
 pub const PROCESS_TIMEOUT = std.Io.Duration.fromSeconds(30);
@@ -160,11 +161,7 @@ pub fn expectJsonDocument(
     };
     try expectJsonObjectKeys(tool, &.{ "name", "version" });
     try expectJsonString(tool.get("name"), "z-fastq");
-    const version = switch (tool.get("version") orelse return error.UnexpectedJsonShape) {
-        .string => |string| string,
-        else => return error.UnexpectedJsonShape,
-    };
-    _ = std.SemanticVersion.parse(version) catch return error.UnexpectedJsonShape;
+    try expectJsonString(tool.get("version"), EXPECTED_VERSION);
 
     const results_value = object.get("results") orelse return error.UnexpectedJsonShape;
     return switch (results_value) {

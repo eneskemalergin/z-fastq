@@ -3,7 +3,7 @@
 const std = @import("std");
 const zfastq = @import("z-fastq");
 
-test "[unit] - [writer]: supported records use exact LF serialization" {
+test "[integration] - [writer]: supported records serialize and round-trip exactly" {
     const cases = [_]struct {
         record: zfastq.Record,
         expected: []const u8,
@@ -17,6 +17,16 @@ test "[unit] - [writer]: supported records use exact LF serialization" {
                 .quality = "!!!!",
             },
             .expected = "@read1 run=1\nACGT\n+\n!!!!\n",
+        },
+        .{
+            .record = .{
+                .header = "read3 lane=1",
+                .id = "read3",
+                .sequence = "AAAA",
+                .plus = "repeat_id",
+                .quality = "!!!!",
+            },
+            .expected = "@read3 lane=1\nAAAA\n+repeat_id\n!!!!\n",
         },
         .{
             .record = .{
@@ -38,6 +48,16 @@ test "[unit] - [writer]: supported records use exact LF serialization" {
             },
             .expected = "@r\rcomment\nA\rC\n+x\ry\n!\r!\n",
         },
+        .{
+            .record = .{
+                .header = "r\x00\xff opaque",
+                .id = "r\x00\xff",
+                .sequence = "A\x00\xff",
+                .plus = "note\x00\xff",
+                .quality = "!\x00\xff",
+            },
+            .expected = "@r\x00\xff opaque\nA\x00\xff\n+note\x00\xff\n!\x00\xff\n",
+        },
     };
 
     for (cases) |case| {
@@ -46,8 +66,16 @@ test "[unit] - [writer]: supported records use exact LF serialization" {
         var writer = zfastq.Writer.init(sink.byteSink());
 
         try writer.writeRecord(case.record);
+        try writer.flush();
 
         try std.testing.expectEqualStrings(case.expected, sink.written());
+
+        var source = zfastq.io.plain.SliceSource.init(sink.written());
+        var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
+        const parsed = (try reader.next()).?;
+        try std.testing.expectEqualDeep(case.record, parsed);
+        try std.testing.expect((try reader.next()) == null);
     }
 }
 
@@ -77,40 +105,15 @@ test "[failure] - [writer]: invalid fields are rejected before output" {
     }
 }
 
-test "[integration] - [writer]: serialized fields round-trip through Reader" {
-    const input =
-        \\@read3 lane=1
-        \\AAAA
-        \\+repeat_id
-        \\!!!!
-        \\
-    ;
-
-    var source = zfastq.io.plain.SliceSource.init(input);
-    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-    const parsed = (try reader.next()).?;
-
-    var out_buf: [256]u8 = undefined;
-    var sink = zfastq.io.plain.SliceSink.init(&out_buf);
-    var writer = zfastq.Writer.init(sink.byteSink());
-    try writer.writeRecord(parsed);
-
-    var source2 = zfastq.io.plain.SliceSource.init(sink.written());
-    var reader2 = try zfastq.Reader.init(std.testing.allocator, source2.byteSource(), .{});
-    defer reader2.deinit();
-    const round = (try reader2.next()).?;
-    try std.testing.expectEqualStrings(parsed.header, round.header);
-    try std.testing.expectEqualStrings(parsed.sequence, round.sequence);
-    try std.testing.expectEqualStrings(parsed.plus, round.plus);
-    try std.testing.expectEqualStrings(parsed.quality, round.quality);
-}
-
-test "[property] - [writer]: generated valid fields round-trip through Reader" {
+test "[integration] - [writer]: generated fields serialize exactly and round-trip" {
     var prng = std.Random.DefaultPrng.init(0xbb67ae8584caa73b);
     const random = prng.random();
 
-    for (0..96) |_| {
+    for (0..96) |case_index| {
+        errdefer std.debug.print(
+            "writer seed=0xbb67ae8584caa73b runner_seed=0x{x} case={d}\n",
+            .{ std.testing.random_seed, case_index },
+        );
         var header_storage: [48]u8 = undefined;
         const header_len = random.intRangeAtMost(usize, 1, header_storage.len);
         for (header_storage[0..header_len]) |*byte| {
@@ -161,6 +164,14 @@ test "[property] - [writer]: generated valid fields round-trip through Reader" {
             .quality = quality,
         });
         try writer.flush();
+
+        var expected_buffer: [512]u8 = undefined;
+        const expected = try std.fmt.bufPrint(
+            &expected_buffer,
+            "@{s}\n{s}\n+{s}\n{s}\n",
+            .{ header, sequence, plus, quality },
+        );
+        try std.testing.expectEqualStrings(expected, sink.written());
 
         var source = zfastq.io.plain.SliceSource.init(sink.written());
         var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
@@ -233,10 +244,7 @@ test "[integration] - [file source]: supplies records to Reader" {
     try std.testing.expectEqualStrings("AC", parsed.sequence);
 }
 
-test "[failure] - [writer]: capacity and sink failures propagate" {
-    var tiny: [3]u8 = undefined;
-    var slice_sink = zfastq.io.plain.SliceSink.init(&tiny);
-    var slice_writer = zfastq.Writer.init(slice_sink.byteSink());
+test "[integration] - [writer]: capacity, write, and flush failures propagate" {
     const parsed = zfastq.Record{
         .header = "r",
         .id = "r",
@@ -244,12 +252,70 @@ test "[failure] - [writer]: capacity and sink failures propagate" {
         .plus = "",
         .quality = "!",
     };
-    try std.testing.expectError(error.WriteFailed, slice_writer.writeRecord(parsed));
+    const complete = "@r\nA\n+\n!\n";
+    const cases = [_]struct { capacity: usize, expected: []const u8 }{
+        .{ .capacity = 0, .expected = "" },
+        .{ .capacity = 3, .expected = "@r\n" },
+        .{ .capacity = complete.len - 1, .expected = "@r\nA\n+\n!" },
+        .{ .capacity = complete.len, .expected = complete },
+    };
+    for (cases) |case| {
+        var output: [complete.len]u8 = undefined;
+        var slice_sink = zfastq.io.plain.SliceSink.init(output[0..case.capacity]);
+        var slice_writer = zfastq.Writer.init(slice_sink.byteSink());
+        if (case.capacity < complete.len) {
+            try std.testing.expectError(error.WriteFailed, slice_writer.writeRecord(parsed));
+        } else {
+            try slice_writer.writeRecord(parsed);
+        }
+        try slice_writer.flush();
+        try std.testing.expectEqualStrings(case.expected, slice_sink.written());
+    }
 
-    var failing = FailingSink{};
-    var failing_writer = zfastq.Writer.init(failing.byteSink());
+    var pending: [1]u8 = undefined;
+    var standard_writer: std.Io.Writer = .{
+        .vtable = &.{ .drain = std.Io.Writer.failingDrain },
+        .buffer = &pending,
+    };
+    var adapter = zfastq.io.plain.WriterSink.init(&standard_writer);
+    var failing_writer = zfastq.Writer.init(adapter.byteSink());
     try std.testing.expectError(error.WriteFailed, failing_writer.writeRecord(parsed));
+    try std.testing.expectEqualStrings("@", standard_writer.buffered());
     try std.testing.expectError(error.WriteFailed, failing_writer.flush());
+}
+
+test "[integration] - [plain adapters]: access errors preserve borrowed file handles" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const write_only = try tmp.dir.createFile(io, "input", .{});
+    defer write_only.close(io);
+    var read_buffer: [8]u8 = undefined;
+    var file_source = zfastq.io.plain.FileSource.init(io, write_only, &read_buffer);
+    var output: [1]u8 = undefined;
+    try std.testing.expectError(error.ReadFailed, file_source.byteSource().read(&output));
+    try write_only.writeStreamingAll(io, "kept");
+
+    var failing_reader: std.Io.Reader = .failing;
+    var reader_source = zfastq.io.plain.ReaderSource.init(&failing_reader);
+    try std.testing.expectError(error.ReadFailed, reader_source.byteSource().read(&output));
+
+    const read_only = try tmp.dir.openFile(io, "input", .{});
+    defer read_only.close(io);
+    for ([_]usize{ 0, 8 }) |buffer_len| {
+        var write_buffer: [8]u8 = undefined;
+        var file_sink = zfastq.io.plain.FileSink.init(io, read_only, write_buffer[0..buffer_len]);
+        const sink = file_sink.byteSink();
+        if (buffer_len == 0) {
+            try std.testing.expectError(error.WriteFailed, sink.write("x"));
+        } else {
+            try sink.write("x");
+            try std.testing.expectError(error.WriteFailed, sink.flush());
+        }
+        var contents: [8]u8 = undefined;
+        const n = try read_only.readPositionalAll(io, &contents, 0);
+        try std.testing.expectEqualStrings("kept", contents[0..n]);
+    }
 }
 
 test "[unit] - [byte sink]: flush succeeds when the sink has no flush callback" {
@@ -282,28 +348,6 @@ test "[unit] - [writer]: the ByteSink wrapper is copied by value" {
     try std.testing.expectEqualStrings("@r\nA\n+\n!\n", original.written());
     try std.testing.expectEqual(@as(usize, 0), replacement.written().len);
 }
-
-const FailingSink = struct {
-    fn byteSink(self: *FailingSink) zfastq.io.ByteSink {
-        return .{ .vtable = &vtable, .ctx = self };
-    }
-
-    const vtable = zfastq.io.ByteSink.VTable{
-        .write = write,
-        .flush = flush,
-    };
-
-    fn write(ctx: *anyopaque, data: []const u8) error{WriteFailed}!void {
-        _ = ctx;
-        _ = data;
-        return error.WriteFailed;
-    }
-
-    fn flush(ctx: *anyopaque) error{WriteFailed}!void {
-        _ = ctx;
-        return error.WriteFailed;
-    }
-};
 
 const NoFlushSink = struct {
     bytes_written: usize = 0,
