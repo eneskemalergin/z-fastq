@@ -1205,7 +1205,7 @@ build_fastp() {
     download \
         "https://opengene.org/fastp/fastp.$FASTP_VERSION" \
         "$ACTIVE_WORK/fastp"
-    install -m 755 "$ACTIVE_WORK/fastp" "$stage/bin/fastp"
+    install -m 755 -s "$ACTIVE_WORK/fastp" "$stage/bin/fastp"
     BUILD_DESCRIPTION='upstream Linux release binary'
 }
 

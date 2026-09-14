@@ -16,25 +16,26 @@ The scripts prepare the tools needed by local comparison workflows. They do not 
 
 ## Current tools
 
-The following sizes are rounded retained executable sizes from the current Linux x86-64 installation. They show the scale of the comparison set; each row is the executable itself.
+The rows below list the pinned comparison tools, the retained Linux x86-64 size, and their roles. The sizes were measured from the current local installation on 2026-09-14. Compiled-tool values are exact byte lengths of the stripped executable linked from `tools/bin/`. The BBTools value is the sum of regular files in its retained runtime tree because BBTools is a Java class tree rather than one executable. Versions are defined by `tools/versions.sh`.
 
-| Tool                             |              Version |    Size | Use here                                                      |
-| -------------------------------- | -------------------: | ------: | ------------------------------------------------------------- |
-| `seqtk`                          |             1.5-r133 |  84 KiB | Count reference, compatible sampling, and interleave delivery |
-| `FastQValidator`                 |               0.1.1a | 176 KiB | Historical validation behavior                                |
-| `Fasten`                         |                0.9.0 | 468 KiB | Plain interleaved probability sampling                        |
-| Needletail and Helicase adapters |      0.7.3 and 0.2.0 | 840 KiB | One-worker parser checks for count and aggregate stats        |
-| `fqtools`                        | 2.3 with HTSlib 1.24 | 892 KiB | Independent count and validation cases                        |
-| `SeqFu`                          |               1.27.1 | 1.7 MiB | Count, stats, check, interleave, and deinterleave             |
-| `IRMA Core`                      |               0.10.1 | 2.4 MiB | Exact sampling, interleave, and deinterleave                  |
-| `fq`                             |               0.12.0 | 2.6 MiB | Validation and paired sampling reference                      |
-| `fastp`                          |                1.3.6 | 2.9 MiB | Broader short-read QC and preprocessing context               |
-| `Rasusa`                         |                5.1.0 | 5.4 MiB | Paired sampling and broader sampling peer                     |
-| `fqkit`                          |               0.4.14 | 5.8 MiB | Interleave, deinterleave, stats, sampling, and sharding       |
-| `SeqKit`                         |               2.13.0 |  19 MiB | Broad stats, sampling, pairing, and conversion peer           |
-| `BBTools`                        |                40.02 |  23 MiB | Sampling, pair validation, interleave, and deinterleave       |
+| Tool                 |              Version | Size (bytes) | Use here                                                      |
+| -------------------- | -------------------: | -----------: | ------------------------------------------------------------- |
+| `seqtk`              |             1.5-r133 |       77,600 | Count reference, compatible sampling, and interleave delivery |
+| `FastQValidator`     |               0.1.1a |      169,120 | Descriptive validation peer                                   |
+| `Fasten`             |                0.9.0 |      470,336 | Plain interleaved probability sampling                        |
+| `Needletail adapter` |                0.7.3 |      425,896 | One-worker parser checks for count and aggregate stats        |
+| `Helicase adapter`   |                0.2.0 |      424,080 | One-worker parser checks for count and aggregate stats        |
+| `fqtools`            | 2.3 with HTSlib 1.24 |      905,088 | Independent count and validation cases                        |
+| `SeqFu`              |               1.27.1 |    1,673,280 | Count, stats, check, interleave, and deinterleave             |
+| `IRMA Core`          |               0.10.1 |    2,485,768 | Exact sampling, interleave, and deinterleave                  |
+| `fq`                 |               0.12.0 |    2,740,832 | Validation and paired sampling reference                      |
+| `fastp`              |                1.3.7 |    3,007,424 | Short-read QC and preprocessing peer                          |
+| `Rasusa`             |                5.1.0 |    5,640,352 | Paired sampling and broader sampling peer                     |
+| `fqkit`              |               0.4.14 |    6,007,128 | Interleave, deinterleave, stats, sampling, and sharding       |
+| `SeqKit`             |               2.13.0 |   20,076,696 | Broad stats, sampling, pairing, and conversion peer           |
+| `BBTools`            |                40.02 |   19,359,140 | Sampling, pair validation, interleave, and deinterleave       |
 
-The table is descriptive local comparison context, not a universal ranking.
+The table describes local comparison inputs; it does not rank the tools.
 
 ## Tracked contents
 
