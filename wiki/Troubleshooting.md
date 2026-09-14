@@ -72,7 +72,7 @@ Sampling and interleaving stream output. A late parser, pair, input, or output f
 
 ## JSON is missing
 
-The current pre-alpha build supports `--json` only for `stats` and `check`. `count` prints decimal counts. Sampling and pair-layout commands write FASTQ. The JSON document shape is provisional; see [Automation](Automation) before depending on it.
+The current build supports `--json` only for `stats` and `check`. `count` prints decimal counts. Sampling and pair-layout commands write FASTQ. The JSON document shape is provisional; see [Automation](Automation) before depending on it.
 
 ## The command returns status `4`
 

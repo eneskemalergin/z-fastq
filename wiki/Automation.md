@@ -30,11 +30,11 @@ FASTQ-producing commands can write earlier records before a later failure. Check
 
 ## Machine-readable output
 
-The current pre-alpha build exposes `--json` for `stats` and `check`:
+The current build exposes `--json` for `stats` and `check`:
 
 ```bash
 z-fastq stats --json reads.fastq.gz > stats.json
 z-fastq check --json reads.fastq.gz > check.json
 ```
 
-The document shape is still evolving and is not a public compatibility contract. If you automate against it during pre-alpha, pin the z-fastq version and validate upgrades deliberately. This page documents the stable workflow boundary around output streams and exit statuses, not an evolving machine-readable format.
+The document shape remains provisional. If you automate against it, pin the z-fastq version and validate upgrades deliberately. This page documents output streams and exit statuses; it does not freeze the JSON format.

@@ -7,8 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/eneskemalergin/z-fastq/releases"><img src="https://img.shields.io/badge/version-v0.0.15-2563eb?style=flat-square" alt="Version v0.0.15"></a>
-  <a href="https://github.com/eneskemalergin/z-fastq"><img src="https://img.shields.io/badge/status-polishing-eab308?style=flat-square" alt="Status: polishing"></a>
+  <a href="https://github.com/eneskemalergin/z-fastq/releases"><img src="https://img.shields.io/badge/version-v0.0.18-2563eb?style=flat-square" alt="Version v0.0.18"></a>
   <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
   <img src="https://img.shields.io/badge/platform-Linux%20x86--64-64748b?style=flat-square" alt="Supported platform: Linux x86-64">
   <img src="https://img.shields.io/badge/license-not%20selected-94a3b8?style=flat-square" alt="License not selected yet">
@@ -34,11 +33,11 @@ The CLI is the primary product. A small Zig module is also exported for applicat
 
 I am building z-fastq around a simple constraint: bioinformatics tools should remain practical on ordinary hardware. That means a small executable, bounded streaming memory, and a predictable cost per process.
 
-The current CLI is single-threaded by design. That keeps one invocation easy to reason about and leaves multi-file scheduling to the workflow layer. My ambition is to make z-fastq one of the fastest general-purpose FASTQ toolkits without requiring server-class hardware. The long-term goal is to process several files at once without hiding a second layer of threads or multiplying memory use inside every worker.
+The current CLI is single-threaded by design. That keeps one invocation easy to reason about and leaves multi-file scheduling to the workflow layer.
 
 ## A few honest boundaries
 
-The supported release target is currently **Linux x86-64**. Native Windows and other targets are not supported yet.
+The supported target is currently **Linux x86-64**. Native Windows and other targets are not supported yet.
 
 The accelerated build uses vendored ISA-L for gzip and CRC work and requires NASM when built from source. The ISA-L-disabled build uses the Zig implementation and retains a portable CRC fallback:
 
@@ -86,7 +85,7 @@ All commands report errors with non-zero exit status. Validation and parsing fai
 
 ## Documentation
 
-The README stays intentionally short. The detailed reference will cover:
+The README stays intentionally short. The detailed reference covers:
 
 - command options and examples;
 - FASTQ and gzip behavior;
@@ -94,39 +93,9 @@ The README stays intentionally short. The detailed reference will cover:
 - sampling compatibility and reproducibility;
 - machine-readable output and exit statuses;
 - resource limits and portability;
-- benchmark methods and results;
 - the Zig module API.
 
 See the [project Wiki](https://github.com/eneskemalergin/z-fastq/wiki) for the evolving user documentation.
-
-## Performance
-
-Performance work is central to the project. The goal is not only to finish a FASTQ job quickly, but to do it with a small enough process footprint that several jobs can share a consumer machine.
-
-### Early signal, not a final benchmark
-
-The project is still in polishing. Internals, defaults, and hot paths change often enough that final benchmark tables and public methodology are still being developed. I prefer to share the direction without presenting unfinished numbers as a permanent leaderboard.
-
-Early local comparisons suggest that z-fastq is often **about 1.5x to 5x faster** than selected peers, while using **roughly 2x to 5x less peak RSS** in comparable runs. The latest audited static ReleaseFast binary is 744,000 bytes, under 1 MB.
-
-Those ranges vary with the command, plain versus gzip input, read length, pairing mode, sampling mode, and comparison tool. Sampling and output-heavy workflows are still being tuned, so these figures are signals of direction rather than a universal ranking. The aim is a fast, small process that can be scheduled across several files without every worker consuming more of the machine than necessary.
-
-The peer set is deliberately mixed. It includes familiar baseline tools such as `seqtk`, `fqtools`, `BBTools`, `SeqFu`, and `FastQValidator`, alongside newer native implementations, including Rust-based tools such as `Needletail`, `Helicase`, `fq`, `Fasten`, `fqkit`, and `Rasusa`. The familiar tools anchor common practice. The newer native tools are closer to z-fastq's low-level design and give a more useful comparison for throughput and memory. I only compare overlapping work, and keep differences in validation rules, RNGs, output behavior, and child-process accounting visible.
-
-The snapshot below uses the static ReleaseFast build with the default vendored ISA-L path on Linux x86-64. For perspective, a few large-input scale probes looked like this:
-
-| Workload         | Input on disk | FASTQ bytes processed | Observed wall time |  Peak RSS |
-| ---------------- | ------------: | --------------------: | -----------------: | --------: |
-| `count`          |  1.4 GB plain |          1.4 GB plain |             212 ms |   896 KiB |
-| `count`          |   793 MB gzip |       6.14 GB decoded |             3.55 s |   896 KiB |
-| `stats`          |  6.1 GB plain |          6.1 GB plain |             2.26 s |   896 KiB |
-| `stats`          |   793 MB gzip |       6.14 GB decoded |             4.62 s |   896 KiB |
-| `interleave`     |   1.0 GB gzip |       3.58 GB decoded |             5.72 s | 1,048 KiB |
-| `check --paired` |   1.0 GB gzip |       3.58 GB decoded |             5.50 s | 1,336 KiB |
-
-Peak RSS here means resident memory measured for the z-fastq process itself. These single-run scale probes are useful for showing the shape of the system, not for making a final cross-platform promise.
-
-Final benchmark documentation will include the measurement method, peer scope, correctness checks, and raw reports when the implementation settles.
 
 ## License
 

@@ -101,4 +101,4 @@ z-fastq stats --json reads.fastq.gz
 z-fastq check --json reads.fastq.gz
 ```
 
-The current pre-alpha build supports `--json` for `stats` and `check`, but its document shape is provisional. See [Automation](Automation).
+The current build supports `--json` for `stats` and `check`, but its document shape is provisional. See [Automation](Automation).

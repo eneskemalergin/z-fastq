@@ -2,8 +2,7 @@
 
 z-fastq is a focused FASTQ toolkit for counting, summarizing, checking, sampling, and working with paired reads. It runs as one Linux x86-64 executable and also exposes a small Zig library.
 
-- Current version: `0.0.15`
-- Current status: polishing
+- Current version: `0.0.18`
 
 I am building z-fastq for a practical reason: FASTQ work should remain usable on ordinary machines. A tool can finish a job quickly and still be a poor workflow component if every process consumes more memory than the job needs. I want the common paths to stream, keep their state bounded, and make their behavior easy to inspect when something goes wrong.
 
