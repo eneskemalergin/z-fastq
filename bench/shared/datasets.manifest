@@ -1,0 +1,18 @@
+# REAL gzip FASTQ for bench/count.
+#
+# Columns (tab-separated):
+# id  filename  expected_records  url  local_path
+#
+# filename is written under bench/shared/data/. local_path is relative to the
+# repository root and is copied when present. bytes/sha256 are checked after
+# copy or download when a sidecar .sha256 file exists; otherwise the copy is
+# accepted and the size is recorded.
+#
+# Dense full is SRR1810900 (fixed 50 bp). DenseSmall is MiniSeq R1 SRR10325788_1
+# for bring-up runs (`bench/count/run.sh --small-real`).
+#
+# id	filename	expected_records	url	local_path
+Dense	REAL_Dense.fastq.gz	24549590	https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR181/000/SRR1810900/SRR1810900.fastq.gz	data/benchmark/SRR1810900.fastq.gz
+DenseSmall	REAL_Dense_small.fastq.gz	60910	https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR103/788/SRR10325788/SRR10325788_1.fastq.gz	data/illumina-pe/SRR10325788_1.fastq.gz
+Variable	REAL_Variable.fastq.gz	282806	https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR164/ERR164407/ERR164407.fastq.gz	data/illumina-se/ERR164407.fastq.gz
+Long	REAL_Long.fastq.gz	120836	https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR540/006/ERR5404926/ERR5404926.fastq.gz	data/ont-long/ERR5404926.fastq.gz
