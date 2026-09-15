@@ -1,0 +1,56 @@
+# Feature assignments for shared FASTQ.
+#
+# Columns (tab-separated):
+# suite  set  role  ids
+#
+# suite  count | stats | check | sample | interleave | deinterleave
+# set    publication | small
+# role   time / check (count)
+#        time (stats, interleave, deinterleave)
+#        se | paired | casava | slash | interleaved | gzip (check, sample)
+# ids    comma-separated datasets.manifest ids; download expands derived deps.
+#
+# Corpus coverage (publication unless noted):
+#   1. Bare-plus fixed Illumina  DenseSmall          count/stats/check/sample small, interleave small
+#   2. Named-plus volume Illumina Dense               count time/check, check se, sample se
+#   3. Mixed-length SE            Variable             every SE role
+#   4. Trimmed Illumina PE        PairR1,PairR2        check/sample paired, stats PairR1, interleave
+#   5. Genomic long reads         Long                 count/stats/check/sample publication
+#   6. CCS                        HiFi                 stats, check se, count/sample small
+#   7. Interleaved PE             Interleaved          check/sample interleaved, deinterleave
+#   8. Concatenated gzip          ConcatGzip           count check, check gzip
+#   9. Casava 1:N:0: / 2:N:0:     CasavaR1,CasavaR2    check casava
+#      @id/1 / @id/2              SlashR1,SlashR2      check slash
+#  10. IUPAC, lowercase, empty, CRLF stay in tests/data/synthetic.
+#
+# Dense is omitted from stats: every quality byte is `?`.
+#
+# suite	set	role	ids
+count	publication	time	Dense,Variable,Long
+count	publication	check	Dense,Variable,Long,ConcatGzip
+count	small	time	DenseSmall,Variable,HiFi
+count	small	check	DenseSmall,Variable,HiFi,ConcatGzip
+stats	publication	time	DenseSmall,Variable,Long,HiFi,PairR1
+stats	small	time	DenseSmall,Variable,HiFi
+check	publication	se	Dense,Variable,Long,HiFi
+check	publication	paired	PairR1,PairR2
+check	publication	casava	CasavaR1,CasavaR2
+check	publication	slash	SlashR1,SlashR2
+check	publication	interleaved	Interleaved
+check	publication	gzip	ConcatGzip
+check	small	se	DenseSmall,Variable,HiFi
+check	small	paired	DenseSmall,PairSmallR2
+check	small	casava	CasavaR1,CasavaR2
+check	small	slash	SlashR1,SlashR2
+check	small	interleaved	InterleavedSmall
+check	small	gzip	ConcatGzip
+sample	publication	se	Dense,Variable,Long
+sample	publication	paired	PairR1,PairR2
+sample	publication	interleaved	Interleaved
+sample	small	se	DenseSmall,Variable,HiFi
+sample	small	paired	DenseSmall,PairSmallR2
+sample	small	interleaved	InterleavedSmall
+interleave	publication	time	PairR1,PairR2
+interleave	small	time	DenseSmall,PairSmallR2
+deinterleave	publication	time	Interleaved
+deinterleave	small	time	InterleavedSmall

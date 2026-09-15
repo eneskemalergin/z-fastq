@@ -1,18 +1,46 @@
-# REAL gzip FASTQ for bench/count.
+# Shared gzip FASTQ for every bench suite.
 #
 # Columns (tab-separated):
-# id  filename  expected_records  url  local_path
+# id  filename  expected_records  accession  url  local_path
 #
-# filename is written under bench/shared/data/. local_path is relative to the
-# repository root and is copied when present. bytes/sha256 are checked after
-# copy or download when a sidecar .sha256 file exists; otherwise the copy is
-# accepted and the size is recorded.
+# Real rows: url is an https ENA path; local_path is copied when present.
+# Derived rows: url is derived:<kind>:<dep,dep>. generate_derived.sh writes them
+# after the listed deps are prepared under bench/shared/data/ and cache/plain/.
 #
-# Dense full is SRR1810900 (fixed 50 bp). DenseSmall is MiniSeq R1 SRR10325788_1
-# for bring-up runs (`bench/count/run.sh --small-real`).
+# Feature assignments live in features.tsv (suite / set / role / ids).
 #
-# id	filename	expected_records	url	local_path
-Dense	REAL_Dense.fastq.gz	24549590	https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR181/000/SRR1810900/SRR1810900.fastq.gz	data/benchmark/SRR1810900.fastq.gz
-DenseSmall	REAL_Dense_small.fastq.gz	60910	https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR103/788/SRR10325788/SRR10325788_1.fastq.gz	data/illumina-pe/SRR10325788_1.fastq.gz
-Variable	REAL_Variable.fastq.gz	282806	https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR164/ERR164407/ERR164407.fastq.gz	data/illumina-se/ERR164407.fastq.gz
-Long	REAL_Long.fastq.gz	120836	https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR540/006/ERR5404926/ERR5404926.fastq.gz	data/ont-long/ERR5404926.fastq.gz
+# Dense          HiSeq 2500 ChIP-seq SE, 50 bp, 24.5M reads, named plus, Q=`?`.
+#                Volume and annotated-plus path. Not a Q20/Q30 file. Plain ~6.1 GiB.
+# DenseSmall     MiniSeq RNA-seq R1, 153 bp, 60,910 records, bare plus. Count
+#                bring-up dense slot and pair-small left mate.
+# PairSmallR2    MiniSeq R2 mate of DenseSmall.
+# Variable       454 GS FLX Titanium SE, 40-631 bp (mean 345). Mixed-length path.
+# Long           MinION Klebsiella WGS DRR217704 (21,247 reads, 17-92337 bp, mean 7435).
+# HiFi           PacBio RS II CCS, 1,114 reads, 863-7274 bp.
+# PairR1/R2      MiSeq PE ERR5404925, 349,760 pairs, trimmed 30-151 bp.
+# ConcatGzip     DenseSmall split into two gzip members (same 60,910 records).
+# InterleavedSmall  MiniSeq R1/R2 interleaved (121,820 records).
+# Interleaved    ERR5404925 R1/R2 interleaved (699,520 records).
+# CasavaR1/R2    MiniSeq sequences with Casava `1:N:0:` / `2:N:0:` names.
+# SlashR1/R2     MiniSeq sequences with `@id/1` / `@id/2` first tokens.
+#
+# Those fourteen ids are the bench corpus. IUPAC / CRLF / empty stay in tests/.
+#
+# MiniSeq ENA path is SRR103/088 (not 788).
+#
+# id	filename	expected_records	accession	url	local_path
+Dense	REAL_Dense.fastq.gz	24549590	SRR1810900	https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR181/000/SRR1810900/SRR1810900.fastq.gz	data/benchmark/SRR1810900.fastq.gz
+DenseSmall	REAL_Dense_small.fastq.gz	60910	SRR10325788	https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR103/088/SRR10325788/SRR10325788_1.fastq.gz	data/illumina-pe/SRR10325788_1.fastq.gz
+PairSmallR2	REAL_PairSmall_R2.fastq.gz	60910	SRR10325788	https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR103/088/SRR10325788/SRR10325788_2.fastq.gz	data/illumina-pe/SRR10325788_2.fastq.gz
+Variable	REAL_Variable.fastq.gz	282806	ERR164407	https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR164/ERR164407/ERR164407.fastq.gz	data/illumina-se/ERR164407.fastq.gz
+Long	REAL_Long.fastq.gz	21247	DRR217704	https://ftp.sra.ebi.ac.uk/vol1/fastq/DRR217/DRR217704/DRR217704_1.fastq.gz	data/ont-long/DRR217704_1.fastq.gz
+HiFi	REAL_HiFi.fastq.gz	1114	DRR054114	https://ftp.sra.ebi.ac.uk/vol1/fastq/DRR054/DRR054114/DRR054114_consensus.fastq.gz	data/pacbio-hifi/DRR054114_consensus.fastq.gz
+PairR1	REAL_Pair_R1.fastq.gz	349760	ERR5404925	https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR540/005/ERR5404925/ERR5404925_1.fastq.gz	data/illumina-pe/ERR5404925_1.fastq.gz
+PairR2	REAL_Pair_R2.fastq.gz	349760	ERR5404925	https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR540/005/ERR5404925/ERR5404925_2.fastq.gz	data/illumina-pe/ERR5404925_2.fastq.gz
+ConcatGzip	DERIVED_ConcatGzip.fastq.gz	60910	derived	derived:concat-gzip:DenseSmall	
+InterleavedSmall	DERIVED_InterleavedSmall.fastq.gz	121820	derived	derived:interleave:DenseSmall,PairSmallR2	
+Interleaved	DERIVED_Interleaved.fastq.gz	699520	derived	derived:interleave:PairR1,PairR2	
+CasavaR1	DERIVED_Casava_R1.fastq.gz	60910	derived	derived:casava1:DenseSmall	
+CasavaR2	DERIVED_Casava_R2.fastq.gz	60910	derived	derived:casava2:PairSmallR2	
+SlashR1	DERIVED_Slash_R1.fastq.gz	60910	derived	derived:slash1:DenseSmall	
+SlashR2	DERIVED_Slash_R2.fastq.gz	60910	derived	derived:slash2:PairSmallR2	

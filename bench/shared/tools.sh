@@ -18,7 +18,10 @@ TOOLS_DIR="$PROJECT_ROOT/tools"
 TOOLS_BIN_DIR="$TOOLS_DIR/bin"
 TOOLS_VENV_DIR="$TOOLS_DIR/venv"
 
-# shellcheck source=../../tools/versions.sh
+# shellcheck disable=SC1091
+source "$BENCH_SHARED_DIR/catalog.sh"
+
+# shellcheck disable=SC1091
 source "$TOOLS_DIR/versions.sh"
 
 ZFASTQ="${ZFASTQ:-$PROJECT_ROOT/zig-out/bin/z-fastq}"
@@ -96,6 +99,10 @@ bench_tool_version() {
     esac
 }
 
+bench_catalog() {
+    catalog_main "$@"
+}
+
 report_python() {
     if [[ -x "$TOOLS_VENV_DIR/bin/python" ]]; then
         echo "$TOOLS_VENV_DIR/bin/python"
@@ -111,9 +118,7 @@ file_size_bytes() {
 }
 
 bench_ensure_scaling() {
-    local py
-    py="$(report_python)"
-    "$py" "$BENCH_SHARED_DIR/generate_scaling.py" "$@"
+    bash "$BENCH_SHARED_DIR/generate_scaling.sh" "$@"
 }
 
 zebrac_json_escape() {
@@ -226,6 +231,7 @@ zebrac_run_current_group() {
 
 bench_group() {
     local json_out="$1"
+    # shellcheck disable=SC2153
     zebrac_run_current_group "$json_out" "$METADATA_JSONL"
     zebrac_clear_commands
 }
