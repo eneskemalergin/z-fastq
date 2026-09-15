@@ -15,10 +15,10 @@ use helicase::{Config, FastqParser, HelicaseParser, ParserOptions};
 mod stats;
 
 const ENGINE_VERSION: &str = "0.2.0";
-const COUNT_CONFIG: Config = ParserOptions::default()
-    .ignore_headers()
-    .ignore_dna()
-    .config();
+// Default config computes headers and DNA as bytes, one Record event per
+// record. That is the same count job as z-fastq / Needletail on four-line input.
+// Do not ignore_headers/ignore_dna here: that is a faster ceiling, not count.
+const COUNT_CONFIG: Config = ParserOptions::default().config();
 const STATS_CONFIG: Config = ParserOptions::default()
     .ignore_headers()
     .dna_string()

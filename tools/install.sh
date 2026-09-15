@@ -46,8 +46,12 @@ Usage:
   tools/install.sh --list              show targets and local state
   tools/install.sh --help              show this help
 
-Names: venv, wrappers, seqtk, fqtools, fq, fqkit, seqkit, rasusa,
+Names: venv, zebrac, wrappers, seqtk, fqtools, fq, fqkit, seqkit, rasusa,
        fasten, seqfu, irma-core, fastqvalidator, fastp, bbtools, peers, all
+
+venv also installs the pinned matplotlib, pandas, and tabulate packages used
+by bench report generation. zebrac is a check-only name: place the binary at
+tools/zebrac; this script does not download it.
 
 The installer uses commands already on PATH. It does not use the repository
 root .venv, install system packages, edit PATH, or activate an environment.
@@ -180,7 +184,7 @@ find_binary() {
     printf '%s\n' "$path"
 }
 
-check_venv() {
+check_venv_root() {
     if [[ ! -x "$VENV_DIR/bin/python" ]]; then
         echo "error: tools/venv is missing; run tools/install.sh" >&2
         return 1
@@ -197,37 +201,88 @@ raise SystemExit(0 if actual == expected and sys.prefix != sys.base_prefix else 
         echo "error: tools/venv does not contain its expected Python environment" >&2
         return 1
     fi
+}
 
-    echo "ok: tools/venv ($("$VENV_DIR/bin/python" --version 2>&1))"
+check_report_packages() {
+    check_venv_root || return 1
+    if ! "$VENV_DIR/bin/python" -I -c '
+import matplotlib
+import pandas
+import tabulate
+import sys
+
+want = (sys.argv[1], sys.argv[2], sys.argv[3])
+got = (matplotlib.__version__, pandas.__version__, tabulate.__version__)
+raise SystemExit(0 if got == want else 1)
+' "$MATPLOTLIB_VERSION" "$PANDAS_VERSION" "$TABULATE_VERSION"; then
+        echo "error: tools/venv report packages are not matplotlib $MATPLOTLIB_VERSION, pandas $PANDAS_VERSION, tabulate $TABULATE_VERSION" >&2
+        return 1
+    fi
+}
+
+check_venv() {
+    check_report_packages || return 1
+    echo "ok: tools/venv ($("$VENV_DIR/bin/python" --version 2>&1); matplotlib $MATPLOTLIB_VERSION, pandas $PANDAS_VERSION, tabulate $TABULATE_VERSION)"
+}
+
+check_zebrac() {
+    local path="$TOOLS_DIR/zebrac"
+    if [[ ! -x "$path" ]]; then
+        echo "error: tools/zebrac is missing or not executable" >&2
+        echo "       place the zebrac binary at $path; tools/install.sh does not build it" >&2
+        return 1
+    fi
+    echo "ok: zebrac ($("$path" --version 2>&1 | awk 'NR==1{print; exit}'))"
+}
+
+install_report_packages() {
+    check_venv_root || return 1
+    if check_report_packages 2>/dev/null; then
+        return 0
+    fi
+    require_command uv
+    echo "install: matplotlib $MATPLOTLIB_VERSION, pandas $PANDAS_VERSION, tabulate $TABULATE_VERSION"
+    if ! uv pip install \
+        --python "$VENV_DIR/bin/python" \
+        --quiet \
+        --disable-pip-version-check \
+        "matplotlib==$MATPLOTLIB_VERSION" \
+        "pandas==$PANDAS_VERSION" \
+        "tabulate==$TABULATE_VERSION"; then
+        echo "error: failed to install report packages into tools/venv" >&2
+        return 1
+    fi
+    check_report_packages
 }
 
 install_venv() {
-    if [[ -e "$VENV_DIR" ]]; then
-        check_venv
-        return
-    fi
+    if [[ ! -e "$VENV_DIR" ]]; then
+        require_command uv
+        require_command python3
 
-    require_command uv
-    require_command python3
+        local python_path
+        python_path="$(command -v python3)"
 
-    local python_path
-    python_path="$(command -v python3)"
-
-    echo "create: tools/venv"
-    if ! uv venv \
-        --no-project \
-        --no-config \
-        --no-python-downloads \
-        --no-cache \
-        --python "$python_path" \
-        "$VENV_DIR"; then
-        rm -rf -- "$VENV_DIR"
-        return 1
+        echo "create: tools/venv"
+        if ! uv venv \
+            --no-project \
+            --no-config \
+            --no-python-downloads \
+            --no-cache \
+            --python "$python_path" \
+            "$VENV_DIR"; then
+            rm -rf -- "$VENV_DIR"
+            return 1
+        fi
+        if ! check_venv_root; then
+            rm -rf -- "$VENV_DIR"
+            return 1
+        fi
+    else
+        check_venv_root || return 1
     fi
-    if ! check_venv; then
-        rm -rf -- "$VENV_DIR"
-        return 1
-    fi
+    install_report_packages || return 1
+    check_venv
 }
 
 rust_host() {
@@ -1385,6 +1440,14 @@ list_targets() {
     printf '%-16s %-8s %s\n' venv "$state" "$detail"
 
     state="missing"
+    detail="place tools/zebrac"
+    if [[ -x "$TOOLS_DIR/zebrac" ]]; then
+        state="ready"
+        detail="$("$TOOLS_DIR/zebrac" --version 2>&1 | awk 'NR==1{print; exit}')"
+    fi
+    printf '%-16s %-8s %s\n' zebrac "$state" "$detail"
+
+    state="missing"
     detail="run tools/install.sh wrappers"
     if wrappers_current; then
         state="ready"
@@ -1411,6 +1474,10 @@ list_targets() {
 run_install_target() {
     case "$1" in
         venv) install_venv ;;
+        zebrac)
+            echo "error: zebrac is not built by tools/install.sh; place the binary at $TOOLS_DIR/zebrac" >&2
+            return 1
+            ;;
         wrappers) install_wrappers ;;
         peers) install_peers ;;
         all)
@@ -1428,10 +1495,12 @@ run_install_target() {
 run_check_target() {
     case "$1" in
         venv) check_venv ;;
+        zebrac) check_zebrac ;;
         wrappers) check_wrappers ;;
         peers) check_peers ;;
         all)
             check_venv
+            check_zebrac
             check_wrappers
             check_peers
             ;;
@@ -1444,7 +1513,7 @@ run_check_target() {
 
 is_named_target() {
     case "$1" in
-        venv|wrappers|peers|all) return 0 ;;
+        venv|zebrac|wrappers|peers|all) return 0 ;;
         *) is_peer_name "$1" ;;
     esac
 }

@@ -16,7 +16,7 @@ The scripts prepare the tools needed by local comparison workflows. They do not 
 
 ## Current tools
 
-The rows below list the pinned comparison tools, the retained Linux x86-64 size, and their roles. The sizes were measured from the current local installation on 2026-09-14. Compiled-tool values are exact byte lengths of the stripped executable linked from `tools/bin/`. The BBTools value is the sum of regular files in its retained runtime tree because BBTools is a Java class tree rather than one executable. Versions are defined by `tools/versions.sh`.
+The rows below list the pinned comparison tools, the retained Linux x86-64 size, and their roles. The sizes were measured from the current local installation on 2026-09-15. Compiled-tool values are exact byte lengths of the stripped executable linked from `tools/bin/`. The BBTools value is the sum of regular files in its retained runtime tree because BBTools is a Java class tree rather than one executable. Versions are defined by `tools/versions.sh`.
 
 | Tool                 |              Version | Size (bytes) | Use here                                                      |
 | -------------------- | -------------------: | -----------: | ------------------------------------------------------------- |
@@ -24,7 +24,7 @@ The rows below list the pinned comparison tools, the retained Linux x86-64 size,
 | `FastQValidator`     |               0.1.1a |      169,120 | Descriptive validation peer                                   |
 | `Fasten`             |                0.9.0 |      470,336 | Plain interleaved probability sampling                        |
 | `Needletail adapter` |                0.7.3 |      425,896 | One-worker parser checks for count and aggregate stats        |
-| `Helicase adapter`   |                0.2.0 |      424,080 | One-worker parser checks for count and aggregate stats        |
+| `Helicase adapter`   |                0.2.0 |      428,944 | One-worker parser checks for count and aggregate stats        |
 | `fqtools`            | 2.3 with HTSlib 1.24 |      905,088 | Independent count and validation cases                        |
 | `SeqFu`              |               1.27.1 |    1,673,280 | Count, stats, check, interleave, and deinterleave             |
 | `IRMA Core`          |               0.10.1 |    2,485,768 | Exact sampling, interleave, and deinterleave                  |
@@ -37,9 +37,21 @@ The rows below list the pinned comparison tools, the retained Linux x86-64 size,
 
 The table describes local comparison inputs; it does not rank the tools.
 
+## Report Python and zebrac
+
+`tools/venv` is also the report environment. `tools/install.sh` (or `tools/install.sh venv`) installs pinned matplotlib 3.10.6, pandas 3.0.1, and tabulate 0.10.0 into that venv. Bench scripts call `tools/venv/bin/python` and do not use a second virtualenv.
+
+The benchmark runner is [zebrac](https://github.com/eneskemalergin/zebrac). Keep the Linux binary at `tools/zebrac`. `tools/install.sh --check zebrac` and `tools/install.sh --check all` verify that path; they do not download or build zebrac.
+
+```bash
+tools/install.sh venv
+tools/install.sh --check venv
+tools/install.sh --check zebrac
+```
+
 ## Tracked contents
 
-- `install.sh` prepares and checks external command installations.
+- `install.sh` prepares and checks external command installations, the report Python packages in `tools/venv`, and the presence of `tools/zebrac`.
 - `versions.sh` owns the selected tool versions.
 - `patches/` contains small source fixes required by pinned external recipes.
 - `wrappers/` contains adapters for tools that need a common comparison interface.

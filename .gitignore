@@ -17,3 +17,13 @@ tmp/
 # Exceptions
 !tests/data/
 !tests/data/**
+
+# Python
+__pycache__/
+
+# Bench: downloads, generated fixtures, raw zebrac JSON (keep figures for REPORT.md)
+bench/*/data/**
+bench/*/results/*
+!bench/*/results/figures/
+bench/shared/cache/**
+bench/shared/data/**
