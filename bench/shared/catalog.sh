@@ -305,7 +305,9 @@ catalog_check_command() {
         count/publication/time \
         count/publication/check \
         count/small/time \
-        count/small/check; do
+        count/small/check \
+        stats/publication/time \
+        stats/small/time; do
         [[ -n "${feature_rows[$required]+present}" ]] ||
             catalog_error "missing feature row ${required}"
     done

@@ -11,8 +11,9 @@ Zebrac is Linux-only. Peers, adapters, zebrac, and report Python are under [`too
 | Suite | Report | Compared fact |
 | ----- | ------ | ------------- |
 | [`count`](count/) | [REPORT.md](count/REPORT.md) | record count integer |
+| [`stats`](stats/) | [REPORT.md](stats/REPORT.md) | human stats block (lengths, ACGTN, GC, arithmetic Phred, Q20/Q30) |
 
-`count` builds both z-fastq binaries: native inflate (`-Disa-l=false`) as `zig-out/bin/z-fastq-native`, then the ISA-L product at `zig-out/bin/z-fastq`.
+Each suite builds both z-fastq binaries: native inflate (`-Disa-l=false`) as `zig-out/bin/z-fastq-native`, then the ISA-L product at `zig-out/bin/z-fastq`.
 
 ## Run
 
@@ -21,11 +22,20 @@ tools/install.sh all
 tools/install.sh --check all
 bash bench/shared/download_data.sh
 bash bench/count/run.sh
+bash bench/shared/download_data.sh --suite stats
+bash bench/stats/run.sh
 ```
 
-Publication sampling (also the `run.sh` default): **5000 ms, 25 runs, 5 warmups**. Zebrac stops when both duration and min-samples are met.
+Publication sampling (also each `run.sh` default): **5000 ms, 25 runs, 5 warmups**. Zebrac stops when both duration and min-samples are met.
 
-Bring-up: `bash bench/count/run.sh --small-real --runs 5 --warmup 3`. That run uses MiniSeq R1 and PacBio CCS in the Dense and Long slots, not SRR1810900 or DRR217704.
+Bring-up:
+
+```bash
+bash bench/count/run.sh --small-real --runs 5 --warmup 3
+bash bench/stats/run.sh --small-real --runs 5 --warmup 3
+```
+
+Count `--small-real` uses MiniSeq R1 and PacBio CCS in the Dense and Long slots, not SRR1810900 or DRR217704. Stats `--small-real` times DenseSmall, Variable, and HiFi; publication stats also times Long and PairR1. Stats never times Dense: every quality byte is `?`.
 
 Timed argv is the tool. Do not wrap in `bash -c` or a pipeline; that measures the shell. Plain vs gzip are separate sections. Gzip throughput is decoded FASTQ MiB/s.
 
@@ -108,7 +118,7 @@ Native z-fastq: no loader, no third-party lock. ISA-L stays static. seqtk is the
 
 `bench/shared/` has `tools.sh`, `catalog.sh`, `datasets.manifest`, `features.tsv`, `download_data.sh`, and `generate_derived.sh`. Cache and downloads are gitignored. After a full publication run, commit each suite's `REPORT.md` plus `results/figures/*.png`.
 
-`bench/count/generate_report.py` remains the report and plot renderer. The shared shell scripts prepare registry selections, FASTQ files, and JSON metadata; they do not parse zebrac results or draw figures.
+Each suite's `generate_report.py` is the report and plot renderer. The shared shell scripts prepare registry selections, FASTQ files, and JSON metadata; they do not parse zebrac results or draw figures.
 
 The shared catalog is for every comparison, not only `count`. `features.tsv` assigns ids per suite, set, and role. `count` times three SE shapes and also checks a two-member concat gzip. Pair, interleaved, Casava, and slash-name files are for `check`, `sample`, `interleave`, and `deinterleave`. IUPAC, lowercase, empty records, and CRLF stay in `tests/data/synthetic`.
 
@@ -130,6 +140,8 @@ The shared catalog is for every comparison, not only `count`. `features.tsv` ass
 ```bash
 bash bench/shared/download_data.sh                     # count publication (+ ConcatGzip)
 bash bench/shared/download_data.sh --small             # count bring-up
+bash bench/shared/download_data.sh --suite stats
+bash bench/shared/download_data.sh --suite stats --small
 bash bench/shared/download_data.sh --suite check --small
 bash bench/shared/download_data.sh --suite check
 bash bench/shared/download_data.sh --all

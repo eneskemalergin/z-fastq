@@ -32,6 +32,7 @@ FQTOOLS="${FQTOOLS:-$TOOLS_BIN_DIR/fqtools}"
 NEEDLETAIL="${NEEDLETAIL:-$TOOLS_BIN_DIR/needletail-adapter}"
 HELICASE="${HELICASE:-$TOOLS_BIN_DIR/helicase-adapter}"
 SEQFU="${SEQFU:-$TOOLS_BIN_DIR/seqfu}"
+SEQKIT="${SEQKIT:-$TOOLS_BIN_DIR/seqkit}"
 
 ZEBRAC_DURATION_MS="${ZEBRAC_DURATION_MS:-5000}"
 ZEBRAC_MIN_SAMPLES="${ZEBRAC_MIN_SAMPLES:-25}"
@@ -53,6 +54,7 @@ bench_tool_path() {
         needletail) echo "$NEEDLETAIL" ;;
         helicase) echo "$HELICASE" ;;
         seqfu) echo "$SEQFU" ;;
+        seqkit) echo "$SEQKIT" ;;
         *) return 1 ;;
     esac
 }
@@ -92,6 +94,9 @@ bench_tool_version() {
             ;;
         seqfu)
             [[ -x "$path" ]] && "$path" --version 2>&1 | awk 'NR==1{print; exit}'
+            ;;
+        seqkit)
+            [[ -x "$path" ]] && "$path" version 2>&1 | awk 'NR==1{print; exit}'
             ;;
         *)
             return 1
