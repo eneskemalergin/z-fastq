@@ -4,7 +4,7 @@
 
 Publication benches for z-fastq. Suites live in `bench/<name>/`. Each suite checks that timed commands agree on the compared fact, then [zebrac](https://github.com/eneskemalergin/zebrac) records wall, peak RSS, and minor page faults.
 
-Zebrac is Linux-only. Peers, adapters, zebrac, and report Python are under [`tools/`](../tools/README.md). **This repo tests Linux x86-64 only.** Other OS cells below are from each tool's own docs or release assets, not from us.
+Zebrac is Linux-only. Peers, adapters, zebrac, and report Python are under [`tools/`](../tools/README.md). **This repo tests Linux x86-64 only.** Other OS cells below are from each tool's own docs or release assets, not from me.
 
 ## Suites
 
@@ -25,13 +25,13 @@ bash bench/count/run.sh
 
 Publication sampling (also the `run.sh` default): **5000 ms, 25 runs, 5 warmups**. Zebrac stops when both duration and min-samples are met.
 
-Bring-up: `bash bench/count/run.sh --small-real --skip-scale --runs 2 --warmup 1 --duration 800`. MiniSeq is not the headline Dense file (SRR1810900).
+Bring-up: `bash bench/count/run.sh --small-real --runs 5 --warmup 3`. That run uses MiniSeq R1 and PacBio CCS in the Dense and Long slots, not SRR1810900 or DRR217704.
 
 Timed argv is the tool. Do not wrap in `bash -c` or a pipeline; that measures the shell. Plain vs gzip are separate sections. Gzip throughput is decoded FASTQ MiB/s.
 
 ## Binaries
 
-Stripped Linux x86-64 sizes on 2026-09-15. Adapters are our wrappers, not upstream CLIs. BBTools is the retained class tree, not one ELF.
+Stripped Linux x86-64 sizes on 2026-09-15. Adapters are my wrappers, not upstream CLIs. BBTools is the retained class tree, not one ELF.
 
 | Binary | Version | Bytes | This host |
 | ------ | ------- | ----: | --------- |
@@ -56,7 +56,7 @@ seqtk is the smallest file (`libz` at runtime). z-fastq is larger because it is 
 
 ## Targets
 
-`yes` = author ships or documents that OS/arch. `pkg` = Bioconda/conda only. `cargo` = `cargo install` / compile. `—` = not stated. `no` = author or this project says no. We have only run the Linux x86-64 column.
+`yes` = author ships or documents that OS/arch. `pkg` = Bioconda/conda only. `cargo` = `cargo install` / compile. `—` = not stated. `no` = author or this project says no. I have only run the Linux x86-64 column.
 
 | Binary | linux amd64 | linux arm64 | macOS amd64 | macOS arm64 | Windows |
 | ------ | ----------- | ----------- | ----------- | ----------- | ------- |
@@ -77,7 +77,7 @@ seqtk is the smallest file (`libz` at runtime). z-fastq is larger because it is 
 | SeqKit | yes | yes | yes | yes | yes |
 | BBTools | JVM | JVM | JVM | JVM | JVM |
 
-Needletail and Helicase are libraries; we time Linux x86-64 adapters. Helicase wants AVX2, SSE3, or NEON. fastp's Linux binary is the documented prebuilt; macOS is compile/conda. Intel ISA-L also documents Windows; that is ISA-L, not z-fastq.
+Needletail and Helicase are libraries; I time Linux x86-64 adapters. Helicase wants AVX2, SSE3, or NEON. fastp's Linux binary is the documented prebuilt; macOS is compile/conda. Intel ISA-L also documents Windows; that is ISA-L, not z-fastq.
 
 ## Dependencies
 
@@ -92,7 +92,7 @@ Runtime shared libraries on this install, then what the build actually pulls in.
 | Needletail adapter | libc, libgcc | 11 crates (`flate2`) |
 | Helicase adapter | libc, libgcc | 12 crates (`deko`, `memmap2`, `flate2`) |
 | Fasten | libc, libgcc | Rust crate graph |
-| fqtools | `libz` | HTSlib 1.24 (bz2/lzma/curl off in our recipe) |
+| fqtools | `libz` | HTSlib 1.24 (bz2/lzma/curl off in my recipe) |
 | SeqFu | `libz` | Nim 2.2.12 + 16 Nimble packages |
 | IRMA Core | libc, libgcc, libpthread, libdl | upstream Rust release |
 | fq | libc, libgcc, libpthread | upstream Rust release |
@@ -106,4 +106,33 @@ Native z-fastq: no loader, no third-party lock. ISA-L stays static. seqtk is the
 
 ## Files
 
-`bench/shared/` has `tools.sh`, `datasets.manifest`, `download_data.sh`, `generate_scaling.py`. Cache and downloads are gitignored. Commit each suite's `REPORT.md` plus `results/figures/*.png`.
+`bench/shared/` has `tools.sh`, `catalog.sh`, `datasets.manifest`, `features.tsv`, `download_data.sh`, and `generate_derived.sh`. Cache and downloads are gitignored. After a full publication run, commit each suite's `REPORT.md` plus `results/figures/*.png`.
+
+`bench/count/generate_report.py` remains the report and plot renderer. The shared shell scripts prepare registry selections, FASTQ files, and JSON metadata; they do not parse zebrac results or draw figures.
+
+The shared catalog is for every comparison, not only `count`. `features.tsv` assigns ids per suite, set, and role. `count` times three SE shapes and also checks a two-member concat gzip. Pair, interleaved, Casava, and slash-name files are for `check`, `sample`, `interleave`, and `deinterleave`. IUPAC, lowercase, empty records, and CRLF stay in `tests/data/synthetic`.
+
+| Id | Accession | What it is | Count | Stats | Check | Sample | Interleave | Deinterleave |
+| -- | --------- | ---------- | ----- | ----- | ----- | ------ | ---------- | ------------ |
+| Dense | SRR1810900 | HiSeq 2500 ChIP-seq, 24.5M x 50 bp, named plus, Q=`?`. Plain ~6.1 GiB. | publication volume | no (constant Q) | SE | SE | no | no |
+| DenseSmall | SRR10325788 R1 | MiniSeq, 60,910 x 153 bp, bare plus. Pair-small left. | `--small-real` dense | real Illumina Q | SE / pair left | SE / pair | pair-small | no |
+| PairSmallR2 | SRR10325788 R2 | MiniSeq mate | ConcatGzip dep | with R1 | `--paired` | `--paired` | pair-small | no |
+| Variable | ERR164407 | 454 GS FLX Titanium, 40-631 bp (mean 345). | mixed-length | min/max/mean | SE | SE | no | no |
+| Long | DRR217704 | MinION Klebsiella WGS, 21,247 reads, 17-92,337 bp (mean 7,435). | publication long | length and Q | SE | SE | no | no |
+| HiFi | DRR054114 | PacBio CCS, 1,114 reads, 863-7274 bp. | `--small-real` long | CCS Q | SE | `--small-real` SE | no | no |
+| PairR1 / PairR2 | ERR5404925 | MiSeq, 349,760 pairs, trimmed 30-151 bp. | no | PairR1 lengths | `--paired` | `--paired` | publication pair | no |
+| ConcatGzip | derived | DenseSmall as two gzip members. | agreement check | no | gzip members | no | no | no |
+| InterleavedSmall | derived | MiniSeq R1/R2 interleaved. | no | no | `--interleaved` | `--interleaved` | no | small |
+| Interleaved | derived | ERR5404925 interleaved. | no | no | `--interleaved` | `--interleaved` | no | publication |
+| CasavaR1 / CasavaR2 | derived | MiniSeq bases, Casava `1:N:0:` / `2:N:0:` names. | no | no | `--pair-names illumina` | no | no | no |
+| SlashR1 / SlashR2 | derived | MiniSeq bases, `@id/1` / `@id/2`. | no | no | illumina vs exact | no | no | no |
+
+```bash
+bash bench/shared/download_data.sh                     # count publication (+ ConcatGzip)
+bash bench/shared/download_data.sh --small             # count bring-up
+bash bench/shared/download_data.sh --suite check --small
+bash bench/shared/download_data.sh --suite check
+bash bench/shared/download_data.sh --all
+```
+
+Old GridION amplicon ERR5404926 (400-700 bp) is not Long. `download_data.sh` replaces `REAL_Long.fastq.gz` when the recorded source URL does not match DRR217704.

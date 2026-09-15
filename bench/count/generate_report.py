@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 
@@ -17,6 +18,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
+import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 import pandas as pd
 import tabulate  # noqa: F401  -- pd.to_markdown()
@@ -26,6 +28,31 @@ RESULTS_DIR = SCRIPT_DIR / "results"
 FIGURES_DIR = RESULTS_DIR / "figures"
 
 DATASET_ORDER = ["Dense", "Variable", "Long"]
+DATASET_FACTS = {
+    "SRR1810900": (
+        "SRR1810900, HiSeq 2500 ChIP-seq, 24.5 million 50 bp single-end reads. "
+        "Plus lines repeat the header; every quality byte is `?`. This file is volume "
+        "and annotated-plus parsing, not a quality histogram. Decoded size is about 6.1 GiB."
+    ),
+    "SRR10325788": (
+        "SRR10325788 MiniSeq RNA-seq R1, 60,910 x 153 bp. The R2 mate is PairSmallR2."
+    ),
+    "ERR164407": (
+        "ERR164407, 454 GS FLX Titanium, 282,806 reads, 40-631 bp (mean 345). Mixed length, not Illumina."
+    ),
+    "DRR217704": (
+        "DRR217704, MinION Klebsiella WGS, 21,247 reads, 17-92,337 bp (mean 7,435)."
+    ),
+    "DRR054114": (
+        "DRR054114, PacBio RS II CCS, 1,114 reads, 863-7274 bp (mean 2,818)."
+    ),
+    "ERR5404926": (
+        "ERR5404926, GridION amplicon, 120,836 reads, 400-700 bp. Not genomic long reads."
+    ),
+    "ERR5404925": (
+        "ERR5404925, MiSeq, 349,760 pairs, trimmed 30-151 bp."
+    ),
+}
 BASELINE = "z-fastq"
 REFERENCE_TOOLS = frozenset({"seqfu"})
 NO_RSS_RATIO = frozenset({"seqfu"})
@@ -48,9 +75,6 @@ GZIP_TOOLS = [
     "seqfu",
     "fqtools",
 ]
-SCALING_TOOLS = ["z-fastq", "needletail", "helicase", "seqtk", "fqtools"]
-SCALING_GZIP_TOOLS = ["z-fastq", "z-fastq-native", "needletail", "helicase", "seqtk", "fqtools"]
-
 COLORS = {
     "z-fastq": "#F7A41D",
     "z-fastq-native": "#FFB74D",
@@ -70,10 +94,30 @@ DISPLAY = {
     "seqfu": "SeqFu (descriptive)",
     "fqtools": "fqtools count",
 }
+# Occupancy scatter: color = tool, marker = dataset. Equal weight is wall x RSS.
+DATASET_MARKERS = {
+    "Dense": "o",
+    "Variable": "s",
+    "Long": "^",
+}
+DATASET_MARKER_NAMES = {
+    "Dense": "circle",
+    "Variable": "square",
+    "Long": "triangle",
+}
+# Isocost dash follows the scatter shape: circle=solid, square=dashed, triangle=dash-dot.
+DATASET_LINESTYLES = {
+    "Dense": "-",
+    "Variable": "--",
+    "Long": "-.",
+}
+DATASET_LINE_NAMES = {
+    "Dense": "solid",
+    "Variable": "dashed",
+    "Long": "dash-dot",
+}
 
 FACET_WSPACE = 0.28
-SIZE_MB_ORDER = [1, 5, 10, 25, 50, 100, 250, 500]
-READ_COUNT_ORDER = [100000, 250000, 500000, 1000000]
 MARKDOWNLINT_DISABLE = "<!-- markdownlint-disable MD024 MD032 MD033 MD036 MD041 MD049 -->"
 
 
@@ -245,8 +289,8 @@ def peer_tools(tools: list[str], baseline: str = BASELINE) -> list[str]:
     return [t for t in tools if t != baseline]
 
 
-def _save(fig, path: Path) -> Path:
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+def _save(fig, path: Path, *, dpi: int = 150) -> Path:
+    fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     return path
 
@@ -353,22 +397,6 @@ def load_section(results_dir: Path, manifest: dict, key: str) -> pd.DataFrame | 
     frames = [load_zebrac_json(path, metadata) for path in sorted(section_dir.glob("*.json"))]
     frames = [frame for frame in frames if not frame.empty]
     return pd.concat(frames, ignore_index=True) if frames else None
-
-
-def enrich_size(df: pd.DataFrame | None) -> pd.DataFrame | None:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    out["size_mb"] = out["workload"].astype(str).str.replace("mb", "", regex=False).astype(float).astype(int)
-    return out
-
-
-def enrich_reads(df: pd.DataFrame | None) -> pd.DataFrame | None:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    out["read_count"] = out["workload"].astype(int)
-    return out
 
 
 def build_ratio_comparisons(
@@ -657,163 +685,341 @@ def fig_metric_facets(work: pd.DataFrame, out: Path, tools: list[str], title: st
     return _save(fig, out)
 
 
-def _scaling_style(tool: str) -> dict:
-    is_ref = tool in REFERENCE_TOOLS
-    is_native = tool == "z-fastq-native"
-    return {
-        "color": COLORS.get(tool, "#888888"),
-        "marker": "D" if is_native else "o",
-        "linestyle": "--" if is_ref else "-",
-        "linewidth": 2.4 if tool == BASELINE else (1.9 if is_native else 1.8),
-        "markersize": 5.5 if is_native else 6,
-        "alpha": 0.92 if is_native else (0.75 if is_ref else 0.95),
-        "zorder": 3 if tool == BASELINE else (2.6 if is_native else 2),
-    }
+def occupancy_tools(tools: list[str]) -> list[str]:
+    return [tool for tool in tools if tool not in NO_RSS_RATIO]
 
 
-SCALING_METRICS = (
-    ("mean", "Wall time (s)", True, 1e-6),
-    ("peak_rss_mb", "Peak RSS (MB)", True, 0.1),
-    ("minor_faults", "Minor page faults", True, 1.0),
-)
-
-
-def fig_scaling_abs(df: pd.DataFrame, out: Path, *, param_col: str, xlabel: str, title: str, tools: list[str]) -> Path:
-    work = df[df["tool"].isin(tools)].copy()
-    tools = [t for t in tools if t in work["tool"].unique()]
-    fig, axes = plt.subplots(1, 3, figsize=(16, 6.4), squeeze=False)
-    for ax, (col, ylab, log_y, floor) in zip(axes[0], SCALING_METRICS):
-        for tool in tools:
-            tdf = work[work["tool"] == tool].sort_values(param_col)
-            if tdf.empty:
+def occupancy_frame(work: pd.DataFrame, tools: list[str]) -> pd.DataFrame:
+    rows: list[dict] = []
+    scored = occupancy_tools(tools)
+    for dataset in [name for name in DATASET_ORDER if name in set(work["dataset"])]:
+        base = work[(work["dataset"] == dataset) & (work["tool"] == BASELINE)]
+        if base.empty:
+            continue
+        z_wall = float(base["mean"].iloc[0])
+        z_rss = float(base["peak_rss_mb"].iloc[0])
+        if z_wall <= 0 or z_rss <= 0:
+            continue
+        z_occ = z_wall * z_rss
+        for tool in scored:
+            row = work[(work["dataset"] == dataset) & (work["tool"] == tool)]
+            if row.empty:
                 continue
-            st = _scaling_style(tool)
-            ax.plot(
-                tdf[param_col].astype(float),
-                tdf[col].astype(float).clip(lower=floor),
-                marker=st["marker"],
-                linestyle=st["linestyle"],
-                color=st["color"],
-                linewidth=st["linewidth"],
-                markersize=st["markersize"],
-                markeredgecolor="white",
-                markeredgewidth=0.6,
-                alpha=st["alpha"],
-                zorder=st["zorder"],
+            wall = float(row["mean"].iloc[0])
+            rss = float(row["peak_rss_mb"].iloc[0])
+            occ = wall * rss
+            rows.append(
+                {
+                    "dataset": dataset,
+                    "tool": tool,
+                    "wall": wall,
+                    "rss": rss,
+                    "occupancy": occ,
+                    "wall_x": wall / z_wall,
+                    "rss_x": rss / z_rss,
+                    "cost_x": occ / z_occ,
+                    "efficiency": z_occ / occ,
+                }
             )
-        ax.set_xscale("log")
-        if log_y:
-            ax.set_yscale("log")
-        ax.grid(alpha=0.28, which="both")
-        ax.set_axisbelow(True)
-        ax.set_ylabel(ylab, fontsize=10)
-        ax.set_title(ylab, fontsize=11, fontweight="bold", pad=8)
-        ax.set_xlabel(xlabel, fontsize=10)
-    fig.subplots_adjust(left=0.07, right=0.98, bottom=0.18, top=0.84, wspace=FACET_WSPACE)
-    pos = axes[0, 0].get_position()
-    fig.text(pos.x0, 0.965, title, ha="left", va="top", fontsize=12, fontweight="bold")
+    return pd.DataFrame(rows)
+
+
+def _plot_isocost_xy(ax, xs: list[float], ys: list[float], *, color: str, linestyle: str, linewidth: float, alpha: float, zorder: float) -> None:
+    if len(xs) < 2:
+        return
+    ax.plot(
+        xs,
+        ys,
+        color=color,
+        linestyle=linestyle,
+        linewidth=linewidth,
+        alpha=alpha,
+        zorder=zorder,
+        solid_capstyle="round",
+        dash_capstyle="round",
+        solid_joinstyle="round",
+        clip_on=True,
+    )
+
+
+def fig_occupancy_scatter(frame: pd.DataFrame, out: Path, title: str, *, alpha: float = 0.5) -> Path:
+    del alpha
+    tools = [tool for tool in GZIP_TOOLS if tool in set(frame["tool"])]
+    datasets = [name for name in DATASET_ORDER if name in set(frame["dataset"])]
+    walls = [float(v) for v in frame["wall"]]
+    rsses = [float(v) for v in frame["rss"]]
+    t_min = max(min(walls) / 1.22, 1e-4)
+    t_max = max(walls) * 1.32
+    z_rsses = [float(v) for v in frame.loc[frame["tool"] == BASELINE, "rss"]]
+    if not z_rsses:
+        raise SystemExit("error: occupancy scatter needs z-fastq ISA-L")
+    y_max = max(max(rsses) * 1.16, max(z_rsses) * 4.05)
+    label_stroke = [pe.withStroke(linewidth=3.2, foreground="white", alpha=0.92)]
+
+    fig, ax = plt.subplots(figsize=(9.4, 7.35))
+    steps = 160
+    k_styles = (
+        (1.0, 2.25, 0.96, 1.55),
+        (2.0, 1.35, 0.72, 1.25),
+        (4.0, 1.12, 0.55, 1.15),
+        (8.0, 0.95, 0.42, 1.05),
+    )
+    for dataset in datasets:
+        sub = frame[frame["dataset"] == dataset]
+        z = sub[sub["tool"] == BASELINE]
+        if z.empty:
+            continue
+        z_wall = float(z["wall"].iloc[0])
+        occ = z_wall * float(z["rss"].iloc[0])
+        dash = DATASET_LINESTYLES.get(dataset, "-")
+        t0 = max(float(sub["wall"].min()) / 1.16, 1e-4)
+        t1 = float(sub["wall"].max()) * 1.18
+        span = math.log(t1 / t0)
+        grid = [t0 * math.exp(span * i / (steps - 1)) for i in range(steps)]
+        for mult, width, shade, zorder in k_styles:
+            color = COLORS[BASELINE] if mult == 1 else "#5a5a5a"
+            xs: list[float] = []
+            ys: list[float] = []
+            for t in grid:
+                rss = occ * mult / t
+                if not math.isfinite(rss) or rss <= 0 or rss > y_max * 1.01:
+                    _plot_isocost_xy(ax, xs, ys, color=color, linestyle=dash, linewidth=width, alpha=shade, zorder=zorder)
+                    xs = []
+                    ys = []
+                    continue
+                xs.append(t)
+                ys.append(rss)
+            _plot_isocost_xy(ax, xs, ys, color=color, linestyle=dash, linewidth=width, alpha=shade, zorder=zorder)
+            label_t = min(max(z_wall * 1.18, t0 * 1.05), t1)
+            label_rss = occ * mult / label_t
+            if 0.12 * y_max < label_rss < 0.96 * y_max:
+                ax.text(
+                    label_t,
+                    label_rss,
+                    f"{mult:.0f}x",
+                    fontsize=7.5,
+                    color="#3f3f3f" if mult > 1 else "#7a4a10",
+                    ha="left",
+                    va="bottom",
+                    zorder=2.4,
+                    path_effects=label_stroke,
+                )
+
+    for tool in tools:
+        color = COLORS.get(tool, "#888888")
+        is_z = tool == BASELINE
+        is_native = tool == "z-fastq-native"
+        for dataset in datasets:
+            hit = frame[(frame["tool"] == tool) & (frame["dataset"] == dataset)]
+            if hit.empty:
+                continue
+            ax.scatter(
+                float(hit["wall"].iloc[0]),
+                float(hit["rss"].iloc[0]),
+                s=118 if is_z else (92 if is_native else 86),
+                marker=DATASET_MARKERS.get(dataset, "o"),
+                facecolor=color,
+                edgecolor="#111111" if is_z else "white",
+                linewidths=1.25 if is_z else 0.85,
+                zorder=5 if is_z else (4.4 if is_native else 4),
+                label="_nolegend_",
+            )
+    ax.set_xscale("log")
+    ax.set_xlim(t_min, t_max)
+    ax.set_ylim(0.0, y_max)
+    ax.set_xlabel("Mean wall time (s), log")
+    ax.set_ylabel("Peak RSS (MB)")
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=10)
+    ax.grid(True, which="major", alpha=0.32, linewidth=0.7)
+    ax.grid(True, which="minor", alpha=0.14, linewidth=0.45)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_color("#4a4a4a")
+        spine.set_linewidth(0.85)
+    ax.tick_params(colors="#333333", length=4, width=0.8)
+    tool_handles = [
+        mlines.Line2D(
+            [],
+            [],
+            color=COLORS.get(tool, "#888888"),
+            marker="o",
+            linestyle="None",
+            markersize=8.5,
+            markeredgecolor="white",
+            markeredgewidth=0.7,
+            label=display_tool(tool),
+        )
+        for tool in tools
+    ]
+    shape_handles = [
+        mlines.Line2D(
+            [],
+            [],
+            color="#333333",
+            marker=DATASET_MARKERS[dataset],
+            linestyle=DATASET_LINESTYLES[dataset],
+            linewidth=1.7,
+            markersize=8.5,
+            markerfacecolor="#333333",
+            markeredgecolor="white",
+            markeredgewidth=0.6,
+            label=f"{dataset} ({DATASET_MARKER_NAMES[dataset]}, {DATASET_LINE_NAMES[dataset]})",
+        )
+        for dataset in datasets
+    ]
+    leg1 = fig.legend(
+        handles=tool_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.095),
+        ncol=min(len(tool_handles), 4),
+        fontsize=8,
+        frameon=False,
+        columnspacing=1.15,
+        handletextpad=0.4,
+    )
+    fig.add_artist(leg1)
+    fig.legend(
+        handles=shape_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.038),
+        ncol=len(shape_handles),
+        fontsize=8,
+        frameon=False,
+        columnspacing=1.35,
+        handletextpad=0.45,
+    )
     fig.text(
-        pos.x0,
-        0.922,
-        "Log-log absolute values. Circle = ISA-L; diamond = native inflate.",
-        ha="left",
+        0.5,
+        0.968,
+        (
+            "Isocosts: RSS = k x (z-fastq wall x RSS) / wall. Dash matches dataset shape "
+            "(circle solid, square dashed, triangle dash-dot). Gold 1x, gray 2x/4x/8x. Lower-left is better."
+        ),
+        ha="center",
         va="top",
-        fontsize=8.5,
+        fontsize=8,
         color="#444444",
         style="italic",
     )
-    handles = []
-    for tool in tools:
-        st = _scaling_style(tool)
-        handles.append(
-            mlines.Line2D(
-                [],
-                [],
-                color=st["color"],
-                marker=st["marker"],
-                linestyle=st["linestyle"],
-                linewidth=st["linewidth"],
-                markersize=st["markersize"],
-                markeredgecolor="white",
-                markeredgewidth=0.6,
-                alpha=st["alpha"],
-                label=display_tool(tool),
+    fig.subplots_adjust(left=0.11, right=0.985, bottom=0.27, top=0.885)
+    return _save(fig, out, dpi=180)
+
+
+def fig_efficiency_bars(frame: pd.DataFrame, out: Path, title: str) -> Path:
+    tools = [tool for tool in GZIP_TOOLS if tool in set(frame["tool"])]
+    datasets = [name for name in DATASET_ORDER if name in set(frame["dataset"])]
+    if not tools or not datasets:
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.text(0.5, 0.5, "No occupancy peers", ha="center", va="center")
+        ax.set_axis_off()
+        return _save(fig, out)
+    hatches = ["", "//", "xx"]
+    width = min(0.22, 0.72 / max(1, len(datasets)))
+    x = list(range(len(tools)))
+    fig, ax = plt.subplots(figsize=(10.5, 5.4))
+    ax.axhline(1.0, color=COLORS[BASELINE], linestyle=(0, (4, 3)), linewidth=1.2, alpha=0.7, zorder=1)
+    for di, dataset in enumerate(datasets):
+        vals = []
+        for tool in tools:
+            hit = frame[(frame["tool"] == tool) & (frame["dataset"] == dataset)]
+            vals.append(float(hit["efficiency"].iloc[0]) if not hit.empty else 0.0)
+        xpos = [i + (di - len(datasets) / 2 + 0.5) * width for i in x]
+        for tool, left, val in zip(tools, xpos, vals):
+            ax.bar(
+                left,
+                val,
+                width=width,
+                color=COLORS.get(tool, "#888888"),
+                alpha=0.88,
+                hatch=hatches[di] if di < len(hatches) else None,
+                edgecolor="#333333",
+                linewidth=0.4,
+                zorder=2,
             )
+            if val > 0:
+                ax.annotate(
+                    f"{val:.2f}x",
+                    (left, val),
+                    xytext=(0, 4),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    rotation=90,
+                )
+    ax.set_xticks(x)
+    ax.set_xticklabels([display_tool(tool) for tool in tools], fontsize=9)
+    ax.set_ylabel("Efficiency vs z-fastq ISA-L (occupancy)", fontsize=10)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.grid(axis="y", alpha=0.28)
+    ax.set_axisbelow(True)
+    shape_handles = [
+        mpatches.Patch(
+            facecolor="#888888",
+            hatch=hatches[di] if di < len(hatches) else None,
+            edgecolor="#333333",
+            label=f"{dataset} ({DATASET_MARKER_NAMES[dataset]})",
         )
+        for di, dataset in enumerate(datasets)
+    ]
     fig.legend(
-        handles=handles,
-        fontsize=8.5,
+        handles=shape_handles,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.08),
-        ncol=min(len(tools), 6),
+        bbox_to_anchor=(0.5, 0.02),
+        ncol=len(shape_handles),
+        fontsize=8,
         frameon=False,
     )
-    return _save(fig, out)
-
-
-def fig_scaling_slope(df: pd.DataFrame, out: Path, *, param_col: str, title: str, tools: list[str]) -> Path:
-    work = df[df["tool"].isin(tools)].copy()
-    tools = [t for t in tools if t in work["tool"].unique() and t != BASELINE]
-    xs = sorted(work[param_col].unique())
-    if len(xs) < 2:
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.text(0.5, 0.5, "Need at least two scale points", ha="center")
-        return _save(fig, out)
-    x0, x1 = xs[0], xs[-1]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 6.2), squeeze=False)
-    for ax, (col, ylab, _log_y, floor) in zip(axes[0], SCALING_METRICS):
-        b0 = work[(work["tool"] == BASELINE) & (work[param_col] == x0)]
-        b1 = work[(work["tool"] == BASELINE) & (work[param_col] == x1)]
-        if b0.empty or b1.empty:
-            continue
-        base0 = float(b0[col].iloc[0])
-        base1 = float(b1[col].iloc[0])
-        for tool in tools:
-            r0 = work[(work["tool"] == tool) & (work[param_col] == x0)]
-            r1 = work[(work["tool"] == tool) & (work[param_col] == x1)]
-            if r0.empty or r1.empty:
-                continue
-            v0 = max(float(r0[col].iloc[0]), floor) / max(base0, floor)
-            v1 = max(float(r1[col].iloc[0]), floor) / max(base1, floor)
-            st = _scaling_style(tool)
-            ax.plot(
-                [0, 1],
-                [v0, v1],
-                color=st["color"],
-                linewidth=2.0,
-                marker=st["marker"],
-                markersize=7,
-                markeredgecolor="white",
-                markeredgewidth=0.7,
-                alpha=0.92,
-            )
-            ax.text(1.04, v1, display_tool(tool), fontsize=7.5, va="center", color=st["color"])
-        ax.axhline(1.0, color=COLORS[BASELINE], linestyle=(0, (4, 3)), linewidth=1.2, alpha=0.7)
-        ax.set_yscale("log")
-        ax.set_xlim(-0.08, 1.55)
-        ax.set_xticks([0, 1])
-        if param_col == "size_mb":
-            ax.set_xticklabels([f"{int(x0)} MB", f"{int(x1)} MB"])
-        else:
-            ax.set_xticklabels([f"{int(x0):,}", f"{int(x1):,}"])
-        ax.set_ylabel("x vs z-fastq ISA-L", fontsize=10)
-        ax.set_title(ylab, fontsize=11, fontweight="bold", pad=8)
-        ax.grid(axis="y", alpha=0.28, which="both")
-        ax.set_axisbelow(True)
-    fig.subplots_adjust(left=0.07, right=0.90, bottom=0.12, top=0.84, wspace=0.32)
-    pos = axes[0, 0].get_position()
-    fig.text(pos.x0, 0.965, title, ha="left", va="top", fontsize=12, fontweight="bold")
     fig.text(
-        pos.x0,
-        0.922,
-        "Left = smallest fixture; right = largest. Gold dashed = 1x. Rising = the peer gets relatively slower or heavier.",
-        ha="left",
+        0.5,
+        0.955,
+        "Higher is better. 1.00 = same wall x RSS as z-fastq ISA-L on that file. Color is the tool; hatch is the dataset.",
+        ha="center",
         va="top",
-        fontsize=8.5,
+        fontsize=9,
         color="#444444",
         style="italic",
     )
+    fig.subplots_adjust(left=0.10, right=0.98, bottom=0.20, top=0.86)
     return _save(fig, out)
+
+
+def md_occupancy_tables(frame: pd.DataFrame, tools: list[str], nums: ReportCounters) -> str:
+    scored = occupancy_tools(tools)
+    if frame.empty:
+        return "_No occupancy rows._"
+    work = frame[frame["tool"].isin(scored)].copy()
+    occ = work.pivot(index="dataset", columns="tool", values="occupancy")
+    occ = occ.reindex([name for name in DATASET_ORDER if name in occ.index])
+    occ = occ[[c for c in scored if c in occ.columns]]
+    occ = occ.map(lambda v: f"{v:.4f}" if pd.notna(v) else "")
+    occ = occ.rename(columns={c: display_tool(c) for c in occ.columns})
+    occ.index.name = "Dataset"
+    eff = work.pivot(index="dataset", columns="tool", values="efficiency")
+    eff = eff.reindex([name for name in DATASET_ORDER if name in eff.index])
+    eff = eff[[c for c in scored if c in eff.columns]]
+
+    def fmt_eff(v) -> str:
+        if pd.isna(v):
+            return ""
+        return "1x" if abs(float(v) - 1.0) < 1e-9 else format_ratio(float(v))
+
+    eff = eff.map(fmt_eff)
+    eff = eff.rename(columns={c: display_tool(c) for c in eff.columns})
+    eff.index.name = "Dataset"
+    t_occ = nums.next_table()
+    t_eff = nums.next_table()
+    return join(
+        [
+            f"**Table {t_occ}:** Occupancy (MB·s) = mean wall x peak RSS. Equal 50/50 weight.",
+            "",
+            to_markdown_aligned(occ),
+            "",
+            f"**Table {t_eff}:** Occupancy efficiency vs z-fastq ISA-L. Higher is better.",
+            "",
+            to_markdown_aligned(eff),
+        ]
+    )
 
 
 def md_metric_block(
@@ -889,13 +1095,56 @@ def md_figure_block(nums: ReportCounters, rel: str, caption: str, reading: list[
     )
 
 
+def real_slots(manifest: dict) -> dict:
+    recorded = manifest.get("datasets")
+    if isinstance(recorded, dict) and recorded.get("Dense") and recorded.get("Long"):
+        return recorded
+    if manifest.get("real_set") == "small":
+        return {
+            "Dense": {"manifest_id": "DenseSmall", "accession": "SRR10325788"},
+            "Variable": {"manifest_id": "Variable", "accession": "ERR164407"},
+            "Long": {"manifest_id": "HiFi", "accession": "DRR054114"},
+        }
+    return {
+        "Dense": {"manifest_id": "Dense", "accession": "SRR1810900"},
+        "Variable": {"manifest_id": "Variable", "accession": "ERR164407"},
+        "Long": {"manifest_id": "Long", "accession": "DRR217704"},
+    }
+
+
+def accession_of(slot: dict) -> str:
+    return str(slot.get("accession") or "")
+
+
+def fact_for(accession: str) -> str:
+    return DATASET_FACTS.get(accession, accession or "an unlisted file")
+
+
+def md_real_files(manifest: dict) -> str:
+    slots = real_slots(manifest)
+    bits = []
+    for name in DATASET_ORDER:
+        acc = accession_of(slots.get(name) or {})
+        bits.append(f"{name} is {fact_for(acc)}")
+    return " ".join(bits)
+
+
 def md_overview(manifest: dict) -> str:
-    real_set = manifest.get("real_set", "full")
-    dense_note = (
-        "Dense in this run is MiniSeq R1 SRR10325788 (bring-up set; not the large SRR1810900 file)."
-        if real_set == "small"
-        else "Dense is the large fixed-length Illumina file SRR1810900 (24.5 million 50 bp reads)."
-    )
+    long_acc = accession_of((real_slots(manifest).get("Long") or {}))
+    if long_acc == "DRR217704":
+        long_shape = "a genomic MinION long-read file"
+    elif long_acc == "DRR054114":
+        long_shape = "a PacBio CCS long-read file"
+    elif long_acc == "ERR5404926":
+        long_shape = "a GridION amplicon file (400-700 bp)"
+    else:
+        long_shape = "a long-read file"
+    concat_note = ""
+    datasets = manifest.get("datasets") or {}
+    if isinstance(datasets, dict) and datasets.get("ConcatGzip"):
+        concat_note = (
+            " Count agreement also includes a two-member concat gzip of the MiniSeq R1 file."
+        )
     verify = manifest.get("verify_pass")
     if manifest.get("verify_skipped"):
         verify_line = "The count-agreement check was skipped (`--skip-tests`). Do not treat this as a published run."
@@ -909,9 +1158,12 @@ def md_overview(manifest: dict) -> str:
         verify_line = "The count-agreement check was not recorded."
     return join(
         [
-            "This report times `z-fastq count` on matched plain and gzip FASTQ. The three real inputs "
-            "are a dense fixed-length Illumina run, a variable-length Illumina run, and an ONT long-read run. "
-            + dense_note,
+            "This report times `z-fastq count` on matched plain and gzip FASTQ. Count uses three shapes "
+            f"from the shared corpus: dense fixed-length Illumina, mixed-length 454, and {long_shape}. "
+            "The same corpus also holds MiniSeq and trimmed MiSeq pairs for check, sample, interleave, and "
+            "deinterleave; those files are not timed here. "
+            + md_real_files(manifest)
+            + concat_note,
             "",
             "**What is timed**",
             "",
@@ -993,7 +1245,8 @@ def md_correctness(manifest: dict) -> str:
         body = (
             f"Status: **{status}**. The check required byte-identical count lines from z-fastq, "
             "z-fastq native (gzip files), Needletail, Helicase, and the independent four-line counter, plus a matching "
-            "seqtk reads field and fqtools integer. The first mismatch would have stopped the run."
+            "seqtk reads field and fqtools integer. Timed files and the two-member concat-gzip fixture are in that "
+            "check. The first mismatch would have stopped the run."
         )
     return join(
         [
@@ -1022,20 +1275,7 @@ def md_provenance(manifest: dict) -> str:
         isa_line += f" ({isa_bytes:,} bytes)"
     if nat_bytes:
         nat_line += f" ({nat_bytes:,} bytes)"
-    real_set = manifest.get("real_set", "full")
-    dense_line = (
-        "Dense in this run is MiniSeq R1 (bring-up). Variable is ERR164407. Long is ERR5404926."
-        if real_set == "small"
-        else "Dense is SRR1810900 (fixed 50 bp Illumina). Variable is ERR164407 (variable Illumina). Long is ERR5404926 (ONT)."
-    )
-    sections = manifest.get("sections") or {}
-    has_scale = any(key.startswith("scale_") for key in sections)
-    scale_note = (
-        " Synthetic size files hold 100k uniform reads. Synthetic read-count files hold 150 bp reads. "
-        "Gzip copies of the read-count files use compresslevel 6."
-        if has_scale
-        else " This run skipped the synthetic size and read-count sweeps."
-    )
+    dense_line = md_real_files(manifest)
     verify = manifest.get("verify_pass")
     log = manifest.get("verify_log") or ""
     if manifest.get("verify_skipped"):
@@ -1058,7 +1298,7 @@ def md_provenance(manifest: dict) -> str:
         "",
     ]
     parts += tool_lines or ["- none recorded"]
-    parts += ["", dense_line + scale_note]
+    parts += ["", dense_line]
     return join(parts)
 
 
@@ -1172,197 +1412,66 @@ def md_perf_section(
             ),
         ]
     )
+    occ_frame = occupancy_frame(df, present)
+    if not occ_frame.empty:
+        stem = fig_name.removesuffix(".png")
+        occ_name = f"{stem}_occupancy.png"
+        eff_name = f"{stem}_efficiency.png"
+        fig_occupancy_scatter(
+            occ_frame,
+            figures_dir / occ_name,
+            f"{'Gzip' if include_throughput else 'Plain'} occupancy: peak RSS vs wall",
+        )
+        fig_efficiency_bars(
+            occ_frame,
+            figures_dir / eff_name,
+            f"{'Gzip' if include_throughput else 'Plain'} occupancy efficiency vs z-fastq",
+        )
+        blocks.extend(
+            [
+                "## Occupancy (50/50 wall and RSS)",
+                "",
+                "Occupancy is mean wall times peak RSS. SeqFu is omitted because child RSS is not measured. The scatter is peak RSS against mean wall, not a ratio plot. Each dataset has its own 1x/2x/4x/8x family through that file's z-fastq ISA-L. Curve dash matches the scatter shape: Dense solid, Variable dashed, Long dash-dot. Color is the tool. Shape is the dataset. Efficiency vs z-fastq is the next figure, not this one.",
+                "",
+                md_occupancy_tables(occ_frame, present, nums),
+                "",
+                md_figure_block(
+                    nums,
+                    f"results/figures/{occ_name}",
+                    "Peak RSS vs mean wall. Per-dataset occupancy isocosts through z-fastq ISA-L.",
+                    [
+                        "X: mean wall (s, log). Y: peak RSS (MB, linear).",
+                        "Color = tool. Shape = dataset (Dense circle/solid, Variable square/dashed, Long triangle/dash-dot).",
+                        "Curves are 1x/2x/4x/8x memory-seconds of that dataset's z-fastq ISA-L. Dash matches the shape. Gold 1x, gray 2x/4x/8x.",
+                        "Lower-left is better. Native inflate appears on gzip only.",
+                    ],
+                ),
+                md_figure_block(
+                    nums,
+                    f"results/figures/{eff_name}",
+                    "Occupancy efficiency vs z-fastq ISA-L. Higher is better. 1.00 matches z-fastq memory-seconds.",
+                    [
+                        "X-axis is the tool. Grouped bars are Dense / Variable / Long (hatch).",
+                        "Bar color is the tool. Gold dashed line is 1x.",
+                        "This is the inverse of occupancy cost on the scatter.",
+                    ],
+                ),
+            ]
+        )
     return join(blocks)
-
-
-def _scaling_pivot(df: pd.DataFrame, tools: list[str], param_col: str, param_order: list, xlabel: str, fmt) -> str:
-    work = df[df["tool"].isin(tools)].copy()
-    if work.empty:
-        return "_No data._"
-    work["cell"] = work.apply(fmt, axis=1)
-    pivot = work.pivot(index=param_col, columns="tool", values="cell")
-    pivot = pivot.reindex([p for p in param_order if p in pivot.index])
-    pivot = pivot[[c for c in tools if c in pivot.columns]]
-    pivot = pivot.rename(columns={c: display_tool(c) for c in pivot.columns})
-    if param_col == "size_mb":
-        pivot.index = [f"{int(v)} MB" for v in pivot.index]
-    else:
-        pivot.index = [f"{int(v):,}" for v in pivot.index]
-    pivot.index.name = xlabel
-    return to_markdown_aligned(pivot)
-
-
-def _scaling_ratio(
-    df: pd.DataFrame,
-    tools: list[str],
-    param_col: str,
-    value_col: str,
-    *,
-    fmt_zf,
-    fmt_comp,
-    ratio_label: str,
-    xlabel: str,
-) -> str:
-    comparisons = build_ratio_comparisons(
-        df,
-        value_col,
-        baseline=BASELINE,
-        peers=peer_tools(tools),
-        group_col=param_col,
-        group_sort=lambda x: float(x),
-    )
-    if comparisons.empty:
-        return "_No comparisons._"
-    comparisons = comparisons.copy()
-    comparisons["dataset"] = comparisons["dataset"].map(
-        lambda v: f"{int(v)} MB" if param_col == "size_mb" else f"{int(v):,}"
-    )
-    return md_ratio_table(
-        comparisons,
-        zf_label="z-fastq",
-        peer_label="Peer",
-        ratio_label=ratio_label,
-        fmt_zf=fmt_zf,
-        fmt_comp=fmt_comp,
-        group_label=xlabel,
-    )
-
-
-def md_scaling(
-    df: pd.DataFrame,
-    *,
-    param_col: str,
-    param_order: list,
-    xlabel: str,
-    title: str,
-    fig_stem: str,
-    fig_title: str,
-    tools: list[str],
-    nums: ReportCounters,
-    figures_dir: Path,
-) -> str:
-    present = tools_in_run(df, tools)
-    fig_scaling_abs(
-        df,
-        figures_dir / f"{fig_stem}.png",
-        param_col=param_col,
-        xlabel=xlabel,
-        title=fig_title,
-        tools=present,
-    )
-    fig_scaling_slope(
-        df,
-        figures_dir / f"{fig_stem}_slope.png",
-        param_col=param_col,
-        title=f"{fig_title}: x at smallest vs largest",
-        tools=present,
-    )
-    t_wall = nums.next_table()
-    t_wall_ratio = nums.next_table()
-    t_rss = nums.next_table()
-    t_rss_ratio = nums.next_table()
-    t_pf = nums.next_table()
-    t_pf_ratio = nums.next_table()
-    f_abs = nums.next_figure()
-    f_slope = nums.next_figure()
-    return join(
-        [
-            f"## {title}",
-            "",
-            "Complete count peers only. SeqFu is excluded so scale lines stay equivalent-work.",
-            "",
-            f"**Table {t_wall}:** Mean ± stddev wall time.",
-            "",
-            _scaling_pivot(df, present, param_col, param_order, xlabel, fmt_wall),
-            "",
-            f"<details><summary><strong>Table {t_wall_ratio}:</strong> Time x = peer / z-fastq ISA-L at each point.</summary>",
-            "",
-            _scaling_ratio(
-                df,
-                present,
-                param_col,
-                "mean",
-                fmt_zf=lambda r: f"{r.zfasta_v:.4f}s",
-                fmt_comp=lambda r: f"{r.comp_v:.4f}s",
-                ratio_label="Time x",
-                xlabel=xlabel,
-            ),
-            "",
-            "</details>",
-            "",
-            f"<details><summary><strong>Table {t_rss}:</strong> Peak RSS (MB) by {xlabel}.</summary>",
-            "",
-            _scaling_pivot(df, present, param_col, param_order, xlabel, fmt_rss),
-            "",
-            "</details>",
-            "",
-            f"<details><summary><strong>Table {t_rss_ratio}:</strong> RSS x = peer / z-fastq ISA-L.</summary>",
-            "",
-            _scaling_ratio(
-                df,
-                present,
-                param_col,
-                "peak_rss_mb",
-                fmt_zf=lambda r: f"{r.zfasta_v:.2f} MB",
-                fmt_comp=lambda r: f"{r.comp_v:.2f} MB",
-                ratio_label="RSS x",
-                xlabel=xlabel,
-            ),
-            "",
-            "</details>",
-            "",
-            f"<details><summary><strong>Table {t_pf}:</strong> Minor page faults by {xlabel}.</summary>",
-            "",
-            _scaling_pivot(df, present, param_col, param_order, xlabel, fmt_faults),
-            "",
-            "</details>",
-            "",
-            f"<details><summary><strong>Table {t_pf_ratio}:</strong> Faults x = peer / z-fastq ISA-L.</summary>",
-            "",
-            _scaling_ratio(
-                df,
-                present,
-                param_col,
-                "minor_faults",
-                fmt_zf=lambda r: f"{r.zfasta_v:.0f}",
-                fmt_comp=lambda r: f"{r.comp_v:.0f}",
-                ratio_label="Faults x",
-                xlabel=xlabel,
-            ),
-            "",
-            "</details>",
-            "",
-            '<div style="margin: 1.5em 0"></div>',
-            "",
-            f"**Figure {f_abs}:** Absolute wall / RSS / page faults vs {xlabel} (log-log).",
-            "",
-            f"![Figure {f_abs}](results/figures/{fig_stem}.png)",
-            "",
-            f"**Reading Figure {f_abs}**",
-            "",
-            "- Facets: wall time | peak RSS | minor page faults.",
-            "- Gold circle = ISA-L. Amber diamond = native inflate (gzip sweep only).",
-            "",
-            '<div style="margin: 1.5em 0"></div>',
-            "",
-            f"**Figure {f_slope}:** x vs z-fastq ISA-L at the smallest vs largest fixture.",
-            "",
-            f"![Figure {f_slope}](results/figures/{fig_stem}_slope.png)",
-            "",
-            f"**Reading Figure {f_slope}**",
-            "",
-            "- Left = smallest fixture; right = largest. Gold dashed = 1x.",
-            "- Rising = the peer gets relatively worse with scale.",
-            "",
-            '<div style="margin: 1.5em 0"></div>',
-        ]
-    )
 
 
 def md_run_banner(manifest: dict) -> str | None:
     notes: list[str] = []
-    if manifest.get("real_set") == "small":
+    slots = real_slots(manifest)
+    dense_acc = accession_of(slots.get("Dense") or {})
+    long_acc = accession_of(slots.get("Long") or {})
+    if dense_acc == "SRR10325788":
         notes.append("Dense is MiniSeq R1, not SRR1810900")
+    if long_acc == "DRR054114":
+        notes.append("Long is PacBio CCS DRR054114, not MinION DRR217704")
+    elif long_acc == "ERR5404926":
+        notes.append("Long is GridION amplicon ERR5404926, not genomic long reads")
     try:
         duration = int(manifest.get("duration_ms") or 0)
         runs = int(manifest.get("runs") or 0)
@@ -1374,9 +1483,6 @@ def md_run_banner(manifest: dict) -> str | None:
             f"zebrac duration_ms={duration}, runs={runs}, warmup={warmup} "
             "(published default is 5000 ms, 25 runs, 5 warmups)"
         )
-    sections = manifest.get("sections") or {}
-    if manifest.get("skip_scale") or not any(key.startswith("scale_") for key in sections):
-        notes.append("synthetic sweeps skipped")
     if not notes:
         return None
     return "_This is a bring-up measurement: " + "; ".join(notes) + ". Read it as a check of the suite, not a published ranking._"
@@ -1427,9 +1533,6 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
 
     plain = load_section(results_dir, manifest, "perf_plain")
     gzip_df = load_section(results_dir, manifest, "perf_gzip")
-    size_df = enrich_size(load_section(results_dir, manifest, "scale_size"))
-    reads_df = enrich_reads(load_section(results_dir, manifest, "scale_reads"))
-    scale_gz = enrich_reads(load_section(results_dir, manifest, "scale_gzip"))
 
     required = []
     if not allow_incomplete:
@@ -1476,54 +1579,6 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
                 nums=nums,
                 figures_dir=figures_dir,
                 include_throughput=True,
-            )
-        )
-        lines.append("")
-    if size_df is not None and not size_df.empty:
-        lines.append(
-            md_scaling(
-                size_df,
-                param_col="size_mb",
-                param_order=SIZE_MB_ORDER,
-                xlabel="File size (MB)",
-                title="Scaling: file size",
-                fig_stem="scaling_size",
-                fig_title="Count vs file size (100k uniform reads)",
-                tools=SCALING_TOOLS,
-                nums=nums,
-                figures_dir=figures_dir,
-            )
-        )
-        lines.append("")
-    if reads_df is not None and not reads_df.empty:
-        lines.append(
-            md_scaling(
-                reads_df,
-                param_col="read_count",
-                param_order=READ_COUNT_ORDER,
-                xlabel="Read count",
-                title="Scaling: read count",
-                fig_stem="scaling_reads",
-                fig_title="Count vs read count (150 bp dense)",
-                tools=SCALING_TOOLS,
-                nums=nums,
-                figures_dir=figures_dir,
-            )
-        )
-        lines.append("")
-    if scale_gz is not None and not scale_gz.empty:
-        lines.append(
-            md_scaling(
-                scale_gz,
-                param_col="read_count",
-                param_order=READ_COUNT_ORDER,
-                xlabel="Read count",
-                title="Scaling: gzip read count",
-                fig_stem="scaling_gzip",
-                fig_title="Gzip count vs read count (150 bp, compresslevel 6)",
-                tools=SCALING_GZIP_TOOLS,
-                nums=nums,
-                figures_dir=figures_dir,
             )
         )
         lines.append("")

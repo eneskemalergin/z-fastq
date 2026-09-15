@@ -117,10 +117,6 @@ file_size_bytes() {
     stat --printf='%s' "$path" 2>/dev/null || stat -f '%z' "$path" 2>/dev/null || echo 0
 }
 
-bench_ensure_scaling() {
-    bash "$BENCH_SHARED_DIR/generate_scaling.sh" "$@"
-}
-
 zebrac_json_escape() {
     local value="$1"
     value="${value//\\/\\\\}"

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Count benchmark runner: same-job count check, then zebrac.
 #
+# Timed files and extra agreement files come from features.tsv
+# (count/<publication|small>/time and .../check).
+#
 # Usage:
 #   bash bench/count/run.sh [options]
 #
@@ -9,8 +12,7 @@
 #
 #   bash bench/count/run.sh
 #   bash bench/count/run.sh --skip-tests --skip-report
-#   bash bench/count/run.sh --skip-scale
-#   bash bench/count/run.sh --small-real --skip-scale
+#   bash bench/count/run.sh --small-real --runs 5 --warmup 3
 #   COUNT_RUN_TIMESTAMP=<ts> bash bench/count/run.sh --skip-tests
 #
 #   -h|--help  print this header
@@ -21,16 +23,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_ROOT="$(dirname "$SCRIPT_DIR")"
 PROJECT_ROOT="$(dirname "$BENCH_ROOT")"
 RESULTS_DIR="$SCRIPT_DIR/results"
-SCALING_DIR="$BENCH_ROOT/shared/cache/scaling"
 DATA_DIR="$BENCH_ROOT/shared/data"
 PLAIN_DIR="$BENCH_ROOT/shared/cache/plain"
 ORACLE="$SCRIPT_DIR/oracle.py"
 FIXTURE_DIR="$PROJECT_ROOT/tests/data/synthetic"
 
+# shellcheck disable=SC1091
 source "$BENCH_ROOT/shared/tools.sh"
-
-SIZE_MBS=(1 5 10 25 50 100 250 500)
-READS_FIXED_COUNTS=(100000 250000 500000 1000000)
 
 RUNS=25
 WARMUP=5
@@ -38,13 +37,8 @@ ZEBRAC_DURATION_MS="${ZEBRAC_DURATION_MS:-5000}"
 DO_TESTS=true
 DO_BENCHMARKS=true
 DO_FULL=true
-DO_SCALE=true
-DO_SCALE_SIZE=true
-DO_SCALE_READS=true
-DO_SCALE_GZIP=true
 DO_REPORT=true
 SMALL_REAL=false
-REGENERATE_FIXTURES=false
 ALLOW_INCOMPLETE=false
 
 while [[ $# -gt 0 ]]; do
@@ -55,13 +49,8 @@ while [[ $# -gt 0 ]]; do
         --skip-tests|--skip-verify) DO_TESTS=false; shift ;;
         --skip-benchmarks|--skip-perf) DO_BENCHMARKS=false; shift ;;
         --skip-full) DO_FULL=false; shift ;;
-        --skip-scale) DO_SCALE=false; shift ;;
-        --skip-size) DO_SCALE_SIZE=false; shift ;;
-        --skip-seqs|--skip-reads) DO_SCALE_READS=false; shift ;;
-        --skip-gzip-scale) DO_SCALE_GZIP=false; shift ;;
         --skip-report) DO_REPORT=false; shift ;;
         --small-real) SMALL_REAL=true; shift ;;
-        --regenerate-fixtures) REGENERATE_FIXTURES=true; shift ;;
         --allow-incomplete) ALLOW_INCOMPLETE=true; shift ;;
         -h|--help)
             sed -n '2,/^set -euo pipefail$/p' "$0" | head -n -1
@@ -91,24 +80,71 @@ PYTHON="$(report_python)" || exit 1
 CHECK_DIR="$(mktemp -d "$RESULTS_DIR/.check.XXXXXX")"
 trap 'rm -rf -- "$CHECK_DIR"' EXIT
 
-DENSE_ID="Dense"
-DENSE_GZ_NAME="REAL_Dense.fastq.gz"
+COUNT_SET="publication"
 if $SMALL_REAL; then
-    DENSE_ID="DenseSmall"
-    DENSE_GZ_NAME="REAL_Dense_small.fastq.gz"
+    COUNT_SET="small"
 fi
 
+DENSE_ID=""
+VARIABLE_ID=""
+LONG_ID=""
 REAL_ORDER=(Dense Variable Long)
 declare -A REAL_GZ=()
 declare -A REAL_PLAIN=()
 declare -A REAL_EXPECTED=()
 declare -A REAL_DECODED=()
+declare -A EXTRA_GZ=()
+declare -A EXTRA_PLAIN=()
+declare -A EXTRA_EXPECTED=()
+EXTRA_ORDER=()
 
 count_add_command() {
     local section="$1" workload="$2" tool="$3" family="$4"
     local json_out="$5" script="$6" input_bytes="$7" decoded_bytes="$8"
     zebrac_add_command "count" "$section" "$workload" "$tool" "$family" \
         "$input_bytes" "$decoded_bytes" "$json_out" "$script"
+}
+
+count_dataset_json() {
+    local id="$1"
+    catalog_has_id "$id" || return 1
+    printf '{'
+    printf '"manifest_id":%s,' "$(zebrac_json_string "$id")"
+    printf '"filename":%s,' "$(zebrac_json_string "${CATALOG_FILENAME[$id]}")"
+    printf '"expected_records":%s,' "${CATALOG_EXPECTED[$id]}"
+    printf '"accession":%s' "$(zebrac_json_string "${CATALOG_ACCESSION[$id]}")"
+    printf '}'
+}
+
+count_datasets_json() {
+    local dense_id="$1"
+    local variable_id="$2"
+    local long_id="$3"
+    local extras_csv="${4:-}"
+    local -a extra_ids=()
+    local id key sep=""
+    if [[ -n "${extras_csv}" ]]; then
+        IFS=',' read -r -a extra_ids <<< "${extras_csv}"
+    fi
+
+    printf '{'
+    for key in Dense Variable Long; do
+        case "${key}" in
+            Dense) id="${dense_id}" ;;
+            Variable) id="${variable_id}" ;;
+            Long) id="${long_id}" ;;
+        esac
+        printf '%s%s:' "${sep}" "$(zebrac_json_string "${key}")"
+        count_dataset_json "${id}" || return 1
+        sep=','
+    done
+    for id in "${extra_ids[@]}"; do
+        [[ -n "${id}" ]] || continue
+        printf '%s%s:' "${sep}" "$(zebrac_json_string "${id}")"
+        count_dataset_json "${id}" || return 1
+        sep=','
+    done
+    printf '}'
 }
 
 run_zebrac_tool() {
@@ -148,58 +184,73 @@ build_subjects() {
     echo "  native: $ZFASTQ_NATIVE"
 }
 
+bind_dataset() {
+    local slot="$1" id="$2"
+    local filename
+    filename="$(bench_catalog field "$id" filename)"
+    REAL_GZ["$slot"]="$DATA_DIR/$filename"
+    REAL_PLAIN["$slot"]="$PLAIN_DIR/${filename%.gz}"
+    REAL_EXPECTED["$slot"]="$(bench_catalog expected "$id")"
+}
+
 ensure_real_data() {
-    local download_args=()
+    local download_args=(--suite count)
     if $SMALL_REAL; then
         download_args+=(--small)
     fi
-    echo "Ensuring REAL gzip FASTQ under $DATA_DIR ..."
+    echo "Ensuring REAL gzip FASTQ under $DATA_DIR (count/$COUNT_SET) ..."
     bash "$BENCH_ROOT/shared/download_data.sh" "${download_args[@]}"
 
-    REAL_GZ["Dense"]="$DATA_DIR/$DENSE_GZ_NAME"
-    REAL_PLAIN["Dense"]="$PLAIN_DIR/${DENSE_GZ_NAME%.gz}"
-    REAL_GZ["Variable"]="$DATA_DIR/REAL_Variable.fastq.gz"
-    REAL_PLAIN["Variable"]="$PLAIN_DIR/REAL_Variable.fastq"
-    REAL_GZ["Long"]="$DATA_DIR/REAL_Long.fastq.gz"
-    REAL_PLAIN["Long"]="$PLAIN_DIR/REAL_Long.fastq"
+    local time_ids check_ids id filename
+    mapfile -t time_ids < <(bench_catalog ids --suite count --set "$COUNT_SET" --role time --no-expand)
+    mapfile -t check_ids < <(bench_catalog ids --suite count --set "$COUNT_SET" --role check --no-expand)
+    if [[ ${#time_ids[@]} -ne 3 ]]; then
+        echo "error: count/$COUNT_SET/time must list exactly 3 ids" >&2
+        exit 1
+    fi
+    DENSE_ID="${time_ids[0]}"
+    VARIABLE_ID="${time_ids[1]}"
+    LONG_ID="${time_ids[2]}"
+    bind_dataset Dense "$DENSE_ID"
+    bind_dataset Variable "$VARIABLE_ID"
+    bind_dataset Long "$LONG_ID"
 
-    local id
-    for id in Dense Variable Long; do
-        [[ -f "${REAL_GZ[$id]}" ]] || {
-            echo "error: missing gzip dataset ${REAL_GZ[$id]}" >&2
-            exit 1
-        }
-        [[ -f "${REAL_PLAIN[$id]}" ]] || {
-            echo "error: missing plain cache ${REAL_PLAIN[$id]}" >&2
-            exit 1
-        }
-        REAL_DECODED["$id"]="$(file_size_bytes "${REAL_PLAIN[$id]}")"
+    local timed=""
+    timed=" ${DENSE_ID} ${VARIABLE_ID} ${LONG_ID} "
+    EXTRA_ORDER=()
+    for id in "${check_ids[@]}"; do
+        [[ "$timed" == *" $id "* ]] && continue
+        filename="$(bench_catalog field "$id" filename)"
+        EXTRA_ORDER+=("$id")
+        EXTRA_GZ["$id"]="$DATA_DIR/$filename"
+        EXTRA_PLAIN["$id"]="$PLAIN_DIR/${filename%.gz}"
+        EXTRA_EXPECTED["$id"]="$(bench_catalog expected "$id")"
     done
 
-    REAL_EXPECTED["Dense"]="$(awk -F'\t' -v id="$DENSE_ID" '$1==id{print $3; exit}' "$BENCH_ROOT/shared/datasets.manifest")"
-    REAL_EXPECTED["Variable"]="$(awk -F'\t' '$1=="Variable"{print $3; exit}' "$BENCH_ROOT/shared/datasets.manifest")"
-    REAL_EXPECTED["Long"]="$(awk -F'\t' '$1=="Long"{print $3; exit}' "$BENCH_ROOT/shared/datasets.manifest")"
-    echo "  Dense gzip: ${REAL_GZ[Dense]}  (manifest id $DENSE_ID, expected ${REAL_EXPECTED[Dense]})"
-}
+    for slot in "${REAL_ORDER[@]}"; do
+        [[ -f "${REAL_GZ[$slot]}" ]] || {
+            echo "error: missing gzip dataset ${REAL_GZ[$slot]}" >&2
+            exit 1
+        }
+        [[ -f "${REAL_PLAIN[$slot]}" ]] || {
+            echo "error: missing plain cache ${REAL_PLAIN[$slot]}" >&2
+            exit 1
+        }
+        REAL_DECODED["$slot"]="$(file_size_bytes "${REAL_PLAIN[$slot]}")"
+    done
+    for id in "${EXTRA_ORDER[@]}"; do
+        [[ -f "${EXTRA_GZ[$id]}" && -f "${EXTRA_PLAIN[$id]}" ]] || {
+            echo "error: missing extra check files for $id" >&2
+            exit 1
+        }
+    done
 
-ensure_scaling_fixtures() {
-    if ! $DO_SCALE; then
-        return 0
-    fi
-    local args=()
-    if $REGENERATE_FIXTURES; then
-        args+=(--force)
-    fi
-    echo "  Ensuring scaling FASTQ under $SCALING_DIR ..."
-    if $DO_SCALE_SIZE; then
-        bench_ensure_scaling --mode size "${args[@]}"
-    fi
-    if $DO_SCALE_READS || $DO_SCALE_GZIP; then
-        bench_ensure_scaling --mode reads "${args[@]}"
-    fi
-    if $DO_SCALE_GZIP; then
-        bench_ensure_scaling --mode gzip "${args[@]}"
-    fi
+    echo "  Dense gzip: ${REAL_GZ[Dense]}  (manifest id $DENSE_ID, expected ${REAL_EXPECTED[Dense]})"
+    echo "  Variable gzip: ${REAL_GZ[Variable]}  (manifest id $VARIABLE_ID, expected ${REAL_EXPECTED[Variable]})"
+    echo "  Long gzip:  ${REAL_GZ[Long]}  (manifest id $LONG_ID, expected ${REAL_EXPECTED[Long]})"
+    for id in "${EXTRA_ORDER[@]}"; do
+        echo "  extra check $id: ${EXTRA_GZ[$id]}  (expected ${EXTRA_EXPECTED[$id]})"
+    done
 }
 
 log_verify() {
@@ -371,7 +422,7 @@ run_tests() {
         expect_count_fail "$FIXTURE_DIR/$bad" "$ZFASTQ_NATIVE" "z-fastq-native"
     done
 
-    local name
+    local name id
     log_verify "--- REAL plain ---"
     for name in "${REAL_ORDER[@]}"; do
         check_same_count "${REAL_PLAIN[$name]}" "${REAL_EXPECTED[$name]}" false \
@@ -383,32 +434,13 @@ run_tests() {
             "$(should_run_oracle "${REAL_EXPECTED[$name]}" && echo true || echo false)"
     done
 
-    if $DO_SCALE && $DO_BENCHMARKS; then
-        local mb count path
-        if $DO_SCALE_SIZE; then
-            log_verify "--- scale size ---"
-            for mb in "${SIZE_MBS[@]}"; do
-                path="$SCALING_DIR/size_${mb}mb.fastq"
-                check_same_count "$path" "100000" false true
-            done
-        fi
-        if $DO_SCALE_READS; then
-            log_verify "--- scale reads ---"
-            for count in "${READS_FIXED_COUNTS[@]}"; do
-                path="$SCALING_DIR/reads_fixed_${count}.fastq"
-                check_same_count "$path" "$count" false \
-                    "$(should_run_oracle "$count" && echo true || echo false)"
-            done
-        fi
-        if $DO_SCALE_GZIP; then
-            log_verify "--- scale gzip ---"
-            for count in "${READS_FIXED_COUNTS[@]}"; do
-                path="$SCALING_DIR/reads_fixed_${count}.fastq.gz"
-                check_same_count "$path" "$count" true \
-                    "$(should_run_oracle "$count" && echo true || echo false)"
-            done
-        fi
-    fi
+    for id in "${EXTRA_ORDER[@]}"; do
+        log_verify "--- extra check $id ---"
+        check_same_count "${EXTRA_PLAIN[$id]}" "${EXTRA_EXPECTED[$id]}" false \
+            "$(should_run_oracle "${EXTRA_EXPECTED[$id]}" && echo true || echo false)"
+        check_same_count "${EXTRA_GZ[$id]}" "${EXTRA_EXPECTED[$id]}" true \
+            "$(should_run_oracle "${EXTRA_EXPECTED[$id]}" && echo true || echo false)"
+    done
 
     log_verify "ALL PASSED"
 }
@@ -455,7 +487,7 @@ run_count_tools() {
 }
 
 run_perf() {
-    local name mb count path decoded
+    local name decoded
     if $DO_FULL; then
         local plain_dir gzip_dir
         plain_dir="$RESULTS_DIR/perf_plain_${TIMESTAMP}"
@@ -472,92 +504,70 @@ run_perf() {
             run_count_tools perf_gzip "$name" "${REAL_GZ[$name]}" "$gzip_dir" true true "$decoded"
         done
     fi
-
-    if $DO_SCALE && $DO_SCALE_SIZE; then
-        local size_dir="$RESULTS_DIR/scale_size_${TIMESTAMP}"
-        mkdir -p "$size_dir"
-        echo "=== scale_size ==="
-        for mb in "${SIZE_MBS[@]}"; do
-            path="$SCALING_DIR/size_${mb}mb.fastq"
-            decoded="$(file_size_bytes "$path")"
-            run_count_tools scale_size "${mb}mb" "$path" "$size_dir" false false "$decoded"
-        done
-    fi
-
-    if $DO_SCALE && $DO_SCALE_READS; then
-        local reads_dir="$RESULTS_DIR/scale_reads_${TIMESTAMP}"
-        mkdir -p "$reads_dir"
-        echo "=== scale_reads ==="
-        for count in "${READS_FIXED_COUNTS[@]}"; do
-            path="$SCALING_DIR/reads_fixed_${count}.fastq"
-            decoded="$(file_size_bytes "$path")"
-            run_count_tools scale_reads "$count" "$path" "$reads_dir" false false "$decoded"
-        done
-    fi
-
-    if $DO_SCALE && $DO_SCALE_GZIP; then
-        local gz_dir="$RESULTS_DIR/scale_gzip_${TIMESTAMP}"
-        mkdir -p "$gz_dir"
-        echo "=== scale_gzip ==="
-        for count in "${READS_FIXED_COUNTS[@]}"; do
-            path="$SCALING_DIR/reads_fixed_${count}.fastq.gz"
-            decoded="$(file_size_bytes "$SCALING_DIR/reads_fixed_${count}.fastq")"
-            run_count_tools scale_gzip "$count" "$path" "$gz_dir" true false "$decoded"
-        done
-    fi
 }
 
 write_manifest() {
-    local python_bin
-    python_bin="$(report_python)"
-    "$python_bin" - "$MANIFEST_PATH" <<'PY'
-import json, os, sys
-from pathlib import Path
+    local real_set="full"
+    $SMALL_REAL && real_set="small"
 
-manifest = Path(sys.argv[1])
-ts = os.environ["COUNT_TS"]
-results = Path(os.environ["COUNT_RESULTS"])
-out = {
-    "schema_version": "count-run.v1",
-    "timestamp": ts,
-    "runner": "zebrac",
-    "mode": "warm",
-    "suite": "count",
-    "real_set": os.environ.get("COUNT_REAL_SET", "full"),
-    "zebrac": os.environ.get("COUNT_ZEBRAC_VER", ""),
-    "z_fastq": os.environ.get("COUNT_ZFASTQ_VER", ""),
-    "z_fastq_native": os.environ.get("COUNT_ZFASTQ_NATIVE_VER", ""),
-    "z_fastq_bytes": int(os.environ.get("COUNT_ZFASTQ_BYTES", "0") or 0),
-    "z_fastq_native_bytes": int(os.environ.get("COUNT_ZFASTQ_NATIVE_BYTES", "0") or 0),
-    "runs": int(os.environ["COUNT_RUNS"]),
-    "warmup": int(os.environ["COUNT_WARMUP"]),
-    "duration_ms": int(os.environ["COUNT_DURATION"]),
-    "metadata": f"metadata_{ts}.jsonl",
-    "verify_log": f"verify_{ts}.log",
-    "verify_skipped": os.environ.get("COUNT_VERIFY_SKIPPED") == "1",
-    "verify_pass": os.environ.get("COUNT_VERIFY_PASS") or None,
-    "tools": json.loads(os.environ.get("COUNT_TOOLS_JSON", "{}")),
-    "sections": {},
-    "skip_full": os.environ.get("COUNT_SKIP_FULL") == "1",
-    "skip_scale": os.environ.get("COUNT_SKIP_SCALE") == "1",
-}
-for key, prefix in (
-    ("perf_plain", "perf_plain_"),
-    ("perf_gzip", "perf_gzip_"),
-    ("scale_size", "scale_size_"),
-    ("scale_reads", "scale_reads_"),
-    ("scale_gzip", "scale_gzip_"),
-):
-    path = results / f"{prefix}{ts}"
-    if path.is_dir():
-        out["sections"][key] = path.name
-log = results / f"verify_{ts}.log"
-if log.is_file() and "ALL PASSED" in log.read_text(encoding="utf-8", errors="replace"):
-    out["verify_skipped"] = False
-    out["verify_pass"] = "ALL PASSED"
-manifest.write_text(json.dumps(out, indent=2) + "\n")
-PY
-    printf '%s\n' "$TIMESTAMP" >"$RESULTS_DIR/LATEST"
+    local verify_skipped_json=false
+    [[ "$VERIFY_SKIPPED" == 1 ]] && verify_skipped_json=true
+    local verify_pass_json=null
+    [[ -n "$VERIFY_PASS" ]] && verify_pass_json="$(zebrac_json_string "$VERIFY_PASS")"
+    if [[ -f "$VERIFY_LOG" ]] && grep -Fq 'ALL PASSED' "$VERIFY_LOG"; then
+        verify_skipped_json=false
+        verify_pass_json='"ALL PASSED"'
+    fi
+
+    local skip_full_json=false
+    $DO_FULL || skip_full_json=true
+
+    local temporary_manifest="${MANIFEST_PATH}.tmp.$$"
+    {
+        printf '{\n'
+        printf '  "schema_version": "count-run.v1",\n'
+        printf '  "timestamp": %s,\n' "$(zebrac_json_string "$TIMESTAMP")"
+        printf '  "runner": "zebrac",\n'
+        printf '  "mode": "warm",\n'
+        printf '  "suite": "count",\n'
+        printf '  "real_set": %s,\n' "$(zebrac_json_string "$real_set")"
+        printf '  "datasets": %s,\n' "$COUNT_DATASETS_JSON"
+        printf '  "zebrac": %s,\n' "$(zebrac_json_string "${COUNT_ZEBRAC_VER}")"
+        printf '  "z_fastq": %s,\n' "$(zebrac_json_string "${COUNT_ZFASTQ_VER}")"
+        printf '  "z_fastq_native": %s,\n' "$(zebrac_json_string "${COUNT_ZFASTQ_NATIVE_VER}")"
+        printf '  "z_fastq_bytes": %s,\n' "$(zebrac_json_number_or_null "${COUNT_ZFASTQ_BYTES}")"
+        printf '  "z_fastq_native_bytes": %s,\n' "$(zebrac_json_number_or_null "${COUNT_ZFASTQ_NATIVE_BYTES}")"
+        printf '  "runs": %s,\n' "$(zebrac_json_number_or_null "$RUNS")"
+        printf '  "warmup": %s,\n' "$(zebrac_json_number_or_null "$WARMUP")"
+        printf '  "duration_ms": %s,\n' "$(zebrac_json_number_or_null "$ZEBRAC_DURATION_MS")"
+        printf '  "metadata": %s,\n' "$(zebrac_json_string "metadata_${TIMESTAMP}.jsonl")"
+        printf '  "verify_log": %s,\n' "$(zebrac_json_string "verify_${TIMESTAMP}.log")"
+        printf '  "verify_skipped": %s,\n' "$verify_skipped_json"
+        printf '  "verify_pass": %s,\n' "$verify_pass_json"
+        printf '  "tools": %s,\n' "$COUNT_TOOLS_JSON"
+        printf '  "sections": {'
+        local section_key section_prefix section_sep=""
+        for section_key in perf_plain perf_gzip; do
+            case "$section_key" in
+                perf_plain) section_prefix=perf_plain_ ;;
+                perf_gzip) section_prefix=perf_gzip_ ;;
+            esac
+            if [[ -d "$RESULTS_DIR/${section_prefix}${TIMESTAMP}" ]]; then
+                printf '%s\n    %s: %s' "$section_sep" \
+                    "$(zebrac_json_string "$section_key")" \
+                    "$(zebrac_json_string "${section_prefix}${TIMESTAMP}")"
+                section_sep=,
+            fi
+        done
+        printf '\n  },\n'
+        printf '  "skip_full": %s\n' "$skip_full_json"
+        printf '}\n'
+    } >"$temporary_manifest"
+    mv -- "$temporary_manifest" "$MANIFEST_PATH"
+
+    local temporary_latest="$RESULTS_DIR/LATEST.tmp.$$"
+    printf '%s\n' "$TIMESTAMP" >"$temporary_latest"
+    mv -- "$temporary_latest" "$RESULTS_DIR/LATEST"
 }
 
 # --- run ---
@@ -566,9 +576,6 @@ echo
 
 build_subjects
 ensure_real_data
-if $DO_SCALE && $DO_BENCHMARKS; then
-    ensure_scaling_fixtures
-fi
 
 VERIFY_PASS=""
 VERIFY_SKIPPED=1
@@ -589,38 +596,27 @@ if $DO_BENCHMARKS; then
     run_perf
 fi
 
-export COUNT_TS="$TIMESTAMP"
-export COUNT_RESULTS="$RESULTS_DIR"
-export COUNT_REAL_SET="$($SMALL_REAL && echo small || echo full)"
-export COUNT_ZEBRAC_VER="$(bench_tool_version zebrac || true)"
-export COUNT_ZFASTQ_VER="$(bench_tool_version z-fastq || true)"
-export COUNT_ZFASTQ_NATIVE_VER="$(bench_tool_version z-fastq-native || true)"
-export COUNT_ZFASTQ_BYTES="$(file_size_bytes "$ZFASTQ")"
-export COUNT_ZFASTQ_NATIVE_BYTES="$(file_size_bytes "$ZFASTQ_NATIVE")"
-export COUNT_RUNS="$RUNS"
-export COUNT_WARMUP="$WARMUP"
-export COUNT_DURATION="$ZEBRAC_DURATION_MS"
-export COUNT_VERIFY_SKIPPED="$VERIFY_SKIPPED"
-export COUNT_VERIFY_PASS="$VERIFY_PASS"
-export COUNT_SKIP_FULL="$($DO_FULL && echo 0 || echo 1)"
-export COUNT_SKIP_SCALE="$($DO_SCALE && echo 0 || echo 1)"
-export COUNT_SEQTK_VER="$(bench_tool_version seqtk || true)"
-export COUNT_FQTOOLS_VER="$(bench_tool_version fqtools || true)"
-export COUNT_NEEDLETAIL_VER="$(bench_tool_version needletail || true)"
-export COUNT_HELICASE_VER="$(bench_tool_version helicase || true)"
-export COUNT_SEQFU_VER="$(bench_tool_version seqfu || true)"
-COUNT_TOOLS_JSON="$("$PYTHON" - <<'PY'
-import json, os
-print(json.dumps({
-    "needletail": os.environ.get("COUNT_NEEDLETAIL_VER", ""),
-    "helicase": os.environ.get("COUNT_HELICASE_VER", ""),
-    "seqtk": os.environ.get("COUNT_SEQTK_VER", ""),
-    "seqfu": os.environ.get("COUNT_SEQFU_VER", ""),
-    "fqtools": os.environ.get("COUNT_FQTOOLS_VER", ""),
-}))
-PY
+COUNT_CHECK_EXTRA="$(IFS=,; printf '%s' "${EXTRA_ORDER[*]}")"
+COUNT_DATASETS_JSON="$(count_datasets_json "$DENSE_ID" "$VARIABLE_ID" "$LONG_ID" "$COUNT_CHECK_EXTRA")"
+COUNT_ZEBRAC_VER="$(bench_tool_version zebrac || true)"
+COUNT_ZFASTQ_VER="$(bench_tool_version z-fastq || true)"
+COUNT_ZFASTQ_NATIVE_VER="$(bench_tool_version z-fastq-native || true)"
+COUNT_ZFASTQ_BYTES="$(file_size_bytes "$ZFASTQ")"
+COUNT_ZFASTQ_NATIVE_BYTES="$(file_size_bytes "$ZFASTQ_NATIVE")"
+COUNT_SEQTK_VER="$(bench_tool_version seqtk || true)"
+COUNT_FQTOOLS_VER="$(bench_tool_version fqtools || true)"
+COUNT_NEEDLETAIL_VER="$(bench_tool_version needletail || true)"
+COUNT_HELICASE_VER="$(bench_tool_version helicase || true)"
+COUNT_SEQFU_VER="$(bench_tool_version seqfu || true)"
+COUNT_TOOLS_JSON="$(
+    printf '{'
+    printf '"needletail":%s,' "$(zebrac_json_string "$COUNT_NEEDLETAIL_VER")"
+    printf '"helicase":%s,' "$(zebrac_json_string "$COUNT_HELICASE_VER")"
+    printf '"seqtk":%s,' "$(zebrac_json_string "$COUNT_SEQTK_VER")"
+    printf '"seqfu":%s,' "$(zebrac_json_string "$COUNT_SEQFU_VER")"
+    printf '"fqtools":%s' "$(zebrac_json_string "$COUNT_FQTOOLS_VER")"
+    printf '}'
 )"
-export COUNT_TOOLS_JSON
 write_manifest
 
 if $DO_REPORT; then
