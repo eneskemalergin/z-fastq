@@ -33,6 +33,8 @@ NEEDLETAIL="${NEEDLETAIL:-$TOOLS_BIN_DIR/needletail-adapter}"
 HELICASE="${HELICASE:-$TOOLS_BIN_DIR/helicase-adapter}"
 SEQFU="${SEQFU:-$TOOLS_BIN_DIR/seqfu}"
 SEQKIT="${SEQKIT:-$TOOLS_BIN_DIR/seqkit}"
+FQ="${FQ:-$TOOLS_BIN_DIR/fq}"
+FASTQVALIDATOR="${FASTQVALIDATOR:-$TOOLS_BIN_DIR/fastQValidator}"
 
 ZEBRAC_DURATION_MS="${ZEBRAC_DURATION_MS:-5000}"
 ZEBRAC_MIN_SAMPLES="${ZEBRAC_MIN_SAMPLES:-25}"
@@ -55,6 +57,8 @@ bench_tool_path() {
         helicase) echo "$HELICASE" ;;
         seqfu) echo "$SEQFU" ;;
         seqkit) echo "$SEQKIT" ;;
+        fq) echo "$FQ" ;;
+        fastqvalidator) echo "$FASTQVALIDATOR" ;;
         *) return 1 ;;
     esac
 }
@@ -97,6 +101,12 @@ bench_tool_version() {
             ;;
         seqkit)
             [[ -x "$path" ]] && "$path" version 2>&1 | awk 'NR==1{print; exit}'
+            ;;
+        fq)
+            [[ -x "$path" ]] && "$path" --version 2>&1 | awk 'NR==1{print; exit}'
+            ;;
+        fastqvalidator)
+            [[ -x "$path" ]] && printf 'fastQValidator %s\n' "$FASTQ_VALIDATOR_VERSION"
             ;;
         *)
             return 1

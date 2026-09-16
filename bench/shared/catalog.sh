@@ -312,7 +312,36 @@ catalog_check_command() {
             catalog_error "missing feature row ${required}"
     done
 
-    local set_name time_text time_count
+    local role_text role_count role_name set_name
+    for set_name in publication small; do
+        for role_name in se paired casava slash interleaved gzip; do
+            required="check/${set_name}/${role_name}"
+            [[ -n "${feature_rows[$required]+present}" ]] ||
+                catalog_error "missing feature row ${required}"
+            role_text="$(catalog_suite_ids check "${set_name}" "${role_name}")" || return 1
+            if [[ -n "${role_text}" ]]; then
+                role_count="$(printf '%s\n' "${role_text}" | awk 'NF { count += 1 } END { print count + 0 }')"
+            else
+                role_count=0
+            fi
+            case "${role_name}" in
+                paired | casava | slash)
+                    [[ "${role_count}" == 2 ]] ||
+                        catalog_error "check/${set_name}/${role_name} must contain exactly 2 datasets"
+                    ;;
+                interleaved | gzip)
+                    [[ "${role_count}" == 1 ]] ||
+                        catalog_error "check/${set_name}/${role_name} must contain exactly 1 dataset"
+                    ;;
+                se)
+                    [[ "${role_count}" -ge 1 ]] ||
+                        catalog_error "check/${set_name}/se must contain at least 1 dataset"
+                    ;;
+            esac
+        done
+    done
+
+    local time_text time_count
     for set_name in publication small; do
         time_text="$(catalog_suite_ids count "${set_name}" time)" || return 1
         if [[ -n "${time_text}" ]]; then
