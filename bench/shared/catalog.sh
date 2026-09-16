@@ -341,6 +341,34 @@ catalog_check_command() {
         done
     done
 
+    for set_name in publication small; do
+        for role_name in se paired interleaved; do
+            required="sample/${set_name}/${role_name}"
+            [[ -n "${feature_rows[$required]+present}" ]] ||
+                catalog_error "missing feature row ${required}"
+            role_text="$(catalog_suite_ids sample "${set_name}" "${role_name}")" || return 1
+            if [[ -n "${role_text}" ]]; then
+                role_count="$(printf '%s\n' "${role_text}" | awk 'NF { count += 1 } END { print count + 0 }')"
+            else
+                role_count=0
+            fi
+            case "${role_name}" in
+                paired)
+                    [[ "${role_count}" == 2 ]] ||
+                        catalog_error "sample/${set_name}/paired must contain exactly 2 datasets"
+                    ;;
+                interleaved)
+                    [[ "${role_count}" == 1 ]] ||
+                        catalog_error "sample/${set_name}/interleaved must contain exactly 1 dataset"
+                    ;;
+                se)
+                    [[ "${role_count}" -ge 1 ]] ||
+                        catalog_error "sample/${set_name}/se must contain at least 1 dataset"
+                    ;;
+            esac
+        done
+    done
+
     local time_text time_count
     for set_name in publication small; do
         time_text="$(catalog_suite_ids count "${set_name}" time)" || return 1

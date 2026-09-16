@@ -35,6 +35,11 @@ SEQFU="${SEQFU:-$TOOLS_BIN_DIR/seqfu}"
 SEQKIT="${SEQKIT:-$TOOLS_BIN_DIR/seqkit}"
 FQ="${FQ:-$TOOLS_BIN_DIR/fq}"
 FASTQVALIDATOR="${FASTQVALIDATOR:-$TOOLS_BIN_DIR/fastQValidator}"
+RASUSA="${RASUSA:-$TOOLS_BIN_DIR/rasusa}"
+IRMA_CORE="${IRMA_CORE:-$TOOLS_BIN_DIR/irma-core}"
+FQKIT="${FQKIT:-$TOOLS_BIN_DIR/fqkit}"
+FASTEN_SAMPLE="${FASTEN_SAMPLE:-$TOOLS_BIN_DIR/fasten_sample}"
+REFORMAT="${REFORMAT:-$TOOLS_BIN_DIR/reformat.sh}"
 
 ZEBRAC_DURATION_MS="${ZEBRAC_DURATION_MS:-5000}"
 ZEBRAC_MIN_SAMPLES="${ZEBRAC_MIN_SAMPLES:-25}"
@@ -59,6 +64,11 @@ bench_tool_path() {
         seqkit) echo "$SEQKIT" ;;
         fq) echo "$FQ" ;;
         fastqvalidator) echo "$FASTQVALIDATOR" ;;
+        rasusa) echo "$RASUSA" ;;
+        irma) echo "$IRMA_CORE" ;;
+        fqkit) echo "$FQKIT" ;;
+        fasten) echo "$FASTEN_SAMPLE" ;;
+        bbtools) echo "$REFORMAT" ;;
         *) return 1 ;;
     esac
 }
@@ -107,6 +117,21 @@ bench_tool_version() {
             ;;
         fastqvalidator)
             [[ -x "$path" ]] && printf 'fastQValidator %s\n' "$FASTQ_VALIDATOR_VERSION"
+            ;;
+        rasusa)
+            [[ -x "$path" ]] && "$path" --version 2>&1 | awk 'NR==1{print; exit}'
+            ;;
+        irma)
+            [[ -x "$path" ]] && "$path" --version 2>&1 | awk 'NR==1{print; exit}'
+            ;;
+        fqkit)
+            [[ -x "$path" ]] && "$path" --version 2>&1 | awk 'NR==1{print; exit}'
+            ;;
+        fasten)
+            [[ -x "$path" ]] && "$path" --version 2>&1 | awk 'NR==1{print; exit}'
+            ;;
+        bbtools)
+            [[ -x "$path" ]] && printf 'BBTools %s\n' "$BBTOOLS_VERSION"
             ;;
         *)
             return 1
