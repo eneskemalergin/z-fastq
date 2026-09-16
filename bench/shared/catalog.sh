@@ -369,6 +369,34 @@ catalog_check_command() {
         done
     done
 
+    for set_name in publication small; do
+        required="interleave/${set_name}/time"
+        [[ -n "${feature_rows[$required]+present}" ]] ||
+            catalog_error "missing feature row ${required}"
+        role_text="$(catalog_suite_ids interleave "${set_name}" time)" || return 1
+        if [[ -n "${role_text}" ]]; then
+            role_count="$(printf '%s\n' "${role_text}" | awk 'NF { count += 1 } END { print count + 0 }')"
+        else
+            role_count=0
+        fi
+        [[ "${role_count}" == 2 ]] ||
+            catalog_error "interleave/${set_name}/time must contain exactly 2 datasets"
+    done
+
+    for set_name in publication small; do
+        required="deinterleave/${set_name}/time"
+        [[ -n "${feature_rows[$required]+present}" ]] ||
+            catalog_error "missing feature row ${required}"
+        role_text="$(catalog_suite_ids deinterleave "${set_name}" time)" || return 1
+        if [[ -n "${role_text}" ]]; then
+            role_count="$(printf '%s\n' "${role_text}" | awk 'NF { count += 1 } END { print count + 0 }')"
+        else
+            role_count=0
+        fi
+        [[ "${role_count}" == 1 ]] ||
+            catalog_error "deinterleave/${set_name}/time must contain exactly 1 dataset"
+    done
+
     local time_text time_count
     for set_name in publication small; do
         time_text="$(catalog_suite_ids count "${set_name}" time)" || return 1

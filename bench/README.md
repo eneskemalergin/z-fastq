@@ -14,6 +14,7 @@ Zebrac is Linux-only. Peers, adapters, zebrac, and report Python are under [`too
 | [`stats`](stats/) | [REPORT.md](stats/REPORT.md) | human stats block (lengths, ACGTN, GC, arithmetic Phred, Q20/Q30) |
 | [`check`](check/) | [REPORT.md](check/REPORT.md) | FASTQ structure, symbols, quality, and pair semantics |
 | [`sample`](sample/) | [REPORT.md](sample/REPORT.md) | source-ordered subset; exact `min(K,N)` or pair-complete fraction |
+| [`interleave`](interleave/) | [REPORT.md](interleave/REPORT.md) | validated pair-complete interleaved stdout in source order |
 
 Each suite builds both z-fastq binaries: native inflate (`-Disa-l=false`) as `zig-out/bin/z-fastq-native`, then the ISA-L product at `zig-out/bin/z-fastq`.
 
@@ -30,6 +31,8 @@ bash bench/shared/download_data.sh --suite check
 bash bench/check/run.sh
 bash bench/shared/download_data.sh --suite sample
 bash bench/sample/run.sh
+bash bench/shared/download_data.sh --suite interleave
+bash bench/interleave/run.sh
 ```
 
 Publication sampling (also each `run.sh` default): **5000 ms, 25 runs, 5 warmups**. Zebrac stops when both duration and min-samples are met.
@@ -41,6 +44,7 @@ bash bench/count/run.sh --small-real --runs 5 --warmup 3
 bash bench/stats/run.sh --small-real --runs 5 --warmup 3
 bash bench/check/run.sh --small-real --runs 5 --warmup 3
 bash bench/sample/run.sh --small-real --runs 5 --warmup 3
+bash bench/interleave/run.sh --small-real --runs 5 --warmup 3
 ```
 
 Count `--small-real` uses MiniSeq R1 and PacBio CCS in the Dense and Long slots, not SRR1810900 or DRR217704. Stats `--small-real` times DenseSmall, Variable, and HiFi; publication stats also times Long and PairR1. Stats never times Dense: every quality byte is `?`.
@@ -48,6 +52,8 @@ Count `--small-real` uses MiniSeq R1 and PacBio CCS in the Dense and Long slots,
 Check `--small-real` uses the small SE, paired, Casava, slash-name, interleaved, and concatenated-gzip rows. The suite still has one runner and one REPORT.md; the showcase is four families so they are not one race. SE geometry (small: DenseSmall / Variable / HiFi; publication: Dense / Variable / Long / HiFi) is the occupancy and efficiency analog of count/stats. Pair layout is `--paired` vs `--interleaved` on the same mates. Name policy is SRA-style paired names vs Casava `1:N:0:` / `2:N:0:` vs `@id/1` / `@id/2` on the same MiniSeq sequences. Concat gzip is two DenseSmall members, timed only for z-fastq ISA-L vs native. External validators (`fq lint --lint-mode panic`, `fastQValidator --minReadLen 0`, `seqfu check --deep --quiet`, `fqtools -d -a -u -l -q s validate`) are timed only on positive workloads they accept; fixture disagreement is recorded and does not fail the run. SeqKit, seqtk, Needletail, Helicase, fastp, and BBTools are not timed here.
 
 Sample `--small-real` uses the small SE, paired, and interleaved rows, each timed as `--fraction 0.1` and `--count 1000` with seed 11. The showcase is four families so they are not one race: SE fraction, SE exact-count (occupancy on each, separately), pair-layout fraction, and pair-layout count. seqtk `sample` / `sample -2` is the screened SE exact reference (LF, nonempty, bare plus; not Dense named-plus). Descriptive timed peers are SeqKit, Rasusa, `fq subsample`, fqkit (exact SE only), IRMA Core (plain SE and paired only), and BBTools `reformat.sh` (hatched; JVM RSS omitted from occupancy). SeqKit RSS is the Go image and is omitted from occupancy. Fasten is not timed (stdin-only, no seed). IRMA gzip is probed and not timed: gzip and plain select different records. IRMA interleaved is not timed: one file is SE records, not pair units. File-writing peers sink to `/dev/null`.
+
+Interleave `--small-real` uses DenseSmall + PairSmallR2; publication uses PairR1 + PairR2. One family: two mate files → validated interleaved stdout. Casava names, slash names, and mixed gzip are fixtures, not a second race. seqtk `mergepe` is the screened exact layout reference (LF, nonempty, bare plus). Descriptive timed peers are SeqFu `interleave -c` (first-token check, not z-fastq illumina), fqkit `merge`, IRMA Core `xleave` (gzip timed: layout zip, not a sampler RNG), and BBTools `reformat.sh` (hatched; JVM RSS omitted from occupancy; `changequality=f` still rewrote fixture `!!` to `##`). SeqKit `pair` is not timed: two output files, not interleaved stdout. File-writing BBTools is timed with `out=/dev/null`. SeqFu interleave is one process and is included in occupancy.
 
 Timed argv is the tool. Do not wrap in `bash -c` or a pipeline; that measures the shell. Plain vs gzip are separate sections. Gzip throughput is decoded FASTQ MiB/s.
 
@@ -158,6 +164,8 @@ bash bench/shared/download_data.sh --suite check --small
 bash bench/shared/download_data.sh --suite check
 bash bench/shared/download_data.sh --suite sample --small
 bash bench/shared/download_data.sh --suite sample
+bash bench/shared/download_data.sh --suite interleave --small
+bash bench/shared/download_data.sh --suite interleave
 bash bench/shared/download_data.sh --all
 ```
 
