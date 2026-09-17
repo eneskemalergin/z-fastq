@@ -5257,7 +5257,24 @@ fn openDescriptorCount() !usize {
 }
 
 test "[integration] - [input resources]: repeated failures close owned files and preserve borrowed files" {
+    const QuietStderr = struct {
+        fn operate(_: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            if (operation == .file_write_streaming) {
+                const write = operation.file_write_streaming;
+                if (write.file.handle == std.Io.File.stderr().handle) {
+                    var discarded = write.header.len;
+                    for (write.data) |data| discarded += data.len * write.splat;
+                    return .{ .file_write_streaming = discarded };
+                }
+            }
+            return std.testing.io.operate(operation);
+        }
+    };
+
     const io = std.testing.io;
+    var quiet_vtable = io.vtable.*;
+    quiet_vtable.operate = QuietStderr.operate;
+    const quiet_io = std.Io{ .userdata = io.userdata, .vtable = &quiet_vtable };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "r1", .data = "@a/1\nA\n+\n!\n" });
@@ -5305,7 +5322,7 @@ test "[integration] - [input resources]: repeated failures close owned files and
         try std.testing.expectEqual(@as(u1, 1), failure.command.input_index);
         try std.testing.expectEqualStrings("io_error", failure.command.details.code);
         try std.testing.expectEqual(@as(usize, 0), sink.written().len);
-        try std.testing.expectEqual(@as(u8, 3), runDeinterleave(io, std.testing.allocator, &.{path}, output_path, path, .{
+        try std.testing.expectEqual(@as(u8, 3), runDeinterleave(quiet_io, std.testing.allocator, &.{path}, output_path, path, .{
             .max_line_bytes = 8192,
             .alphabet = .iupac,
             .pair_name_policy = .illumina,
