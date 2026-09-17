@@ -1604,15 +1604,18 @@ pub fn writeCanonicalRecordSpan(writer: *Writer, span: []const u8) WriteError!vo
 }
 
 fn writeRecordFields(writer: *Writer, record: Record) WriteError!void {
-    try writer.sink.write("@");
-    try writer.sink.write(record.header);
-    try writer.sink.write("\n");
-    try writer.sink.write(record.sequence);
-    try writer.sink.write("\n+");
-    try writer.sink.write(record.plus);
-    try writer.sink.write("\n");
-    try writer.sink.write(record.quality);
-    try writer.sink.write("\n");
+    const fields = [_][]const u8{
+        "@",
+        record.header,
+        "\n",
+        record.sequence,
+        "\n+",
+        record.plus,
+        "\n",
+        record.quality,
+        "\n",
+    };
+    try writer.sink.writeVec(&fields);
 }
 
 fn isWritableField(bytes: []const u8) bool {

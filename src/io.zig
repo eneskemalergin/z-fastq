@@ -51,11 +51,17 @@ pub const ByteSink = struct {
 
     pub const VTable = struct {
         write: *const fn (ctx: *anyopaque, data: []const u8) WriteError!void,
+        writeVec: ?*const fn (ctx: *anyopaque, data: []const []const u8) WriteError!void = null,
         flush: ?*const fn (ctx: *anyopaque) WriteError!void = null,
     };
 
     pub fn write(self: *const ByteSink, data: []const u8) WriteError!void {
         return self.vtable.write(self.ctx, data);
+    }
+
+    pub fn writeVec(self: *const ByteSink, data: []const []const u8) WriteError!void {
+        if (self.vtable.writeVec) |write_vec| return write_vec(self.ctx, data);
+        for (data) |bytes| try self.write(bytes);
     }
 
     pub fn flush(self: *const ByteSink) WriteError!void {
@@ -529,12 +535,37 @@ pub const WriterSink = struct {
 
 const WRITER_SINK_VTABLE = ByteSink.VTable{
     .write = writerWrite,
+    .writeVec = writerWriteVec,
     .flush = writerFlush,
 };
 
 fn writerWrite(ctx: *anyopaque, data: []const u8) WriteError!void {
     const self: *WriterSink = @ptrCast(@alignCast(ctx));
     self.writer.writeAll(data) catch return error.WriteFailed;
+}
+
+fn writerWriteVec(ctx: *anyopaque, data: []const []const u8) WriteError!void {
+    const self: *WriterSink = @ptrCast(@alignCast(ctx));
+    writeVecToWriter(self.writer, data) catch return error.WriteFailed;
+}
+
+fn writeVecToWriter(writer: *std.Io.Writer, data: []const []const u8) std.Io.Writer.Error!void {
+    if (data.len == 0) return;
+
+    var total: usize = 0;
+    for (data) |bytes| {
+        total = std.math.add(usize, total, bytes.len) catch {
+            for (data) |fallback_bytes| try writer.writeAll(fallback_bytes);
+            return;
+        };
+    }
+
+    if (total <= writer.unusedCapacityLen()) {
+        _ = try writer.writeVec(data);
+        return;
+    }
+
+    for (data) |bytes| try writer.writeAll(bytes);
 }
 
 fn writerFlush(ctx: *anyopaque) WriteError!void {
@@ -564,12 +595,18 @@ pub const FileSink = struct {
 
 const FILE_SINK_VTABLE = ByteSink.VTable{
     .write = fileSinkWrite,
+    .writeVec = fileSinkWriteVec,
     .flush = fileSinkFlush,
 };
 
 fn fileSinkWrite(ctx: *anyopaque, data: []const u8) WriteError!void {
     const self: *FileSink = @ptrCast(@alignCast(ctx));
     self.file_writer.interface.writeAll(data) catch return error.WriteFailed;
+}
+
+fn fileSinkWriteVec(ctx: *anyopaque, data: []const []const u8) WriteError!void {
+    const self: *FileSink = @ptrCast(@alignCast(ctx));
+    writeVecToWriter(&self.file_writer.interface, data) catch return error.WriteFailed;
 }
 
 fn fileSinkFlush(ctx: *anyopaque) WriteError!void {
