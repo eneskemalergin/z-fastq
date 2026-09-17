@@ -444,7 +444,7 @@ pub const OwnedRecord = struct {
 };
 
 fn firstToken(header: []const u8) []const u8 {
-    const end = std.mem.indexOfAny(u8, header, "\t ") orelse header.len;
+    const end = std.mem.findAny(u8, header, "\t ") orelse header.len;
     return header[0..end];
 }
 
@@ -1138,7 +1138,7 @@ pub const Reader = struct {
         if (self.cursor == 0) return;
 
         const tail_len = self.fill_end - self.cursor;
-        std.mem.copyForwards(u8, self.buf[0..tail_len], self.buf[self.cursor..self.fill_end]);
+        @memmove(self.buf[0..tail_len], self.buf[self.cursor..self.fill_end]);
         self.fill_end = tail_len;
         self.cursor = 0;
     }
@@ -1200,7 +1200,7 @@ pub const Reader = struct {
         while (true) {
             if (self.cursor < self.fill_end) {
                 const haystack = self.buf[self.cursor..self.fill_end];
-                if (std.mem.indexOfScalar(u8, haystack, '\n')) |rel| {
+                if (std.mem.findScalar(u8, haystack, '\n')) |rel| {
                     if (retain) {
                         try self.appendLineBytes(field_index, content_start, haystack[0..rel], true);
                     } else {
@@ -1616,7 +1616,7 @@ fn writeRecordFields(writer: *Writer, record: Record) WriteError!void {
 }
 
 fn isWritableField(bytes: []const u8) bool {
-    return std.mem.indexOfScalar(u8, bytes, '\n') == null and
+    return std.mem.findScalar(u8, bytes, '\n') == null and
         (bytes.len == 0 or bytes[bytes.len - 1] != '\r');
 }
 
@@ -2529,7 +2529,7 @@ test "[property] - [reader]: structural masks match scalar line boundaries" {
             var expected: [4]usize = undefined;
             var search_start: usize = 0;
             for (&expected) |*line_end| {
-                const relative = std.mem.indexOfScalar(
+                const relative = std.mem.findScalar(
                     u8,
                     input[search_start..],
                     '\n',

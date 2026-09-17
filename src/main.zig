@@ -4678,7 +4678,7 @@ test "[failure] - [exact sample]: selection allocation failure precedes later bl
             "@two\nC\n+\n#\n" ++
             "@bad\nG\nx\n$\n",
     });
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(
         &path_buffer,
         ".zig-cache/tmp/{s}/records.fastq",
@@ -4717,7 +4717,7 @@ test "[failure] - [exact sample]: final record-count change keeps a valid prefix
         defer file.close(io);
         try std.Io.File.writeStreamingAll(file, io, "@one\nA\n+\n!\n");
     }
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(
         &path_buffer,
         ".zig-cache/tmp/{s}/{s}",
@@ -4811,7 +4811,7 @@ test "[failure] - [exact sample]: a FIFO replacement reports input changed on re
         .flags = .{ .nonblocking = true },
     };
     defer keeper.close(io);
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(
         &path_buffer,
         ".zig-cache/tmp/{s}/{s}",
@@ -4870,19 +4870,19 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
         .data = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n",
     });
 
-    var path1_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path1_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path1 = try std.fmt.bufPrint(
         &path1_buffer,
         ".zig-cache/tmp/{s}/r1.fastq",
         .{tmp.sub_path},
     );
-    var path2_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path2_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path2 = try std.fmt.bufPrint(
         &path2_buffer,
         ".zig-cache/tmp/{s}/r2.fastq",
         .{tmp.sub_path},
     );
-    var pairs_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var pairs_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const pairs_path = try std.fmt.bufPrint(
         &pairs_path_buffer,
         ".zig-cache/tmp/{s}/pairs.fastq",
@@ -4963,19 +4963,19 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path1_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path1_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path1 = try std.fmt.bufPrint(
         &path1_buffer,
         ".zig-cache/tmp/{s}/r1.fastq",
         .{tmp.sub_path},
     );
-    var path2_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path2_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path2 = try std.fmt.bufPrint(
         &path2_buffer,
         ".zig-cache/tmp/{s}/r2.fastq",
         .{tmp.sub_path},
     );
-    var pairs_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var pairs_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const pairs_path = try std.fmt.bufPrint(
         &pairs_path_buffer,
         ".zig-cache/tmp/{s}/pairs.fastq",
@@ -5475,7 +5475,7 @@ test "[edge] - [single fraction sample]: fraction zero avoids allocation in the 
     try input.appendSlice(std.testing.allocator, "@large ");
     try input.appendNTimes(std.testing.allocator, 'x', io_layer.DEFAULT_READER_BUFFER_BYTES + 1);
     const header_len = input.items.len;
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(
         &path_buffer,
         ".zig-cache/tmp/{s}/input.fastq",
@@ -5533,7 +5533,7 @@ test "[edge] - [paired fraction sample]: fraction zero keeps buffered mate one b
         .sub_path = "pairs.fastq",
         .data = input_bytes.items,
     });
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(
         &path_buffer,
         ".zig-cache/tmp/{s}/pairs.fastq",
@@ -5814,7 +5814,7 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
         }
     }
 
-    const split = std.mem.indexOf(u8, input.items, "@pair/2").?;
+    const split = std.mem.find(u8, input.items, "@pair/2").?;
     for (0..5) |failure_mode| {
         if (failure_mode == 1) input.items[input.items.len - 2] = ' ';
         if (failure_mode == 2) input.items[split + 1] = 'x';
@@ -5855,7 +5855,7 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
 fn exerciseRetainedPairAllocations(allocator: std.mem.Allocator, input: []const u8) !void {
     const output = try std.testing.allocator.alloc(u8, input.len);
     defer std.testing.allocator.free(output);
-    const split = std.mem.indexOf(u8, input, "@pair/2").?;
+    const split = std.mem.find(u8, input, "@pair/2").?;
     var source = io_layer.SliceSource.init(input);
     var sink1 = io_layer.SliceSink.init(output[0..split]);
     var sink2 = io_layer.SliceSink.init(output[split..]);

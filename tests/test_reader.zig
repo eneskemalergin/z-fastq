@@ -161,7 +161,7 @@ test "[property] - [record validation]: alphabet policies classify every byte" {
                 .plus = "",
                 .quality = "!",
             }, .{ .alphabet = policy.alphabet });
-            const accepted = std.mem.indexOfScalar(u8, policy.accepted, sequence[0]) != null;
+            const accepted = std.mem.findScalar(u8, policy.accepted, sequence[0]) != null;
             try std.testing.expectEqual(accepted, details == null);
             if (details) |semantic_error| {
                 try std.testing.expectEqual(

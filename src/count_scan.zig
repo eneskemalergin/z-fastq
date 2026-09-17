@@ -294,7 +294,7 @@ pub const Scanner = struct {
         var pos: usize = 0;
 
         while (pos < data.len) {
-            const rel = std.mem.indexOfScalar(u8, data[pos..], '\n');
+            const rel = std.mem.findScalar(u8, data[pos..], '\n');
             if (rel == null) {
                 try self.consumeLineBytes(data[pos..]);
                 self.byte_offset = try progressAfter(self.byte_offset, data.len - pos);
