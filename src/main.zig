@@ -1615,12 +1615,11 @@ const RecordInput = struct {
     }
 };
 
-// Keep the inlined vector loop stable when unrelated CLI code changes size.
 fn collectStats(
     allocator: std.mem.Allocator,
     source: zfastq.io.ByteSource,
     options: InputOptions,
-) align(4096) StatsOutcome {
+) StatsOutcome {
     var reader = zfastq.Reader.init(
         allocator,
         source,
@@ -3633,7 +3632,7 @@ fn deinterleaveSource(
     writer2: *zfastq.Writer,
     staging_limit: usize,
     options: DeinterleaveOptions,
-) align(4096) DeinterleaveWriteError!?PairCommandFailure {
+) DeinterleaveWriteError!?PairCommandFailure {
     var reader = zfastq.Reader.init(
         allocator,
         source,
