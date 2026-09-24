@@ -2112,6 +2112,23 @@ fn runPairSampleCommand(
         },
     }
 
+    const needs_staging = options.pair_mode == .interleaved and switch (mode) {
+        .fraction => |fraction| fraction != .none,
+        .count => |count| count != 0,
+    };
+    const staging_limit = if (needs_staging)
+        deinterleaveStagingLimit(options.max_line_bytes) catch {
+            if (canReportInputFailure(io, null)) {
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: sample record staging size exceeds supported limit\n",
+                ) catch {};
+            }
+            return 4;
+        }
+    else
+        0;
     options.output_identity = stdoutFileIdentity(io) catch {
         if (canReportInputFailure(io, null)) printOutputFailure(io);
         return 3;
@@ -2122,18 +2139,6 @@ fn runPairSampleCommand(
     var writer = zfastq.Writer.init(sink_adapter.byteSink());
     const failure = (switch (mode) {
         .fraction => |fraction| blk: {
-            const staging_limit = if (options.pair_mode == .interleaved and
-                fraction != .none)
-                deinterleaveStagingLimit(options.max_line_bytes) catch {
-                    std.Io.File.writeStreamingAll(
-                        .stderr(),
-                        io,
-                        "error: sample record staging size exceeds supported limit\n",
-                    ) catch {};
-                    return 4;
-                }
-            else
-                0;
             var selector = sampling.Selector.init(fraction, options.seed);
             var output_selector: PairOutputSelector = .{ .fraction = &selector };
             break :blk switch (options.pair_mode) {
@@ -2162,6 +2167,7 @@ fn runPairSampleCommand(
             inputs,
             &writer,
             count,
+            staging_limit,
             options,
         ),
     }) catch {
@@ -2820,6 +2826,7 @@ fn sampleExactPairs(
     inputs: []const []const u8,
     writer: *zfastq.Writer,
     count: u64,
+    staging_limit: usize,
     options: SampleOptions,
 ) error{WriteFailed}!?PairCommandFailure {
     var selector = sampling.ExactSelector.init(count, options.seed);
@@ -2841,6 +2848,7 @@ fn sampleExactPairs(
             .empty,
             completed.snapshots,
             selector.record_count,
+            staging_limit,
             options,
         ),
         .indexes => |indexes| sampleExactPairSecondPass(
@@ -2852,6 +2860,7 @@ fn sampleExactPairs(
             indexes,
             completed.snapshots,
             selector.record_count,
+            staging_limit,
             options,
         ),
     };
@@ -2969,6 +2978,7 @@ fn sampleExactPairSecondPass(
     indexes: sampling.ExactIndexes,
     snapshots: ExactPairSnapshots,
     expected_count: u64,
+    staging_limit: usize,
     options: SampleOptions,
 ) error{WriteFailed}!?PairCommandFailure {
     return switch (snapshots) {
@@ -2992,6 +3002,7 @@ fn sampleExactPairSecondPass(
             indexes,
             snapshot,
             expected_count,
+            staging_limit,
             options,
         ),
     };
@@ -3150,16 +3161,9 @@ fn sampleExactInterleavedSecondPass(
     indexes: sampling.ExactIndexes,
     snapshot: FileSnapshot,
     expected_count: u64,
+    staging_limit: usize,
     options: SampleOptions,
 ) error{WriteFailed}!?PairCommandFailure {
-    const staging_limit = deinterleaveStagingLimit(options.max_line_bytes) catch {
-        return pairCommandFailure(
-            0,
-            "arithmetic_limit",
-            "record staging size exceeds supported limit",
-            4,
-        );
-    };
     var input: RecordInput = undefined;
     switch (initExactInput(&input, io, path, snapshot, options.output_identity)) {
         .failure => |failure| return .{ .command = .{ .input_index = 0, .details = failure } },
@@ -5179,6 +5183,7 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
         .empty,
         changed_pair_snapshot,
         1,
+        try deinterleaveStagingLimit(zfastq.limits.DEFAULT_MAX_LINE_BYTES),
         .{
             .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
             .alphabet = .iupac,
@@ -5272,6 +5277,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         .empty,
         pair_snapshot,
         1,
+        try deinterleaveStagingLimit(zfastq.limits.DEFAULT_MAX_LINE_BYTES),
         .{
             .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
             .alphabet = .iupac,
@@ -5324,6 +5330,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         .empty,
         mismatch_pair_snapshot,
         1,
+        try deinterleaveStagingLimit(zfastq.limits.DEFAULT_MAX_LINE_BYTES),
         .{
             .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
             .alphabet = .iupac,
@@ -5471,7 +5478,7 @@ fn exerciseExactAllocations(allocator: std.mem.Allocator) !void {
                 }
             } else {
                 const inputs = if (mode == .paired) paths[0..2] else paths[2..3];
-                if (try sampleExactPairs(io, allocator, inputs, &writer, count, options)) |failure| {
+                if (try sampleExactPairs(io, allocator, inputs, &writer, count, try deinterleaveStagingLimit(options.max_line_bytes), options)) |failure| {
                     try std.testing.expectEqual(descriptors, try openDescriptorCount());
                     return pairAllocationFailure(failure);
                 }
@@ -5627,7 +5634,7 @@ test "[integration] - [output aliases]: rejection closes inputs on both exact pa
         const single_failure = (try sampleExactSecondPass(true, io, allocator, paths[0], &writer, .empty, snapshots[0], 1, options)).?;
         try std.testing.expectEqualStrings("input_changed", single_failure.code);
         try std.testing.expectEqual(@as(u8, 3), single_failure.exit_code);
-        const interleaved_failure = (try sampleExactInterleavedSecondPass(true, io, allocator, paths[0], &writer, .empty, snapshots[0], 1, options)).?;
+        const interleaved_failure = (try sampleExactInterleavedSecondPass(true, io, allocator, paths[0], &writer, .empty, snapshots[0], 1, try deinterleaveStagingLimit(options.max_line_bytes), options)).?;
         try std.testing.expectEqualStrings("input_changed", interleaved_failure.command.details.code);
         try std.testing.expectEqual(@as(u8, 3), interleaved_failure.exitCode());
         try std.testing.expectEqual(descriptors, try openDescriptorCount());
