@@ -930,9 +930,11 @@ run_contract_tests() {
                 "stderr contains P001" "stderr=$(summarize_output "$err")"
     done
 
-    log_verify "--- odd count leaves unflushed empty outputs ---"
+    log_verify "--- odd count preserves earlier complete pairs ---"
     local odd="$CHECK_DIR/p002.interleaved.fastq"
     printf '@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n@extra/1\nA\n+\n!\n' >"$odd"
+    printf '@ok/1\nA\n+\n!\n' >"$CHECK_DIR/p002.expected.r1"
+    printf '@ok/2\nT\n+\n#\n' >"$CHECK_DIR/p002.expected.r2"
     for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
         local tag out1 out2 err
         tag="$(basename "$binary")"
@@ -942,7 +944,8 @@ run_contract_tests() {
             "$binary" deinterleave --out1 "$out1" --out2 "$out2" "$odd")"
         [[ "$status" == 1 ]] ||
             deinterleave_fail "$tag P002 extra R1 exit" "exit 1" "exit=$status"
-        expect_empty_files "$tag P002 extra R1 outputs" "$out1" "$out2"
+        cmp_or_fail "$tag P002 earlier R1" "$CHECK_DIR/p002.expected.r1" "$out1"
+        cmp_or_fail "$tag P002 earlier R2" "$CHECK_DIR/p002.expected.r2" "$out2"
         grep -Fq 'P002' "$err" ||
             deinterleave_fail "$tag P002 extra R1 diagnostic" \
                 "stderr contains P002" "stderr=$(summarize_output "$err")"

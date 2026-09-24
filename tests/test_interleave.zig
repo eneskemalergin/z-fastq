@@ -226,6 +226,44 @@ test "[cli] - [interleave]: validation precedence protects the failing pair" {
     );
 }
 
+test "[cli] - [interleave]: later failure preserves complete pairs beyond the output buffer" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const r1_path = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    var r1: std.ArrayList(u8) = .empty;
+    var r2: std.ArrayList(u8) = .empty;
+    var expected: std.ArrayList(u8) = .empty;
+    for (0..4096) |_| {
+        try r1.appendSlice(allocator, "@ok/1\nA\n+\n!\n");
+        try r2.appendSlice(allocator, "@ok/2\nT\n+\n#\n");
+        try expected.appendSlice(allocator, FIRST_PAIR);
+    }
+    try std.testing.expect(expected.items.len > 64 * 1024);
+    const offset = r2.items.len + 7;
+    try r1.appendSlice(allocator, "@bad/1\nA\n+\n!\n");
+    try r2.appendSlice(allocator, "@bad/2\n.\n+\n#\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = r1.items });
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = r2.items });
+    const expected_stderr = try std.fmt.allocPrint(
+        allocator,
+        "error: {s}: S002: sequence byte is outside the selected alphabet " ++
+            "(record 4096, line 2, offset {d})\n",
+        .{ r2_path, offset },
+    );
+
+    try cli.expectResult(
+        try cli.run(allocator, &.{ "interleave", r1_path, r2_path }),
+        1,
+        expected.items,
+        expected_stderr,
+    );
+}
+
 test "[cli] - [interleave]: pair mismatches and unequal counts are exact" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -3567,15 +3567,15 @@ fn runDeinterleave(
     };
     if (failure) |details| {
         printPairCommandFailure(io, inputs, .interleaved, details);
-        return details.exitCode();
     }
 
+    var exit_code: u8 = if (failure) |details| details.exitCode() else 0;
     flushDeinterleaveWriters(&output1.writer, &output2.writer) catch |err| {
         const failed_output = if (err == error.Output1WriteFailed) &output1 else &output2;
         printPathError(io, failed_output.path, "I/O error");
-        return 3;
+        exit_code = @max(exit_code, 3);
     };
-    return 0;
+    return exit_code;
 }
 
 fn validateDeinterleaveArguments(
@@ -5691,6 +5691,147 @@ test "[failure] - [deinterleave]: flushes outputs in order and stops after failu
     );
     try std.testing.expectEqual(@as(usize, 2), sink1.flush_count);
     try std.testing.expectEqual(@as(usize, 1), sink2.flush_count);
+}
+
+test "[integration] - [deinterleave]: output flush failures preserve diagnostics and exit precedence" {
+    const Capture = struct {
+        dir: std.Io.Dir,
+        stderr: std.Io.Writer,
+        fail_write: usize,
+        writes: usize = 0,
+        closed: usize = 0,
+
+        fn openFile(
+            ctx: ?*anyopaque,
+            _: std.Io.Dir,
+            path: []const u8,
+            options: std.Io.Dir.OpenFileOptions,
+        ) std.Io.File.OpenError!std.Io.File {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            return self.dir.openFile(std.testing.io, path, options);
+        }
+
+        fn createFile(
+            ctx: ?*anyopaque,
+            _: std.Io.Dir,
+            path: []const u8,
+            options: std.Io.Dir.CreateFileOptions,
+        ) std.Io.File.OpenError!std.Io.File {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            return self.dir.createFile(std.testing.io, path, options);
+        }
+
+        fn closeFiles(ctx: ?*anyopaque, files: []const std.Io.File) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            for (files) |file| file.close(std.testing.io);
+            self.closed += files.len;
+        }
+
+        fn readPositional(
+            _: ?*anyopaque,
+            file: std.Io.File,
+            data: []const []u8,
+            offset: u64,
+        ) std.Io.File.ReadPositionalError!usize {
+            const io = std.testing.io;
+            return io.vtable.fileReadPositional(io.userdata, file, data, offset);
+        }
+
+        fn writePositional(
+            ctx: ?*anyopaque,
+            file: std.Io.File,
+            header: []const u8,
+            data: []const []const u8,
+            splat: usize,
+            offset: u64,
+        ) std.Io.File.WritePositionalError!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.writes += 1;
+            if (self.writes == self.fail_write) return error.NoSpaceLeft;
+            const io = std.testing.io;
+            return io.vtable.fileWritePositional(io.userdata, file, header, data, splat, offset);
+        }
+
+        fn operate(ctx: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (operation == .file_write_streaming) {
+                const write = operation.file_write_streaming;
+                if (write.file.handle == std.Io.File.stderr().handle) {
+                    return .{ .file_write_streaming = self.stderr.writeSplatHeader(
+                        write.header,
+                        write.data,
+                        write.splat,
+                    ) catch error.NoSpaceLeft };
+                }
+            }
+            return std.testing.io.operate(operation);
+        }
+    };
+
+    const r1 = "@ok/1\nA\n+\n!\n";
+    const r2 = "@ok/2\nT\n+\n#\n";
+    const cases = [_]struct { tail: []const u8, exit_code: u8, stderr: []const u8 }{
+        .{ .tail = "", .exit_code = 0, .stderr = "" },
+        .{
+            .tail = "@odd/1\nA\n+\n!\n",
+            .exit_code = 1,
+            .stderr = "error: input: P002: paired input is missing a mate " ++
+                "(pair 1, remaining R1, last R1 record 2, last R2 record 1)\n",
+        },
+        .{
+            .tail = "@too-long-header\nA\n+\n!\n",
+            .exit_code = 4,
+            .stderr = "error: input: line length limit exceeded\n",
+        },
+    };
+    var vtable = std.Io.failing.vtable.*;
+    vtable.dirOpenFile = Capture.openFile;
+    vtable.dirCreateFile = Capture.createFile;
+    vtable.fileClose = Capture.closeFiles;
+    vtable.fileReadPositional = Capture.readPositional;
+    vtable.fileWritePositional = Capture.writePositional;
+    vtable.operate = Capture.operate;
+    for (cases) |case| {
+        for (0..3) |fail_write| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            const bytes = try std.mem.concat(allocator, u8, &.{ r1, r2, case.tail });
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input", .data = bytes });
+            var stderr_buffer: [512]u8 = undefined;
+            var capture: Capture = .{
+                .dir = tmp.dir,
+                .stderr = .fixed(&stderr_buffer),
+                .fail_write = fail_write,
+            };
+
+            const status = runDeinterleave(
+                .{ .userdata = &capture, .vtable = &vtable },
+                std.testing.allocator,
+                &.{"input"},
+                "out1",
+                "out2",
+                .{ .max_line_bytes = 8, .alphabet = .iupac, .pair_name_policy = .illumina },
+            );
+
+            const expected_status = if (fail_write == 0) case.exit_code else @max(case.exit_code, 3);
+            const expected_stderr = if (fail_write == 0) case.stderr else try std.fmt.allocPrint(
+                allocator,
+                "{s}error: out{d}: I/O error\n",
+                .{ case.stderr, fail_write },
+            );
+            try std.testing.expectEqual(expected_status, status);
+            try std.testing.expectEqualStrings(expected_stderr, capture.stderr.buffered());
+            try std.testing.expectEqual(@as(usize, if (fail_write == 1) 1 else 2), capture.writes);
+            try std.testing.expectEqual(@as(usize, 3), capture.closed);
+            const output1 = try tmp.dir.readFileAlloc(std.testing.io, "out1", allocator, .limited(64));
+            const output2 = try tmp.dir.readFileAlloc(std.testing.io, "out2", allocator, .limited(64));
+            try std.testing.expectEqualStrings(if (fail_write == 1) "" else r1, output1);
+            try std.testing.expectEqualStrings(if (fail_write == 0) r2 else "", output2);
+        }
+    }
 }
 
 test "[failure] - [deinterleave]: staging allocation failure emits no output" {

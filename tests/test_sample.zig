@@ -1784,24 +1784,88 @@ test "[cli] - [sample]: every record is validated before selection" {
     );
 }
 
-test "[cli] - [sample]: a later malformed record leaves the selected prefix" {
+test "[cli] - [sample]: a later malformed record preserves output below and above 64 KiB" {
+    for ([_]usize{ 1, 8192 }) |records| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var input: std.ArrayList(u8) = .empty;
+        for (0..records) |_| try input.appendSlice(allocator, "@ok\nA\n+\n!\n");
+        const prefix_len = input.items.len;
+        try input.appendSlice(allocator, "@bad\nA\nx\n!\n");
+        const expected_stderr = try std.fmt.allocPrint(
+            allocator,
+            "error: -: S001: plus line must start with '+' " ++
+                "(record {d}, line 3, offset {d})\n",
+            .{ records, prefix_len + 7 },
+        );
+
+        try cli.expectResult(
+            try cli.runWithStdin(
+                allocator,
+                &.{ "sample", "--fraction", "1", "-" },
+                input.items,
+                if (records == 1) 2 else 4096,
+            ),
+            1,
+            input.items[0..prefix_len],
+            expected_stderr,
+        );
+    }
+}
+
+test "[cli] - [paired sample]: later failures retain complete fraction output beyond the buffer" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    const allocator = arena.allocator();
+    const r1_path = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    const pairs_path = try cli.tempPath(allocator, &tmp.sub_path, "pairs.fastq");
+    var r1: std.ArrayList(u8) = .empty;
+    var r2: std.ArrayList(u8) = .empty;
+    var pairs: std.ArrayList(u8) = .empty;
+    for (0..4096) |index| try appendPair(allocator, &r1, &r2, &pairs, index);
+    const r2_prefix_len = r2.items.len;
+    const prefix_len = pairs.items.len;
+    try std.testing.expect(prefix_len > 64 * 1024);
+    const tail1 = "@bad/1\nA\n+\n!\n";
+    const tail2 = "@bad/2\n.\n+\n#\n";
+    try r1.appendSlice(allocator, tail1);
+    try r2.appendSlice(allocator, tail2);
+    try pairs.appendSlice(allocator, tail1 ++ tail2);
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = r1.items });
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = r2.items });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = pairs.items });
 
-    const result = try cli.runWithStdin(
-        arena.allocator(),
-        &.{ "sample", "--fraction", "1", "-" },
-        "@ok\nA\n+\n!\n@bad\nA\nx\n!\n",
-        2,
-    );
-
-    try cli.expectResult(
-        result,
-        1,
-        "@ok\nA\n+\n!\n",
-        "error: -: S001: plus line must start with '+' " ++
-            "(record 1, line 3, offset 17)\n",
-    );
+    for ([_]bool{ false, true }) |interleaved| {
+        const expected_stderr = try std.fmt.allocPrint(
+            allocator,
+            "error: {s}: S002: sequence byte is outside the selected alphabet " ++
+                "(record {d}, line 2, offset {d})\n",
+            .{
+                if (interleaved) pairs_path else r2_path,
+                @as(usize, if (interleaved) 8193 else 4096),
+                (if (interleaved) prefix_len + tail1.len else r2_prefix_len) + 7,
+            },
+        );
+        for ([_]bool{ false, true }) |exact| {
+            const selection = if (exact) "--count" else "--fraction";
+            const amount = if (exact) "4097" else "1";
+            const args: []const []const u8 = if (interleaved)
+                &.{ "sample", "--interleaved", selection, amount, pairs_path }
+            else
+                &.{ "sample", "--paired", selection, amount, r1_path, r2_path };
+            try cli.expectResult(
+                try cli.run(allocator, args),
+                1,
+                if (exact) "" else pairs.items[0..prefix_len],
+                expected_stderr,
+            );
+        }
+    }
 }
 
 test "[cli] - [sample]: piped input and output make progress together" {

@@ -305,8 +305,8 @@ test "[cli] - [deinterleave]: structural, semantic, pair, and odd-count preceden
         .{input_path},
     );
     try cli.expectResult(try runDeinterleave(allocator, input_path, paths), 1, "", odd);
-    try expectEmptyFile(paths[0]);
-    try expectEmptyFile(paths[1]);
+    try expectFile(allocator, paths[0], "@ok/1\nA\n+\n!\n");
+    try expectFile(allocator, paths[1], "@ok/2\nT\n+\n#\n");
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "input.fastq",
@@ -375,7 +375,52 @@ test "[cli] - [deinterleave]: failed input leaves command-created outputs" {
     try expectEmptyFile(paths[1]);
 }
 
-test "[cli] - [deinterleave]: validation failures leave empty outputs" {
+test "[cli] - [deinterleave]: late gzip failure retains the same complete prefix in both outputs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq.gz");
+    var r1: std.ArrayList(u8) = .empty;
+    var r2: std.ArrayList(u8) = .empty;
+    try appendRecord(allocator, &r1, "ok/1", 'A', '!', 151);
+    try appendRecord(allocator, &r2, "ok/2", 'T', '#', 51);
+    var input: std.ArrayList(u8) = .empty;
+    for (0..2000) |_| {
+        try input.appendSlice(allocator, r1.items);
+        try input.appendSlice(allocator, r2.items);
+    }
+    var gzip: std.ArrayList(u8) = .empty;
+    var offset: usize = 0;
+    while (offset < input.items.len) {
+        const end = @min(offset + 60 * 1024, input.items.len);
+        try cli.appendGzipMember(allocator, &gzip, input.items[offset..end], .{});
+        offset = end;
+    }
+    gzip.items[gzip.items.len - 8] ^= 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq.gz", .data = gzip.items });
+    const paths = try outputPaths(allocator, &tmp.sub_path, "corrupt-prefix");
+    const expected_stderr = try std.fmt.allocPrint(allocator, "error: {s}: I/O error\n", .{input_path});
+
+    try cli.expectResult(try runDeinterleave(allocator, input_path, paths), 3, "", expected_stderr);
+    const output1 = try tmp.dir.readFileAlloc(io, "corrupt-prefix-r1.fastq", allocator, .limited(1024 * 1024));
+    const output2 = try tmp.dir.readFileAlloc(io, "corrupt-prefix-r2.fastq", allocator, .limited(1024 * 1024));
+    try std.testing.expect(output1.len > 64 * 1024);
+    try std.testing.expect(output2.len > 64 * 1024);
+    try std.testing.expectEqual(@as(usize, 0), output1.len % r1.items.len);
+    try std.testing.expectEqual(@as(usize, 0), output2.len % r2.items.len);
+    const pairs = output1.len / r1.items.len;
+    try std.testing.expect(pairs <= 2000);
+    try std.testing.expectEqual(pairs, output2.len / r2.items.len);
+    for (0..pairs) |index| {
+        try std.testing.expectEqualSlices(u8, r1.items, output1[index * r1.items.len ..][0..r1.items.len]);
+        try std.testing.expectEqualSlices(u8, r2.items, output2[index * r2.items.len ..][0..r2.items.len]);
+    }
+}
+
+test "[cli] - [deinterleave]: validation failures in the first pair leave empty outputs" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -435,6 +480,143 @@ test "[cli] - [deinterleave]: validation failures leave empty outputs" {
         );
         try expectEmptyFile(paths[0]);
         try expectEmptyFile(paths[1]);
+    }
+}
+
+test "[cli] - [deinterleave]: later failures preserve complete pairs beyond both output buffers" {
+    const io = std.testing.io;
+    const layouts = [_]struct { pairs: usize, r1_len: usize, r2_len: usize }{
+        .{ .pairs = 2000, .r1_len = 151, .r2_len = 51 },
+        .{ .pairs = 1, .r1_len = 70001, .r2_len = 90001 },
+    };
+    for (layouts) |layout| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+        var r1: std.ArrayList(u8) = .empty;
+        var r2: std.ArrayList(u8) = .empty;
+        var input: std.ArrayList(u8) = .empty;
+        for (0..layout.pairs) |_| {
+            const start1 = r1.items.len;
+            const start2 = r2.items.len;
+            try appendRecord(allocator, &r1, "ok/1", 'A', '!', layout.r1_len);
+            try appendRecord(allocator, &r2, "ok/2", 'T', '#', layout.r2_len);
+            try input.appendSlice(allocator, r1.items[start1..]);
+            try input.appendSlice(allocator, r2.items[start2..]);
+        }
+        try std.testing.expect(r1.items.len > 64 * 1024);
+        try std.testing.expect(r2.items.len > 64 * 1024);
+        const prefix_len = input.items.len;
+        const record_index = 2 * layout.pairs;
+        const cases = [_]struct {
+            tail: []const u8,
+            message: []const u8,
+            record_delta: usize = 0,
+            line: ?u3 = null,
+            offset: usize = 0,
+        }{
+            .{
+                .tail = "@bad/1\nA\nx\n!\n@bad/2\nT\n+\n#\n",
+                .message = "S001: plus line must start with '+'",
+                .line = 3,
+                .offset = 9,
+            },
+            .{
+                .tail = "@bad/1\nA\n+\n!\n@bad/2\n.\n+\n#\n",
+                .message = "S002: sequence byte is outside the selected alphabet",
+                .record_delta = 1,
+                .line = 2,
+                .offset = 20,
+            },
+            .{
+                .tail = "bad/1\nA\n+\n!\n",
+                .message = "S003: header line must start with '@' and contain a nonempty identifier",
+                .line = 1,
+            },
+            .{
+                .tail = "@bad/1\nA\n+\n",
+                .message = "S004: unexpected end of file in quality line",
+                .line = 4,
+                .offset = 11,
+            },
+            .{
+                .tail = "@bad/1\nAA\n+\n!\n@bad/2\nT\n+\n#\n",
+                .message = "S005: sequence and quality lengths differ",
+                .line = 4,
+                .offset = 12,
+            },
+            .{
+                .tail = "@bad/1\nA\n+\n!\n@bad/2\nT\n+\n \n",
+                .message = "S006: quality byte must be ASCII 33 through 126",
+                .record_delta = 1,
+                .line = 4,
+                .offset = 24,
+            },
+            .{
+                .tail = "@left/1\nA\n+\n!\n@right/2\nT\n+\n#\n",
+                .message = try std.fmt.allocPrint(
+                    allocator,
+                    "P001: paired identifiers or mate markers do not match (pair {d})\n" ++
+                        "  R1: input={s}, record={d}, offset={d}, first_token=left/1 " ++
+                        "[length=6, truncated=false], normalized_id=left " ++
+                        "[length=4, truncated=false], mate_markers=1\n" ++
+                        "  R2: input={s}, record={d}, offset={d}, first_token=right/2 " ++
+                        "[length=7, truncated=false], normalized_id=right " ++
+                        "[length=5, truncated=false], mate_markers=2",
+                    .{
+                        layout.pairs, input_path,       record_index,    prefix_len,
+                        input_path,   record_index + 1, prefix_len + 14,
+                    },
+                ),
+            },
+            .{
+                .tail = "@odd/1\nA\n+\n!\n",
+                .message = try std.fmt.allocPrint(
+                    allocator,
+                    "P002: paired input is missing a mate " ++
+                        "(pair {d}, remaining R1, last R1 record {d}, last R2 record {d})",
+                    .{ layout.pairs, record_index, record_index - 1 },
+                ),
+            },
+            .{
+                .tail = "@bad/1\nA\n+\n!\n@bad/2\nT\n+\r\r\n#\n",
+                .message = "record fields ending in CR cannot be written with LF endings",
+            },
+        };
+        for (cases) |case| {
+            input.shrinkRetainingCapacity(prefix_len);
+            try input.appendSlice(allocator, case.tail);
+            const expected_stderr = if (case.line) |line|
+                try std.fmt.allocPrint(
+                    allocator,
+                    "error: {s}: {s} (record {d}, line {d}, offset {d})\n",
+                    .{
+                        input_path, case.message,             record_index + case.record_delta,
+                        line,       prefix_len + case.offset,
+                    },
+                )
+            else
+                try std.fmt.allocPrint(allocator, "error: {s}: {s}\n", .{ input_path, case.message });
+            var gzip: std.ArrayList(u8) = .empty;
+            var offset: usize = 0;
+            while (offset < input.items.len) {
+                const end = @min(offset + 60 * 1024, input.items.len);
+                try cli.appendGzipMember(allocator, &gzip, input.items[offset..end], .{});
+                offset = end;
+            }
+            for ([_][]const u8{ input.items, gzip.items }) |bytes| {
+                try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = bytes });
+                const paths = try outputPaths(allocator, &tmp.sub_path, "prefix");
+                try cli.expectResult(try runDeinterleave(allocator, input_path, paths), 1, "", expected_stderr);
+                try expectFile(allocator, paths[0], r1.items);
+                try expectFile(allocator, paths[1], r2.items);
+                try tmp.dir.deleteFile(io, "prefix-r1.fastq");
+                try tmp.dir.deleteFile(io, "prefix-r2.fastq");
+            }
+        }
     }
 }
 
@@ -983,6 +1165,7 @@ fn expectFile(
         allocator,
         .limited(4 * 1024 * 1024),
     );
+    try std.testing.expectEqual(expected.len, actual.len);
     try std.testing.expectEqualSlices(u8, expected, actual);
 }
 

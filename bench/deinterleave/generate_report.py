@@ -1224,7 +1224,7 @@ def md_capability(manifest: dict) -> str:
     )
     return join(
         [
-            "A valid z-fastq deinterleave reads one interleaved file, checks consecutive pair names (default `illumina`, optional `exact`), and writes R1 then R2 to two exclusive-create files as LF FASTQ. Empty input yields two empty files. On these small fixtures, P001 and P002 leave empty outputs because the write buffer is not flushed on failure. seqtk `seq -l 0 -1`/`-2` is the screened positional layout reference (byte-identical on LF, nonempty, bare plus) and is not timed. Other splitters are descriptive: they are timed only when they exit 0 on the catalog interleaved file they claim to support.",
+            "A valid z-fastq deinterleave reads one interleaved file, checks consecutive pair names (default `illumina`, optional `exact`), and writes R1 then R2 to two exclusive-create files as LF FASTQ. Empty input yields two empty files. The run's verification log records what remains after a validation failure. An output failure can leave unequal counts or a partial record. seqtk `seq -l 0 -1`/`-2` is the screened positional layout reference (byte-identical on LF, nonempty, bare plus) and is not timed. Other splitters are descriptive: they are timed only when they exit 0 on the catalog interleaved file they claim to support.",
             "",
             to_markdown_aligned(peers, index=False),
             "",
@@ -1276,9 +1276,9 @@ def md_correctness(manifest: dict) -> str:
     else:
         body = (
             f"Status: **{status}**. Both z-fastq binaries passed empty input, slash and Casava names, "
-            "gzip, CRLF→LF, `--pair-names exact` on identical tokens, stdin, exact-on-slash exit 1 with empty outputs, "
+            "gzip, CRLF to LF, `--pair-names exact` on identical tokens, stdin, exact-on-slash exit 1 with empty outputs, "
             "arity, stdout `--out1`/`--out2`, identical output paths, `/dev/null` twice, `--json`, `--paired`, invalid `--pair-names` / `--alphabet`, "
-            "existing `--out1` / `--out2` / input-as-output refusal, P001 empty outputs, and P002 empty outputs on these small fixtures (unflushed). "
+            "existing `--out1` / `--out2` / input-as-output refusal, and the P001 and P002 cases recorded in the verification log. "
             "CRLF, gzip slash, native gzip slash, and stdin were byte-compared to ISA-L LF slash mates. "
             "ISA-L matched seqtk `seq -l 0 -1`/`-2` on slash, CRLF slash, gzip slash, empty input, and the catalog file "
             f"(this suite is bare plus). Catalog gzip mates matched catalog plain mates, which matched {catalog_mates}. "
