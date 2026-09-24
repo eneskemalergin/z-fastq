@@ -317,6 +317,14 @@ pub fn runWithClosedStdout(
     );
 }
 
+pub fn runWithStdinFile(
+    allocator: std.mem.Allocator,
+    command_args: []const []const u8,
+    file: std.Io.File,
+) !CommandResult {
+    return runInstalled(allocator, command_args, .{ .file = file }, .capture, PROCESS_TIMEOUT);
+}
+
 pub fn runWithClosedStdin(
     allocator: std.mem.Allocator,
     command_args: []const []const u8,
@@ -379,6 +387,7 @@ pub fn finishSpawned(
 const StdinMode = union(enum) {
     closed,
     stalled,
+    file: std.Io.File,
     data: struct {
         bytes: []const u8,
         chunk_len: usize,
@@ -411,6 +420,7 @@ fn runInstalled(
         .stdin = switch (stdin_mode) {
             .closed => .close,
             .stalled, .data => .pipe,
+            .file => |file| .{ .file = file },
         },
         .stdout = switch (stdout_mode) {
             .capture => .pipe,
@@ -427,7 +437,7 @@ fn runInstalled(
     var stdin_group: std.Io.Group = .init;
     defer stdin_group.cancel(io);
     const has_stdin_writer = switch (stdin_mode) {
-        .closed, .stalled => false,
+        .closed, .stalled, .file => false,
         .data => |data| writer: {
             const child_stdin = proc.stdin.?;
             proc.stdin = null;

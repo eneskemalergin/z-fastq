@@ -1619,6 +1619,60 @@ test "[cli] - [paired sample]: refill-spanning mismatch preserves both identitie
     );
 }
 
+test "[cli] - [paired sample]: aliases reject even when selecting zero pairs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const copy = try cli.tempPath(allocator, &tmp.sub_path, "copy.fastq");
+    const aliases = [_][]const u8{
+        path,
+        try cli.tempPath(allocator, &tmp.sub_path, "./input.fastq"),
+        try cli.tempPath(allocator, &tmp.sub_path, "hard.fastq"),
+        try cli.tempPath(allocator, &tmp.sub_path, "link.fastq"),
+    };
+    const payload = "@SRR1.1 1 length=4\nACGT\n+\nIIII\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = payload });
+    try tmp.dir.hardLink("input.fastq", tmp.dir, "hard.fastq", io, .{});
+    try tmp.dir.symLink(io, "input.fastq", "link.fastq", .{});
+    var gzip: std.ArrayList(u8) = .empty;
+    try cli.appendGzipMember(allocator, &gzip, payload, .{});
+
+    for ([_][]const u8{ payload, gzip.items, "", "invalid FASTQ" }) |bytes| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = bytes });
+        try tmp.dir.writeFile(io, .{ .sub_path = "copy.fastq", .data = bytes });
+        for ([_][]const u8{ "--fraction", "--count" }) |mode| {
+            for ([_][]const u8{ "0", "1" }) |amount| {
+                for (aliases) |alias| {
+                    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{alias});
+                    try cli.expectResult(try cli.run(allocator, &.{ "sample", "--paired", mode, amount, path, alias }), 2, "", diagnostic);
+                }
+                for (0..2) |stdin_side| {
+                    const inputs: [2][]const u8 = if (stdin_side == 0) .{ "-", path } else .{ path, "-" };
+                    const diagnostic = if (std.mem.eql(u8, mode, "--count"))
+                        "error: paired exact-count sampling requires file paths\n"
+                    else
+                        try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{inputs[1]});
+                    const file = try tmp.dir.openFile(io, "input.fastq", .{});
+                    defer file.close(io);
+                    try cli.expectResult(try cli.runWithStdinFile(allocator, &.{ "sample", "--paired", mode, amount, inputs[0], inputs[1] }, file), 2, "", diagnostic);
+                    if (bytes.len != 0) {
+                        var first: [1]u8 = undefined;
+                        try std.testing.expectEqual(@as(usize, 1), try file.readStreaming(io, &.{&first}));
+                        try std.testing.expectEqual(bytes[0], first[0]);
+                    }
+                }
+                if (std.mem.eql(u8, bytes, "invalid FASTQ")) continue;
+                const expected = if (bytes.len == 0 or std.mem.eql(u8, amount, "0")) "" else payload ++ payload;
+                try cli.expectResult(try cli.run(allocator, &.{ "sample", "--paired", mode, amount, path, copy }), 0, expected, "");
+            }
+        }
+    }
+}
+
 test "[cli] - [paired sample]: arguments and output failures retain their classes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

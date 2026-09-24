@@ -666,6 +666,70 @@ test "[cli] - [check-json]: output failure preserves an observed limit status in
     }
 }
 
+test "[cli] - [paired check]: aliases reject before reading or writing JSON" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const copy = try cli.tempPath(allocator, &tmp.sub_path, "copy.fastq");
+    const aliases = [_][]const u8{
+        path,
+        try cli.tempPath(allocator, &tmp.sub_path, "./input.fastq"),
+        try cli.tempPath(allocator, &tmp.sub_path, "hard.fastq"),
+        try cli.tempPath(allocator, &tmp.sub_path, "link.fastq"),
+    };
+    const payload = "@SRR1.1 1 length=4\nACGT\n+\nIIII\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = payload });
+    try tmp.dir.hardLink("input.fastq", tmp.dir, "hard.fastq", io, .{});
+    try tmp.dir.symLink(io, "input.fastq", "link.fastq", .{});
+    var gzip: std.ArrayList(u8) = .empty;
+    try cli.appendGzipMember(allocator, &gzip, payload, .{});
+
+    for ([_][]const u8{ payload, gzip.items, "", "invalid FASTQ" }) |bytes| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = bytes });
+        try tmp.dir.writeFile(io, .{ .sub_path = "copy.fastq", .data = bytes });
+        for ([_][]const []const u8{ &.{ "check", "--paired" }, &.{ "check", "--paired", "--json" } }) |command| {
+            for (aliases) |alias| {
+                const args = try std.mem.concat(allocator, []const u8, &.{ command, &.{ path, alias } });
+                const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{alias});
+                try cli.expectResult(try cli.run(allocator, args), 2, "", diagnostic);
+            }
+            for (0..2) |stdin_side| {
+                const inputs: [2][]const u8 = if (stdin_side == 0) .{ "-", path } else .{ path, "-" };
+                const args = try std.mem.concat(allocator, []const u8, &.{ command, &inputs });
+                const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{inputs[1]});
+                const file = try tmp.dir.openFile(io, "input.fastq", .{});
+                defer file.close(io);
+                try cli.expectResult(try cli.runWithStdinFile(allocator, args, file), 2, "", diagnostic);
+                if (bytes.len != 0) {
+                    var first: [1]u8 = undefined;
+                    try std.testing.expectEqual(@as(usize, 1), try file.readStreaming(io, &.{&first}));
+                    try std.testing.expectEqual(bytes[0], first[0]);
+                }
+            }
+            if (std.mem.eql(u8, bytes, "invalid FASTQ")) continue;
+            const args = try std.mem.concat(allocator, []const u8, &.{ command, &.{ path, copy } });
+            const result = try cli.run(allocator, args);
+            try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+            try std.testing.expectEqualStrings("", result.stderr);
+            if (command.len == 2) {
+                try std.testing.expectEqualStrings("", result.stdout);
+            } else {
+                var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
+                defer parsed.deinit();
+                const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/check-v1");
+                try std.testing.expectEqual(@as(usize, 1), results.len);
+                try cli.expectJsonObjectKeys(results[0].object, &.{ "inputs", "status" });
+                try expectJsonInputs(results[0].object.get("inputs"), path, copy);
+                try cli.expectJsonString(results[0].object.get("status"), "ok");
+            }
+        }
+    }
+}
+
 test "[cli] - [paired check]: documented name forms and input transports pass" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

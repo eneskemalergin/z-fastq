@@ -63,6 +63,115 @@ test "[cli] - [interleave]: fields, order, line endings, and name policies are e
     );
 }
 
+test "[cli] - [interleave]: aliases reject before reading while distinct copies pass" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const copy = try cli.tempPath(allocator, &tmp.sub_path, "copy.fastq");
+    const aliases = [_][]const u8{
+        path,
+        try cli.tempPath(allocator, &tmp.sub_path, "./input.fastq"),
+        try cli.tempPath(allocator, &tmp.sub_path, "hard.fastq"),
+        try cli.tempPath(allocator, &tmp.sub_path, "link.fastq"),
+    };
+    const payload = "@SRR1.1 1 length=4\nACGT\n+\nIIII\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = payload });
+    try tmp.dir.hardLink("input.fastq", tmp.dir, "hard.fastq", io, .{});
+    try tmp.dir.symLink(io, "input.fastq", "link.fastq", .{});
+    var gzip: std.ArrayList(u8) = .empty;
+    try cli.appendGzipMember(allocator, &gzip, payload, .{});
+
+    for ([_][]const u8{ payload, gzip.items, "", "invalid FASTQ" }) |bytes| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = bytes });
+        try tmp.dir.writeFile(io, .{ .sub_path = "copy.fastq", .data = bytes });
+        for (aliases) |alias| {
+            const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{alias});
+            try cli.expectResult(try cli.run(allocator, &.{ "interleave", path, alias }), 2, "", diagnostic);
+        }
+        for (0..2) |stdin_side| {
+            const inputs: [2][]const u8 = if (stdin_side == 0) .{ "-", path } else .{ path, "-" };
+            const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{inputs[1]});
+            const file = try tmp.dir.openFile(io, "input.fastq", .{});
+            defer file.close(io);
+            try cli.expectResult(try cli.runWithStdinFile(allocator, &.{ "interleave", inputs[0], inputs[1] }, file), 2, "", diagnostic);
+            if (bytes.len != 0) {
+                var first: [1]u8 = undefined;
+                try std.testing.expectEqual(@as(usize, 1), try file.readStreaming(io, &.{&first}));
+                try std.testing.expectEqual(bytes[0], first[0]);
+            }
+        }
+        if (std.mem.eql(u8, bytes, "invalid FASTQ")) continue;
+        try cli.expectResult(try cli.run(allocator, &.{ "interleave", path, copy }), 0, if (bytes.len == 0) "" else payload ++ payload, "");
+    }
+}
+
+test "[cli] - [paired FIFO inputs]: a sequential writer completes without losing bytes" {
+    const Producer = struct {
+        io: std.Io,
+        dir: std.Io.Dir,
+        bytes: []const u8,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.write() catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn write(self: *@This()) !void {
+            for ([_][]const u8{ "r1", "r2" }) |name| {
+                const file = try self.dir.openFile(self.io, name, .{ .mode = .write_only });
+                defer file.close(self.io);
+                // The first write must exceed the pipe capacity to exercise backpressure.
+                try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(
+                    std.os.linux.fcntl(file.handle, std.os.linux.F.SETPIPE_SZ, 4096),
+                ));
+                try file.writeStreamingAll(self.io, self.bytes);
+            }
+        }
+    };
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const paths = [_][]const u8{
+        try cli.tempPath(allocator, &tmp.sub_path, "r1"),
+        try cli.tempPath(allocator, &tmp.sub_path, "r2"),
+    };
+    for ([_][:0]const u8{ "r1", "r2" }) |name| {
+        try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.mknodat(
+            tmp.dir.handle,
+            name,
+            std.os.linux.S.IFIFO | 0o600,
+            0,
+        )));
+    }
+    const payload = "@same\n" ++ "A" ** 3000 ++ "\n+\n" ++ "I" ** 3000 ++ "\n";
+    var gzip: std.ArrayList(u8) = .empty;
+    try cli.appendGzipMember(allocator, &gzip, payload, .{});
+    for ([_][]const u8{ payload, gzip.items, "" }) |bytes| {
+        var producer: Producer = .{ .io = io, .dir = tmp.dir, .bytes = bytes };
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        try group.concurrent(io, Producer.run, .{&producer});
+        try cli.expectResult(
+            try cli.run(allocator, &.{ "interleave", paths[0], paths[1] }),
+            0,
+            if (bytes.len == 0) "" else payload ++ payload,
+            "",
+        );
+        try group.await(io);
+        if (producer.err) |err| return err;
+    }
+}
+
 test "[cli] - [interleave]: terminal CR fields reject the pair before either mate is written" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
