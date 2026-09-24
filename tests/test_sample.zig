@@ -76,6 +76,141 @@ fn appendSelectedPairs(
     }
 }
 
+test "[cli] - [sample]: stdout aliases reject before reading or writing in every mode" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const names = [_][]const u8{ "r1.fastq", "r2.fastq" };
+    const paths = [_][]const u8{
+        try cli.tempPath(allocator, &tmp.sub_path, names[0]),
+        try cli.tempPath(allocator, &tmp.sub_path, names[1]),
+    };
+    const aliases = [_][4][]const u8{
+        .{ "r1.fastq", "./r1.fastq", "r1-hard.fastq", "r1-link.fastq" },
+        .{ "r2.fastq", "./r2.fastq", "r2-hard.fastq", "r2-link.fastq" },
+    };
+    for (names, aliases) |name, links| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+        try tmp.dir.hardLink(name, tmp.dir, links[2], io, .{});
+        try tmp.dir.symLink(io, name, links[3], .{});
+    }
+
+    const record = "@same\nAC\n+\nII\n";
+    for ([_][]const []const u8{ &.{"sample"}, &.{ "sample", "--paired" }, &.{ "sample", "--interleaved" } }, 0..) |prefix, mode| {
+        const input_count: usize = if (mode == 1) 2 else 1;
+        const payload = if (mode == 2) record ++ record else record;
+        var gzip: std.ArrayList(u8) = .empty;
+        try cli.appendGzipMember(allocator, &gzip, payload, .{});
+        for ([_][]const u8{ payload, gzip.items }) |bytes| {
+            for ([_][2][]const u8{ .{ "--fraction", "0" }, .{ "--fraction", "1" }, .{ "--count", "0" }, .{ "--count", "1" } }) |selection| {
+                var args: std.ArrayList([]const u8) = .empty;
+                try args.appendSlice(allocator, prefix);
+                try args.appendSlice(allocator, &selection);
+                try args.appendSlice(allocator, paths[0..input_count]);
+                for (0..input_count) |side| {
+                    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: input file is output file\n", .{paths[side]});
+                    for (aliases[side]) |alias| {
+                        for ([_]bool{ false, true }) |append| {
+                            for (names) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+                            const output: std.Io.File = .{
+                                .handle = try std.posix.openat(tmp.dir.handle, alias, .{
+                                    .ACCMODE = .WRONLY,
+                                    .TRUNC = !append,
+                                    .APPEND = append,
+                                    .CLOEXEC = true,
+                                }, 0),
+                                .flags = .{ .nonblocking = false },
+                            };
+                            defer output.close(io);
+
+                            try cli.expectResult(try cli.runWithStdoutFile(allocator, args.items, output, null), 2, "", diagnostic);
+                            for (names, 0..) |name, index| {
+                                const actual = try tmp.dir.readFileAlloc(io, name, allocator, .limited(1024));
+                                try std.testing.expectEqualStrings(if (!append and index == side) "" else bytes, actual);
+                            }
+                            for (names[0..input_count]) |stderr_name| {
+                                const stderr_file: std.Io.File = .{
+                                    .handle = try std.posix.openat(tmp.dir.handle, stderr_name, .{
+                                        .ACCMODE = .WRONLY,
+                                        .APPEND = true,
+                                        .CLOEXEC = true,
+                                    }, 0),
+                                    .flags = .{ .nonblocking = false },
+                                };
+                                defer stderr_file.close(io);
+                                try std.testing.expectEqual(@as(u8, 2), try cli.runWithOutputFiles(allocator, args.items, output, stderr_file));
+                                for (names, 0..) |name, index| {
+                                    try std.testing.expectEqualStrings(if (!append and index == side) "" else bytes, try tmp.dir.readFileAlloc(io, name, allocator, .limited(1024)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "[cli] - [sample]: shared input and output aliases preserve the paired-input error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const payload = "@same\nAC\n+\nII\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = payload });
+    const output: std.Io.File = .{
+        .handle = try std.posix.openat(tmp.dir.handle, "input.fastq", .{
+            .ACCMODE = .WRONLY,
+            .APPEND = true,
+            .CLOEXEC = true,
+        }, 0),
+        .flags = .{ .nonblocking = false },
+    };
+    defer output.close(io);
+    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{path});
+    for ([_][2][]const u8{ .{ "--fraction", "0" }, .{ "--fraction", "1" }, .{ "--count", "0" }, .{ "--count", "1" } }) |selection| {
+        const args = [_][]const u8{ "sample", "--paired", selection[0], selection[1], path, path };
+        try cli.expectResult(try cli.runWithStdoutFile(allocator, &args, output, null), 2, "", diagnostic);
+        try std.testing.expectEqual(@as(u8, 2), try cli.runWithOutputFiles(allocator, &args, output, output));
+        try std.testing.expectEqualStrings(payload, try tmp.dir.readFileAlloc(io, "input.fastq", allocator, .limited(1024)));
+    }
+}
+
+test "[cli] - [sample]: redirected stdin aliases reject without consuming input" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const other = try cli.tempPath(allocator, &tmp.sub_path, "other.fastq");
+    const payload = "@same\nAC\n+\nII\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = payload });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.fastq", .data = payload });
+    const output = try tmp.dir.openFile(io, "input.fastq", .{ .mode = .write_only });
+    defer output.close(io);
+    for ([_][]const []const u8{
+        &.{ "sample", "--fraction", "1", "-" },
+        &.{ "sample", "--interleaved", "--fraction", "0", "-" },
+        &.{ "sample", "--paired", "--fraction", "1", "-", other },
+        &.{ "sample", "--paired", "--fraction", "0", other, "-" },
+    }) |args| {
+        const input = try tmp.dir.openFile(io, "input.fastq", .{});
+        defer input.close(io);
+        try cli.expectResult(try cli.runWithStdoutFile(allocator, args, output, input), 2, "", "error: -: input file is output file\n");
+        var first: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try input.readStreaming(io, &.{&first}));
+        try std.testing.expectEqual(@as(u8, '@'), first[0]);
+        try std.testing.expectEqualStrings(payload, try tmp.dir.readFileAlloc(io, "input.fastq", allocator, .limited(1024)));
+    }
+}
+
 test "[unit] - [MT19937-64]: scalar seed 5489 matches the published vector" {
     const expected = [_]u64{
         14514284786278117030,

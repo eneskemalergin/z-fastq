@@ -669,6 +669,7 @@ const CommandFailure = struct {
     record_index: ?u64 = null,
     byte_offset: ?u64 = null,
     line_in_record: ?u3 = null,
+    suppress_diagnostic: bool = false,
 
     fn lint(details: zfastq.ParseError) CommandFailure {
         return .{
@@ -1064,7 +1065,7 @@ fn checkPaired(
 ) ?PairCommandFailure {
     var input1: RecordInput = undefined;
     var input2: RecordInput = undefined;
-    if (initPairedRecordInputs(&input1, &input2, io, inputs)) |failure| return failure;
+    if (initPairedRecordInputs(&input1, &input2, io, inputs, null)) |failure| return failure;
     defer input1.deinit(io);
     defer input2.deinit(io);
 
@@ -1190,7 +1191,7 @@ fn checkInterleaved(
     options: PairedCheckOptions,
 ) ?PairCommandFailure {
     var input: RecordInput = undefined;
-    if (initRecordInput(&input, io, input_label)) |failure| {
+    if (initRecordInput(&input, io, input_label, null)) |failure| {
         return .{ .command = .{ .input_index = 0, .details = failure } };
     }
     defer input.deinit(io);
@@ -1385,13 +1386,16 @@ fn initRecordInput(
     input: *RecordInput,
     io: std.Io,
     label: []const u8,
+    output_identity: ?FileIdentity,
 ) ?CommandFailure {
     const file = openRecordFile(io, label) catch |err| return inputOpenFailure(err);
     const owns_file = !std.mem.eql(u8, label, "-");
-    input.init(io, file, owns_file) catch {
-        if (owns_file) file.close(io);
+    var transferred = false;
+    defer if (!transferred and owns_file) file.close(io);
+    if (outputFileFailure(io, file, output_identity)) |failure| return failure;
+    input.init(io, file, owns_file) catch
         return CommandFailure.plain("io_error", "I/O error", 3);
-    };
+    transferred = true;
     return null;
 }
 
@@ -1412,6 +1416,7 @@ fn initPairedRecordInputs(
     input2: *RecordInput,
     io: std.Io,
     inputs: []const []const u8,
+    output_identity: ?FileIdentity,
 ) ?PairCommandFailure {
     for (inputs, 0..) |label, index| {
         if (std.mem.eql(u8, label, "-")) {
@@ -1431,7 +1436,7 @@ fn initPairedRecordInputs(
         return .{ .command = .{ .input_index = 1, .details = inputOpenFailure(err) } };
     defer if (!transferred and owns2) file2.close(io);
 
-    if (pairedFilesFailure(io, file1, file2)) |failure| return failure;
+    if (pairedFilesFailure(io, file1, file2, output_identity)) |failure| return failure;
     input1.init(io, file1, owns1) catch return pairCommandFailure(0, "io_error", "I/O error", 3);
     if (owns2) {
         prepareRecordFile(io, &file2) catch return pairCommandFailure(1, "io_error", "I/O error", 3);
@@ -1453,7 +1458,7 @@ fn openNonblockingRecordFile(label: []const u8) std.posix.OpenError!std.Io.File 
     return .{ .handle = handle, .flags = .{ .nonblocking = true } };
 }
 
-fn prepareRecordFile(io: std.Io, file: *std.Io.File) (std.Io.Cancelable || error{Io})!void {
+fn prepareRecordFile(io: std.Io, file: *std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!void {
     const linux = std.os.linux;
     const stat = try statRecordFile(io, file.*);
     if (stat.mode & linux.S.IFMT == linux.S.IFIFO) {
@@ -1480,31 +1485,94 @@ const FileIdentity = struct {
     inode: u64,
 };
 
-fn fileIdentity(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{Io})!FileIdentity {
+fn fileIdentity(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!FileIdentity {
     // std.Io.File.Stat does not retain the device containing the inode.
     const stat = try statRecordFile(io, file);
     return .{ .device_major = stat.dev_major, .device_minor = stat.dev_minor, .inode = stat.ino };
 }
 
-fn statRecordFile(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{Io})!std.os.linux.Statx {
+fn statRecordFile(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!std.os.linux.Statx {
     const linux = std.os.linux;
     var stat: linux.Statx = undefined;
     while (true) switch (linux.errno(linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .{ .INO = true, .TYPE = true }, &stat))) {
         .SUCCESS => break,
         .INTR => try io.checkCancel(),
+        .BADF => return error.BadFileDescriptor,
         else => return error.Io,
     };
     if (!stat.mask.INO or !stat.mask.TYPE) return error.Io;
     return stat;
 }
 
-fn pairedFilesFailure(io: std.Io, file1: std.Io.File, file2: std.Io.File) ?PairCommandFailure {
+fn stdoutFileIdentity(io: std.Io) (std.Io.Cancelable || error{Io})!?FileIdentity {
+    const stat = statRecordFile(io, .stdout()) catch |err| switch (err) {
+        // Inspect before opening inputs, which could reuse a closed descriptor 1.
+        error.BadFileDescriptor => return null,
+        else => |other| return other,
+    };
+    if (stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG) return null;
+    return .{ .device_major = stat.dev_major, .device_minor = stat.dev_minor, .inode = stat.ino };
+}
+
+fn outputFileFailure(io: std.Io, file: std.Io.File, output_identity: ?FileIdentity) ?CommandFailure {
+    const output = output_identity orelse return null;
+    const input = fileIdentity(io, file) catch return inputInspectionFailure(io, output_identity);
+    if (std.meta.eql(input, output)) {
+        return outputAliasFailure(io, &.{input});
+    }
+    return null;
+}
+
+fn canReportInputFailure(io: std.Io, known_inputs: ?[]const FileIdentity) bool {
+    const stat = statRecordFile(io, .stderr()) catch return false;
+    // Without input identities, a regular stderr file could be an input.
+    const inputs = known_inputs orelse return stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG;
+    const stderr_identity: FileIdentity = .{
+        .device_major = stat.dev_major,
+        .device_minor = stat.dev_minor,
+        .inode = stat.ino,
+    };
+    for (inputs) |input| {
+        if (std.meta.eql(input, stderr_identity)) return false;
+    }
+    return true;
+}
+
+fn outputAliasFailure(io: std.Io, inputs: []const FileIdentity) CommandFailure {
+    var failure = CommandFailure.plain("same_output", "input file is output file", 2);
+    failure.suppress_diagnostic = !canReportInputFailure(io, inputs);
+    return failure;
+}
+
+fn inputInspectionFailure(io: std.Io, output_identity: ?FileIdentity) CommandFailure {
+    var failure = CommandFailure.plain("io_error", "failed to inspect file", 3);
+    if (output_identity != null) failure.suppress_diagnostic = !canReportInputFailure(io, null);
+    return failure;
+}
+
+fn pairedFilesFailure(io: std.Io, file1: std.Io.File, file2: std.Io.File, output_identity: ?FileIdentity) ?PairCommandFailure {
     const first = fileIdentity(io, file1) catch
-        return pairCommandFailure(0, "io_error", "failed to inspect file", 3);
+        return .{ .command = .{ .input_index = 0, .details = inputInspectionFailure(io, output_identity) } };
     const second = fileIdentity(io, file2) catch
-        return pairCommandFailure(1, "io_error", "failed to inspect file", 3);
+        return .{ .command = .{ .input_index = 1, .details = inputInspectionFailure(io, output_identity) } };
     if (std.meta.eql(first, second)) {
-        return pairCommandFailure(1, "same_input", "paired inputs refer to the same file", 2);
+        var failure = pairCommandFailure(1, "same_input", "paired inputs refer to the same file", 2);
+        if (output_identity) |output| {
+            if (std.meta.eql(first, output)) {
+                failure.command.details.suppress_diagnostic = !canReportInputFailure(io, &.{first});
+            }
+        }
+        return failure;
+    }
+    if (output_identity) |output| {
+        for ([_]FileIdentity{ first, second }, 0..) |input, index| {
+            if (std.meta.eql(input, output)) {
+                return .{ .command = .{
+                    .input_index = @intCast(index),
+                    .details = outputAliasFailure(io, &.{ first, second }),
+                } };
+            }
+        }
     }
     return null;
 }
@@ -1531,7 +1599,7 @@ fn checkInput(
     options: CheckOptions,
 ) ?CommandFailure {
     var input: RecordInput = undefined;
-    if (initRecordInput(&input, io, label)) |failure| return failure;
+    if (initRecordInput(&input, io, label, null)) |failure| return failure;
     defer input.deinit(io);
     return checkRecordInput(&input, options);
 }
@@ -1645,7 +1713,7 @@ fn statsInput(
     options: InputOptions,
 ) StatsOutcome {
     var input: RecordInput = undefined;
-    if (initRecordInput(&input, io, label)) |failure| return .{ .failure = failure };
+    if (initRecordInput(&input, io, label, null)) |failure| return .{ .failure = failure };
     defer input.deinit(io);
     return collectStats(allocator, input.byteSource(), options);
 }
@@ -1852,6 +1920,7 @@ const SampleOptions = struct {
     pair_mode: PairMode = .none,
     pair_name_policy: pairing.NamePolicy = .illumina,
     pair_names_set: bool = false,
+    output_identity: ?FileIdentity = null,
 };
 
 const SampleMode = union(enum) {
@@ -1905,8 +1974,9 @@ fn runSample(
     io: std.Io,
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
-    options: SampleOptions,
+    parsed_options: SampleOptions,
 ) u8 {
+    var options = parsed_options;
     const mode: SampleMode = if (options.fraction) |fraction| blk: {
         if (options.count != null) {
             std.Io.File.writeStreamingAll(
@@ -1956,6 +2026,10 @@ fn runSample(
         return 2;
     }
 
+    options.output_identity = stdoutFileIdentity(io) catch {
+        if (canReportInputFailure(io, null)) printOutputFailure(io);
+        return 3;
+    };
     var stdout_buffer: [64 * 1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     var sink_adapter = io_layer.WriterSink.init(&stdout_writer.interface);
@@ -2001,8 +2075,9 @@ fn runPairSampleCommand(
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
     mode: SampleMode,
-    options: SampleOptions,
+    parsed_options: SampleOptions,
 ) u8 {
+    var options = parsed_options;
     const expected_inputs: usize = if (options.pair_mode == .paired) 2 else 1;
     if (inputs.len != expected_inputs) {
         const message = if (options.pair_mode == .paired)
@@ -2037,6 +2112,10 @@ fn runPairSampleCommand(
         },
     }
 
+    options.output_identity = stdoutFileIdentity(io) catch {
+        if (canReportInputFailure(io, null)) printOutputFailure(io);
+        return 3;
+    };
     var stdout_buffer: [64 * 1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     var sink_adapter = io_layer.WriterSink.init(&stdout_writer.interface);
@@ -2064,6 +2143,7 @@ fn runPairSampleCommand(
                     .alphabet = options.alphabet,
                     .pair_name_policy = options.pair_name_policy,
                     .selection = output_selector,
+                    .output_identity = options.output_identity,
                 }),
                 .interleaved => sampleInterleavedFractionInput(
                     io,
@@ -2110,7 +2190,7 @@ fn sampleInterleavedFractionInput(
     options: SampleOptions,
 ) error{WriteFailed}!?PairCommandFailure {
     var input: RecordInput = undefined;
-    if (initRecordInput(&input, io, input_label)) |failure| {
+    if (initRecordInput(&input, io, input_label, options.output_identity)) |failure| {
         return .{ .command = .{ .input_index = 0, .details = failure } };
     }
     defer input.deinit(io);
@@ -2417,7 +2497,7 @@ fn sampleFractionInput(
     options: SampleOptions,
 ) error{WriteFailed}!?CommandFailure {
     var input: RecordInput = undefined;
-    if (initRecordInput(&input, io, label)) |failure| return failure;
+    if (initRecordInput(&input, io, label, options.output_identity)) |failure| return failure;
     defer input.deinit(io);
     if (comptime build_options.use_isa_l) {
         if (selector.* == .none) {
@@ -2560,7 +2640,7 @@ fn sampleExactFirstPass(
     options: SampleOptions,
 ) ExactFirstPass {
     var input: RecordInput = undefined;
-    const initial = switch (initExactInput(&input, io, path, null)) {
+    const initial = switch (initExactInput(&input, io, path, null, options.output_identity)) {
         .failure => |failure| return .{ .failure = failure },
         .success => |snapshot| snapshot,
     };
@@ -2626,7 +2706,7 @@ fn sampleExactSecondPass(
     options: SampleOptions,
 ) error{WriteFailed}!?CommandFailure {
     var input: RecordInput = undefined;
-    switch (initExactInput(&input, io, path, expected_snapshot)) {
+    switch (initExactInput(&input, io, path, expected_snapshot, options.output_identity)) {
         .failure => |failure| return failure,
         .success => {},
     }
@@ -2798,6 +2878,7 @@ fn sampleExactPairFirstPass(
             inputs,
             selector,
             pair_options,
+            options.output_identity,
         ),
         .interleaved => sampleExactInterleavedFirstPass(
             io,
@@ -2805,6 +2886,7 @@ fn sampleExactPairFirstPass(
             inputs[0],
             selector,
             pair_options,
+            options.output_identity,
         ),
     };
 }
@@ -2815,10 +2897,11 @@ fn sampleExactPairedFirstPass(
     inputs: []const []const u8,
     selector: *sampling.ExactSelector,
     options: PairedCheckOptions,
+    output_identity: ?FileIdentity,
 ) ExactPairFirstPass {
     var input1: RecordInput = undefined;
     var input2: RecordInput = undefined;
-    const snapshots = switch (initExactPairedInputs(&input1, &input2, io, inputs, null)) {
+    const snapshots = switch (initExactPairedInputs(&input1, &input2, io, inputs, null, output_identity)) {
         .failure => |failure| return .{ .failure = failure },
         .success => |snapshots| snapshots,
     };
@@ -2850,9 +2933,10 @@ fn sampleExactInterleavedFirstPass(
     path: []const u8,
     selector: *sampling.ExactSelector,
     options: PairedCheckOptions,
+    output_identity: ?FileIdentity,
 ) ExactPairFirstPass {
     var input: RecordInput = undefined;
-    const snapshot = switch (initExactInput(&input, io, path, null)) {
+    const snapshot = switch (initExactInput(&input, io, path, null, output_identity)) {
         .failure => |failure| return .{ .failure = .{ .command = .{
             .input_index = 0,
             .details = failure,
@@ -2926,7 +3010,7 @@ fn sampleExactPairedSecondPass(
 ) error{WriteFailed}!?PairCommandFailure {
     var input1: RecordInput = undefined;
     var input2: RecordInput = undefined;
-    switch (initExactPairedInputs(&input1, &input2, io, inputs, snapshots)) {
+    switch (initExactPairedInputs(&input1, &input2, io, inputs, snapshots, options.output_identity)) {
         .failure => |failure| return failure,
         .success => {},
     }
@@ -3077,7 +3161,7 @@ fn sampleExactInterleavedSecondPass(
         );
     };
     var input: RecordInput = undefined;
-    switch (initExactInput(&input, io, path, snapshot)) {
+    switch (initExactInput(&input, io, path, snapshot, options.output_identity)) {
         .failure => |failure| return .{ .command = .{ .input_index = 0, .details = failure } },
         .success => {},
     }
@@ -3227,15 +3311,25 @@ fn initExactInput(
     io: std.Io,
     path: []const u8,
     expected_snapshot: ?FileSnapshot,
+    output_identity: ?FileIdentity,
 ) ExactInput {
     const opened = switch (openExactInput(io, path, expected_snapshot)) {
         .failure => |failure| return .{ .failure = failure },
         .success => |opened| opened,
     };
-    input.init(io, opened.file, true) catch {
-        opened.file.close(io);
+    var transferred = false;
+    defer if (!transferred) opened.file.close(io);
+    if (outputFileFailure(io, opened.file, output_identity)) |failure| {
+        if (expected_snapshot != null and failure.exit_code == 2) {
+            var changed = inputChangedFailure();
+            changed.suppress_diagnostic = failure.suppress_diagnostic;
+            return .{ .failure = changed };
+        }
+        return .{ .failure = failure };
+    }
+    input.init(io, opened.file, true) catch
         return .{ .failure = CommandFailure.plain("io_error", "I/O error", 3) };
-    };
+    transferred = true;
     return .{ .success = opened.snapshot };
 }
 
@@ -3295,6 +3389,7 @@ fn initExactPairedInputs(
     io: std.Io,
     inputs: []const []const u8,
     expected_snapshots: ?[2]FileSnapshot,
+    output_identity: ?FileIdentity,
 ) ExactPairedInputs {
     var transferred = false;
     const first = switch (openExactInput(io, inputs[0], if (expected_snapshots) |expected| expected[0] else null)) {
@@ -3308,11 +3403,13 @@ fn initExactPairedInputs(
     };
     defer if (!transferred) second.file.close(io);
 
-    if (pairedFilesFailure(io, first.file, second.file)) |failure| {
-        return .{ .failure = if (expected_snapshots != null and failure.exitCode() == 2)
-            inputChangedPairFailure(1)
-        else
-            failure };
+    if (pairedFilesFailure(io, first.file, second.file, output_identity)) |failure| {
+        if (expected_snapshots != null and failure.exitCode() == 2) {
+            var changed = inputChangedPairFailure(failure.command.input_index);
+            changed.command.details.suppress_diagnostic = failure.command.details.suppress_diagnostic;
+            return .{ .failure = changed };
+        }
+        return .{ .failure = failure };
     }
     input1.init(io, first.file, true) catch
         return .{ .failure = pairCommandFailure(0, "io_error", "I/O error", 3) };
@@ -3361,16 +3458,22 @@ const InterleaveOptions = struct {
     alphabet: zfastq.Alphabet,
     pair_name_policy: pairing.NamePolicy,
     selection: PairOutputSelector = .all,
+    output_identity: ?FileIdentity = null,
 };
 
 fn runInterleave(
     io: std.Io,
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
-    options: InterleaveOptions,
+    parsed_options: InterleaveOptions,
 ) u8 {
     if (validateInterleaveInputs(io, inputs)) |exit_code| return exit_code;
 
+    var options = parsed_options;
+    options.output_identity = stdoutFileIdentity(io) catch {
+        if (canReportInputFailure(io, null)) printOutputFailure(io);
+        return 3;
+    };
     var stdout_buffer: [64 * 1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     var sink_adapter = io_layer.WriterSink.init(&stdout_writer.interface);
@@ -3430,7 +3533,7 @@ fn interleaveInputs(
 ) error{WriteFailed}!?PairCommandFailure {
     var input1: RecordInput = undefined;
     var input2: RecordInput = undefined;
-    if (initPairedRecordInputs(&input1, &input2, io, inputs)) |failure| return failure;
+    if (initPairedRecordInputs(&input1, &input2, io, inputs, options.output_identity)) |failure| return failure;
     defer input1.deinit(io);
     defer input2.deinit(io);
 
@@ -4299,6 +4402,7 @@ fn printPathError(io: std.Io, path: []const u8, message: []const u8) void {
 }
 
 fn printCommandFailure(io: std.Io, path: []const u8, failure: CommandFailure) void {
+    if (failure.suppress_diagnostic) return;
     if (failure.record_index == null or
         failure.byte_offset == null or
         failure.line_in_record == null)
@@ -4951,7 +5055,7 @@ test "[failure] - [exact sample]: a FIFO replacement reports input changed on re
         .{ tmp.sub_path, name },
     );
     var input: RecordInput = undefined;
-    const failure = switch (initExactInput(&input, io, path, snapshot)) {
+    const failure = switch (initExactInput(&input, io, path, snapshot, null)) {
         .failure => |failure| failure,
         .success => {
             input.deinit(io);
@@ -5477,6 +5581,73 @@ test "[integration] - [paired inputs]: identity follows open descriptors after p
     }
 }
 
+test "[integration] - [output aliases]: rejection closes inputs on both exact passes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const names = [_][]const u8{ "r1", "r2" };
+    var paths: [2][]const u8 = undefined;
+    var snapshots: [2]FileSnapshot = undefined;
+    var identities: [2]FileIdentity = undefined;
+    for (names, 0..) |name, index| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "@same\nAC\n+\nII\n" });
+        paths[index] = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+        const file = try tmp.dir.openFile(io, name, .{});
+        defer file.close(io);
+        snapshots[index] = try fileSnapshot(file, io);
+        identities[index] = try fileIdentity(io, file);
+    }
+    const descriptors = try openDescriptorCount();
+    for (0..8) |_| {
+        var input1: RecordInput = undefined;
+        var input2: RecordInput = undefined;
+        const stream_failure = initRecordInput(&input1, io, paths[0], identities[0]).?;
+        try std.testing.expectEqualStrings("same_output", stream_failure.code);
+        try std.testing.expectEqual(descriptors, try openDescriptorCount());
+        for ([_]?FileSnapshot{ null, snapshots[0] }) |snapshot| {
+            const failure = initExactInput(&input1, io, paths[0], snapshot, identities[0]).failure;
+            try std.testing.expectEqualStrings(if (snapshot == null) "same_output" else "input_changed", failure.code);
+            try std.testing.expectEqual(descriptors, try openDescriptorCount());
+        }
+
+        var output: [128]u8 = undefined;
+        var sink = io_layer.SliceSink.init(&output);
+        var writer = zfastq.Writer.init(sink.byteSink());
+        var options: SampleOptions = .{
+            .max_line_bytes = 8192,
+            .alphabet = .iupac,
+            .fraction = null,
+            .count = 1,
+            .seed = 11,
+            .output_identity = identities[0],
+        };
+        const single_failure = (try sampleExactSecondPass(true, io, allocator, paths[0], &writer, .empty, snapshots[0], 1, options)).?;
+        try std.testing.expectEqualStrings("input_changed", single_failure.code);
+        try std.testing.expectEqual(@as(u8, 3), single_failure.exit_code);
+        const interleaved_failure = (try sampleExactInterleavedSecondPass(true, io, allocator, paths[0], &writer, .empty, snapshots[0], 1, options)).?;
+        try std.testing.expectEqualStrings("input_changed", interleaved_failure.command.details.code);
+        try std.testing.expectEqual(@as(u8, 3), interleaved_failure.exitCode());
+        try std.testing.expectEqual(descriptors, try openDescriptorCount());
+        for (identities, 0..) |identity, side| {
+            options.output_identity = identity;
+            const paired_stream = initPairedRecordInputs(&input1, &input2, io, &paths, identity).?;
+            try std.testing.expectEqualStrings("same_output", paired_stream.command.details.code);
+            try std.testing.expectEqual(@as(u1, @intCast(side)), paired_stream.command.input_index);
+            try std.testing.expectEqual(descriptors, try openDescriptorCount());
+            const paired_failure = (try sampleExactPairedSecondPass(true, io, allocator, &paths, &writer, .empty, snapshots, 1, options)).?;
+            try std.testing.expectEqualStrings("input_changed", paired_failure.command.details.code);
+            try std.testing.expectEqual(@as(u8, 3), paired_failure.exitCode());
+            try std.testing.expectEqual(@as(u1, @intCast(side)), paired_failure.command.input_index);
+            try std.testing.expectEqual(descriptors, try openDescriptorCount());
+        }
+        try writer.flush();
+        try std.testing.expectEqual(@as(usize, 0), sink.written().len);
+    }
+}
+
 test "[integration] - [input resources]: repeated failures close owned files and preserve borrowed files" {
     const QuietStderr = struct {
         fn operate(_: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
@@ -5516,12 +5687,12 @@ test "[integration] - [input resources]: repeated failures close owned files and
     const descriptors = try openDescriptorCount();
     for (0..8) |_| {
         var input: RecordInput = undefined;
-        try std.testing.expect(initRecordInput(&input, io, path) == null);
+        try std.testing.expect(initRecordInput(&input, io, path, null) == null);
         input.deinit(io);
-        try std.testing.expectEqualStrings("io_error", initRecordInput(&input, io, directory).?.code);
-        try std.testing.expectEqualStrings("io_error", initExactInput(&input, io, directory, null).failure.code);
-        try std.testing.expectEqualStrings("input_changed", initExactInput(&input, io, path, changed).failure.code);
-        try std.testing.expectEqualStrings("input_changed", initExactInput(&input, io, missing, changed).failure.code);
+        try std.testing.expectEqualStrings("io_error", initRecordInput(&input, io, directory, null).?.code);
+        try std.testing.expectEqualStrings("io_error", initExactInput(&input, io, directory, null, null).failure.code);
+        try std.testing.expectEqualStrings("input_changed", initExactInput(&input, io, path, changed, null).failure.code);
+        try std.testing.expectEqualStrings("input_changed", initExactInput(&input, io, missing, changed, null).failure.code);
         try std.testing.expectEqual(descriptors, try openDescriptorCount());
 
         const pairs = [_][2][]const u8{
@@ -5535,10 +5706,10 @@ test "[integration] - [input resources]: repeated failures close owned files and
             var input1: RecordInput = undefined;
             var input2: RecordInput = undefined;
             const expected = if (index == 0) "same_input" else "io_error";
-            const stream_failure = initPairedRecordInputs(&input1, &input2, io, &paths).?;
+            const stream_failure = initPairedRecordInputs(&input1, &input2, io, &paths, null).?;
             try std.testing.expectEqualStrings(expected, stream_failure.command.details.code);
             try std.testing.expectEqual(descriptors, try openDescriptorCount());
-            const exact_failure = initExactPairedInputs(&input1, &input2, io, &paths, null).failure;
+            const exact_failure = initExactPairedInputs(&input1, &input2, io, &paths, null, null).failure;
             try std.testing.expectEqualStrings(expected, exact_failure.command.details.code);
             try std.testing.expectEqual(descriptors, try openDescriptorCount());
         }
@@ -5551,7 +5722,7 @@ test "[integration] - [input resources]: repeated failures close owned files and
             try std.testing.expectEqual(@as(u64, "@a/1\nA\n+\n!\n".len), (try borrowed.stat(io)).size);
             const invalid: std.Io.File = .{ .handle = -1, .flags = .{ .nonblocking = false } };
             for ([_][2]std.Io.File{ .{ invalid, borrowed }, .{ borrowed, invalid } }, 0..) |files, side| {
-                const failure = pairedFilesFailure(io, files[0], files[1]).?;
+                const failure = pairedFilesFailure(io, files[0], files[1], null).?;
                 try std.testing.expectEqual(@as(u8, 3), failure.exitCode());
                 try std.testing.expectEqual(@as(u1, @intCast(side)), failure.command.input_index);
                 try std.testing.expectEqualStrings("failed to inspect file", failure.command.details.message);

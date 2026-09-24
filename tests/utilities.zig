@@ -325,6 +325,49 @@ pub fn runWithStdinFile(
     return runInstalled(allocator, command_args, .{ .file = file }, .capture, PROCESS_TIMEOUT);
 }
 
+pub fn runWithStdoutFile(
+    allocator: std.mem.Allocator,
+    command_args: []const []const u8,
+    stdout_file: std.Io.File,
+    stdin_file: ?std.Io.File,
+) !CommandResult {
+    return runInstalled(
+        allocator,
+        command_args,
+        if (stdin_file) |file| .{ .file = file } else .{ .data = .{ .bytes = "", .chunk_len = 1 } },
+        .{ .file = stdout_file },
+        PROCESS_TIMEOUT,
+    );
+}
+
+pub fn runWithOutputFiles(
+    allocator: std.mem.Allocator,
+    command_args: []const []const u8,
+    stdout_file: std.Io.File,
+    stderr_file: std.Io.File,
+) !u8 {
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, ZFASTQ_BIN);
+    try argv.appendSlice(allocator, command_args);
+    var proc = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .close,
+        .stdout = .{ .file = stdout_file },
+        .stderr = .{ .file = stderr_file },
+    });
+    defer proc.kill(io);
+    var deadline = try ProcessDeadline.init(io, &proc, PROCESS_TIMEOUT);
+    defer deadline.deinit();
+    return deadline.waitForExit() catch |err| switch (err) {
+        error.Timeout => return deadline.failTimeout(),
+        else => |other| return other,
+    };
+}
+
 pub fn runWithClosedStdin(
     allocator: std.mem.Allocator,
     command_args: []const []const u8,
@@ -394,9 +437,10 @@ const StdinMode = union(enum) {
     },
 };
 
-const StdoutMode = enum {
+const StdoutMode = union(enum) {
     capture,
     closed,
+    file: std.Io.File,
 };
 
 fn runInstalled(
@@ -425,6 +469,7 @@ fn runInstalled(
         .stdout = switch (stdout_mode) {
             .capture => .pipe,
             .closed => .close,
+            .file => |file| .{ .file = file },
         },
         .stderr = .pipe,
     });
@@ -459,7 +504,7 @@ fn runInstalled(
             &proc,
             process_deadline.timeout(),
         ),
-        .closed => collectCommandStderr(
+        .closed, .file => collectCommandStderr(
             allocator,
             io,
             &proc,

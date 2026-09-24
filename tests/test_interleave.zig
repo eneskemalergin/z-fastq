@@ -109,6 +109,108 @@ test "[cli] - [interleave]: aliases reject before reading while distinct copies 
     }
 }
 
+test "[cli] - [interleave]: stdout aliases of either input reject before reading or writing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const names = [_][]const u8{ "r1.fastq", "r2.fastq" };
+    const paths = [_][]const u8{
+        try cli.tempPath(allocator, &tmp.sub_path, names[0]),
+        try cli.tempPath(allocator, &tmp.sub_path, names[1]),
+    };
+    const payload = "@same\nAC\n+\nII\n";
+    var gzip: std.ArrayList(u8) = .empty;
+    try cli.appendGzipMember(allocator, &gzip, payload, .{});
+    for (0..2) |side| {
+        try tmp.dir.writeFile(io, .{ .sub_path = names[side], .data = "" });
+        try tmp.dir.hardLink(names[side], tmp.dir, "hard.fastq", io, .{});
+        defer tmp.dir.deleteFile(io, "hard.fastq") catch {};
+        try tmp.dir.symLink(io, names[side], "link.fastq", .{});
+        defer tmp.dir.deleteFile(io, "link.fastq") catch {};
+        const aliases = [_][]const u8{ names[side], "hard.fastq", "link.fastq" };
+        for ([_][]const u8{ payload, gzip.items, "invalid FASTQ" }) |bytes| {
+            for (aliases) |alias| {
+                for ([_]bool{ false, true }) |append| {
+                    for (names) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+                    const output: std.Io.File = .{
+                        .handle = try std.posix.openat(tmp.dir.handle, alias, .{
+                            .ACCMODE = .WRONLY,
+                            .TRUNC = !append,
+                            .APPEND = append,
+                            .CLOEXEC = true,
+                        }, 0),
+                        .flags = .{ .nonblocking = false },
+                    };
+                    defer output.close(io);
+                    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: input file is output file\n", .{paths[side]});
+                    try cli.expectResult(try cli.runWithStdoutFile(allocator, &.{ "interleave", paths[0], paths[1] }, output, null), 2, "", diagnostic);
+                    for (names, 0..) |name, index| {
+                        try std.testing.expectEqualStrings(if (!append and index == side) "" else bytes, try tmp.dir.readFileAlloc(io, name, allocator, .limited(1024)));
+                    }
+                    for (names) |stderr_name| {
+                        const stderr_file: std.Io.File = .{
+                            .handle = try std.posix.openat(tmp.dir.handle, stderr_name, .{
+                                .ACCMODE = .WRONLY,
+                                .APPEND = true,
+                                .CLOEXEC = true,
+                            }, 0),
+                            .flags = .{ .nonblocking = false },
+                        };
+                        defer stderr_file.close(io);
+                        try std.testing.expectEqual(@as(u8, 2), try cli.runWithOutputFiles(allocator, &.{ "interleave", paths[0], paths[1] }, output, stderr_file));
+                        for (names, 0..) |name, index| {
+                            try std.testing.expectEqualStrings(if (!append and index == side) "" else bytes, try tmp.dir.readFileAlloc(io, name, allocator, .limited(1024)));
+                        }
+                    }
+                }
+            }
+        }
+        for ([_]bool{ false, true }) |stdin_alias| {
+            for (names) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = payload });
+            const input = try tmp.dir.openFile(io, names[if (stdin_alias) side else 1 - side], .{});
+            defer input.close(io);
+            const output = try tmp.dir.openFile(io, names[side], .{ .mode = .write_only });
+            defer output.close(io);
+            var inputs = paths;
+            inputs[if (stdin_alias) side else 1 - side] = "-";
+            const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: input file is output file\n", .{inputs[side]});
+            try cli.expectResult(try cli.runWithStdoutFile(allocator, &.{ "interleave", inputs[0], inputs[1] }, output, input), 2, "", diagnostic);
+            var first: [1]u8 = undefined;
+            try std.testing.expectEqual(@as(usize, 1), try input.readStreaming(io, &.{&first}));
+            try std.testing.expectEqual(@as(u8, '@'), first[0]);
+        }
+    }
+}
+
+test "[cli] - [interleave]: shared input and output aliases preserve the paired-input error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const payload = "@same\nAC\n+\nII\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = payload });
+    const output: std.Io.File = .{
+        .handle = try std.posix.openat(tmp.dir.handle, "input.fastq", .{
+            .ACCMODE = .WRONLY,
+            .APPEND = true,
+            .CLOEXEC = true,
+        }, 0),
+        .flags = .{ .nonblocking = false },
+    };
+    defer output.close(io);
+    const args = [_][]const u8{ "interleave", path, path };
+    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{path});
+    try cli.expectResult(try cli.runWithStdoutFile(allocator, &args, output, null), 2, "", diagnostic);
+    try std.testing.expectEqual(@as(u8, 2), try cli.runWithOutputFiles(allocator, &args, output, output));
+    try std.testing.expectEqualStrings(payload, try tmp.dir.readFileAlloc(io, "input.fastq", allocator, .limited(1024)));
+}
+
 test "[cli] - [paired FIFO inputs]: a sequential writer completes without losing bytes" {
     const Producer = struct {
         io: std.Io,
