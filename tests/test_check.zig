@@ -308,16 +308,77 @@ test "[cli] - [check]: semantic locations survive every field position and line 
     );
 }
 
-test "[cli] - [check]: gzip members validate and corrupt trailers exit as I/O" {
+test "[cli] - [check]: files and stdin preserve prefix detection and gzip failures" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try cli.tempPath(allocator, &tmp.sub_path, "input");
+    const plain = "@one\nAC\n+\n!!\n@two\nGT\n+\n!~\n";
     var gzip: std.ArrayList(u8) = .empty;
 
     try cli.appendGzipMember(allocator, &gzip, "@one\nAC\n+\n!!\n", .{});
+    const first_member_end = gzip.items.len;
     try cli.appendGzipMember(allocator, &gzip, "@two\nGT\n+\n!~\n", .{});
-    const valid = try cli.runWithStdin(allocator, &.{ "check", "-" }, gzip.items, 1);
-    try cli.expectResult(valid, 0, "", "");
+    var empty_gzip: std.ArrayList(u8) = .empty;
+    try cli.appendGzipMember(allocator, &empty_gzip, "", .{});
+    var semantic_gzip: std.ArrayList(u8) = .empty;
+    try cli.appendGzipMember(allocator, &semantic_gzip, "@one\nAC\n+\n!!\n", .{});
+    try cli.appendGzipMember(allocator, &semantic_gzip, "@two\nG.\n+\n!!\n", .{});
+    const corrupt = try allocator.dupe(u8, gzip.items);
+    corrupt[corrupt.len - 8] ^= 1;
+
+    const cases = [_]struct {
+        bytes: []const u8,
+        exit_code: u8 = 0,
+        message: []const u8 = "",
+    }{
+        .{ .bytes = "" },
+        .{ .bytes = plain },
+        .{ .bytes = empty_gzip.items },
+        .{ .bytes = gzip.items[0..first_member_end] },
+        .{ .bytes = gzip.items },
+        .{
+            .bytes = "@r",
+            .exit_code = 1,
+            .message = "S004: unexpected end of file in sequence line (record 0, line 2, offset 2)\n",
+        },
+        .{
+            .bytes = gzip.items[0..1],
+            .exit_code = 1,
+            .message = "S003: header line must start with '@' and contain a nonempty identifier " ++
+                "(record 0, line 1, offset 0)\n",
+        },
+        .{ .bytes = gzip.items[0..2], .exit_code = 3, .message = "I/O error\n" },
+        .{ .bytes = gzip.items[0..9], .exit_code = 3, .message = "I/O error\n" },
+        .{ .bytes = gzip.items[0..10], .exit_code = 3, .message = "I/O error\n" },
+        .{ .bytes = gzip.items[0 .. first_member_end + 2], .exit_code = 3, .message = "I/O error\n" },
+        .{ .bytes = corrupt, .exit_code = 3, .message = "I/O error\n" },
+        .{
+            .bytes = semantic_gzip.items,
+            .exit_code = 1,
+            .message = "S002: sequence byte is outside the selected alphabet " ++
+                "(record 1, line 2, offset 19)\n",
+        },
+    };
+    for (cases, 0..) |case, index| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "input", .data = case.bytes });
+        for ([_][]const u8{ path, "-" }, 0..) |label, transport| {
+            errdefer std.debug.print("check input case {d}, input {s}\n", .{ index, label });
+            const result = if (transport == 0)
+                try cli.run(allocator, &.{ "check", path })
+            else
+                try cli.runWithStdin(allocator, &.{ "check", "-" }, case.bytes, 1);
+            const stderr = if (case.message.len == 0) "" else try std.fmt.allocPrint(
+                allocator,
+                "error: {s}: {s}",
+                .{ label, case.message },
+            );
+            try cli.expectResult(result, case.exit_code, "", stderr);
+        }
+    }
 
     const valid_json = try cli.runWithStdin(
         allocator,
@@ -340,28 +401,6 @@ test "[cli] - [check]: gzip members validate and corrupt trailers exit as I/O" {
     );
     try std.testing.expectEqual(@as(usize, 1), valid_results.len);
     try expectCheckStatus(valid_results[0], "-", "ok");
-
-    var semantic_gzip: std.ArrayList(u8) = .empty;
-    try cli.appendGzipMember(allocator, &semantic_gzip, "@one\nAC\n+\n!!\n", .{});
-    try cli.appendGzipMember(allocator, &semantic_gzip, "@two\nG.\n+\n!!\n", .{});
-    const semantic = try cli.runWithStdin(
-        allocator,
-        &.{ "check", "-" },
-        semantic_gzip.items,
-        1,
-    );
-    try cli.expectResult(
-        semantic,
-        1,
-        "",
-        "error: -: S002: sequence byte is outside the selected alphabet " ++
-            "(record 1, line 2, offset 19)\n",
-    );
-
-    const corrupt = try allocator.dupe(u8, gzip.items);
-    corrupt[corrupt.len - 8] ^= 1;
-    const damaged = try cli.runWithStdin(allocator, &.{ "check", "-" }, corrupt, 7);
-    try cli.expectResult(damaged, 3, "", "error: -: I/O error\n");
 
     const damaged_json = try cli.runWithStdin(
         allocator,

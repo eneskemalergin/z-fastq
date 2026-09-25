@@ -238,12 +238,18 @@ test "[cli] - [count]: empty CRLF identifiers fail after dense warmup across gzi
     }
 }
 
-test "[cli] - [count]: gzip detection, member ends, and damage keep distinct exit classes" {
+test "[cli] - [count]: files and stdin preserve prefix detection and gzip exit classes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try cli.tempPath(allocator, &tmp.sub_path, "input");
     var valid: std.ArrayList(u8) = .empty;
     try appendGzipMember(allocator, &valid, "@r\nA\n+\n!\n", .{});
+    var empty: std.ArrayList(u8) = .empty;
+    try appendGzipMember(allocator, &empty, "", .{});
 
     const magic = try allocator.dupe(u8, valid.items);
     magic[0] ^= 1;
@@ -274,21 +280,28 @@ test "[cli] - [count]: gzip detection, member ends, and damage keep distinct exi
     const later_size = try allocator.dupe(u8, members.items);
     later_size[later_size.len - 4] ^= 1;
 
-    const plain_error = "error: -: S003: header line must start with '@' and contain a nonempty identifier " ++
+    const plain_error = "S003: header line must start with '@' and contain a nonempty identifier " ++
         "(record 0, line 1, offset 0)\n";
     const cases = [_]struct {
         bytes: []const u8,
         exit_code: u8 = 3,
         stdout: []const u8 = "",
-        stderr: []const u8 = "error: -: I/O error\n",
+        message: []const u8 = "I/O error\n",
     }{
-        .{ .bytes = valid.items[0..0], .exit_code = 0, .stdout = "0\n", .stderr = "" },
-        .{ .bytes = valid.items[0..1], .exit_code = 1, .stderr = plain_error },
+        .{ .bytes = "", .exit_code = 0, .stdout = "0\n", .message = "" },
+        .{ .bytes = empty.items, .exit_code = 0, .stdout = "0\n", .message = "" },
+        .{ .bytes = "@r\nA\n+\n!\n", .exit_code = 0, .stdout = "1\n", .message = "" },
+        .{
+            .bytes = "@r",
+            .exit_code = 1,
+            .message = "S004: unexpected end of file in sequence line (record 0, line 2, offset 2)\n",
+        },
+        .{ .bytes = valid.items[0..1], .exit_code = 1, .message = plain_error },
         .{ .bytes = valid.items[0..2] },
-        .{ .bytes = magic, .exit_code = 1, .stderr = plain_error },
-        .{ .bytes = metadata, .exit_code = 0, .stdout = "1\n", .stderr = "" },
-        .{ .bytes = members.items[0..valid.items.len], .exit_code = 0, .stdout = "1\n", .stderr = "" },
-        .{ .bytes = members.items, .exit_code = 0, .stdout = "2\n", .stderr = "" },
+        .{ .bytes = magic, .exit_code = 1, .message = plain_error },
+        .{ .bytes = metadata, .exit_code = 0, .stdout = "1\n", .message = "" },
+        .{ .bytes = members.items[0..valid.items.len], .exit_code = 0, .stdout = "1\n", .message = "" },
+        .{ .bytes = members.items, .exit_code = 0, .stdout = "2\n", .message = "" },
         .{ .bytes = method },
         .{ .bytes = reserved },
         .{ .bytes = deflate },
@@ -296,6 +309,7 @@ test "[cli] - [count]: gzip detection, member ends, and damage keep distinct exi
         .{ .bytes = size },
         .{ .bytes = with_header_crc.items },
         .{ .bytes = valid.items[0..9] },
+        .{ .bytes = valid.items[0..10] },
         .{ .bytes = valid.items[0..12] },
         .{ .bytes = valid.items[0 .. valid.items.len - 1] },
         .{ .bytes = members.items[0 .. valid.items.len + 3] },
@@ -304,9 +318,20 @@ test "[cli] - [count]: gzip detection, member ends, and damage keep distinct exi
         .{ .bytes = later_size },
     };
     for (cases, 0..) |case, index| {
-        errdefer std.debug.print("gzip count case {d}\n", .{index});
-        const result = try runCliWithStdin(allocator, &.{ "count", "-" }, case.bytes, 1);
-        try cli.expectResult(result, case.exit_code, case.stdout, case.stderr);
+        try tmp.dir.writeFile(io, .{ .sub_path = "input", .data = case.bytes });
+        for ([_][]const u8{ path, "-" }, 0..) |label, transport| {
+            errdefer std.debug.print("count input case {d}, input {s}\n", .{ index, label });
+            const result = if (transport == 0)
+                try runCount(allocator, path)
+            else
+                try runCliWithStdin(allocator, &.{ "count", "-" }, case.bytes, 1);
+            const stderr = if (case.message.len == 0) "" else try std.fmt.allocPrint(
+                allocator,
+                "error: {s}: {s}",
+                .{ label, case.message },
+            );
+            try cli.expectResult(result, case.exit_code, case.stdout, stderr);
+        }
     }
 }
 

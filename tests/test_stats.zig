@@ -44,6 +44,28 @@ const SAMPLE_FIELDS =
     \\
 ;
 
+const EMPTY_FIELDS =
+    \\reads: 0
+    \\bases: 0
+    \\min_length: -
+    \\max_length: -
+    \\mean_length: -
+    \\a: 0
+    \\c: 0
+    \\g: 0
+    \\t: 0
+    \\n: 0
+    \\other_bases: 0
+    \\gc_fraction: -
+    \\quality_sum: 0
+    \\mean_quality: -
+    \\q20_bases: 0
+    \\q20_fraction: -
+    \\q30_bases: 0
+    \\q30_fraction: -
+    \\
+;
+
 test "[unit] - [statistics]: records accumulate exact public results" {
     var stats: zfastq.Stats = .{};
     try stats.addRecord(record("AaCcGgTtNnR?", "!5?I~!!!!!!!"));
@@ -193,7 +215,7 @@ test "[unit] - [quality]: Phred+33 accepts both boundaries only" {
     try std.testing.expectError(error.InvalidQuality, zfastq.decodePhred33(127));
 }
 
-test "[cli] - [stats]: plain, gzip, and fragmented stdin print identical fields" {
+test "[cli] - [stats]: files and stdin preserve prefixes, gzip members, and exact fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -201,31 +223,62 @@ test "[cli] - [stats]: plain, gzip, and fragmented stdin print identical fields"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeTempFile(io, &tmp, "reads.fastq.gz", SAMPLE_FASTQ);
-    try writeTempFile(io, &tmp, "reads.bin", &SAMPLE_GZIP);
-    const plain_path = try cli.tempPath(allocator, &tmp.sub_path, "reads.fastq.gz");
-    const gzip_path = try cli.tempPath(allocator, &tmp.sub_path, "reads.bin");
+    var members: std.ArrayList(u8) = .empty;
+    try cli.appendGzipMember(allocator, &members, "", .{});
+    const empty_member_end = members.items.len;
+    try cli.appendGzipMember(allocator, &members, SAMPLE_FASTQ[0..1], .{});
+    try cli.appendGzipMember(allocator, &members, SAMPLE_FASTQ[1..], .{});
+    const later_header = SAMPLE_GZIP ++ [_]u8{ 0x1f, 0x8b };
 
-    const plain = try runCli(allocator, &.{ "stats", plain_path }, "", 1);
-    const gzip = try runCli(allocator, &.{ "stats", gzip_path }, "", 1);
-    const plain_stdin = try runCli(allocator, &.{ "stats", "-" }, SAMPLE_FASTQ, 1);
-    const gzip_stdin = try runCli(allocator, &.{ "stats", "-" }, &SAMPLE_GZIP, 1);
-
-    for ([_]struct {
-        result: CommandResult,
-        label: []const u8,
+    const cases = [_]struct {
+        name: []const u8 = "input",
+        bytes: []const u8,
+        fields: []const u8 = SAMPLE_FIELDS,
+        exit_code: u8 = 0,
+        message: []const u8 = "",
     }{
-        .{ .result = plain, .label = plain_path },
-        .{ .result = gzip, .label = gzip_path },
-        .{ .result = plain_stdin, .label = "-" },
-        .{ .result = gzip_stdin, .label = "-" },
-    }) |case| {
-        try std.testing.expectEqual(@as(u8, 0), case.result.exit_code);
-        try std.testing.expectEqualStrings(
-            try expectedStats(allocator, case.label),
-            case.result.stdout,
-        );
-        try std.testing.expectEqual(@as(usize, 0), case.result.stderr.len);
+        .{ .name = "reads.fastq.gz", .bytes = SAMPLE_FASTQ },
+        .{ .name = "reads.bin", .bytes = &SAMPLE_GZIP },
+        .{ .bytes = members.items },
+        .{ .bytes = "", .fields = EMPTY_FIELDS },
+        .{ .bytes = members.items[0..empty_member_end], .fields = EMPTY_FIELDS },
+        .{
+            .bytes = "@r",
+            .exit_code = 1,
+            .message = "S004: unexpected end of file in sequence line (record 0, line 2, offset 2)\n",
+        },
+        .{
+            .bytes = SAMPLE_GZIP[0..1],
+            .exit_code = 1,
+            .message = "S003: header line must start with '@' and contain a nonempty identifier " ++
+                "(record 0, line 1, offset 0)\n",
+        },
+        .{ .bytes = SAMPLE_GZIP[0..2], .exit_code = 3, .message = "I/O error\n" },
+        .{ .bytes = SAMPLE_GZIP[0..9], .exit_code = 3, .message = "I/O error\n" },
+        .{ .bytes = SAMPLE_GZIP[0..10], .exit_code = 3, .message = "I/O error\n" },
+        .{ .bytes = &later_header, .exit_code = 3, .message = "I/O error\n" },
+    };
+    for (cases, 0..) |case, index| {
+        try writeTempFile(io, &tmp, case.name, case.bytes);
+        const path = try cli.tempPath(allocator, &tmp.sub_path, case.name);
+        for ([_][]const u8{ path, "-" }, 0..) |label, transport| {
+            errdefer std.debug.print("stats input case {d}, input {s}\n", .{ index, label });
+            const result = if (transport == 0)
+                try cli.run(allocator, &.{ "stats", path })
+            else
+                try runCli(allocator, &.{ "stats", "-" }, case.bytes, 1);
+            const stdout = if (case.exit_code == 0) try std.fmt.allocPrint(
+                allocator,
+                "input: {s}\n{s}",
+                .{ label, case.fields },
+            ) else "";
+            const stderr = if (case.message.len == 0) "" else try std.fmt.allocPrint(
+                allocator,
+                "error: {s}: {s}",
+                .{ label, case.message },
+            );
+            try cli.expectResult(result, case.exit_code, stdout, stderr);
+        }
     }
 }
 
@@ -283,28 +336,7 @@ test "[cli] - [stats]: empty input and a zero-length record remain distinct" {
 
     const empty = try runCli(allocator, &.{ "stats", "-" }, "", 1);
     try std.testing.expectEqual(@as(u8, 0), empty.exit_code);
-    try std.testing.expectEqualStrings(
-        \\input: -
-        \\reads: 0
-        \\bases: 0
-        \\min_length: -
-        \\max_length: -
-        \\mean_length: -
-        \\a: 0
-        \\c: 0
-        \\g: 0
-        \\t: 0
-        \\n: 0
-        \\other_bases: 0
-        \\gc_fraction: -
-        \\quality_sum: 0
-        \\mean_quality: -
-        \\q20_bases: 0
-        \\q20_fraction: -
-        \\q30_bases: 0
-        \\q30_fraction: -
-        \\
-    , empty.stdout);
+    try std.testing.expectEqualStrings("input: -\n" ++ EMPTY_FIELDS, empty.stdout);
     try std.testing.expectEqual(@as(usize, 0), empty.stderr.len);
 
     const zero = try runCli(allocator, &.{ "stats", "-" }, "@z\n\n+\n\n", 1);

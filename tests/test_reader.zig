@@ -212,18 +212,38 @@ test "[failure] - [gzip source]: a read failure after decoded output propagates"
     try std.testing.expectError(error.ReadFailed, source.read(&output));
 }
 
-test "[property] - [input detection]: a one-byte first read replays plain prefix bytes" {
-    const data = "@r\nA\n+\n!\n";
-    var input_buffer: [2]u8 = undefined;
-    var input = FragmentReader.init(data, 1, &input_buffer);
+test "[property] - [plain reader source]: sniffed prefixes survive short reads and EOF" {
+    const cases = [_][]const u8{ "", "x", "@r", "\x1f", "\x1f\x8a", "@r\nA\n+\n!\n" };
+    for (cases) |data| {
+        for ([_]usize{ 1, 3 }) |input_chunk_len| {
+            for ([_]usize{ 1, 3, 16 }) |output_chunk_len| {
+                errdefer std.debug.print("plain prefix length {d}, chunks {d}/{d}\n", .{
+                    data.len, input_chunk_len, output_chunk_len,
+                });
+                var input_buffer: [2]u8 = undefined;
+                var input = FragmentReader.init(data, input_chunk_len, &input_buffer);
+                if (data.len < 2) {
+                    try std.testing.expectError(error.EndOfStream, input.interface.peek(2));
+                } else {
+                    try std.testing.expectEqualStrings(data[0..2], try input.interface.peek(2));
+                }
 
-    try std.testing.expectEqualSlices(u8, data[0..2], try input.interface.peek(2));
-    var plain = zfastq.io.plain.ReaderSource.init(&input.interface);
-    const source = plain.byteSource();
-    var output: [data.len]u8 = undefined;
-
-    try std.testing.expectEqual(data.len, try source.read(&output));
-    try std.testing.expectEqualStrings(data, &output);
+                var plain = zfastq.io.plain.ReaderSource.init(&input.interface);
+                const source = plain.byteSource();
+                var output: [16]u8 = undefined;
+                var offset: usize = 0;
+                for (0..data.len + 1) |_| {
+                    const n = try source.read(output[0..output_chunk_len]);
+                    try std.testing.expect(n <= data.len - offset);
+                    try std.testing.expectEqualStrings(data[offset..][0..n], output[0..n]);
+                    offset += n;
+                    if (n == 0) break;
+                }
+                try std.testing.expectEqual(data.len, offset);
+                try std.testing.expectEqual(@as(usize, 0), try source.read(&output));
+            }
+        }
+    }
 }
 
 test "[unit] - [lint code]: every implemented code has its stable tag" {
