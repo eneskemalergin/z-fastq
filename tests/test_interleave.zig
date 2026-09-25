@@ -435,6 +435,17 @@ test "[cli] - [interleave]: validation precedence protects the failing pair" {
         "",
         r2_error,
     );
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "r1.fastq",
+        .data = "@bad/1\nR\n+\n \n",
+    });
+    try cli.expectResult(
+        try cli.run(allocator, &.{ "interleave", r1_path, r2_path }),
+        1,
+        "",
+        r2_error,
+    );
 }
 
 test "[cli] - [interleave]: later failure preserves complete pairs beyond the output buffer" {

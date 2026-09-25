@@ -270,6 +270,20 @@ test "[cli] - [deinterleave]: structural, semantic, pair, and odd-count preceden
 
     try tmp.dir.writeFile(io, .{
         .sub_path = "input.fastq",
+        .data = "@bad/1\nR\n+\n \n@bad/2\nA\nx\n!\n",
+    });
+    paths = try outputPaths(allocator, &tmp.sub_path, "iupac-quality");
+    try cli.expectResult(
+        try runDeinterleave(allocator, input_path, paths),
+        1,
+        "",
+        structural_error,
+    );
+    try expectEmptyFile(paths[0]);
+    try expectEmptyFile(paths[1]);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "input.fastq",
         .data = "@left/1\nA\n+\n!\n@right/2\nT\n+\n#\n",
     });
     paths = try outputPaths(allocator, &tmp.sub_path, "mismatch");

@@ -168,6 +168,20 @@ test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
             "(record 0, line 3, offset 5)\n",
     );
 
+    const early_quality_lf = try cli.runWithStdin(
+        allocator,
+        &.{ "check", "--interleaved", "-" },
+        "@a/1\nR\n+\n \n@a/2\nAAA\n+\n!\n!\n",
+        26,
+    );
+    try cli.expectResult(
+        early_quality_lf,
+        1,
+        "",
+        "error: -: S005: sequence and quality lengths differ " ++
+            "(record 1, line 4, offset 22)\n",
+    );
+
     const empty_identifier = try cli.runWithStdin(
         allocator,
         &.{ "check", "-" },

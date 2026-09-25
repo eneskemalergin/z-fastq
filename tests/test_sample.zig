@@ -1284,6 +1284,21 @@ test "[cli] - [paired sample]: failing pairs leave only earlier complete pairs" 
     const pairs_path = try cli.tempPath(allocator, &tmp.sub_path, "pairs.fastq");
     const first_pair = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n";
 
+    for ([_][]const u8{ "0", "1" }) |fraction| {
+        try cli.expectResult(
+            try cli.runWithStdin(
+                allocator,
+                &.{ "sample", "--interleaved", "--fraction", fraction, "-" },
+                "@a/1\nR\n+\n \n@a/2\nAAA\n+\n!\n!\n",
+                26,
+            ),
+            1,
+            "",
+            "error: -: S005: sequence and quality lengths differ " ++
+                "(record 1, line 4, offset 22)\n",
+        );
+    }
+
     try tmp.dir.writeFile(io, .{
         .sub_path = "r1.fastq",
         .data = "@ok/1\nA\n+\n!\n@left/1\nC\n+\n$\n",

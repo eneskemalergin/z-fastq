@@ -687,15 +687,6 @@ const CommandFailure = struct {
     }
 };
 
-fn validateCommandRecord(
-    validator: *fastq.AdaptiveRecordValidator,
-    record: zfastq.Record,
-    offsets: zfastq.RecordOffsets,
-    record_index: u64,
-) ?CommandFailure {
-    return mapSemanticFailure(validator.validate(record), offsets, record_index);
-}
-
 fn recordHasUnwritableEnding(record: zfastq.Record, canonical_span: ?[]const u8) bool {
     return canonical_span == null and fastq.recordHasTerminalCr(record);
 }
@@ -708,13 +699,12 @@ fn unwritableRecordFailure() CommandFailure {
     );
 }
 
-fn validateCurrentCommandRecord(
-    validator: *fastq.AdaptiveRecordValidator,
+fn mapCurrentSemanticFailure(
+    maybe_error: ?zfastq.SemanticError,
     reader: *const zfastq.Reader,
-    record: zfastq.Record,
     record_index: u64,
 ) ?CommandFailure {
-    const semantic_error = validator.validate(record) orelse return null;
+    const semantic_error = maybe_error orelse return null;
     const offsets = reader.currentRecordOffsets() orelse return CommandFailure.plain(
         "io_error",
         "record location is unavailable",
@@ -1238,7 +1228,7 @@ fn checkInterleavedSource(
         var first_token_len: usize = 0;
         var first_mate_marker: ?u2 = null;
         var mate1_markers: u2 = 0;
-        const buffered_record2 = fastq.nextBufferedRecordWithoutId(&reader) catch |err| {
+        const buffered_record2 = fastq.nextBufferedValidatedRecord(&reader, &validator) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
@@ -1246,9 +1236,9 @@ fn checkInterleavedSource(
         };
         const both_headers_borrowed = buffered_record2 != null;
         var semantic2: ?zfastq.SemanticError = null;
-        const header2 = if (buffered_record2) |record2| header: {
-            if (semantic1 == null) semantic2 = validator.validate(record2);
-            break :header record2.header;
+        const header2 = if (buffered_record2) |validated2| header: {
+            if (semantic1 == null) semantic2 = validated2.semantic_error;
+            break :header validated2.record.header;
         } else header: {
             if (semantic1 == null) {
                 const name1 = pairing.parseName(record1.header, options.pair_name_policy);
@@ -2219,8 +2209,7 @@ const InterleavedFirstRecordStorage = enum {
 };
 
 const RefillSpanningMate = struct {
-    record: ?zfastq.Record,
-    canonical_span: ?[]const u8,
+    record: ?fastq.ValidatedRecord,
     first_storage: InterleavedFirstRecordStorage,
 };
 
@@ -2232,16 +2221,15 @@ fn nextAfterPreservingInterleavedMate1(
     record1: zfastq.Record,
     canonical_span1: ?[]const u8,
     staging_limit: usize,
+    validator: *fastq.AdaptiveRecordValidator,
 ) (zfastq.ReaderError || error{RecordStagingLimit})!RefillSpanningMate {
-    var canonical_span2: ?[]const u8 = null;
     if (fastq.retainFallbackRecordStorage(reader, retained, record1)) {
         const transferred_record2 = try fastq.nextBufferedAfterFallbackTransfer(
             reader,
-            &canonical_span2,
+            validator,
         );
         if (transferred_record2) |record2| return .{
             .record = record2,
-            .canonical_span = canonical_span2,
             .first_storage = .retained,
         };
         // Reader's four line limits cover CLI staging limits, including markers.
@@ -2252,8 +2240,7 @@ fn nextAfterPreservingInterleavedMate1(
             }
         }
         return .{
-            .record = try fastq.nextFallbackWithoutId(reader, &canonical_span2),
-            .canonical_span = canonical_span2,
+            .record = try fastq.nextFallbackValidatedRecord(reader, validator),
             .first_storage = .retained,
         };
     }
@@ -2265,10 +2252,8 @@ fn nextAfterPreservingInterleavedMate1(
         canonical_span1,
         staging_limit,
     );
-    const record2 = try fastq.nextWithoutId(reader, &canonical_span2);
     return .{
-        .record = record2,
-        .canonical_span = canonical_span2,
+        .record = try fastq.nextValidatedRecord(reader, validator),
         .first_storage = .staged,
     };
 }
@@ -2319,18 +2304,18 @@ fn sampleInterleavedSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        var canonical_span1: ?[]const u8 = null;
-        const record1 = fastq.nextWithoutId(&reader, &canonical_span1) catch |err| {
+        const validated1 = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
             } };
         } orelse return null;
+        const record1 = validated1.record;
+        const canonical_span1 = validated1.canonical_span;
         const record_index1 = reader.recordIndex() - 1;
         const offsets1 = reader.currentRecordOffsets().?;
-        const semantic1 = validateCommandRecord(
-            &validator,
-            record1,
+        const semantic1 = mapSemanticFailure(
+            validated1.semantic_error,
             offsets1,
             record_index1,
         );
@@ -2341,11 +2326,10 @@ fn sampleInterleavedSource(
         const selected = semantic1 == null and selection.selectPair();
         const unwritable1 = selected and recordHasUnwritableEnding(record1, canonical_span1);
 
-        var canonical_span2: ?[]const u8 = null;
         var record1_storage: InterleavedFirstRecordStorage = .unused;
-        const buffered_record2 = fastq.nextBufferedWithoutId(
+        const buffered_record2 = fastq.nextBufferedValidatedRecord(
             &reader,
-            &canonical_span2,
+            &validator,
         ) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
@@ -2353,7 +2337,7 @@ fn sampleInterleavedSource(
             } };
         };
         const both_headers_borrowed = buffered_record2 != null;
-        const record2 = (if (buffered_record2) |complete_record2| buffered: {
+        const validated2 = (if (buffered_record2) |complete_record2| buffered: {
             if (selected) record1_storage = .reader;
             break :buffered complete_record2;
         } else record: {
@@ -2368,9 +2352,9 @@ fn sampleInterleavedSource(
                 first_mate_marker = name1.first_mate_marker;
                 mate1_markers = name1.mate_markers;
             }
-            if (!selected) break :record fastq.nextWithoutId(
+            if (!selected) break :record fastq.nextValidatedRecord(
                 &reader,
-                &canonical_span2,
+                &validator,
             ) catch |err| {
                 return .{ .command = .{
                     .input_index = 0,
@@ -2386,6 +2370,7 @@ fn sampleInterleavedSource(
                 record1,
                 canonical_span1,
                 staging_limit,
+                &validator,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return pairCommandFailure(
                     0,
@@ -2404,7 +2389,6 @@ fn sampleInterleavedSource(
                     .details = mapReaderFailure(&reader, @errorCast(err)),
                 } },
             };
-            canonical_span2 = preserved.canonical_span;
             record1_storage = preserved.first_storage;
             break :record preserved.record;
         }) orelse return .{ .pair = .{ .count_mismatch = .{
@@ -2416,15 +2400,16 @@ fn sampleInterleavedSource(
             },
         } } };
 
+        const record2 = validated2.record;
+        const canonical_span2 = validated2.canonical_span;
         if (semantic1) |failure| {
             return .{ .command = .{ .input_index = 0, .details = failure } };
         }
 
         const record_index2 = reader.recordIndex() - 1;
         const offsets2 = reader.currentRecordOffsets().?;
-        if (validateCommandRecord(
-            &validator,
-            record2,
+        if (mapSemanticFailure(
+            validated2.semantic_error,
             offsets2,
             record_index2,
         )) |failure| {
@@ -2564,21 +2549,19 @@ fn nextValidatedSampleRecord(
     reader: *zfastq.Reader,
     validator: *fastq.AdaptiveRecordValidator,
 ) SampleRecordOutcome {
-    var canonical_span: ?[]const u8 = null;
-    const record = fastq.nextWithoutId(reader, &canonical_span) catch |err| {
+    const validated = fastq.nextValidatedRecord(reader, validator) catch |err| {
         return .{ .failure = mapReaderFailure(reader, err) };
     } orelse return .done;
-    if (validateCurrentCommandRecord(
-        validator,
+    if (mapCurrentSemanticFailure(
+        validated.semantic_error,
         reader,
-        record,
         reader.recordIndex() - 1,
     )) |failure| {
         return .{ .failure = failure };
     }
     return .{ .record = .{
-        .record = record,
-        .canonical_span = canonical_span,
+        .record = validated.record,
+        .canonical_span = validated.canonical_span,
     } };
 }
 
@@ -2734,16 +2717,16 @@ fn sampleExactSecondPass(
     var failure: ?CommandFailure = null;
     while (cursor.unit_count < expected_count) {
         if (cursor.selectNextCached(&next_selected)) {
-            var canonical_span: ?[]const u8 = null;
-            const record = fastq.nextWithoutId(&reader, &canonical_span) catch |err| {
+            const validated = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
                 failure = mapReaderFailure(&reader, err);
                 break;
             } orelse break;
-            if (validator.validate(record) != null) {
+            if (validated.semantic_error != null) {
                 failure = inputChangedFailure();
                 break;
             }
-            if (canonical_span) |span| {
+            const record = validated.record;
+            if (validated.canonical_span) |span| {
                 fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
             } else {
                 if (recordHasUnwritableEnding(record, null)) {
@@ -3058,14 +3041,20 @@ fn sampleExactPairedSecondPass(
         const selected = cursor.selectNextCached(&next_selected);
         var canonical_span1: ?[]const u8 = null;
         var record1: ?zfastq.Record = null;
+        var semantic1: ?zfastq.SemanticError = null;
         const got1 = if (selected) selected_record: {
-            record1 = fastq.nextWithoutId(&reader1, &canonical_span1) catch |err| failed: {
+            const validated = fastq.nextValidatedRecord(&reader1, &validator1) catch |err| failed: {
                 failure = .{ .command = .{
                     .input_index = 0,
                     .details = mapReaderFailure(&reader1, err),
                 } };
                 break :failed null;
             };
+            if (validated) |value| {
+                record1 = value.record;
+                canonical_span1 = value.canonical_span;
+                semantic1 = value.semantic_error;
+            }
             break :selected_record record1 != null;
         } else reader1.advance() catch |err| failed: {
             failure = .{ .command = .{
@@ -3078,14 +3067,20 @@ fn sampleExactPairedSecondPass(
 
         var canonical_span2: ?[]const u8 = null;
         var record2: ?zfastq.Record = null;
+        var semantic2: ?zfastq.SemanticError = null;
         const got2 = if (selected) selected_record: {
-            record2 = fastq.nextWithoutId(&reader2, &canonical_span2) catch |err| failed: {
+            const validated = fastq.nextValidatedRecord(&reader2, &validator2) catch |err| failed: {
                 failure = .{ .command = .{
                     .input_index = 1,
                     .details = mapReaderFailure(&reader2, err),
                 } };
                 break :failed null;
             };
+            if (validated) |value| {
+                record2 = value.record;
+                canonical_span2 = value.canonical_span;
+                semantic2 = value.semantic_error;
+            }
             break :selected_record record2 != null;
         } else reader2.advance() catch |err| failed: {
             failure = .{ .command = .{
@@ -3104,11 +3099,11 @@ fn sampleExactPairedSecondPass(
             break;
         }
         if (selected) {
-            if (validator1.validate(record1.?) != null) {
+            if (semantic1 != null) {
                 failure = inputChangedPairFailure(0);
                 break;
             }
-            if (validator2.validate(record2.?) != null) {
+            if (semantic2 != null) {
                 failure = inputChangedPairFailure(1);
                 break;
             }
@@ -3231,8 +3226,7 @@ fn sampleExactInterleavedSecondPass(
             continue;
         }
 
-        var canonical_span1: ?[]const u8 = null;
-        const record1 = fastq.nextWithoutId(&reader, &canonical_span1) catch |err| failed: {
+        const validated1 = fastq.nextValidatedRecord(&reader, &validator) catch |err| failed: {
             failure = .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
@@ -3240,14 +3234,15 @@ fn sampleExactInterleavedSecondPass(
             break :failed null;
         } orelse break;
 
-        const invalid1 = validator.validate(record1) != null;
+        const record1 = validated1.record;
+        const canonical_span1 = validated1.canonical_span;
+        const invalid1 = validated1.semantic_error != null;
         const header1_len = record1.header.len;
         const unwritable1 = recordHasUnwritableEnding(record1, canonical_span1);
-        var canonical_span2: ?[]const u8 = null;
         var record1_storage: InterleavedFirstRecordStorage = .reader;
-        const buffered_record2 = fastq.nextBufferedWithoutId(
+        const buffered_record2 = fastq.nextBufferedValidatedRecord(
             &reader,
-            &canonical_span2,
+            &validator,
         ) catch |err| failed: {
             failure = .{ .command = .{
                 .input_index = 0,
@@ -3255,7 +3250,7 @@ fn sampleExactInterleavedSecondPass(
             } };
             break :failed null;
         };
-        const record2 = buffered_record2 orelse record: {
+        const validated2 = buffered_record2 orelse record: {
             const preserved = nextAfterPreservingInterleavedMate1(
                 allocator,
                 &reader,
@@ -3264,6 +3259,7 @@ fn sampleExactInterleavedSecondPass(
                 record1,
                 canonical_span1,
                 staging_limit,
+                &validator,
             ) catch |err| failed: {
                 failure = .{ .command = .{
                     .input_index = 0,
@@ -3279,12 +3275,13 @@ fn sampleExactInterleavedSecondPass(
                 break :failed null;
             };
             if (failure != null) break :record null;
-            canonical_span2 = preserved.?.canonical_span;
             record1_storage = preserved.?.first_storage;
             break :record preserved.?.record;
         } orelse break;
 
-        if (invalid1 or validator.validate(record2) != null) {
+        const record2 = validated2.record;
+        const canonical_span2 = validated2.canonical_span;
+        if (invalid1 or validated2.semantic_error != null) {
             failure = inputChangedPairFailure(0);
             break;
         }
@@ -3625,20 +3622,22 @@ fn interleaveSources(
     var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        var canonical_span1: ?[]const u8 = null;
-        const record1 = fastq.nextWithoutId(&reader1, &canonical_span1) catch |err| {
+        const validated1 = fastq.nextValidatedRecord(&reader1, &validator1) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader1, err),
             } };
         };
-        var canonical_span2: ?[]const u8 = null;
-        const record2 = fastq.nextWithoutId(&reader2, &canonical_span2) catch |err| {
+        const validated2 = fastq.nextValidatedRecord(&reader2, &validator2) catch |err| {
             return .{ .command = .{
                 .input_index = 1,
                 .details = mapReaderFailure(&reader2, err),
             } };
         };
+        const record1 = if (validated1) |value| value.record else null;
+        const record2 = if (validated2) |value| value.record else null;
+        const canonical_span1 = if (validated1) |value| value.canonical_span else null;
+        const canonical_span2 = if (validated2) |value| value.canonical_span else null;
 
         if (record1 == null and record2 == null) return null;
         if (record1 == null or record2 == null) {
@@ -3661,17 +3660,15 @@ fn interleaveSources(
         const record_index2 = reader2.recordIndex() - 1;
         const offsets1 = reader1.currentRecordOffsets().?;
         const offsets2 = reader2.currentRecordOffsets().?;
-        if (validateCommandRecord(
-            &validator1,
-            record1.?,
+        if (mapSemanticFailure(
+            validated1.?.semantic_error,
             offsets1,
             record_index1,
         )) |failure| {
             return .{ .command = .{ .input_index = 0, .details = failure } };
         }
-        if (validateCommandRecord(
-            &validator2,
-            record2.?,
+        if (mapSemanticFailure(
+            validated2.?.semantic_error,
             offsets2,
             record_index2,
         )) |failure| {
@@ -3922,41 +3919,40 @@ fn deinterleaveSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        var canonical_span1: ?[]const u8 = null;
-        const record1 = fastq.nextWithoutId(&reader, &canonical_span1) catch |err| {
+        const validated1 = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
             } };
         } orelse return null;
+        const record1 = validated1.record;
+        const canonical_span1 = validated1.canonical_span;
         const record_index1 = reader.recordIndex() - 1;
         const offsets1 = reader.currentRecordOffsets().?;
         const header1_len = record1.header.len;
-        const semantic1 = validateCommandRecord(
-            &validator,
-            record1,
+        const semantic1 = mapSemanticFailure(
+            validated1.semantic_error,
             offsets1,
             record_index1,
         );
 
         const unwritable1 = recordHasUnwritableEnding(record1, canonical_span1);
-        var canonical_span2: ?[]const u8 = null;
         var record1_storage: InterleavedFirstRecordStorage = .reader;
-        const buffered_record2 = fastq.nextBufferedWithoutId(
+        const buffered_record2 = fastq.nextBufferedValidatedRecord(
             &reader,
-            &canonical_span2,
+            &validator,
         ) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
             } };
         };
-        const record2 = buffered_record2 orelse record: {
+        const validated2 = buffered_record2 orelse record: {
             @branchHint(.cold);
             if (semantic1 != null) {
-                break :record fastq.nextWithoutId(
+                break :record fastq.nextValidatedRecord(
                     &reader,
-                    &canonical_span2,
+                    &validator,
                 ) catch |err| {
                     return .{ .command = .{
                         .input_index = 0,
@@ -3980,6 +3976,7 @@ fn deinterleaveSource(
                 record1,
                 canonical_span1,
                 staging_limit,
+                &validator,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return pairCommandFailure(
                     0,
@@ -3998,7 +3995,6 @@ fn deinterleaveSource(
                     .details = mapReaderFailure(&reader, @errorCast(err)),
                 } },
             };
-            canonical_span2 = preserved.canonical_span;
             record1_storage = preserved.first_storage;
             break :record preserved.record orelse return .{ .pair = .{ .count_mismatch = .{
                 .pair_index = record_index1 / 2,
@@ -4010,15 +4006,16 @@ fn deinterleaveSource(
             } } };
         };
 
+        const record2 = validated2.record;
+        const canonical_span2 = validated2.canonical_span;
         if (semantic1) |details| {
             return .{ .command = .{ .input_index = 0, .details = details } };
         }
 
         const record_index2 = reader.recordIndex() - 1;
         const offsets2 = reader.currentRecordOffsets().?;
-        if (validateCommandRecord(
-            &validator,
-            record2,
+        if (mapSemanticFailure(
+            validated2.semantic_error,
             offsets2,
             record_index2,
         )) |details| {
@@ -5246,6 +5243,7 @@ test "[integration] - [paired exact sample]: selected pairs are revalidated afte
         .{ .after1 = "@b/1\n.\n+\n!\n" },
         .{ .after2 = "@b/2\n.\n+\n!\n", .failed_input = 1 },
         .{ .after1 = "@b/1\nA\n+\n \n" },
+        .{ .after1 = "@b/1\nR\n+\n \n" },
         .{ .after2 = "@b/2\nT\n+\n\x7f\n", .failed_input = 1 },
         .{ .after2 = "@c/2\nT\n+\n!\n" },
         .{ .after2 = "@b/1\nT\n+\n!\n" },
@@ -5266,6 +5264,13 @@ test "[integration] - [paired exact sample]: selected pairs are revalidated afte
         },
         .{
             .after1 = "@b/1\n.\n+\n!\n",
+            .after2 = "@c/2\nT\nx\n!\n",
+            .failed_input = 1,
+            .code = "S001",
+            .exit_code = 1,
+        },
+        .{
+            .after1 = "@b/1\nR\n+\n \n",
             .after2 = "@c/2\nT\nx\n!\n",
             .failed_input = 1,
             .code = "S001",
@@ -5416,6 +5421,7 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
             defer staged.deinit(allocator);
             var span1: ?[]const u8 = null;
             var span2: ?[]const u8 = null;
+            var validator = fastq.AdaptiveRecordValidator.init(.{});
             const record1 = (try fastq.nextWithoutId(&reader, &span1)).?;
             if (try fastq.nextBufferedWithoutId(&reader, &span2)) |_| {
                 try std.testing.expectEqual(.reader, storage);
@@ -5428,6 +5434,7 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
                     record1,
                     span1,
                     staging_limit,
+                    &validator,
                 );
                 try std.testing.expectEqual(storage, next.first_storage);
                 try std.testing.expect(next.record != null);
@@ -6645,6 +6652,7 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
         var staging: std.ArrayList(u8) = .empty;
         defer staging.deinit(std.testing.allocator);
         var span: ?[]const u8 = null;
+        var validator = fastq.AdaptiveRecordValidator.init(.{});
         const record1 = (try fastq.nextWithoutId(&reader, &span)).?;
         try std.testing.expect((try fastq.nextBufferedWithoutId(&reader, &span)) == null);
         const next = try nextAfterPreservingInterleavedMate1(
@@ -6655,12 +6663,14 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
             record1,
             null,
             try deinterleaveStagingLimit(reader.options.max_line_bytes),
+            &validator,
         );
         try std.testing.expect(next.first_storage == .retained);
         try std.testing.expectEqual(@as(usize, 0), staging.capacity);
         try std.testing.expect(std.mem.allEqual(u8, record1.sequence, 'A'));
-        try std.testing.expectEqual(second_field_len, next.record.?.sequence.len);
-        try std.testing.expect(std.mem.allEqual(u8, next.record.?.sequence, 'T'));
+        try std.testing.expectEqual(second_field_len, next.record.?.record.sequence.len);
+        try std.testing.expect(std.mem.allEqual(u8, next.record.?.record.sequence, 'T'));
+        try std.testing.expect(next.record.?.semantic_error == null);
     }
 
     try std.testing.checkAllAllocationFailures(
