@@ -238,13 +238,17 @@ test "[cli] - [count]: empty CRLF identifiers fail after dense warmup across gzi
     }
 }
 
-test "[cli] - [count]: damaged gzip framing and member data exit as I/O" {
+test "[cli] - [count]: gzip detection, member ends, and damage keep distinct exit classes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     var valid: std.ArrayList(u8) = .empty;
     try appendGzipMember(allocator, &valid, "@r\nA\n+\n!\n", .{});
 
+    const magic = try allocator.dupe(u8, valid.items);
+    magic[0] ^= 1;
+    const metadata = try allocator.dupe(u8, valid.items);
+    metadata[4] ^= 1;
     const method = try allocator.dupe(u8, valid.items);
     method[2] = 0;
     const reserved = try allocator.dupe(u8, valid.items);
@@ -262,27 +266,47 @@ test "[cli] - [count]: damaged gzip framing and member data exit as I/O" {
     });
     with_header_crc.items[10] ^= 1;
 
-    var damaged_later: std.ArrayList(u8) = .empty;
-    try damaged_later.appendSlice(allocator, valid.items);
-    try damaged_later.appendSlice(allocator, &.{ 0x1f, 0x8b, 0x08 });
+    var members: std.ArrayList(u8) = .empty;
+    try members.appendSlice(allocator, valid.items);
+    try appendGzipMember(allocator, &members, "@second\nTT\n+\n##\n", .{});
+    const later_checksum = try allocator.dupe(u8, members.items);
+    later_checksum[later_checksum.len - 8] ^= 1;
+    const later_size = try allocator.dupe(u8, members.items);
+    later_size[later_size.len - 4] ^= 1;
 
-    const cases = [_][]const u8{
-        method,
-        reserved,
-        deflate,
-        checksum,
-        size,
-        with_header_crc.items,
-        valid.items[0..9],
-        valid.items[0..12],
-        valid.items[0 .. valid.items.len - 1],
-        damaged_later.items,
+    const plain_error = "error: -: S003: header line must start with '@' and contain a nonempty identifier " ++
+        "(record 0, line 1, offset 0)\n";
+    const cases = [_]struct {
+        bytes: []const u8,
+        exit_code: u8 = 3,
+        stdout: []const u8 = "",
+        stderr: []const u8 = "error: -: I/O error\n",
+    }{
+        .{ .bytes = valid.items[0..0], .exit_code = 0, .stdout = "0\n", .stderr = "" },
+        .{ .bytes = valid.items[0..1], .exit_code = 1, .stderr = plain_error },
+        .{ .bytes = valid.items[0..2] },
+        .{ .bytes = magic, .exit_code = 1, .stderr = plain_error },
+        .{ .bytes = metadata, .exit_code = 0, .stdout = "1\n", .stderr = "" },
+        .{ .bytes = members.items[0..valid.items.len], .exit_code = 0, .stdout = "1\n", .stderr = "" },
+        .{ .bytes = members.items, .exit_code = 0, .stdout = "2\n", .stderr = "" },
+        .{ .bytes = method },
+        .{ .bytes = reserved },
+        .{ .bytes = deflate },
+        .{ .bytes = checksum },
+        .{ .bytes = size },
+        .{ .bytes = with_header_crc.items },
+        .{ .bytes = valid.items[0..9] },
+        .{ .bytes = valid.items[0..12] },
+        .{ .bytes = valid.items[0 .. valid.items.len - 1] },
+        .{ .bytes = members.items[0 .. valid.items.len + 3] },
+        .{ .bytes = members.items[0 .. members.items.len - 1] },
+        .{ .bytes = later_checksum },
+        .{ .bytes = later_size },
     };
-    for (cases) |bytes| {
-        const result = try runCliWithStdin(allocator, &.{ "count", "-" }, bytes, 1);
-        try std.testing.expectEqual(@as(u8, 3), result.exit_code);
-        try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
-        try std.testing.expectEqualStrings("error: -: I/O error\n", result.stderr);
+    for (cases, 0..) |case, index| {
+        errdefer std.debug.print("gzip count case {d}\n", .{index});
+        const result = try runCliWithStdin(allocator, &.{ "count", "-" }, case.bytes, 1);
+        try cli.expectResult(result, case.exit_code, case.stdout, case.stderr);
     }
 }
 

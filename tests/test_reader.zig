@@ -3,11 +3,55 @@
 const std = @import("std");
 const zfastq = @import("z-fastq");
 
+const GZIP_EMPTY = [_]u8{
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+    0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00,
+};
+
 const GZIP_OPTIONAL_X = [_]u8{
     0x1f, 0x8b, 0x08, 0x1e, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
     0x02, 0x00, 'x',  'y',  'n',  0x00, 'c',  0x00, 0xca, 0x4e,
     0x01, 0x01, 0x00, 0xfe, 0xff, 'x',  0x83, 0x16, 0xdc, 0x8c,
     0x01, 0x00, 0x00, 0x00,
+};
+
+const GZIP_FIXED = [_]u8{
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x03,
+    0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca,
+    0x49, 0xe1, 0x02, 0x00, 0xd5, 0xe0, 0x39, 0xb7, 0x0c, 0x00,
+    0x00, 0x00,
+};
+
+const GZIP_DYNAMIC = [_]u8{
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+    0x3d, 0xc6, 0x39, 0x11, 0x00, 0x00, 0x0c, 0x02, 0x30, 0x2b,
+    0xb5, 0x52, 0x1e, 0xff, 0x96, 0x38, 0x16, 0x96, 0x5c, 0x1e,
+    0x94, 0xcb, 0x6d, 0x01, 0x17, 0x1c, 0x39, 0xb4, 0x13, 0x00,
+    0x00, 0x00,
+};
+
+const GZIP_CASES = [_]struct {
+    name: []const u8,
+    compressed: []const u8,
+    decoded: []const u8,
+    prefix: ?struct { compressed_len: usize, decoded_len: usize } = null,
+}{
+    .{ .name = "empty member", .compressed = &GZIP_EMPTY, .decoded = "" },
+    .{ .name = "stored with optional header", .compressed = &GZIP_OPTIONAL_X, .decoded = "x" },
+    .{ .name = "fixed", .compressed = &GZIP_FIXED, .decoded = "Hello world\n" },
+    .{ .name = "dynamic", .compressed = &GZIP_DYNAMIC, .decoded = "ABCDEABCD ABCDEABCD" },
+    .{
+        .name = "stored and dynamic members",
+        .compressed = &(GZIP_OPTIONAL_X ++ GZIP_DYNAMIC),
+        .decoded = "xABCDEABCD ABCDEABCD",
+        .prefix = .{ .compressed_len = GZIP_OPTIONAL_X.len, .decoded_len = 1 },
+    },
+};
+
+const GZIP_CHUNKS = [_]struct { input: usize, output: usize }{
+    .{ .input = 1, .output = 1 },
+    .{ .input = 31, .output = 17 },
 };
 
 test "[unit] - [root]: every exported declaration is analyzable" {
@@ -34,6 +78,124 @@ test "[property] - [gzip source]: optional member chains decode at every input c
         try std.testing.expectEqual(@as(usize, 2), try source.read(&output));
         try std.testing.expectEqualStrings("xx", &output);
         try std.testing.expectEqual(@as(usize, 0), try source.read(&output));
+    }
+}
+
+test "[property] - [gzip source]: truncations accept only complete member prefixes" {
+    var output: [4096]u8 = undefined;
+    for (GZIP_CASES) |case| {
+        for (GZIP_CHUNKS) |chunks| {
+            for (0..case.compressed.len + 1) |end| {
+                errdefer std.debug.print("gzip {s}, cut {d}, chunks {d}/{d}\n", .{
+                    case.name, end, chunks.input, chunks.output,
+                });
+                var expected: ?[]const u8 = null;
+                if (end == case.compressed.len) expected = case.decoded;
+                if (case.prefix) |prefix| {
+                    if (end == prefix.compressed_len) {
+                        expected = case.decoded[0..prefix.decoded_len];
+                    }
+                }
+
+                const result = decodeGzip(case.compressed[0..end], chunks.input, chunks.output, &output);
+                if (expected) |bytes| {
+                    try std.testing.expectEqualStrings(bytes, try result);
+                } else {
+                    try std.testing.expectError(error.ReadFailed, result);
+                }
+            }
+        }
+    }
+}
+
+test "[fuzz] - [gzip source]: byte mutations fail or preserve frozen output" {
+    var mutated: [GZIP_OPTIONAL_X.len + GZIP_DYNAMIC.len]u8 = undefined;
+    var output: [4096]u8 = undefined;
+    const masks = [_]u8{ 1, 2, 4, 8, 16, 32, 64, 128, 0x55, 0xaa, 0xff };
+
+    for (GZIP_CASES) |case| {
+        const compressed = mutated[0..case.compressed.len];
+        @memcpy(compressed, case.compressed);
+        for (case.compressed, 0..) |original, offset| {
+            for (masks) |mask| {
+                compressed[offset] = original ^ mask;
+                for (GZIP_CHUNKS) |chunks| {
+                    errdefer std.debug.print("gzip {s}, byte {d}, xor 0x{x}, chunks {d}/{d}\n", .{
+                        case.name, offset, mask, chunks.input, chunks.output,
+                    });
+                    const decoded = decodeGzip(compressed, chunks.input, chunks.output, &output) catch |err| switch (err) {
+                        error.ReadFailed => continue,
+                        else => return err,
+                    };
+                    try std.testing.expectEqualStrings(case.decoded, decoded);
+                }
+            }
+            compressed[offset] = original;
+        }
+    }
+}
+
+test "[failure] - [gzip source]: header CRC, CRC32, and ISIZE are checked in every member" {
+    const valid = GZIP_OPTIONAL_X ++ GZIP_OPTIONAL_X;
+    var corrupted = valid;
+    var output: [16]u8 = undefined;
+    const checked_bytes = [_]usize{ 18, 19, 26, 27, 28, 29, 30, 31, 32, 33 };
+
+    for ([_]usize{ 0, GZIP_OPTIONAL_X.len }) |member_start| {
+        for (checked_bytes) |byte| {
+            const offset = member_start + byte;
+            for (0..8) |bit| {
+                corrupted[offset] = valid[offset] ^ (@as(u8, 1) << @intCast(bit));
+                for (GZIP_CHUNKS) |chunks| {
+                    errdefer std.debug.print("gzip checksum byte {d}, bit {d}, chunks {d}/{d}\n", .{
+                        offset, bit, chunks.input, chunks.output,
+                    });
+                    try std.testing.expectError(
+                        error.ReadFailed,
+                        decodeGzip(&corrupted, chunks.input, chunks.output, &output),
+                    );
+                }
+            }
+            corrupted[offset] = valid[offset];
+        }
+    }
+}
+
+test "[edge] - [gzip source]: history refills preserve bytes and validate the final trailer" {
+    // Frozen gzip of "ACGT" repeated 16,385 times, beyond the native 64 KiB buffer.
+    const compressed = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff,
+        0xed, 0xc3, 0x31, 0x09, 0x00, 0x00, 0x0c, 0x03, 0x30, 0x6d,
+        0xa5, 0xc7, 0x0c, 0xd4, 0xbf, 0x96, 0x19, 0x49, 0x20, 0xe9,
+        0x2d, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+        0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+        0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+        0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+        0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+        0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+        0xaa, 0xaa, 0xaa, 0xaa, 0xda, 0xdb, 0x03, 0x57, 0xe1, 0x9b,
+        0x36, 0x04, 0x00, 0x01, 0x00,
+    };
+    const expected = "ACGT" ** 16385;
+    var output: [expected.len + 1]u8 = undefined;
+
+    for ([_]usize{ 257, 32769 }) |output_chunk_len| {
+        try std.testing.expectEqualStrings(
+            expected,
+            try decodeGzip(&compressed, 31, output_chunk_len, &output),
+        );
+        for ([_]usize{ compressed.len - 8, compressed.len - 4 }) |offset| {
+            var corrupted = compressed;
+            corrupted[offset] ^= 1;
+            try std.testing.expectError(
+                error.ReadFailed,
+                decodeGzip(&corrupted, 31, output_chunk_len, &output),
+            );
+        }
+        try std.testing.expectError(
+            error.ReadFailed,
+            decodeGzip(compressed[0 .. compressed.len - 1], 31, output_chunk_len, &output),
+        );
     }
 }
 
@@ -1391,6 +1553,26 @@ const ChunkSource = struct {
         return n;
     }
 };
+
+fn decodeGzip(
+    compressed: []const u8,
+    input_chunk_len: usize,
+    output_chunk_len: usize,
+    output: []u8,
+) ![]const u8 {
+    var input_buffer: [64]u8 = undefined;
+    var input = FragmentReader.init(compressed, input_chunk_len, &input_buffer);
+    var gzip = zfastq.io.gzip.ReaderSource.init(&input.interface);
+    const source = gzip.byteSource();
+    var written: usize = 0;
+    while (written < output.len) {
+        const end = @min(output.len, written + output_chunk_len);
+        const n = try source.read(output[written..end]);
+        if (n == 0) return output[0..written];
+        written += n;
+    }
+    return error.TestOutputLimit;
+}
 
 const FragmentReader = struct {
     interface: std.Io.Reader,
