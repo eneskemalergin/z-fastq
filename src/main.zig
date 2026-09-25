@@ -2724,6 +2724,7 @@ fn sampleExactSecondPass(
         .{ .max_line_bytes = options.max_line_bytes },
     ) catch return CommandFailure.plain("out_of_memory", "out of memory", 3);
     defer reader.deinit();
+    var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     var cursor = ExactOutputCursor{
         .select_all = select_all,
@@ -2738,6 +2739,10 @@ fn sampleExactSecondPass(
                 failure = mapReaderFailure(&reader, err);
                 break;
             } orelse break;
+            if (validator.validate(record) != null) {
+                failure = inputChangedFailure();
+                break;
+            }
             if (canonical_span) |span| {
                 fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
             } else {
@@ -3040,6 +3045,8 @@ fn sampleExactPairedSecondPass(
         .{ .max_line_bytes = options.max_line_bytes },
     ) catch return pairCommandFailure(1, "out_of_memory", "out of memory", 3);
     defer reader2.deinit();
+    var validator1 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
+    var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     var cursor = ExactOutputCursor{
         .select_all = select_all,
@@ -3097,6 +3104,18 @@ fn sampleExactPairedSecondPass(
             break;
         }
         if (selected) {
+            if (validator1.validate(record1.?) != null) {
+                failure = inputChangedPairFailure(0);
+                break;
+            }
+            if (validator2.validate(record2.?) != null) {
+                failure = inputChangedPairFailure(1);
+                break;
+            }
+            if (!pairing.headersMatch(record1.?.header, record2.?.header, options.pair_name_policy)) {
+                failure = inputChangedPairFailure(0);
+                break;
+            }
             if (recordHasUnwritableEnding(record1.?, canonical_span1)) {
                 failure = .{ .command = .{ .input_index = 0, .details = unwritableRecordFailure() } };
                 break;
@@ -3177,6 +3196,7 @@ fn sampleExactInterleavedSecondPass(
         .{ .max_line_bytes = options.max_line_bytes },
     ) catch return pairCommandFailure(0, "out_of_memory", "out of memory", 3);
     defer reader.deinit();
+    var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
     var staged_record: std.ArrayList(u8) = .empty;
     defer staged_record.deinit(allocator);
     var retained_record_storage: fastq.RetainedRecordStorage = .{};
@@ -3220,6 +3240,8 @@ fn sampleExactInterleavedSecondPass(
             break :failed null;
         } orelse break;
 
+        const invalid1 = validator.validate(record1) != null;
+        const header1_len = record1.header.len;
         const unwritable1 = recordHasUnwritableEnding(record1, canonical_span1);
         var canonical_span2: ?[]const u8 = null;
         var record1_storage: InterleavedFirstRecordStorage = .reader;
@@ -3262,6 +3284,19 @@ fn sampleExactInterleavedSecondPass(
             break :record preserved.?.record;
         } orelse break;
 
+        if (invalid1 or validator.validate(record2) != null) {
+            failure = inputChangedPairFailure(0);
+            break;
+        }
+        const header1 = switch (record1_storage) {
+            .unused => unreachable,
+            .reader, .retained => record1.header,
+            .staged => staged_record.items[1 .. 1 + header1_len],
+        };
+        if (!pairing.headersMatch(header1, record2.header, options.pair_name_policy)) {
+            failure = inputChangedPairFailure(0);
+            break;
+        }
         if (unwritable1 or recordHasUnwritableEnding(record2, canonical_span2)) {
             failure = .{ .command = .{ .input_index = 0, .details = unwritableRecordFailure() } };
             break;
@@ -5070,34 +5105,398 @@ test "[failure] - [exact sample]: a FIFO replacement reports input changed on re
     try std.testing.expectEqual(@as(u8, 3), failure.exit_code);
 }
 
-test "[integration] - [exact sample]: the output pass trusts first-pass semantics" {
+fn writeExactTestInput(
+    io: std.Io,
+    path: []const u8,
+    bytes: []const u8,
+    gzip: bool,
+    snapshot: ?FileSnapshot,
+) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var buffer: [4096]u8 = undefined;
+    var output = file.writer(io, &buffer);
+    if (gzip) {
+        const len = std.math.cast(u16, bytes.len) orelse return error.TestFixtureTooLarge;
+        try output.interface.writeAll(&.{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255, 1 });
+        try output.interface.writeInt(u16, len, .little);
+        try output.interface.writeInt(u16, ~len, .little);
+        try output.interface.writeAll(bytes);
+        try output.interface.writeInt(u32, std.hash.Crc32.hash(bytes), .little);
+        try output.interface.writeInt(u32, len, .little);
+    } else {
+        try output.interface.writeAll(bytes);
+    }
+    try output.interface.flush();
+    if (snapshot) |expected| {
+        try file.setTimestamps(io, .{
+            .modify_timestamp = .{ .new = .{ .nanoseconds = expected.mtime_nanoseconds } },
+        });
+        try std.testing.expect(sameFileSnapshot(expected, try fileSnapshot(file, io)));
+    }
+}
+
+test "[integration] - [exact sample]: selected records are revalidated after metadata-preserving changes" {
     const io = std.testing.io;
-    const path = "tests/data/synthetic/bad_alphabet.fastq";
-    const snapshot = try snapshotTestFile(io, path);
-
-    var output: [64]u8 = undefined;
-    var sink = io_layer.SliceSink.init(&output);
-    var writer = zfastq.Writer.init(sink.byteSink());
-    const failure = try sampleExactSecondPass(
-        false,
-        io,
-        std.testing.allocator,
-        path,
-        &writer,
-        .{ .low_words = &.{1}, .middle_bytes = &.{0} },
-        snapshot,
-        1,
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/input", .{tmp.sub_path});
+    defer allocator.free(path);
+    const prefix = "@a\nC\n+\n#\n";
+    const cases = [_]struct {
+        before: []const u8 = "@b\nA\n+\n!\n",
+        after: []const u8,
+        alphabet: zfastq.Alphabet = .iupac,
+        valid_output: ?[]const u8 = null,
+    }{
+        .{ .after = "@b\n.\n+\n!\n" },
+        .{ .after = "@b\nA\n+\n \n" },
+        .{ .after = "@b\nA\n+\n\x7f\n" },
+        .{ .after = "@b\nR\n+\n!\n", .alphabet = .acgtn },
+        .{ .after = "@b\nR\n+\n!\n", .valid_output = "@b\nR\n+\n!\n" },
+        .{ .before = "@b\r\nA\r\n+\r\n!\r\n", .after = "@b\r\n.\r\n+\r\n!\r\n" },
         .{
-            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-            .alphabet = .iupac,
-            .fraction = null,
-            .count = 1,
-            .seed = 11,
+            .before = "@b\r\nA\r\n+\r\n!\r\n",
+            .after = "@b\r\nR\r\n+\r\n~\r\n",
+            .valid_output = "@b\nR\n+\n~\n",
         },
-    );
+    };
+    for ([_]bool{ false, true }) |gzip| {
+        inline for (.{ .all, .selected, .unselected }) |selection| {
+            for (cases, 0..) |case, case_index| {
+                errdefer std.debug.print("gzip={} selection={s} case={d}\n", .{ gzip, @tagName(selection), case_index });
+                var input_buffer: [128]u8 = undefined;
+                const before = try std.fmt.bufPrint(&input_buffer, "{s}{s}", .{ prefix, case.before });
+                try writeExactTestInput(io, path, before, gzip, null);
+                const options = SampleOptions{
+                    .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+                    .alphabet = case.alphabet,
+                    .fraction = null,
+                    .count = if (selection == .all) 2 else 1,
+                    .seed = 11,
+                };
+                var selector = sampling.ExactSelector.init(options.count.?, options.seed);
+                defer selector.deinit(allocator);
+                const first = sampleExactFirstPass(io, allocator, path, &selector, options);
+                try std.testing.expect(first == .success);
+                try std.testing.expectEqual(@as(u64, 2), selector.record_count);
+                const snapshot = first.success.snapshot;
+                const after = try std.fmt.bufPrint(&input_buffer, "{s}{s}", .{ prefix, case.after });
+                try writeExactTestInput(io, path, after, gzip, snapshot);
 
-    try std.testing.expect(failure == null);
-    try std.testing.expectEqualStrings("@bad_alphabet\nAC.X\n+\n!!!!\n", sink.written());
+                var output: [128]u8 = undefined;
+                var sink = io_layer.SliceSink.init(&output);
+                var writer = zfastq.Writer.init(sink.byteSink());
+                const failure = try sampleExactSecondPass(
+                    selection == .all,
+                    io,
+                    allocator,
+                    path,
+                    &writer,
+                    if (selection == .all) .empty else .{
+                        .low_words = &.{if (selection == .selected) 2 else 1},
+                        .middle_bytes = &.{0},
+                    },
+                    snapshot,
+                    selector.record_count,
+                    options,
+                );
+                if (selection != .unselected and case.valid_output == null) {
+                    try std.testing.expect(failure != null);
+                    try std.testing.expectEqualStrings("input_changed", failure.?.code);
+                    try std.testing.expectEqualStrings("input changed during exact sampling", failure.?.message);
+                    try std.testing.expectEqual(@as(u8, 3), failure.?.exit_code);
+                } else {
+                    try std.testing.expect(failure == null);
+                }
+                var expected: [128]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{s}{s}", .{
+                    if (selection == .selected) "" else prefix,
+                    if (selection == .unselected) "" else case.valid_output orelse "",
+                }), sink.written());
+            }
+        }
+    }
+}
+
+test "[integration] - [paired exact sample]: selected pairs are revalidated after metadata-preserving changes" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path1 = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/r1", .{tmp.sub_path});
+    defer allocator.free(path1);
+    const path2 = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/r2", .{tmp.sub_path});
+    defer allocator.free(path2);
+    const prefix1 = "@a\nC\n+\n#\n";
+    const prefix2 = "@a\nG\n+\n$\n";
+    const prefix = prefix1 ++ prefix2;
+    const cases = [_]struct {
+        before1: []const u8 = "@b/1\nA\n+\n!\n",
+        before2: []const u8 = "@b/2\nT\n+\n!\n",
+        after1: []const u8 = "@b/1\nA\n+\n!\n",
+        after2: []const u8 = "@b/2\nT\n+\n!\n",
+        alphabet: zfastq.Alphabet = .iupac,
+        policy: pairing.NamePolicy = .illumina,
+        failed_input: ?u1 = 0,
+        code: []const u8 = "input_changed",
+        exit_code: u8 = 3,
+    }{
+        .{ .after1 = "@b/1\n.\n+\n!\n" },
+        .{ .after2 = "@b/2\n.\n+\n!\n", .failed_input = 1 },
+        .{ .after1 = "@b/1\nA\n+\n \n" },
+        .{ .after2 = "@b/2\nT\n+\n\x7f\n", .failed_input = 1 },
+        .{ .after2 = "@c/2\nT\n+\n!\n" },
+        .{ .after2 = "@b/1\nT\n+\n!\n" },
+        .{ .before2 = "@b/1\nT\n+\n!\n", .policy = .exact },
+        .{
+            .before1 = "@b/1 1:a\nA\n+\n!\n",
+            .after1 = "@b/1 1:a\nA\n+\n!\n",
+            .before2 = "@b/1 2:a\nT\n+\n!\n",
+            .after2 = "@b/1 2:b\nT\n+\n!\n",
+            .policy = .exact,
+            .failed_input = null,
+        },
+        .{ .after2 = "@b/2\nR\n+\n!\n", .alphabet = .acgtn, .failed_input = 1 },
+        .{ .after2 = "@b/2\nR\n+\n!\n", .failed_input = null },
+        .{
+            .before1 = "@b/1\r\nA\r\n+\r\n!\r\n",
+            .after1 = "@b/1\r\n.\r\n+\r\n!\r\n",
+        },
+        .{
+            .after1 = "@b/1\n.\n+\n!\n",
+            .after2 = "@c/2\nT\nx\n!\n",
+            .failed_input = 1,
+            .code = "S001",
+            .exit_code = 1,
+        },
+    };
+    for ([_]PairMode{ .paired, .interleaved }) |mode| {
+        const inputs: []const []const u8 = if (mode == .paired) &.{ path1, path2 } else &.{path1};
+        for ([_]bool{ false, true }) |gzip| {
+            inline for (.{ .all, .selected, .unselected }) |selection| {
+                for (cases, 0..) |case, case_index| {
+                    errdefer std.debug.print("mode={s} gzip={} selection={s} case={d}\n", .{ @tagName(mode), gzip, @tagName(selection), case_index });
+                    const options = SampleOptions{
+                        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+                        .alphabet = case.alphabet,
+                        .fraction = null,
+                        .count = if (selection == .all) 2 else 1,
+                        .seed = 11,
+                        .pair_mode = mode,
+                        .pair_name_policy = case.policy,
+                    };
+                    var buffer1: [256]u8 = undefined;
+                    var buffer2: [256]u8 = undefined;
+                    const before1 = if (mode == .paired)
+                        try std.fmt.bufPrint(&buffer1, "{s}{s}", .{ prefix1, case.before1 })
+                    else
+                        try std.fmt.bufPrint(&buffer1, "{s}{s}{s}", .{ prefix, case.before1, case.before2 });
+                    try writeExactTestInput(io, path1, before1, gzip, null);
+                    if (mode == .paired) {
+                        const before2 = try std.fmt.bufPrint(&buffer2, "{s}{s}", .{ prefix2, case.before2 });
+                        try writeExactTestInput(io, path2, before2, gzip, null);
+                    }
+                    var selector = sampling.ExactSelector.init(options.count.?, options.seed);
+                    defer selector.deinit(allocator);
+                    const first = sampleExactPairFirstPass(io, allocator, inputs, &selector, options);
+                    try std.testing.expect(first == .success);
+                    try std.testing.expectEqual(@as(u64, 2), selector.record_count);
+                    const snapshots = first.success.snapshots;
+                    const after1 = if (mode == .paired)
+                        try std.fmt.bufPrint(&buffer1, "{s}{s}", .{ prefix1, case.after1 })
+                    else
+                        try std.fmt.bufPrint(&buffer1, "{s}{s}{s}", .{ prefix, case.after1, case.after2 });
+                    try writeExactTestInput(io, path1, after1, gzip, if (mode == .paired)
+                        snapshots.paired[0]
+                    else
+                        snapshots.interleaved);
+                    if (mode == .paired) {
+                        const after2 = try std.fmt.bufPrint(&buffer2, "{s}{s}", .{ prefix2, case.after2 });
+                        try writeExactTestInput(io, path2, after2, gzip, snapshots.paired[1]);
+                    }
+
+                    var output: [256]u8 = undefined;
+                    var sink = io_layer.SliceSink.init(&output);
+                    var writer = zfastq.Writer.init(sink.byteSink());
+                    const failure = try sampleExactPairSecondPass(
+                        selection == .all,
+                        io,
+                        allocator,
+                        inputs,
+                        &writer,
+                        if (selection == .all) .empty else .{
+                            .low_words = &.{if (selection == .selected) 2 else 1},
+                            .middle_bytes = &.{0},
+                        },
+                        snapshots,
+                        selector.record_count,
+                        try deinterleaveStagingLimit(options.max_line_bytes),
+                        options,
+                    );
+                    const reject = case.failed_input != null and
+                        (selection != .unselected or std.mem.eql(u8, case.code, "S001"));
+                    if (reject) {
+                        try std.testing.expect(failure != null);
+                        try std.testing.expect(failure.? == .command);
+                        const command = failure.?.command;
+                        try std.testing.expectEqual(if (mode == .paired) case.failed_input.? else 0, command.input_index);
+                        try std.testing.expectEqualStrings(case.code, command.details.code);
+                        try std.testing.expectEqual(case.exit_code, command.details.exit_code);
+                    } else {
+                        try std.testing.expect(failure == null);
+                    }
+                    var expected: [256]u8 = undefined;
+                    const emit_changed = !reject and selection != .unselected;
+                    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{s}{s}{s}", .{
+                        if (selection == .selected) "" else prefix,
+                        if (emit_changed) case.after1 else "",
+                        if (emit_changed) case.after2 else "",
+                    }), sink.written());
+                }
+            }
+        }
+    }
+}
+
+test "[integration] - [interleaved exact sample]: revalidation survives mate storage changes and output failures" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pairs", .{tmp.sub_path});
+    defer allocator.free(path);
+    const prefix = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n";
+    const options = SampleOptions{
+        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+        .alphabet = .iupac,
+        .fraction = null,
+        .count = 2,
+        .seed = 11,
+        .pair_mode = .interleaved,
+    };
+    const staging_limit = try deinterleaveStagingLimit(options.max_line_bytes);
+    const Change = enum { valid, alphabet1, quality1, alphabet2, quality2, name, structure, write };
+    for ([_]InterleavedFirstRecordStorage{ .reader, .staged, .retained }) |storage| {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(allocator);
+        try input.appendSlice(allocator, prefix);
+        var header_starts: [2]usize = undefined;
+        var sequence_starts: [2]usize = undefined;
+        var plus_starts: [2]usize = undefined;
+        var quality_starts: [2]usize = undefined;
+        for (0..2) |mate| {
+            const field_len: usize = if (storage == .retained or (storage == .staged and mate == 1))
+                zfastq.limits.DEFAULT_READER_BUFFER_BYTES
+            else
+                8;
+            try input.append(allocator, '@');
+            header_starts[mate] = input.items.len;
+            try input.appendNTimes(allocator, 'b', 192);
+            try input.appendSlice(allocator, if (mate == 0) "/1\n" else "/2\n");
+            sequence_starts[mate] = input.items.len;
+            try input.appendNTimes(allocator, if (mate == 0) 'A' else 'T', field_len);
+            try input.append(allocator, '\n');
+            plus_starts[mate] = input.items.len;
+            try input.appendSlice(allocator, "+\n");
+            quality_starts[mate] = input.items.len;
+            try input.appendNTimes(allocator, '!', field_len);
+            try input.append(allocator, '\n');
+        }
+        {
+            var source = io_layer.SliceSource.init(input.items);
+            var reader = try zfastq.Reader.init(allocator, source.byteSource(), .{});
+            defer reader.deinit();
+            try std.testing.expect(try reader.advance());
+            try std.testing.expect(try reader.advance());
+            var retained: fastq.RetainedRecordStorage = .{};
+            defer retained.deinit(allocator);
+            var staged: std.ArrayList(u8) = .empty;
+            defer staged.deinit(allocator);
+            var span1: ?[]const u8 = null;
+            var span2: ?[]const u8 = null;
+            const record1 = (try fastq.nextWithoutId(&reader, &span1)).?;
+            if (try fastq.nextBufferedWithoutId(&reader, &span2)) |_| {
+                try std.testing.expectEqual(.reader, storage);
+            } else {
+                const next = try nextAfterPreservingInterleavedMate1(
+                    allocator,
+                    &reader,
+                    &retained,
+                    &staged,
+                    record1,
+                    span1,
+                    staging_limit,
+                );
+                try std.testing.expectEqual(storage, next.first_storage);
+                try std.testing.expect(next.record != null);
+            }
+        }
+        try writeExactTestInput(io, path, input.items, false, null);
+        var selector = sampling.ExactSelector.init(2, options.seed);
+        defer selector.deinit(allocator);
+        const first = sampleExactPairFirstPass(io, allocator, &.{path}, &selector, options);
+        try std.testing.expect(first == .success);
+        try std.testing.expectEqual(@as(u64, 2), selector.record_count);
+        const snapshot = first.success.snapshots.interleaved;
+        const changed = try allocator.dupe(u8, input.items);
+        defer allocator.free(changed);
+        const output = try allocator.alloc(u8, input.items.len);
+        defer allocator.free(output);
+        for ([_]bool{ false, true }) |select_all| {
+            for (std.enums.values(Change)) |change| {
+                errdefer std.debug.print("storage={s} select_all={} change={s}\n", .{ @tagName(storage), select_all, @tagName(change) });
+                @memcpy(changed, input.items);
+                switch (change) {
+                    .valid, .write => {},
+                    .alphabet1 => changed[sequence_starts[0]] = '.',
+                    .quality1 => changed[quality_starts[0]] = ' ',
+                    .alphabet2 => changed[sequence_starts[1]] = '.',
+                    .quality2 => changed[quality_starts[1]] = 0x7f,
+                    .name => changed[header_starts[1] + 180] = 'c',
+                    .structure => {
+                        changed[sequence_starts[0]] = '.';
+                        changed[plus_starts[1]] = 'x';
+                    },
+                }
+                try writeExactTestInput(io, path, changed, false, snapshot);
+                const expected_prefix = if (select_all) prefix else "";
+                var sink = io_layer.SliceSink.init(if (change == .write)
+                    output[0..expected_prefix.len]
+                else
+                    output);
+                var writer = zfastq.Writer.init(sink.byteSink());
+                const result = sampleExactInterleavedSecondPass(
+                    select_all,
+                    io,
+                    allocator,
+                    path,
+                    &writer,
+                    if (select_all) .empty else .{ .low_words = &.{2}, .middle_bytes = &.{0} },
+                    snapshot,
+                    2,
+                    staging_limit,
+                    options,
+                );
+                if (change == .write) {
+                    try std.testing.expectError(error.WriteFailed, result);
+                } else if (change == .valid) {
+                    try std.testing.expect(try result == null);
+                    try std.testing.expectEqualStrings(if (select_all) input.items else input.items[prefix.len..], sink.written());
+                    continue;
+                } else {
+                    const failure = try result;
+                    try std.testing.expect(failure != null);
+                    try std.testing.expect(failure.? == .command);
+                    const details = failure.?.command.details;
+                    try std.testing.expectEqualStrings(if (change == .structure) "S001" else "input_changed", details.code);
+                    try std.testing.expectEqual(@as(u8, if (change == .structure) 1 else 3), details.exit_code);
+                }
+                try std.testing.expectEqualStrings(expected_prefix, sink.written());
+            }
+        }
+    }
 }
 
 test "[failure] - [paired exact sample]: each input snapshot is checked independently" {
@@ -5293,93 +5692,6 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
     };
     try std.testing.expectEqualStrings("input_changed", odd_command.details.code);
     try std.testing.expectEqualStrings(first_pair, interleaved_sink.written());
-
-    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "@left/1\nA\n+\n!\n" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "@right/2\nT\n+\n#\n" });
-    const mismatch_snapshot1 = try snapshotTestFile(io, path1);
-    const mismatch_snapshot2 = try snapshotTestFile(io, path2);
-    var mismatch_output: [64]u8 = undefined;
-    var mismatch_sink = io_layer.SliceSink.init(&mismatch_output);
-    var mismatch_writer = zfastq.Writer.init(mismatch_sink.byteSink());
-    const mismatch_failure = try sampleExactPairedSecondPass(
-        true,
-        io,
-        std.testing.allocator,
-        &inputs,
-        &mismatch_writer,
-        .empty,
-        .{ mismatch_snapshot1, mismatch_snapshot2 },
-        1,
-        paired_options,
-    );
-    try std.testing.expect(mismatch_failure == null);
-    const mismatched_pair = "@left/1\nA\n+\n!\n@right/2\nT\n+\n#\n";
-    try std.testing.expectEqualStrings(mismatched_pair, mismatch_sink.written());
-
-    try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = mismatched_pair });
-    const mismatch_pair_snapshot = try snapshotTestFile(io, pairs_path);
-    var mismatch_pair_output: [64]u8 = undefined;
-    var mismatch_pair_sink = io_layer.SliceSink.init(&mismatch_pair_output);
-    var mismatch_pair_writer = zfastq.Writer.init(mismatch_pair_sink.byteSink());
-    const mismatch_pair_failure = try sampleExactInterleavedSecondPass(
-        true,
-        io,
-        std.testing.allocator,
-        pairs_path,
-        &mismatch_pair_writer,
-        .empty,
-        mismatch_pair_snapshot,
-        1,
-        try deinterleaveStagingLimit(zfastq.limits.DEFAULT_MAX_LINE_BYTES),
-        .{
-            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-            .alphabet = .iupac,
-            .fraction = null,
-            .count = 1,
-            .seed = 11,
-            .pair_mode = .interleaved,
-        },
-    );
-    try std.testing.expect(mismatch_pair_failure == null);
-    try std.testing.expectEqualStrings(mismatched_pair, mismatch_pair_sink.written());
-
-    const semantic_cases = [_]struct {
-        r1: []const u8,
-        r2: []const u8,
-    }{
-        .{
-            .r1 = "@bad/1\n.\n+\n!\n",
-            .r2 = "@bad/2\nT\n+\n#\n",
-        },
-        .{
-            .r1 = "@bad/1\nA\n+\n!\n",
-            .r2 = "@bad/2\n.\n+\n#\n",
-        },
-    };
-    for (semantic_cases) |case| {
-        try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = case.r1 });
-        try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = case.r2 });
-        const semantic_snapshot1 = try snapshotTestFile(io, path1);
-        const semantic_snapshot2 = try snapshotTestFile(io, path2);
-        var semantic_output: [64]u8 = undefined;
-        var semantic_sink = io_layer.SliceSink.init(&semantic_output);
-        var semantic_writer = zfastq.Writer.init(semantic_sink.byteSink());
-        const semantic_failure = try sampleExactPairedSecondPass(
-            true,
-            io,
-            std.testing.allocator,
-            &inputs,
-            &semantic_writer,
-            .empty,
-            .{ semantic_snapshot1, semantic_snapshot2 },
-            1,
-            paired_options,
-        );
-        try std.testing.expect(semantic_failure == null);
-        var expected: [64]u8 = undefined;
-        const expected_pair = try std.fmt.bufPrint(&expected, "{s}{s}", .{ case.r1, case.r2 });
-        try std.testing.expectEqualStrings(expected_pair, semantic_sink.written());
-    }
 
     const structural_r1 = "@bad/1\nA\n+\n!\n";
     const structural_r2 = "@bad/2\nT\nx\n#\n";
