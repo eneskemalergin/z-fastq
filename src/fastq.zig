@@ -2691,6 +2691,61 @@ test "[edge] - [reader]: fallback projections retain only requested fields" {
     try std.testing.expectEqual(@as(usize, 0), validated_reader.fallback_fields[3].storage.len);
 }
 
+test "[edge] - [reader]: counts and locations cross 32 bits through buffered and fallback reads" {
+    const crossing: u64 = 1 << 32;
+    const data = "@r\nA\n+\n!\n" ** 3 ++ "@bad\nA\n?\n!\n";
+    for ([_]usize{ 1, 28, data.len }) |split| {
+        for ([_]bool{ false, true }) |advance| {
+            errdefer std.debug.print("reader 32-bit crossing: split {d}, advance {}\n", .{
+                split, advance,
+            });
+            var source = ProjectionTestSource.init(data, split, null);
+            var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+            defer reader.deinit();
+            reader.byte_offset = crossing - 3;
+            reader.record_index = crossing - 1;
+
+            for (0..3) |index| {
+                const start = crossing - 3 + 9 * index;
+                if (advance) {
+                    try std.testing.expect(try reader.advance());
+                } else {
+                    try std.testing.expectEqualDeep(Record{
+                        .header = "r",
+                        .id = "r",
+                        .sequence = "A",
+                        .plus = "",
+                        .quality = "!",
+                    }, (try reader.next()).?);
+                    try std.testing.expectEqualDeep(RecordOffsets{
+                        .header = start,
+                        .sequence = start + 3,
+                        .plus = start + 5,
+                        .quality = start + 7,
+                    }, reader.currentRecordOffsets().?);
+                }
+                try std.testing.expectEqual(crossing + index, reader.recordIndex());
+                try std.testing.expectEqual(start + 9, reader.byteOffset());
+            }
+            if (advance) {
+                try std.testing.expectError(error.S001InvalidPlusLine, reader.advance());
+            } else {
+                try std.testing.expectError(error.S001InvalidPlusLine, reader.next());
+            }
+            try std.testing.expectEqual(crossing + 2, reader.recordIndex());
+            try std.testing.expectEqual(crossing + 33, reader.byteOffset());
+            try std.testing.expectEqualDeep(ParseError{
+                .code = .s001_invalid_plus_line,
+                .message = "plus line must start with '+'",
+                .record_index = crossing + 2,
+                .byte_offset = crossing + 31,
+                .line_in_record = 3,
+            }, reader.takeLastError().?);
+            try std.testing.expect(reader.takeLastError() == null);
+        }
+    }
+}
+
 test "[edge] - [reader]: buffered progress rejects maximum offset and record count" {
     const data = "@r\nA\n+\n!\n";
 
@@ -3823,6 +3878,78 @@ test "[property] - [check scanner]: generated semantic mutations retain exact lo
                 );
             }
             data.items[quality_start + invalid_index] = '!';
+        }
+    }
+}
+
+test "[edge] - [check scanner]: counts and error locations cross 32 bits" {
+    const crossing: u64 = 1 << 32;
+    const valid = "@r\nA\n+\n!\n" ** 3;
+    const cases = [_]struct {
+        data: []const u8,
+        code: LintCode,
+        message: []const u8,
+        offset: u64,
+        line: u3,
+        at_eof: bool = false,
+    }{
+        .{
+            .data = "@bad\nA.\n+\n!!\n",
+            .code = .s002_invalid_sequence_alphabet,
+            .message = "sequence byte is outside the selected alphabet",
+            .offset = crossing + 30,
+            .line = 2,
+        },
+        .{
+            .data = "@bad\nAA\n+\n! \n",
+            .code = .s006_invalid_quality_range,
+            .message = "quality byte must be ASCII 33 through 126",
+            .offset = crossing + 35,
+            .line = 4,
+        },
+        .{
+            .data = "@bad\nA\n+\n",
+            .code = .s004_truncated_record,
+            .message = "unexpected end of file in quality line",
+            .offset = crossing + 33,
+            .line = 4,
+            .at_eof = true,
+        },
+    };
+    for ([_]usize{ 1, valid.len }) |chunk_len| {
+        for (cases) |case| {
+            errdefer std.debug.print("check 32-bit crossing: chunk {d}, code {s}\n", .{
+                chunk_len, codeTag(case.code),
+            });
+            var scanner = CheckScanner.init(.{}, .{});
+            scanner.byte_offset = crossing - 3;
+            scanner.line_start_offset = scanner.byte_offset;
+            scanner.record_index = crossing - 1;
+            var cursor: usize = 0;
+            while (cursor < valid.len) {
+                const end = @min(cursor + chunk_len, valid.len);
+                try std.testing.expectEqual(end - cursor, try scanner.feed(valid[cursor..end]));
+                cursor = end;
+            }
+            try scanner.finishEof();
+            try std.testing.expectEqual(crossing + 2, scanner.record_index);
+            try std.testing.expectEqual(crossing + 24, scanner.byte_offset);
+
+            if (case.at_eof) {
+                try std.testing.expectEqual(case.data.len, try scanner.feed(case.data));
+                try std.testing.expectError(error.Format, scanner.finishEof());
+            } else {
+                try std.testing.expectError(error.Format, scanner.feed(case.data));
+            }
+            try std.testing.expectEqual(crossing + 2, scanner.record_index);
+            try std.testing.expectEqualDeep(ParseError{
+                .code = case.code,
+                .message = case.message,
+                .record_index = crossing + 2,
+                .byte_offset = case.offset,
+                .line_in_record = case.line,
+            }, scanner.takeLastError().?);
+            try std.testing.expect(scanner.takeLastError() == null);
         }
     }
 }

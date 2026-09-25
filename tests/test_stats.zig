@@ -158,6 +158,61 @@ test "[failure] - [statistics]: length mismatch precedes quality validation" {
     try std.testing.expectEqualDeep(before, stats.result());
 }
 
+test "[edge] - [statistics]: record updates cross 32 bits without losing counters or ratios" {
+    const crossing: u64 = 1 << 32;
+    // Each seeded history consists of ACGTNX records with six Phred-93 qualities.
+    for ([_]u64{ crossing / 558, crossing / 6, crossing - 1 }) |initial_reads| {
+        errdefer std.debug.print("stats 32-bit crossing: initial reads {d}\n", .{initial_reads});
+        var stats = zfastq.Stats{
+            .reads = initial_reads,
+            .bases = initial_reads * 6,
+            .min_length = 6,
+            .max_length = 6,
+            .a = initial_reads,
+            .c = initial_reads,
+            .g = initial_reads,
+            .t = initial_reads,
+            .n = initial_reads,
+            .other_bases = initial_reads,
+            .quality_sum = initial_reads * 558,
+            .q20_bases = initial_reads * 6,
+            .q30_bases = initial_reads * 6,
+        };
+        for (1..4) |added| {
+            try stats.addRecord(record("ACGTNX", "~~~~~~"));
+            const reads = initial_reads + added;
+            try std.testing.expectEqualDeep(zfastq.StatsResult{
+                .reads = reads,
+                .bases = reads * 6,
+                .min_length = 6,
+                .max_length = 6,
+                .mean_length = 6,
+                .a = reads,
+                .c = reads,
+                .g = reads,
+                .t = reads,
+                .n = reads,
+                .other_bases = reads,
+                .gc_fraction = 0.5,
+                .quality_sum = reads * 558,
+                .mean_quality = 93,
+                .q20_bases = reads * 6,
+                .q20_fraction = 1,
+                .q30_bases = reads * 6,
+                .q30_fraction = 1,
+            }, stats.result());
+        }
+
+        const before = stats.result();
+        try std.testing.expectError(error.S006InvalidQuality, stats.addRecord(record("ACGTNX", "~~~ ~~")));
+        try std.testing.expectEqualDeep(before, stats.result());
+        const details = stats.takeLastQualityError().?;
+        try std.testing.expectEqual(@as(usize, 3), details.byte_index);
+        try std.testing.expectEqual(@as(u8, 32), details.byte);
+        try std.testing.expect(stats.takeLastQualityError() == null);
+    }
+}
+
 test "[failure] - [statistics]: every public counter addition is checked" {
     const maximum = std.math.maxInt(u64);
     const cases = [_]zfastq.Stats{

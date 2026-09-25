@@ -737,6 +737,48 @@ test "[property] - [derived record]: normalized records enable fast parsing with
     }
 }
 
+test "[edge] - [count scanner]: counts and error locations cross 32 bits with and without dense scanning" {
+    const crossing: u64 = 1 << 32;
+    const record = "@r\nA\n+\n!\n";
+    const valid = record ** 3;
+    for ([_]bool{ false, true }) |warm| {
+        for ([_]usize{ 1, valid.len }) |chunk_len| {
+            errdefer std.debug.print("count 32-bit crossing: warm {}, chunk {d}\n", .{
+                warm, chunk_len,
+            });
+            var scanner = Scanner.init(.{});
+            if (warm) {
+                _ = try scanner.feed(record ** 2);
+                try std.testing.expect(scanner.layout_confirmed);
+            }
+            scanner.byte_offset = crossing - 3;
+            scanner.line_start_offset = scanner.byte_offset;
+            scanner.record_index = crossing - 1;
+            var cursor: usize = 0;
+            while (cursor < valid.len) {
+                const end = @min(cursor + chunk_len, valid.len);
+                try std.testing.expectEqual(end - cursor, try scanner.feed(valid[cursor..end]));
+                cursor = end;
+            }
+            try scanner.finishEof();
+            try std.testing.expectEqual(crossing + 2, scanner.record_index);
+            try std.testing.expectEqual(crossing + 24, scanner.byte_offset);
+
+            try std.testing.expectError(error.S001InvalidPlusLine, scanner.feed("@bad\nA\n?\n!\n"));
+            try std.testing.expectEqual(crossing + 2, scanner.record_index);
+            try std.testing.expectEqual(crossing + 33, scanner.byte_offset);
+            try std.testing.expectEqualDeep(fastq.ParseError{
+                .code = .s001_invalid_plus_line,
+                .message = "plus line must start with '+'",
+                .record_index = crossing + 2,
+                .byte_offset = crossing + 31,
+                .line_in_record = 3,
+            }, scanner.takeLastError().?);
+            try std.testing.expect(scanner.takeLastError() == null);
+        }
+    }
+}
+
 test "[edge] - [count scanner]: fast progress rejects maximum offset and record count" {
     const data = "@r\nA\n+\n!\n";
 

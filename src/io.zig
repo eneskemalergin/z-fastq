@@ -659,6 +659,64 @@ test "[integration] - [plain file source]: buffered prefixes drain once before d
     }
 }
 
+test "[edge] - [native gzip]: member sizes wrap at 32 bits and reset between members" {
+    if (USE_ISA_L) return error.SkipZigTest;
+
+    // Stored blocks expose each size crossing; the empty final block delays trailer validation.
+    const member = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+        0x00, 0x01, 0x00, 0xfe, 0xff, 'a',  0x00, 0x01, 0x00, 0xfe,
+        0xff, 'b',  0x00, 0x02, 0x00, 0xfd, 0xff, 'c',  'd',  0x01,
+        0x00, 0x00, 0xff, 0xff, 0x11, 0xcd, 0x82, 0xed, 0x04, 0x00,
+        0x00, 0x00,
+    };
+    const chunks = [_][]const u8{ "a", "b", "cd", "a", "b", "cd" };
+    const sizes = [_]u32{ 0xffff_ffff, 0, 2, 1, 2, 4 };
+    for ([_]bool{ false, true }) |borrowed| {
+        for ([_]u32{ 2, 3, 4 }) |trailer_size| {
+            errdefer std.debug.print("gzip size wrap: borrowed {}, ISIZE {d}\n", .{
+                borrowed, trailer_size,
+            });
+            var compressed = member ++ member;
+            std.mem.writeInt(u32, compressed[member.len - 4 .. member.len], trailer_size, .little);
+            var input = std.Io.Reader.fixed(&compressed);
+            var source = GzipSource.init(&input);
+            var decompressor_buffer: [flate.max_window_len]u8 = undefined;
+            try source.beginMemberWithBuffer(&decompressor_buffer);
+            // Only size is seeded; CRC still covers the actual four-byte payload.
+            source.size = 0xffff_fffe;
+            const bytes = source.byteSource();
+            var output: [2]u8 = undefined;
+
+            for (chunks, sizes, 0..) |expected, size, index| {
+                if (index == 3 and trailer_size != 2) {
+                    if (borrowed) {
+                        try std.testing.expectError(error.ReadFailed, readGzipChunk(&source, &decompressor_buffer));
+                    } else {
+                        try std.testing.expectError(error.ReadFailed, bytes.read(&output));
+                    }
+                    break;
+                }
+                const decoded = if (borrowed)
+                    (try readGzipChunk(&source, &decompressor_buffer)) orelse return error.TestUnexpectedResult
+                else
+                    output[0..try bytes.read(output[0..expected.len])];
+                try std.testing.expectEqualStrings(expected, decoded);
+                try std.testing.expectEqual(size, source.size);
+            }
+            if (trailer_size == 2) {
+                for (0..2) |_| {
+                    if (borrowed) {
+                        try std.testing.expect(try readGzipChunk(&source, &decompressor_buffer) == null);
+                    } else {
+                        try std.testing.expectEqual(@as(usize, 0), try bytes.read(&output));
+                    }
+                }
+            }
+        }
+    }
+}
+
 test "[property] - [gzip direct delivery]: preserves bytes across members" {
     const gzip_x = [_]u8{
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
