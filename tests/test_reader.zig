@@ -556,20 +556,54 @@ test "[unit] - [reader]: supported record forms parse exactly" {
 }
 
 test "[property] - [reader]: borrowed fields survive every fixed short-read size" {
-    const data = "@read1 comment\nACGT\n+repeat\n!!!!\n";
-    for (1..data.len + 1) |chunk_len| {
-        var chunked = ChunkSource.init(data, chunk_len);
-        const source = chunked.byteSource();
-        var reader = try zfastq.Reader.init(std.testing.allocator, source, .{});
-        defer reader.deinit();
+    const cases = [_]struct {
+        data: []const u8,
+        header: []const u8,
+        id: []const u8,
+        sequence: []const u8,
+        plus: []const u8,
+        quality: []const u8,
+    }{
+        .{
+            .data = "@read1 comment\nACGT\n+repeat\n!!!!\n",
+            .header = "read1 comment",
+            .id = "read1",
+            .sequence = "ACGT",
+            .plus = "repeat",
+            .quality = "!!!!",
+        },
+        .{
+            .data = "@r\r\r\nA\r\r\n+\r\r\n!\r\r\n",
+            .header = "r\r",
+            .id = "r\r",
+            .sequence = "A\r",
+            .plus = "\r",
+            .quality = "!\r",
+        },
+        .{
+            .data = "@r\nAA\n+\n!\r",
+            .header = "r",
+            .id = "r",
+            .sequence = "AA",
+            .plus = "",
+            .quality = "!\r",
+        },
+    };
+    for (cases) |case| {
+        for (1..case.data.len + 1) |chunk_len| {
+            var chunked = ChunkSource.init(case.data, chunk_len);
+            var reader = try zfastq.Reader.init(std.testing.allocator, chunked.byteSource(), .{});
+            defer reader.deinit();
 
-        const parsed = (try reader.next()).?;
-        try std.testing.expectEqualStrings("read1 comment", parsed.header);
-        try std.testing.expectEqualStrings("read1", parsed.id);
-        try std.testing.expectEqualStrings("ACGT", parsed.sequence);
-        try std.testing.expectEqualStrings("repeat", parsed.plus);
-        try std.testing.expectEqualStrings("!!!!", parsed.quality);
-        try std.testing.expectEqual(@as(u64, data.len), reader.byteOffset());
+            const parsed = (try reader.next()).?;
+            try std.testing.expectEqualStrings(case.header, parsed.header);
+            try std.testing.expectEqualStrings(case.id, parsed.id);
+            try std.testing.expectEqualStrings(case.sequence, parsed.sequence);
+            try std.testing.expectEqualStrings(case.plus, parsed.plus);
+            try std.testing.expectEqualStrings(case.quality, parsed.quality);
+            try std.testing.expectEqual(@as(u64, case.data.len), reader.byteOffset());
+            try std.testing.expect((try reader.next()) == null);
+        }
     }
 }
 
@@ -901,21 +935,23 @@ test "[edge] - [reader]: the configured line limit is exact" {
     defer invalid_reader.deinit();
     try std.testing.expectError(zfastq.ReaderError.LineTooLong, invalid_reader.next());
 
-    const lone_cr_at_eof = "@r\nA\n+\n!\r";
+    const lone_cr_at_eof = "@r\nACGT\n+\n!!!!\r";
     var eof_source = zfastq.io.plain.SliceSource.init(lone_cr_at_eof);
     var eof_reader = try zfastq.Reader.init(
         std.testing.allocator,
         eof_source.byteSource(),
-        .{ .max_line_bytes = 1 },
+        .{ .max_line_bytes = 4 },
     );
     defer eof_reader.deinit();
     try std.testing.expectError(zfastq.ReaderError.LineTooLong, eof_reader.next());
+    try std.testing.expectEqual(@as(u64, lone_cr_at_eof.len), eof_reader.byteOffset());
 
-    var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 1 });
+    var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 4 });
     try std.testing.expectError(
         zfastq.ReaderError.LineTooLong,
-        zfastq.count_scan.countSlice(lone_cr_at_eof, .{ .max_line_bytes = 1 }, &scan),
+        zfastq.count_scan.countSlice(lone_cr_at_eof, .{ .max_line_bytes = 4 }, &scan),
     );
+    try std.testing.expectEqual(@as(u64, lone_cr_at_eof.len), scan.byte_offset);
 }
 
 test "[property] - [count scanner]: inline counts match Reader advance" {

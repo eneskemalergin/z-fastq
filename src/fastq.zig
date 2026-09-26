@@ -700,16 +700,10 @@ const LineFeedSearch = struct {
             offset = self.block_end;
         }
 
-        const Bytes = @Vector(lanes, u8);
-        const Mask = @Int(.unsigned, lanes);
         while (bytes.len - offset >= lanes) : (offset += lanes) {
-            const block: Bytes = bytes[offset..][0..lanes].*;
             self.block_start = offset;
             self.block_end = offset + lanes;
-            self.mask = if (lanes == STRUCTURAL_BLOCK_BYTES)
-                newlineMask(bytes[offset..][0..STRUCTURAL_BLOCK_BYTES])
-            else
-                @as(Mask, @bitCast(block == @as(Bytes, @splat('\n'))));
+            self.mask = newlineMask(lanes, bytes[offset..][0..lanes]);
             if (self.mask != 0) return offset + @as(usize, @intCast(@ctz(self.mask)));
         }
         for (bytes[offset..], offset..) |byte, index| {
@@ -1086,10 +1080,7 @@ pub const Reader = struct {
             else
                 record_start + relative_ends[line_index - 1] + 1;
             const raw_end = record_start + relative_ends[line_index];
-            const end = if (raw_end > start and self.buf[raw_end - 1] == '\r')
-                raw_end - 1
-            else
-                raw_end;
+            const end = start + lineContentLen(self.buf[start..raw_end]);
             if (include_canonical_span) canonical = canonical and end == raw_end;
             ranges[line_index] = .{ .start = start, .end = end };
         }
@@ -1190,10 +1181,7 @@ pub const Reader = struct {
     fn predictQualityEnd(self: *const Reader, ends: *[4]usize) bool {
         const bytes = self.buf[self.cursor..self.fill_end];
         const sequence_start = ends[0] + 1;
-        const sequence_end = ends[1] - @intFromBool(
-            ends[1] > sequence_start and bytes[ends[1] - 1] == '\r',
-        );
-        const sequence_len = sequence_end - sequence_start;
+        const sequence_len = lineContentLen(bytes[sequence_start..ends[1]]);
         const quality_start = ends[2] + 1;
         if (sequence_len >= bytes.len - quality_start) return false;
         const quality_end = quality_start + sequence_len;
@@ -1469,7 +1457,7 @@ pub const Reader = struct {
                     self.cursor += rel + 1;
                     self.byte_offset = next_offset;
                     if (retain) {
-                        self.stripLineCr(field_index, content_start);
+                        field.len = content_start + lineContentLen(field.storage[content_start..field.len]);
                         const content = field.storage[0..field.len];
                         return .{
                             .content_len = content.len,
@@ -1608,13 +1596,6 @@ pub const Reader = struct {
             if (excess > 1 or chunk[chunk.len - 1] != '\r') return error.LineTooLong;
         }
         return new_len;
-    }
-
-    fn stripLineCr(self: *Reader, field_index: usize, content_start: usize) void {
-        const field = &self.fallback_fields[field_index];
-        if (field.len > content_start and field.storage[field.len - 1] == '\r') {
-            field.len -= 1;
-        }
     }
 
     fn ensureFieldCapacity(
@@ -2087,6 +2068,12 @@ pub const Machine = struct {
     }
 };
 
+/// Excludes one trailing CR; callers check LF termination and handle EOF separately.
+pub fn lineContentLen(line: []const u8) usize {
+    if (line.len > 0 and line[line.len - 1] == '\r') return line.len - 1;
+    return line.len;
+}
+
 pub fn headerPrefixIsValid(first_byte: ?u8, identifier_first_byte: ?u8) bool {
     return first_byte == '@' and identifierFirstByteIsValid(identifier_first_byte);
 }
@@ -2103,8 +2090,8 @@ pub const CheckScannerError = error{
 
 const STRUCTURAL_BLOCK_BYTES = 64;
 
-fn newlineMask(block: *const [STRUCTURAL_BLOCK_BYTES]u8) u64 {
-    const Bytes = @Vector(STRUCTURAL_BLOCK_BYTES, u8);
+pub fn newlineMask(comptime lanes: usize, block: *const [lanes]u8) @Int(.unsigned, lanes) {
+    const Bytes = @Vector(lanes, u8);
     const bytes: Bytes = block.*;
     return @bitCast(bytes == @as(Bytes, @splat('\n')));
 }
@@ -2298,7 +2285,7 @@ fn scanCompleteRecord(
 ) ?CompleteRecord {
     const data = buffer[start..];
     const header_end = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start) orelse return null) - start;
-    const header_len = header_end - @intFromBool(header_end != 0 and data[header_end - 1] == '\r');
+    const header_len = lineContentLen(data[0..header_end]);
     const header = data[0..header_len];
     if (header.len > max_line_bytes) return null;
     if (!headerPrefixIsValid(
@@ -2313,17 +2300,13 @@ fn scanCompleteRecord(
         alphabet,
         &use_full_iupac,
     ) orelse return null;
-    const sequence_len = sequence_raw_len - @intFromBool(
-        sequence_raw_len != 0 and data[sequence_start + sequence_raw_len - 1] == '\r',
-    );
+    const sequence_len = lineContentLen(data[sequence_start..][0..sequence_raw_len]);
     if (sequence_len > max_line_bytes) return null;
 
     const plus_start = sequence_start + sequence_raw_len + 1;
     const plus_raw_len = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start + plus_start) orelse
         return null) - start - plus_start;
-    const plus_len = plus_raw_len - @intFromBool(
-        plus_raw_len != 0 and data[plus_start + plus_raw_len - 1] == '\r',
-    );
+    const plus_len = lineContentLen(data[plus_start..][0..plus_raw_len]);
     const plus = data[plus_start..][0..plus_len];
     if (plus.len > max_line_bytes) return null;
     if (plus.len == 0 or plus[0] != '+') return null;
@@ -4851,20 +4834,25 @@ test "[unit] - [check scanner]: state remains fixed-size" {
     try std.testing.expect(@sizeOf(CheckScanner) <= 160);
 }
 
-test "[property] - [check scanner]: structural masks preserve newline positions" {
-    var block: [STRUCTURAL_BLOCK_BYTES]u8 = @splat('A');
-    for (0..STRUCTURAL_BLOCK_BYTES) |lane| {
-        block[lane] = '\n';
-        try std.testing.expectEqual(@as(u64, 1) << @intCast(lane), newlineMask(&block));
-        block[lane] = 'A';
-    }
+test "[property] - [LF mask]: preserves newline positions across block widths" {
+    inline for (.{ 1, 16, STRUCTURAL_BLOCK_BYTES, std.simd.suggestVectorLength(u8) orelse 1 }) |lanes| {
+        const Mask = @Int(.unsigned, lanes);
+        var block: [lanes]u8 = @splat('A');
+        try std.testing.expectEqual(@as(Mask, 0), newlineMask(lanes, &block));
+        for (0..lanes) |lane| {
+            block[lane] = '\n';
+            try std.testing.expectEqual(@as(Mask, 1) << @intCast(lane), newlineMask(lanes, &block));
+            block[lane] = 'A';
+        }
 
-    var expected: u64 = 0;
-    for ([_]usize{ 0, 1, 15, 16, 31, 32, 47, 48, 62, 63 }) |lane| {
-        block[lane] = '\n';
-        expected |= @as(u64, 1) << @intCast(lane);
+        var expected: Mask = 0;
+        for ([_]usize{ 0, 1, 15, 16, 31, 32, 47, 48, 62, 63 }) |lane| {
+            if (lane >= lanes) continue;
+            block[lane] = '\n';
+            expected |= @as(Mask, 1) << @intCast(lane);
+        }
+        try std.testing.expectEqual(expected, newlineMask(lanes, &block));
     }
-    try std.testing.expectEqual(expected, newlineMask(&block));
 }
 
 fn firstValidSequenceLineEnd(bytes: []const u8, alphabet: Alphabet) ?usize {

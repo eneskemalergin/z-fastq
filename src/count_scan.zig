@@ -53,15 +53,15 @@ const DenseLayout = struct {
         const header = record[0 .. layout.sequence_start - 1];
         const sequence = record[layout.sequence_start..layout.sequence_end];
         const quality = record[layout.quality_start..layout.quality_end];
-        const header_len = lineContentLen(header);
-        const sequence_len = lineContentLen(sequence);
-        const quality_len = lineContentLen(quality);
+        const header_len = fastq.lineContentLen(header);
+        const sequence_len = fastq.lineContentLen(sequence);
+        const quality_len = fastq.lineContentLen(quality);
         return header_len >= 2 and fastq.headerPrefixIsValid(record[0], record[1]) and
             record[layout.sequence_start - 1] == '\n' and
-            !@call(.always_inline, containsNewline, .{header}) and
+            !@call(.always_inline, containsNewline, .{ 1, .{header} }) and
             header_len <= max_line_bytes and
             record[layout.sequence_end] == '\n' and
-            !@call(.always_inline, containsNewlinePair, .{ sequence, quality }) and
+            !@call(.always_inline, containsNewline, .{ 2, .{ sequence, quality } }) and
             sequence_len <= max_line_bytes and
             record[layout.plus_start] == '+' and
             record[layout.plus_start + 1] == '\n' and
@@ -246,10 +246,10 @@ pub const Scanner = struct {
             (plus_len > 0 and data[plus_end - 1] == '\r') or
             (quality_len > 0 and data[quality_end - 1] == '\r'))
         {
-            const header_len = lineContentLen(data[0..header_end]);
-            const sequence_content_len = lineContentLen(data[sequence_start..sequence_end]);
-            const plus_content_len = lineContentLen(data[plus_start..plus_end]);
-            const quality_content_len = lineContentLen(data[quality_start..quality_end]);
+            const header_len = fastq.lineContentLen(data[0..header_end]);
+            const sequence_content_len = fastq.lineContentLen(data[sequence_start..sequence_end]);
+            const plus_content_len = fastq.lineContentLen(data[plus_start..plus_end]);
+            const quality_content_len = fastq.lineContentLen(data[quality_start..quality_end]);
             // Failed normalized proofs keep line-limit and structural error order in the fallback.
             if (header_len < 2 or !fastq.headerPrefixIsValid(data[0], data[1]) or
                 header_len > self.options.max_line_bytes or
@@ -445,80 +445,50 @@ fn progressAfter(current: u64, amount: usize) fastq.ReaderError!u64 {
     return std.math.add(u64, current, amount_u64) catch error.ArithmeticLimit;
 }
 
-fn lineContentLen(line: []const u8) usize {
-    if (line.len > 0 and line[line.len - 1] == '\r') return line.len - 1;
-    return line.len;
-}
-
-fn containsNewline(bytes: []const u8) bool {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse @sizeOf(usize);
-    const Vector = @Vector(vector_len, u8);
-    const newline: Vector = @splat('\n');
-
-    if (bytes.len >= vector_len) {
-        const full_end = bytes.len - bytes.len % vector_len;
-        var pos: usize = 0;
-        while (pos < full_end) : (pos += vector_len) {
-            const chunk: Vector = bytes[pos..][0..vector_len].*;
-            if (@reduce(.Or, chunk == newline)) return true;
-        }
-        if (pos < bytes.len) {
-            const chunk: Vector = bytes[bytes.len - vector_len ..][0..vector_len].*;
-            if (@reduce(.Or, chunk == newline)) return true;
-        }
-        return false;
-    }
-
-    for (bytes) |byte| {
-        if (byte == '\n') return true;
-    }
-    return false;
-}
-
-fn containsNewlinePair(first: []const u8, second: []const u8) bool {
-    std.debug.assert(first.len == second.len);
+fn containsNewline(comptime slice_count: usize, slices: [slice_count][]const u8) bool {
+    const len = slices[0].len;
+    inline for (slices[1..]) |slice| std.debug.assert(slice.len == len);
 
     const vector_len = std.simd.suggestVectorLength(u8) orelse @sizeOf(usize);
     const Vector = @Vector(vector_len, u8);
     const newline: Vector = @splat('\n');
 
-    if (first.len >= vector_len) {
-        const full_end = first.len - first.len % vector_len;
+    if (len >= vector_len) {
+        const full_end = len - len % vector_len;
         var pos: usize = 0;
         while (pos < full_end) : (pos += vector_len) {
-            const first_chunk: Vector = first[pos..][0..vector_len].*;
-            const second_chunk: Vector = second[pos..][0..vector_len].*;
-            const first_has_newline = @reduce(.Or, first_chunk == newline);
-            const second_has_newline = @reduce(.Or, second_chunk == newline);
-            if (first_has_newline or second_has_newline) return true;
+            var found = false;
+            inline for (slices) |slice| {
+                const chunk: Vector = slice[pos..][0..vector_len].*;
+                found = @reduce(.Or, chunk == newline) or found;
+            }
+            if (found) return true;
         }
-        if (pos < first.len) {
-            const first_chunk: Vector = first[first.len - vector_len ..][0..vector_len].*;
-            const second_chunk: Vector = second[second.len - vector_len ..][0..vector_len].*;
-            const first_has_newline = @reduce(.Or, first_chunk == newline);
-            const second_has_newline = @reduce(.Or, second_chunk == newline);
-            if (first_has_newline or second_has_newline) return true;
+        if (pos < len) {
+            var found = false;
+            inline for (slices) |slice| {
+                const chunk: Vector = slice[len - vector_len ..][0..vector_len].*;
+                found = @reduce(.Or, chunk == newline) or found;
+            }
+            if (found) return true;
         }
         return false;
     }
 
-    for (first, second) |first_byte, second_byte| {
-        if (first_byte == '\n' or second_byte == '\n') return true;
+    for (0..len) |pos| {
+        inline for (slices) |slice| {
+            if (slice[pos] == '\n') return true;
+        }
     }
     return false;
 }
 
 fn findRecordNewlines(bytes: []const u8, line_ends: *[4]usize) bool {
-    const Vector = @Vector(16, u8);
-    const newline: Vector = @splat('\n');
-
     var found: usize = 0;
     var pos: usize = 0;
     while (bytes.len - pos >= 32) : (pos += 32) {
-        const first: Vector = bytes[pos..][0..16].*;
-        const second: Vector = bytes[pos + 16 ..][0..16].*;
-        const first_mask: u16 = @bitCast(first == newline);
-        const second_mask: u16 = @bitCast(second == newline);
+        const first_mask = fastq.newlineMask(16, bytes[pos..][0..16]);
+        const second_mask = fastq.newlineMask(16, bytes[pos + 16 ..][0..16]);
         var mask = @as(u32, first_mask) | @as(u32, second_mask) << 16;
         while (mask != 0) {
             line_ends[found] = pos + @as(usize, @intCast(@ctz(mask)));
@@ -528,8 +498,7 @@ fn findRecordNewlines(bytes: []const u8, line_ends: *[4]usize) bool {
         }
     }
     if (bytes.len - pos >= 16) {
-        const block: Vector = bytes[pos..][0..16].*;
-        var mask: u16 = @bitCast(block == newline);
+        var mask = fastq.newlineMask(16, bytes[pos..][0..16]);
         while (mask != 0) {
             line_ends[found] = pos + @as(usize, @intCast(@ctz(mask)));
             found += 1;
@@ -653,6 +622,38 @@ test "[property] - [count scanner]: dense validation checks every field region" 
             try std.testing.expectEqual(@as(u64, 2), details.record_index);
             try std.testing.expectEqual(case.line, details.line_in_record);
             try std.testing.expectEqual(prefix.len + case.offset, details.byte_offset);
+        }
+    }
+}
+
+test "[property] - [dense newline scan]: matches scalar searches across vector tails" {
+    const lanes = std.simd.suggestVectorLength(u8) orelse @sizeOf(usize);
+    var first_storage: [3 * lanes + 2]u8 = undefined;
+    var second_storage: [3 * lanes + 2]u8 = undefined;
+    for ([_]usize{ 0, 1, lanes - 1 }) |alignment| {
+        for (0..2 * lanes + 3) |len| {
+            @memset(&first_storage, '\n');
+            @memset(&second_storage, '\n');
+            const first = first_storage[alignment..][0..len];
+            const second = second_storage[alignment..][0..len];
+            @memset(first, 0xff);
+            @memset(second, '\r');
+            try std.testing.expect(!containsNewline(1, .{first}));
+            try std.testing.expect(!containsNewline(2, .{ first, second }));
+
+            for (0..len) |pos| {
+                inline for (.{ first, second }, .{ 0xff, '\r' }) |slice, original| {
+                    slice[pos] = '\n';
+                    const first_has_lf = std.mem.findScalar(u8, first, '\n') != null;
+                    const second_has_lf = std.mem.findScalar(u8, second, '\n') != null;
+                    try std.testing.expectEqual(first_has_lf, containsNewline(1, .{first}));
+                    try std.testing.expectEqual(
+                        first_has_lf or second_has_lf,
+                        containsNewline(2, .{ first, second }),
+                    );
+                    slice[pos] = original;
+                }
+            }
         }
     }
 }
