@@ -781,6 +781,15 @@ pub const Reader = struct {
         options: Options,
     ) !Reader {
         const buf = try allocator.alloc(u8, io_layer.DEFAULT_READER_BUFFER_BYTES);
+        return initBuffer(allocator, source, options, buf);
+    }
+
+    fn initBuffer(
+        allocator: std.mem.Allocator,
+        source: ByteSource,
+        options: Options,
+        buf: []u8,
+    ) Reader {
         return .{
             .allocator = allocator,
             .source = source,
@@ -1672,21 +1681,9 @@ pub fn initBorrowedGzipReader(
     options: Options,
 ) !Reader {
     std.debug.assert(source.decompressor_buffer.len != 0);
-    return .{
-        .allocator = allocator,
-        .source = source.byteSource(),
-        .buf = source.decompressor_buffer[0..0],
-        .transport_storage = source.decompressor_buffer[0..0],
-        .borrowed_gzip = source,
-        .fill_end = 0,
-        .cursor = 0,
-        .fallback_fields = .{ .{}, .{}, .{}, .{} },
-        .record_index = 0,
-        .byte_offset = 0,
-        .options = options,
-        .machine = .{},
-        .last_error = null,
-    };
+    var reader = Reader.initBuffer(allocator, source.byteSource(), options, source.decompressor_buffer[0..0]);
+    reader.borrowed_gzip = source;
+    return reader;
 }
 
 fn fieldStorageLimit(max_line_bytes: usize) usize {
