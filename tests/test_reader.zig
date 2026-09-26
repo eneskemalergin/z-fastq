@@ -739,14 +739,18 @@ test "[edge] - [reader]: fallback fields survive growth and owned copies survive
     try std.testing.expect(std.mem.allEqual(u8, owned.quality, 'I'));
 }
 
-test "[unit] - [reader]: a common record allocates only during initialization" {
+test "[unit] - [reader]: complete buffered records allocate only the transport buffer" {
     const data = "@r\nACGT\n+\n!!!!\n";
     var source = zfastq.io.plain.SliceSource.init(data);
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
     var reader = try zfastq.Reader.init(failing.allocator(), source.byteSource(), .{});
     defer reader.deinit();
 
-    _ = try reader.next();
+    const record = (try reader.next()).?;
+    try std.testing.expectEqualStrings("ACGT", record.sequence);
+    try std.testing.expect((try reader.next()) == null);
+    try std.testing.expectEqual(@as(usize, 1), failing.allocations);
+    try std.testing.expectEqual(zfastq.limits.DEFAULT_READER_BUFFER_BYTES, failing.allocated_bytes);
     try std.testing.expect(!failing.has_induced_failure);
 }
 

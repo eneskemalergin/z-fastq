@@ -770,8 +770,6 @@ pub const Reader = struct {
         options: Options,
     ) !Reader {
         const buf = try allocator.alloc(u8, io_layer.DEFAULT_READER_BUFFER_BYTES);
-        errdefer allocator.free(buf);
-        const fallback_sequence = try allocator.alloc(u8, io_layer.DEFAULT_READER_BUFFER_BYTES);
         return .{
             .allocator = allocator,
             .source = source,
@@ -780,12 +778,7 @@ pub const Reader = struct {
             .borrowed_gzip = null,
             .fill_end = 0,
             .cursor = 0,
-            .fallback_fields = .{
-                .{},
-                .{ .storage = fallback_sequence },
-                .{},
-                .{},
-            },
+            .fallback_fields = .{ .{}, .{}, .{}, .{} },
             .record_index = 0,
             .byte_offset = 0,
             .options = options,
@@ -1248,14 +1241,21 @@ pub const Reader = struct {
     }
 
     fn canBufferIncompleteRecord(self: *const Reader) bool {
-        const capacity = io_layer.DEFAULT_READER_BUFFER_BYTES;
         return self.borrowed_gzip == null and self.pending_refill == null and
-            self.fallback_fields[1].storage.len >= capacity and
             self.fill_end - self.cursor != self.buf.len;
+    }
+
+    fn ensureRefillCapacity(self: *Reader) ReaderError!void {
+        const field = &self.fallback_fields[1];
+        const capacity = io_layer.DEFAULT_READER_BUFFER_BYTES;
+        if (field.storage.len >= capacity) return;
+        field.storage = self.allocator.realloc(field.storage, capacity) catch
+            return error.OutOfMemory;
     }
 
     fn bufferIncompleteRecord(self: *Reader, prefix_len: usize) ReaderError!?[]u8 {
         if (!self.canBufferIncompleteRecord()) return null;
+        try self.ensureRefillCapacity();
         const byte_offset = self.byte_offset;
         const record_index = self.record_index;
         const machine = self.machine;
@@ -1675,7 +1675,6 @@ pub fn initBorrowedGzipReader(
     options: Options,
 ) !Reader {
     std.debug.assert(source.decompressor_buffer.len != 0);
-    const fallback_sequence = try allocator.alloc(u8, io_layer.DEFAULT_READER_BUFFER_BYTES);
     return .{
         .allocator = allocator,
         .source = source.byteSource(),
@@ -1684,12 +1683,7 @@ pub fn initBorrowedGzipReader(
         .borrowed_gzip = source,
         .fill_end = 0,
         .cursor = 0,
-        .fallback_fields = .{
-            .{},
-            .{ .storage = fallback_sequence },
-            .{},
-            .{},
-        },
+        .fallback_fields = .{ .{}, .{}, .{}, .{} },
         .record_index = 0,
         .byte_offset = 0,
         .options = options,
@@ -1804,6 +1798,7 @@ pub fn nextPairedValidatedRecord(
         }
     }
     if (size >= capacity) return null;
+    try reader.ensureRefillCapacity();
     const saved = reader.fallback_fields[1].storage[0..size];
     if (span) |bytes| @memmove(saved, bytes) else saved[0] = '@';
     var offset: usize = 1;
@@ -1839,6 +1834,7 @@ pub fn nextPairedValidatedHeader(
     if (try nextBufferedValidatedRecord(reader, validator)) |second| return second;
     if (!reader.canBufferIncompleteRecord() or
         first_header.len >= io_layer.DEFAULT_READER_BUFFER_BYTES) return null;
+    try reader.ensureRefillCapacity();
     const saved = reader.fallback_fields[1].storage[0..first_header.len];
     @memmove(saved, first_header.*);
     first_header.* = saved;
@@ -2914,7 +2910,7 @@ fn expectBufferedLineProgress(
         .max_line_bytes = max_line_bytes,
     });
     defer reference.deinit();
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
     var reader = try Reader.init(failing.allocator(), source.byteSource(), .{
         .max_line_bytes = max_line_bytes,
     });
@@ -3196,7 +3192,7 @@ test "[unit] - [reader]: prediction and retry use the current buffer without all
             const input = try ReaderSpillFixture.init(std.testing.allocator, len, len, ending, true);
             defer std.testing.allocator.free(input);
             var source = ProjectionTestSource.init(input, 0, null);
-            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
             var reader = try Reader.init(failing.allocator(), source.byteSource(), .{});
             defer reader.deinit();
             const predicted = (try nextPredictedPayload(&reader)).?;
@@ -3216,7 +3212,7 @@ test "[unit] - [reader]: prediction and retry use the current buffer without all
 
     const input = "@r\nACG\n+\n!\n!\n";
     var source = ProjectionTestSource.init(input, 0, null);
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
     var reader = try Reader.init(failing.allocator(), source.byteSource(), .{});
     defer reader.deinit();
     const predicted = (try nextPredictedPayload(&reader)).?;
@@ -3514,6 +3510,110 @@ test "[property] - [reader]: paired refills retain oversized and EOF fallbacks" 
             try expectPairedRefill(header_only, input, first.len, 37, null, .{ .max_line_bytes = field_len - 1 }, .{});
         }
     }
+}
+
+test "[failure] - [reader]: lazy refill allocation preserves progress and buffered mates" {
+    const first = "@r/1\nAR\n+left\n!~\n";
+    const second = "@r/2\nC\n+right\n#\n";
+    for (0..3) |delivery| {
+        var source = ProjectionTestSource.init(first ++ second ** 2, first.len + 5, null);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+        var reader = try Reader.init(failing.allocator(), source.byteSource(), .{ .max_line_bytes = 8 });
+        defer reader.deinit();
+        var validator = AdaptiveRecordValidator.init(.{});
+        var mate1 = (try nextValidatedRecord(&reader, &validator)).?;
+        source.chunk_limit = 3;
+        const position = source.pos;
+        const reads = source.read_count;
+
+        try std.testing.expect((try nextBufferedValidatedRecord(&reader, &validator)) == null);
+        try std.testing.expect(!failing.has_induced_failure);
+        const result = switch (delivery) {
+            0 => nextValidatedRecord(&reader, &validator),
+            1 => nextPairedValidatedRecord(&reader, &mate1, &validator),
+            2 => nextPairedValidatedHeader(&reader, &mate1.record.header, &validator),
+            else => unreachable,
+        };
+        try std.testing.expectError(error.OutOfMemory, result);
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[1].storage.len);
+        try std.testing.expectEqual(position, source.pos);
+        try std.testing.expectEqual(reads, source.read_count);
+        try std.testing.expectEqual(@as(u64, first.len), reader.byteOffset());
+        try std.testing.expectEqual(@as(u64, 1), reader.recordIndex());
+        try std.testing.expect(reader.takeLastError() == null);
+        try std.testing.expectEqualStrings("r/1", mate1.record.header);
+        try std.testing.expectEqualStrings("AR", mate1.record.sequence);
+        try std.testing.expectEqualStrings("left", mate1.record.plus);
+        try std.testing.expectEqualStrings("!~", mate1.record.quality);
+
+        failing.fail_index = std.math.maxInt(usize);
+        const mate2 = (try switch (delivery) {
+            0 => nextValidatedRecord(&reader, &validator),
+            1 => nextPairedValidatedRecord(&reader, &mate1, &validator),
+            2 => nextPairedValidatedHeader(&reader, &mate1.record.header, &validator),
+            else => unreachable,
+        }).?;
+        try std.testing.expectEqualStrings(second, mate2.canonical_span.?);
+        try std.testing.expect(mate2.semantic_error == null);
+        if (delivery != 0) try std.testing.expectEqualStrings("r/1", mate1.record.header);
+        if (delivery == 1) {
+            try std.testing.expectEqualStrings(first, mate1.canonical_span.?);
+            try std.testing.expectEqualStrings("AR", mate1.record.sequence);
+            try std.testing.expectEqualStrings("!~", mate1.record.quality);
+        }
+        try std.testing.expectEqual(@as(usize, 2), failing.allocations);
+        try std.testing.expectEqual(2 * io_layer.DEFAULT_READER_BUFFER_BYTES, failing.allocated_bytes);
+        const reserve = reader.fallback_fields[1].storage.ptr;
+        try std.testing.expectEqualStrings(second, (try nextValidatedRecord(&reader, &validator)).?.canonical_span.?);
+        try std.testing.expect((try nextValidatedRecord(&reader, &validator)) == null);
+        try std.testing.expectEqual(reserve, reader.fallback_fields[1].storage.ptr);
+        try std.testing.expectEqual(@as(usize, 2), failing.allocations);
+    }
+}
+
+test "[edge] - [reader]: refill reserve grows from projected fields and retains earlier capacity" {
+    const old = "@old\nAC\n+\n!!\n";
+    const first = "@r/1\nAR\n+left\n!~\n";
+    const second = "@r/2\nC\n+right\n#\n";
+    var source = ProjectionTestSource.init(old ++ first ++ second, old.len - 1, null);
+    source.chunk_limit = old.len - 1;
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{ .max_line_bytes = 8 });
+    defer reader.deinit();
+    const payload = (try reader.nextPayload()).?;
+    try std.testing.expectEqualStrings("AC", payload.sequence);
+    try std.testing.expectEqualStrings("!!", payload.quality);
+    try std.testing.expectEqual(@as(usize, 2), reader.fallback_fields[1].storage.len);
+    try std.testing.expectEqual(@as(usize, 3), reader.fallback_fields[3].storage.len);
+    const sequence = reader.fallback_fields[1].storage.ptr;
+    const quality = reader.fallback_fields[3].storage.ptr;
+    const position = source.pos;
+
+    tracking.fail_index = tracking.allocations;
+    var validator = AdaptiveRecordValidator.init(.{});
+    try std.testing.expectError(error.OutOfMemory, nextValidatedRecord(&reader, &validator));
+    try std.testing.expect(tracking.has_induced_failure);
+    try std.testing.expectEqual(sequence, reader.fallback_fields[1].storage.ptr);
+    try std.testing.expectEqualStrings("AC", payload.sequence);
+    try std.testing.expectEqualStrings("!!", payload.quality);
+    try std.testing.expectEqual(position, source.pos);
+    try std.testing.expectEqual(@as(u64, old.len), reader.byteOffset());
+    try std.testing.expectEqual(@as(u64, 1), reader.recordIndex());
+
+    tracking.fail_index = std.math.maxInt(usize);
+    source.chunk_limit = 3;
+    var mate1 = (try nextValidatedRecord(&reader, &validator)).?;
+    const allocations = tracking.allocations;
+    const mate2 = (try nextPairedValidatedRecord(&reader, &mate1, &validator)).?;
+    try std.testing.expectEqualStrings(first, mate1.canonical_span.?);
+    try std.testing.expectEqualStrings(second, mate2.canonical_span.?);
+    try std.testing.expect(mate1.semantic_error == null and mate2.semantic_error == null);
+    try std.testing.expectEqual(allocations, tracking.allocations);
+    try std.testing.expectEqual(quality, reader.fallback_fields[3].storage.ptr);
+    try std.testing.expectEqual(@as(usize, 3), reader.fallback_fields[3].storage.len);
+    try std.testing.expectEqual(2 * io_layer.DEFAULT_READER_BUFFER_BYTES + 3, tracking.allocated_bytes - tracking.freed_bytes);
+    try std.testing.expect((try nextValidatedRecord(&reader, &validator)) == null);
 }
 
 test "[property] - [reader]: structural masks match scalar line boundaries" {
@@ -3931,10 +4031,7 @@ test "[edge] - [reader]: fallback projections retain only requested fields" {
     const validated = (try validated_reader.nextValidatedHeader(&validator)).?;
     try std.testing.expectEqualStrings("abc", validated.header);
     try std.testing.expect(validated.semantic_error == null);
-    try std.testing.expectEqual(
-        io_layer.DEFAULT_READER_BUFFER_BYTES,
-        validated_reader.fallback_fields[1].storage.len,
-    );
+    try std.testing.expectEqual(@as(usize, 0), validated_reader.fallback_fields[1].storage.len);
     try std.testing.expectEqual(@as(usize, 0), validated_reader.fallback_fields[1].len);
     try std.testing.expectEqual(@as(usize, 0), validated_reader.fallback_fields[2].storage.len);
     try std.testing.expectEqual(@as(usize, 0), validated_reader.fallback_fields[3].storage.len);
@@ -4125,9 +4222,7 @@ test "[edge] - [reader]: spill field capacities stop at the line limit" {
         try std.testing.expect(std.mem.allEqual(u8, record.quality, 'I'));
         for (&reader.fallback_fields, 0..) |*field, field_index| {
             try std.testing.expectEqual(max_line_bytes, field.len);
-            const expected_capacity = if (field_index == 1)
-                io_layer.DEFAULT_READER_BUFFER_BYTES
-            else if (crlf or field_index == 3)
+            const expected_capacity = if (crlf or field_index == 3)
                 storage_limit
             else
                 max_line_bytes;
@@ -4137,7 +4232,7 @@ test "[edge] - [reader]: spill field capacities stop at the line limit" {
             ReaderError.LineTooLong,
             reader.ensureFieldCapacity(0, storage_limit + 1, false),
         );
-        const warm_allocated = tracking.allocated_bytes;
+        var warm_allocated = tracking.allocated_bytes;
         var count: usize = 1;
         while (try reader.next()) |next| {
             try std.testing.expectEqual(max_line_bytes - 1, next.header.len);
@@ -4154,7 +4249,10 @@ test "[edge] - [reader]: spill field capacities stop at the line limit" {
             }
             try std.testing.expect(tracking.allocated_bytes - tracking.freed_bytes <=
                 2 * io_layer.DEFAULT_READER_BUFFER_BYTES + 3 * storage_limit);
-            if (crlf) try std.testing.expectEqual(warm_allocated, tracking.allocated_bytes);
+            // The second record first attempts whole-record refill assembly.
+            try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.fallback_fields[1].storage.len);
+            if (crlf and count > 1) try std.testing.expectEqual(warm_allocated, tracking.allocated_bytes);
+            warm_allocated = tracking.allocated_bytes;
             count += 1;
         }
         try std.testing.expectEqual(@as(usize, 4), count);
@@ -4173,7 +4271,9 @@ test "[property] - [reader]: repeated initialization releases both source modes 
                 try Reader.init(allocator, source.byteSource(), .{ .max_line_bytes = limit });
             defer reader.deinit();
 
-            try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.fallback_fields[1].storage.len);
+            for (reader.fallback_fields) |field| {
+                try std.testing.expectEqual(@as(usize, 0), field.storage.len);
+            }
             try std.testing.expectEqual(
                 @as(usize, if (borrowed) 0 else io_layer.DEFAULT_READER_BUFFER_BYTES),
                 reader.transport_storage.len,
@@ -4185,8 +4285,13 @@ test "[property] - [reader]: repeated initialization releases both source modes 
             if (borrowed and @sizeOf(@FieldType(io_layer.GzipSource, "decompressor_buffer")) == 0) continue;
             try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ limit, borrowed });
             var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-            for (0..3) |_| {
+            for (0..3) |iteration| {
                 try Exercise.run(tracking.allocator(), limit, borrowed);
+                try std.testing.expectEqual(@as(usize, if (borrowed) 0 else iteration + 1), tracking.allocations);
+                try std.testing.expectEqual(
+                    @as(usize, if (borrowed) 0 else (iteration + 1) * io_layer.DEFAULT_READER_BUFFER_BYTES),
+                    tracking.allocated_bytes,
+                );
                 try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
             }
         }
@@ -4201,6 +4306,54 @@ test "[edge] - [reader]: field storage limit saturates after checked overflow" {
     try std.testing.expectEqual(max, fieldStorageLimit(max));
 }
 
+test "[property] - [reader]: borrowed gzip allocates only for retained fallback fields" {
+    // The separate parser test executable always uses native gzip.
+    if (@sizeOf(@FieldType(io_layer.GzipSource, "decompressor_buffer")) == 0) return;
+    const Exercise = struct {
+        const bytes = "@r\r\nAR\r\n+left\r\n!~\r\n@next\nC\n+\n#\n";
+
+        fn run(allocator: std.mem.Allocator, split: usize) !void {
+            var compressed: [128]u8 = undefined;
+            var output = std.Io.Writer.fixed(&compressed);
+            for ([_][]const u8{ bytes[0..split], bytes[split..] }) |part| {
+                const len: u16 = @intCast(part.len);
+                try output.writeAll(&.{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255, 1 });
+                try output.writeInt(u16, len, .little);
+                try output.writeInt(u16, ~len, .little);
+                try output.writeAll(part);
+                try output.writeInt(u32, std.hash.Crc32.hash(part), .little);
+                try output.writeInt(u32, len, .little);
+            }
+            var input = std.Io.Reader.fixed(output.buffered());
+            var gzip = io_layer.GzipSource.init(&input);
+            var reader = try initBorrowedGzipReader(allocator, &gzip, .{ .max_line_bytes = 8 });
+            defer reader.deinit();
+            const first = (try reader.next()).?;
+            try std.testing.expectEqualStrings("r", first.header);
+            try std.testing.expectEqualStrings("r", first.id);
+            try std.testing.expectEqualStrings("AR", first.sequence);
+            try std.testing.expectEqualStrings("left", first.plus);
+            try std.testing.expectEqualStrings("!~", first.quality);
+            const second = (try reader.next()).?;
+            try std.testing.expectEqualStrings("next", second.header);
+            try std.testing.expectEqualStrings("C", second.sequence);
+            try std.testing.expectEqualStrings("#", second.quality);
+            try std.testing.expect((try reader.next()) == null);
+            try std.testing.expectEqual(@as(u64, bytes.len), reader.byteOffset());
+            for (reader.fallback_fields) |field| try std.testing.expect(field.storage.len <= 9);
+        }
+    };
+    for ([_]usize{ 0, 1, 5, 14, Exercise.bytes.len - 1 }) |split| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{split});
+        var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        try Exercise.run(tracking.allocator(), split);
+        try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+        if (split == 0) {
+            try std.testing.expectEqual(@as(usize, 0), tracking.allocations);
+        } else try std.testing.expect(tracking.allocations > 0);
+    }
+}
+
 test "[unit] - [reader]: field storage exchanges preserve both live prefixes" {
     const window = io_layer.DEFAULT_READER_BUFFER_BYTES;
     var source = io_layer.SliceSource.init("");
@@ -4208,6 +4361,7 @@ test "[unit] - [reader]: field storage exchanges preserve both live prefixes" {
     var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{});
     defer reader.deinit();
     reader.machine.expected = .sequence;
+    try reader.ensureFieldCapacity(1, window, false);
     reader.fallback_fields[1].len = window;
     @memset(reader.fallback_fields[1].storage, 'A');
     reader.fallback_fields[2].storage = try tracking.allocator().alloc(u8, 2 * window);
@@ -4237,7 +4391,7 @@ test "[unit] - [reader]: field storage exchanges preserve both live prefixes" {
 test "[failure] - [reader]: failed spill growth preserves owned storage" {
     var source = io_layer.SliceSource.init("");
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = 2,
+        .fail_index = 1,
         .resize_fail_index = 0,
     });
     var reader = try Reader.init(
@@ -4261,6 +4415,7 @@ test "[property] - [reader]: storage exchange preserves unequal prefixes" {
             var source = io_layer.SliceSource.init("");
             var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
             defer reader.deinit();
+            try reader.ensureFieldCapacity(1, window, false);
             const field = &reader.fallback_fields[1];
             const donor = &reader.fallback_fields[0];
             field.len = live;
@@ -4466,7 +4621,7 @@ test "[failure] - [reader]: failed quality-tail reserve preserves owned storage"
     try std.testing.expectError(ReaderError.OutOfMemory, reader.next());
     try std.testing.expectEqual(@as(usize, 4), reader.fallback_fields[0].storage.len);
     try std.testing.expectEqual(
-        io_layer.DEFAULT_READER_BUFFER_BYTES,
+        sequence_len,
         reader.fallback_fields[1].storage.len,
     );
     try std.testing.expectEqual(@as(usize, 1), reader.fallback_fields[2].storage.len);

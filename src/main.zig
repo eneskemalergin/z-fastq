@@ -6362,7 +6362,7 @@ test "[edge] - [paired fraction sample]: fraction zero keeps buffered mate one b
     var selector = sampling.Selector.init(.none, 11);
     var output_selector: PairOutputSelector = .{ .fraction = &selector };
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = 2,
+        .fail_index = 1,
     });
 
     const failure = try sampleInterleavedFractionInput(
