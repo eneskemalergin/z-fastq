@@ -1008,19 +1008,8 @@ pub const Reader = struct {
             relative_ends = checked.line_ends;
         } else if (!findLineEnds(self.buf[self.cursor..self.fill_end], &relative_ends)) {
             if (allow_refill) {
-                if (try self.bufferIncompleteRecord()) |bytes| {
-                    const buf = self.buf;
-                    const cursor = self.cursor;
-                    const fill_end = self.fill_end;
-                    self.buf = bytes;
-                    self.cursor = 0;
-                    self.fill_end = bytes.len;
-                    defer {
-                        self.buf = buf;
-                        self.cursor = cursor;
-                        self.fill_end = fill_end;
-                    }
-                    return self.readBufferedRecord(projection, include_canonical_span, validator, false);
+                if (try self.bufferIncompleteRecord(0)) |bytes| {
+                    return self.readSavedRecord(bytes, projection, include_canonical_span, validator);
                 }
             }
             return .incomplete;
@@ -1117,16 +1106,41 @@ pub const Reader = struct {
         stopped: bool = false,
     };
 
-    fn bufferIncompleteRecord(self: *Reader) ReaderError!?[]u8 {
+    fn readSavedRecord(
+        self: *Reader,
+        bytes: []u8,
+        comptime projection: BufferedProjection,
+        comptime include_canonical_span: bool,
+        validator: ?*AdaptiveRecordValidator,
+    ) ReaderError!BufferedRecordResult(projection) {
+        const buf = self.buf;
+        const cursor = self.cursor;
+        const fill_end = self.fill_end;
+        self.buf = bytes;
+        self.cursor = 0;
+        self.fill_end = bytes.len;
+        defer {
+            self.buf = buf;
+            self.cursor = cursor;
+            self.fill_end = fill_end;
+        }
+        return self.readBufferedRecord(projection, include_canonical_span, validator, false);
+    }
+
+    fn canBufferIncompleteRecord(self: *const Reader) bool {
         const capacity = io_layer.DEFAULT_READER_BUFFER_BYTES;
-        if (self.borrowed_gzip != null or self.pending_refill != null or
-            self.fallback_fields[1].storage.len < capacity or
-            self.fill_end - self.cursor == self.buf.len) return null;
+        return self.borrowed_gzip == null and self.pending_refill == null and
+            self.fallback_fields[1].storage.len >= capacity and
+            self.fill_end - self.cursor != self.buf.len;
+    }
+
+    fn bufferIncompleteRecord(self: *Reader, prefix_len: usize) ReaderError!?[]u8 {
+        if (!self.canBufferIncompleteRecord()) return null;
         const byte_offset = self.byte_offset;
         const record_index = self.record_index;
         const machine = self.machine;
         const record_offsets = self.record_offsets;
-        var record: RefillRecord = .{ .start = self.cursor };
+        var record: RefillRecord = .{ .start = self.cursor, .len = prefix_len };
         while (true) {
             const line = try self.readLine(false, null, &record);
             if (record.stopped) break;
@@ -1138,12 +1152,12 @@ pub const Reader = struct {
         self.machine = machine;
         self.record_offsets = record_offsets;
         const bytes = self.fallback_fields[1].storage[0..record.len];
-        if (!record.stopped) return bytes;
+        if (!record.stopped) return bytes[prefix_len..];
         self.cursor = record.start;
         if (record.len != 0) {
             self.pending_refill = .{ .bytes = self.buf, .cursor = self.cursor, .end = self.fill_end };
             self.buf = bytes;
-            self.cursor = 0;
+            self.cursor = prefix_len;
             self.fill_end = bytes.len;
         }
         return null;
@@ -1636,6 +1650,82 @@ pub fn nextBufferedValidatedRecord(
         .incomplete, .eof => null,
         .record => |buffered| finishValidatedRecord(reader, buffered),
     };
+}
+
+/// Updates mate 1's views when moving it; both mates borrow until the next advance.
+/// On null, preserve the updated mate 1 before continuing with ordinary reads.
+pub fn nextPairedValidatedRecord(
+    reader: *Reader,
+    first: *ValidatedRecord,
+    validator: *AdaptiveRecordValidator,
+) ReaderError!?ValidatedRecord {
+    if (try nextBufferedValidatedRecord(reader, validator)) |second| return second;
+    if (!reader.canBufferIncompleteRecord()) return null;
+    // Separate fallback fields can overlap the destination before they are copied.
+    if (first.record.sequence.ptr == reader.fallback_fields[1].storage.ptr) return null;
+    const capacity = io_layer.DEFAULT_READER_BUFFER_BYTES;
+    const span = first.canonical_span;
+    var size: usize = 6;
+    if (span) |bytes| {
+        size = bytes.len;
+    } else {
+        inline for (.{ "header", "sequence", "plus", "quality" }) |field| {
+            const len = @field(first.record, field).len;
+            if (len > capacity - size) return null;
+            size += len;
+        }
+    }
+    if (size >= capacity) return null;
+    const saved = reader.fallback_fields[1].storage[0..size];
+    if (span) |bytes| @memmove(saved, bytes) else saved[0] = '@';
+    var offset: usize = 1;
+    inline for (.{ "header", "sequence", "plus", "quality" }, 0..) |field, index| {
+        const bytes = &@field(first.record, field);
+        const start = if (span) |raw| @intFromPtr(bytes.ptr) - @intFromPtr(raw.ptr) else offset;
+        const dest = saved[start..][0..bytes.len];
+        if (span == null) {
+            @memmove(dest, bytes.*);
+            offset += bytes.len;
+            saved[offset] = '\n';
+            offset += 1;
+            if (index == 1) {
+                saved[offset] = '+';
+                offset += 1;
+            }
+        }
+        bytes.* = dest;
+    }
+    first.record.id = first.record.header[0..first.record.id.len];
+    // Staging writes one canonical span, including when the input uses CRLF.
+    first.canonical_span = if (recordHasTerminalCr(first.record)) null else saved;
+    return nextSavedPairMate(reader, size, validator);
+}
+
+/// Keeps only mate 1's updated header alive through the mate-2 read.
+/// On null, preserve that header before continuing with ordinary reads.
+pub fn nextPairedValidatedHeader(
+    reader: *Reader,
+    first_header: *[]const u8,
+    validator: *AdaptiveRecordValidator,
+) ReaderError!?ValidatedRecord {
+    if (try nextBufferedValidatedRecord(reader, validator)) |second| return second;
+    if (!reader.canBufferIncompleteRecord() or
+        first_header.len >= io_layer.DEFAULT_READER_BUFFER_BYTES) return null;
+    const saved = reader.fallback_fields[1].storage[0..first_header.len];
+    @memmove(saved, first_header.*);
+    first_header.* = saved;
+    return nextSavedPairMate(reader, saved.len, validator);
+}
+
+fn nextSavedPairMate(
+    reader: *Reader,
+    prefix_len: usize,
+    validator: *AdaptiveRecordValidator,
+) ReaderError!?ValidatedRecord {
+    const bytes = try reader.bufferIncompleteRecord(prefix_len) orelse return null;
+    const buffered = try reader.readSavedRecord(bytes, .validated, true, validator);
+    std.debug.assert(buffered == .record);
+    return finishValidatedRecord(reader, buffered.record);
 }
 
 fn nextBufferedRecord(
@@ -2830,6 +2920,166 @@ fn expectRefillDelivery(
         try std.testing.expectEqual(reference_source.pos, source.pos);
         try std.testing.expectEqual(reference_source.read_count, source.read_count);
         if (finished) return;
+    }
+}
+
+fn expectPairedRefill(
+    comptime header_only: bool,
+    input: []const u8,
+    split: usize,
+    chunk_limit: usize,
+    fail_at: ?usize,
+    options: Options,
+    progress: struct { records: u64 = 0, bytes: u64 = 0 },
+) !void {
+    errdefer std.debug.print("pair refill: header {}, bytes {d}, split {d}, chunk {d}, failure {?d}, progress {any}\n", .{
+        header_only, input.len, split, chunk_limit, fail_at, progress,
+    });
+    var reference_source = ProjectionTestSource.init(input, split, fail_at);
+    reference_source.chunk_limit = chunk_limit;
+    var source = reference_source;
+    var reference = try Reader.init(std.testing.allocator, reference_source.byteSource(), options);
+    defer reference.deinit();
+    var reader = try Reader.init(std.testing.allocator, source.byteSource(), options);
+    defer reader.deinit();
+    reference.record_index = progress.records;
+    reader.record_index = progress.records;
+    reference.byte_offset = progress.bytes;
+    reader.byte_offset = progress.bytes;
+    var reference_validator = AdaptiveRecordValidator.init(.{});
+    var validator = AdaptiveRecordValidator.init(.{});
+
+    while (true) {
+        var finished = false;
+        pair: {
+            const expected_first = nextValidatedRecord(&reference, &reference_validator);
+            const actual_first = nextValidatedRecord(&reader, &validator);
+            const first = expected_first catch |err| {
+                try std.testing.expectError(err, actual_first);
+                finished = true;
+                break :pair;
+            };
+            var delivered = try actual_first;
+            try std.testing.expectEqual(first == null, delivered == null);
+            if (first == null) {
+                finished = true;
+                break :pair;
+            }
+            // The reference owns mate 1 before an ordinary read invalidates it.
+            var saved = try toOwned(std.testing.allocator, first.?.record);
+            defer saved.deinit();
+            const expected_second = nextValidatedRecord(&reference, &reference_validator);
+            const paired_second = if (header_only)
+                nextPairedValidatedHeader(&reader, &delivered.?.record.header, &validator)
+            else
+                nextPairedValidatedRecord(&reader, &delivered.?, &validator);
+            const actual_second: ReaderError!?ValidatedRecord = second: {
+                const buffered = paired_second catch |err| break :second err;
+                try std.testing.expectEqualStrings(saved.header, delivered.?.record.header);
+                if (!header_only) {
+                    inline for (.{ "id", "sequence", "plus", "quality" }) |field| {
+                        try std.testing.expectEqualStrings(@field(saved, field), @field(delivered.?.record, field));
+                    }
+                    if (delivered.?.canonical_span) |span| {
+                        const output = try std.mem.concat(std.testing.allocator, u8, &.{
+                            "@", saved.header, "\n", saved.sequence, "\n+", saved.plus, "\n", saved.quality, "\n",
+                        });
+                        defer std.testing.allocator.free(output);
+                        try std.testing.expectEqualStrings(output, span);
+                    }
+                }
+                break :second buffered orelse nextValidatedRecord(&reader, &validator);
+            };
+            if (expected_second) |second| {
+                const actual = try actual_second;
+                try std.testing.expectEqual(second == null, actual == null);
+                if (second) |expected| {
+                    try std.testing.expectEqualDeep(expected.record, actual.?.record);
+                    try expectSemanticErrorEqual(expected.semantic_error, actual.?.semantic_error);
+                } else finished = true;
+            } else |err| {
+                try std.testing.expectError(err, actual_second);
+                finished = true;
+            }
+        }
+        try std.testing.expectEqual(reference.recordIndex(), reader.recordIndex());
+        try std.testing.expectEqual(reference.byteOffset(), reader.byteOffset());
+        try std.testing.expectEqual(reference.currentRecordOffsets(), reader.currentRecordOffsets());
+        try std.testing.expectEqualDeep(reference.machine, reader.machine);
+        try std.testing.expectEqualDeep(reference_validator, validator);
+        try expectProjectionErrorEqual(reference.takeLastError(), reader.takeLastError());
+        try std.testing.expectEqual(reference_source.pos, source.pos);
+        try std.testing.expectEqual(reference_source.read_count, source.read_count);
+        if (finished) return;
+    }
+}
+
+test "[property] - [reader]: paired refills preserve fields, progress, and failures" {
+    const first = "@r/1\nAR\n+left\n!~\n";
+    const first_crlf = "@r/1\r\nAR\r\n+left\r\n!~\r\n";
+    inline for (.{ false, true }) |header_only| {
+        for ([_][]const u8{
+            first ++ "@r/2\nC\n+right\n#\n" ++ first,
+            first_crlf ++ "@r/2\r\nC\r\n+right\r\n#\r\n" ++ first,
+            first ++ "@r/2\n\n+\n\n",
+            first_crlf ++ "@r/2\nR\n+right\n \n",
+            first ++ "@r/2\n?\n-\n \n",
+            first ++ "@r/2\nAC\n+\n!\n",
+            first ++ "@r/2\r\r\nR\rA\n+\r\r\n!!!\n",
+            "@r/1\r\r\nAR\n+left\r\r\n!~\n" ++ first,
+        }) |input| {
+            for (0..input.len + 1) |split| {
+                try expectPairedRefill(header_only, input, split, std.math.maxInt(usize), null, .{}, .{});
+                try expectPairedRefill(header_only, input[0..split], 0, 3, null, .{}, .{});
+                try expectPairedRefill(header_only, input, 0, 3, split, .{}, .{});
+            }
+            for (1..input.len + 1) |chunk_limit| {
+                try expectPairedRefill(header_only, input, 0, chunk_limit, null, .{ .max_line_bytes = 8 }, .{});
+            }
+        }
+        for ([_]u64{ (1 << 32) - 3, std.math.maxInt(u64) - first.len, std.math.maxInt(u64) - 1 }) |counter| {
+            try expectPairedRefill(header_only, first ** 2, first.len, 3, null, .{}, .{ .bytes = counter });
+            try expectPairedRefill(header_only, first ** 2, first.len, 3, null, .{}, .{ .records = counter });
+        }
+    }
+}
+
+test "[property] - [reader]: paired refills retain oversized and EOF fallbacks" {
+    const capacity = io_layer.DEFAULT_READER_BUFFER_BYTES;
+    const first = "@r/1\nAR\n+left\n!~\n";
+    const last = "@last\nN\n+\n!\n";
+    for ([_]usize{ capacity - first.len - 1, capacity - first.len, capacity - first.len + 1, capacity - 3, capacity - 2, capacity + 1, 2 * capacity + 11 }) |record_len| {
+        const field_len = (record_len - 9) / 2;
+        const second = try ReaderSpillFixture.init(std.testing.allocator, field_len, field_len, "\n", true);
+        defer std.testing.allocator.free(second);
+        const padding = if (second.len == record_len) "" else "x";
+        const input = try std.mem.concat(std.testing.allocator, u8, &.{ first, second[0..4], padding, second[4..], last });
+        defer std.testing.allocator.free(input);
+        inline for (.{ false, true }) |header_only| {
+            if (record_len + (if (header_only) @as(usize, 3) else first.len) <= capacity) {
+                var source = ProjectionTestSource.init(input, first.len, null);
+                source.chunk_limit = 17;
+                var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+                var reader = try Reader.init(failing.allocator(), source.byteSource(), .{});
+                defer reader.deinit();
+                var validator = AdaptiveRecordValidator.init(.{});
+                var mate1 = (try nextValidatedRecord(&reader, &validator)).?;
+                const mate2 = (try if (header_only)
+                    nextPairedValidatedHeader(&reader, &mate1.record.header, &validator)
+                else
+                    nextPairedValidatedRecord(&reader, &mate1, &validator)).?;
+                try std.testing.expectEqualStrings("r/1", mate1.record.header);
+                try std.testing.expectEqual(field_len, mate2.record.sequence.len);
+                try std.testing.expectEqualStrings(input[first.len .. first.len + record_len], mate2.canonical_span.?);
+                try std.testing.expect(!failing.has_induced_failure);
+            }
+            for ([_]usize{ first.len, capacity - 1, capacity, capacity + 1 }) |split| {
+                try expectPairedRefill(header_only, input, split, std.math.maxInt(usize), null, .{}, .{});
+            }
+            try expectPairedRefill(header_only, input, first.len, 17, null, .{}, .{});
+            try expectPairedRefill(header_only, input[0 .. first.len + record_len - 1], first.len, 37, null, .{}, .{});
+            try expectPairedRefill(header_only, input, first.len, 37, null, .{ .max_line_bytes = field_len - 1 }, .{});
+        }
     }
 }
 

@@ -1211,7 +1211,7 @@ fn checkInterleavedSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        const record1 = fastq.nextValidatedHeader(&reader, &validator) catch |err| {
+        var record1 = fastq.nextValidatedHeader(&reader, &validator) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
@@ -1228,15 +1228,18 @@ fn checkInterleavedSource(
         var first_token_len: usize = 0;
         var first_mate_marker: ?u2 = null;
         var mate1_markers: u2 = 0;
-        const buffered_record2 = fastq.nextBufferedValidatedRecord(&reader, &validator) catch |err| {
+        const paired_record2 = (if (semantic1 == null)
+            fastq.nextPairedValidatedHeader(&reader, &record1.header, &validator)
+        else
+            fastq.nextBufferedValidatedRecord(&reader, &validator)) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
             } };
         };
-        const both_headers_borrowed = buffered_record2 != null;
+        const both_headers_borrowed = paired_record2 != null;
         var semantic2: ?zfastq.SemanticError = null;
-        const header2 = if (buffered_record2) |validated2| header: {
+        const header2 = if (paired_record2) |validated2| header: {
             if (semantic1 == null) semantic2 = validated2.semantic_error;
             break :header validated2.record.header;
         } else header: {
@@ -2304,14 +2307,12 @@ fn sampleInterleavedSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        const validated1 = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
+        var validated1 = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
             } };
         } orelse return null;
-        const record1 = validated1.record;
-        const canonical_span1 = validated1.canonical_span;
         const record_index1 = reader.recordIndex() - 1;
         const offsets1 = reader.currentRecordOffsets().?;
         const semantic1 = mapSemanticFailure(
@@ -2324,20 +2325,24 @@ fn sampleInterleavedSource(
         var first_mate_marker: ?u2 = null;
         var mate1_markers: u2 = 0;
         const selected = semantic1 == null and selection.selectPair();
-        const unwritable1 = selected and recordHasUnwritableEnding(record1, canonical_span1);
+        const unwritable1 = selected and recordHasUnwritableEnding(validated1.record, validated1.canonical_span);
 
         var record1_storage: InterleavedFirstRecordStorage = .unused;
-        const buffered_record2 = fastq.nextBufferedValidatedRecord(
-            &reader,
-            &validator,
-        ) catch |err| {
+        const paired_record2 = (if (selected)
+            fastq.nextPairedValidatedRecord(&reader, &validated1, &validator)
+        else if (semantic1 == null)
+            fastq.nextPairedValidatedHeader(&reader, &validated1.record.header, &validator)
+        else
+            fastq.nextBufferedValidatedRecord(&reader, &validator)) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
             } };
         };
-        const both_headers_borrowed = buffered_record2 != null;
-        const validated2 = (if (buffered_record2) |complete_record2| buffered: {
+        const record1 = validated1.record;
+        const canonical_span1 = validated1.canonical_span;
+        const both_headers_borrowed = paired_record2 != null;
+        const validated2 = (if (paired_record2) |complete_record2| buffered: {
             if (selected) record1_storage = .reader;
             break :buffered complete_record2;
         } else record: {
@@ -3226,7 +3231,7 @@ fn sampleExactInterleavedSecondPass(
             continue;
         }
 
-        const validated1 = fastq.nextValidatedRecord(&reader, &validator) catch |err| failed: {
+        var validated1 = fastq.nextValidatedRecord(&reader, &validator) catch |err| failed: {
             failure = .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
@@ -3234,13 +3239,11 @@ fn sampleExactInterleavedSecondPass(
             break :failed null;
         } orelse break;
 
-        const record1 = validated1.record;
-        const canonical_span1 = validated1.canonical_span;
         const invalid1 = validated1.semantic_error != null;
-        const header1_len = record1.header.len;
-        const unwritable1 = recordHasUnwritableEnding(record1, canonical_span1);
+        const header1_len = validated1.record.header.len;
+        const unwritable1 = recordHasUnwritableEnding(validated1.record, validated1.canonical_span);
         var record1_storage: InterleavedFirstRecordStorage = .reader;
-        const buffered_record2 = fastq.nextBufferedValidatedRecord(
+        var paired_record2 = fastq.nextBufferedValidatedRecord(
             &reader,
             &validator,
         ) catch |err| failed: {
@@ -3250,7 +3253,23 @@ fn sampleExactInterleavedSecondPass(
             } };
             break :failed null;
         };
-        const validated2 = buffered_record2 orelse record: {
+        // HACK: Preserve retry diagnostics until the exact-output bug is fixed.
+        if (paired_record2 == null and failure == null) {
+            paired_record2 = fastq.nextPairedValidatedRecord(
+                &reader,
+                &validated1,
+                &validator,
+            ) catch |err| {
+                failure = .{ .command = .{
+                    .input_index = 0,
+                    .details = mapReaderFailure(&reader, err),
+                } };
+                break;
+            };
+        }
+        const record1 = validated1.record;
+        const canonical_span1 = validated1.canonical_span;
+        const validated2 = paired_record2 orelse record: {
             const preserved = nextAfterPreservingInterleavedMate1(
                 allocator,
                 &reader,
@@ -3919,35 +3938,35 @@ fn deinterleaveSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        const validated1 = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
+        var validated1 = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
             } };
         } orelse return null;
-        const record1 = validated1.record;
-        const canonical_span1 = validated1.canonical_span;
         const record_index1 = reader.recordIndex() - 1;
         const offsets1 = reader.currentRecordOffsets().?;
-        const header1_len = record1.header.len;
+        const header1_len = validated1.record.header.len;
         const semantic1 = mapSemanticFailure(
             validated1.semantic_error,
             offsets1,
             record_index1,
         );
 
-        const unwritable1 = recordHasUnwritableEnding(record1, canonical_span1);
+        const unwritable1 = recordHasUnwritableEnding(validated1.record, validated1.canonical_span);
         var record1_storage: InterleavedFirstRecordStorage = .reader;
-        const buffered_record2 = fastq.nextBufferedValidatedRecord(
-            &reader,
-            &validator,
-        ) catch |err| {
+        const paired_record2 = (if (semantic1 == null)
+            fastq.nextPairedValidatedRecord(&reader, &validated1, &validator)
+        else
+            fastq.nextBufferedValidatedRecord(&reader, &validator)) catch |err| {
             return .{ .command = .{
                 .input_index = 0,
                 .details = mapReaderFailure(&reader, err),
             } };
         };
-        const validated2 = buffered_record2 orelse record: {
+        const record1 = validated1.record;
+        const canonical_span1 = validated1.canonical_span;
+        const validated2 = paired_record2 orelse record: {
             @branchHint(.cold);
             if (semantic1 != null) {
                 break :record fastq.nextValidatedRecord(
@@ -5372,7 +5391,7 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pairs", .{tmp.sub_path});
     defer allocator.free(path);
-    const prefix = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n";
+    const small_prefix = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n";
     const options = SampleOptions{
         .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
         .alphabet = .iupac,
@@ -5386,7 +5405,13 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
     for ([_]InterleavedFirstRecordStorage{ .reader, .staged, .retained }) |storage| {
         var input: std.ArrayList(u8) = .empty;
         defer input.deinit(allocator);
-        try input.appendSlice(allocator, prefix);
+        if (storage == .reader) {
+            // Put the selected pair across the transport refill while both mates stay small.
+            try input.appendSlice(allocator, "@a/1 ");
+            try input.appendNTimes(allocator, 'x', zfastq.limits.DEFAULT_READER_BUFFER_BYTES - 300 - small_prefix.len - 1);
+            try input.appendSlice(allocator, small_prefix[4..]);
+        } else try input.appendSlice(allocator, small_prefix);
+        const prefix_len = input.items.len;
         var header_starts: [2]usize = undefined;
         var sequence_starts: [2]usize = undefined;
         var plus_starts: [2]usize = undefined;
@@ -5409,6 +5434,7 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
             try input.appendNTimes(allocator, '!', field_len);
             try input.append(allocator, '\n');
         }
+        const prefix = input.items[0..prefix_len];
         {
             var source = io_layer.SliceSource.init(input.items);
             var reader = try zfastq.Reader.init(allocator, source.byteSource(), .{});
@@ -5419,11 +5445,12 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
             defer retained.deinit(allocator);
             var staged: std.ArrayList(u8) = .empty;
             defer staged.deinit(allocator);
-            var span1: ?[]const u8 = null;
-            var span2: ?[]const u8 = null;
             var validator = fastq.AdaptiveRecordValidator.init(.{});
-            const record1 = (try fastq.nextWithoutId(&reader, &span1)).?;
-            if (try fastq.nextBufferedWithoutId(&reader, &span2)) |_| {
+            var first_record = (try fastq.nextValidatedRecord(&reader, &validator)).?;
+            if (storage == .reader) {
+                try std.testing.expect((try fastq.nextBufferedValidatedRecord(&reader, &validator)) == null);
+            }
+            if (try fastq.nextPairedValidatedRecord(&reader, &first_record, &validator)) |_| {
                 try std.testing.expectEqual(.reader, storage);
             } else {
                 const next = try nextAfterPreservingInterleavedMate1(
@@ -5431,8 +5458,8 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
                     &reader,
                     &retained,
                     &staged,
-                    record1,
-                    span1,
+                    first_record.record,
+                    first_record.canonical_span,
                     staging_limit,
                     &validator,
                 );
@@ -5504,6 +5531,52 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
             }
         }
     }
+}
+
+test "[integration] - [interleaved exact sample]: preserves buffered mate failure diagnostics" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pairs", .{tmp.sub_path});
+    defer allocator.free(path);
+    const original = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n@b/1\nA\n+\n!\n@b/2\nT\n+\n#\n";
+    const changed = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n@b/1\nA\n+\n!\n@b/2\nT\nx\n#\n";
+    try writeExactTestInput(io, path, original, false, null);
+    const snapshot = try snapshotTestFile(io, path);
+    try writeExactTestInput(io, path, changed, false, snapshot);
+    var output: [original.len]u8 = undefined;
+    var sink = io_layer.SliceSink.init(&output);
+    var writer = zfastq.Writer.init(sink.byteSink());
+    const options = SampleOptions{
+        .max_line_bytes = 64,
+        .alphabet = .iupac,
+        .fraction = null,
+        .count = 2,
+        .seed = 11,
+        .pair_mode = .interleaved,
+    };
+    const failure = (try sampleExactInterleavedSecondPass(
+        true,
+        io,
+        allocator,
+        path,
+        &writer,
+        .empty,
+        snapshot,
+        2,
+        260,
+        options,
+    )).?;
+    try std.testing.expect(failure == .command);
+    const details = failure.command.details;
+    try std.testing.expectEqualStrings("S001", details.code);
+    try std.testing.expectEqual(@as(u8, 1), details.exit_code);
+    try std.testing.expectEqual(@as(?u64, 3), details.record_index);
+    try std.testing.expectEqual(@as(?u3, 3), details.line_in_record);
+    // The existing buffered-error path retries at quality and replaces offset 40.
+    try std.testing.expectEqual(@as(?u64, 42), details.byte_offset);
+    try std.testing.expectEqualStrings(original[0..22], sink.written());
 }
 
 test "[failure] - [paired exact sample]: each input snapshot is checked independently" {
@@ -6329,6 +6402,105 @@ test "[edge] - [paired fraction sample]: fraction zero keeps buffered mate one b
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
 }
 
+const InterleavedTestSource = struct {
+    data: []const u8,
+    first_chunk: usize,
+    position: usize = 0,
+
+    fn read(ctx: *anyopaque, dest: []u8) error{ReadFailed}!usize {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const size = if (self.position == 0) self.first_chunk else 3;
+        const n = @min(size, @min(dest.len, self.data.len - self.position));
+        @memcpy(dest[0..n], self.data[self.position..][0..n]);
+        self.position += n;
+        return n;
+    }
+};
+
+test "[property] - [interleaved input]: small pairs need no preservation allocations" {
+    const expected1 = "@pair/1\nR\n+left\n!\n";
+    const expected2 = "@pair/2\nT\n+right\n#\n";
+    for ([_][2][]const u8{
+        .{ expected1, expected2 },
+        .{ "@pair/1\r\nR\r\n+left\r\n!\r\n", "@pair/2\r\nT\r\n+right\r\n#\r\n" },
+        .{ "@pair/1\r\nR\n+left\r\n!\n", "@pair/2\nT\r\n+right\n#\r\n" },
+    }) |mates| {
+        const input = try std.mem.concat(std.testing.allocator, u8, &mates);
+        defer std.testing.allocator.free(input);
+        for ([_]usize{ mates[0].len, mates[0].len + 7 }) |first_chunk| {
+            for (0..4) |command| {
+                var source: InterleavedTestSource = .{ .data = input, .first_chunk = first_chunk };
+                const bytes: zfastq.io.ByteSource = .{ .ctx = &source, .vtable = &.{ .read = InterleavedTestSource.read } };
+                var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+                var out1: [128]u8 = undefined;
+                var out2: [128]u8 = undefined;
+                var sink1 = io_layer.SliceSink.init(&out1);
+                var sink2 = io_layer.SliceSink.init(&out2);
+                var writer1 = zfastq.Writer.init(sink1.byteSink());
+                var writer2 = zfastq.Writer.init(sink2.byteSink());
+                var selector = sampling.Selector.init(if (command == 1) .none else .all, 11);
+                var selection: PairOutputSelector = .{ .fraction = &selector };
+                const failure = switch (command) {
+                    0 => checkInterleavedSource(failing.allocator(), bytes, .{
+                        .max_line_bytes = 64,
+                        .alphabet = .iupac,
+                        .pair_mode = .interleaved,
+                        .pair_name_policy = .illumina,
+                    }, null),
+                    1, 2 => try sampleInterleavedSource(failing.allocator(), bytes, &writer1, &selection, 260, .{
+                        .max_line_bytes = 64,
+                        .alphabet = .iupac,
+                        .fraction = if (command == 1) .none else .all,
+                        .count = null,
+                        .seed = 11,
+                        .pair_mode = .interleaved,
+                        .pair_name_policy = .illumina,
+                    }),
+                    3 => try deinterleaveSource(failing.allocator(), bytes, &writer1, &writer2, 260, .{
+                        .max_line_bytes = 64,
+                        .alphabet = .iupac,
+                        .pair_name_policy = .illumina,
+                    }),
+                    else => unreachable,
+                };
+
+                try std.testing.expect(failure == null);
+                try std.testing.expect(!failing.has_induced_failure);
+                try std.testing.expectEqualStrings(switch (command) {
+                    0, 1 => "",
+                    2 => expected1 ++ expected2,
+                    3 => expected1,
+                    else => unreachable,
+                }, sink1.written());
+                try std.testing.expectEqualStrings(if (command == 3) expected2 else "", sink2.written());
+            }
+        }
+    }
+}
+
+test "[failure] - [deinterleave]: preserves CRLF output on a failed write" {
+    const first = "@pair/1\r\nR\r\n+left\r\n!\r\n";
+    const second = "@pair/2\r\nT\r\n+right\r\n#\r\n";
+    var source: InterleavedTestSource = .{ .data = first ++ second, .first_chunk = first.len };
+    var output: ["@pair/1\nR\n+left\n!\n".len - 1]u8 = undefined;
+    var sink1 = io_layer.SliceSink.init(&output);
+    var sink2 = io_layer.SliceSink.init(&.{});
+    var writer1 = zfastq.Writer.init(sink1.byteSink());
+    var writer2 = zfastq.Writer.init(sink2.byteSink());
+
+    try std.testing.expectError(error.Output1WriteFailed, deinterleaveSource(
+        std.testing.allocator,
+        .{ .ctx = &source, .vtable = &.{ .read = InterleavedTestSource.read } },
+        &writer1,
+        &writer2,
+        260,
+        .{ .max_line_bytes = 64, .alphabet = .iupac, .pair_name_policy = .illumina },
+    ));
+    // Canonical staging submits the complete mate to this all-or-error sink.
+    try std.testing.expectEqualStrings("", sink1.written());
+    try std.testing.expectEqualStrings("", sink2.written());
+}
+
 const DeinterleaveTestSink = struct {
     buffer: [256]u8 = undefined,
     length: usize = 0,
@@ -6626,6 +6798,11 @@ test "[failure] - [deinterleave]: staging allocation failure emits no output" {
     try std.testing.expectEqualStrings("out_of_memory", command_failure.code);
     try std.testing.expectEqual(@as(usize, 0), sink1.length);
     try std.testing.expectEqual(@as(usize, 0), sink2.length);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseRetainedPairAllocations,
+        .{input.items},
+    );
 }
 
 test "[failure] - [deinterleave]: both fallback owners survive allocation and output failures" {
