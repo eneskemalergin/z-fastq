@@ -118,6 +118,82 @@ test "[cli] - [check]: files and fragmented stdin produce exact fixture results"
     try cli.expectResult(empty_input, 0, "", "");
 }
 
+test "[cli] - [check]: counts agree with count and stats under explicit validation rules" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = try cli.tempPath(allocator, &tmp.sub_path, "records");
+    const cases = [_]struct {
+        input: []const u8,
+        reads: u64,
+        alphabet: []const u8 = "acgtn",
+        check_error: []const u8 = "",
+        stats_ok: bool = true,
+    }{
+        .{ .input = "", .reads = 0 },
+        .{ .input = "@empty\n\n+annotation\n\n", .reads = 1 },
+        .{ .input = "@r\r\nAcgTn\r\n+note\r\n!5?I~\r\n", .reads = 1 },
+        .{ .input = "@r\r\nA\n+\r\n!\n@r\n\n+empty\r\n\r\n", .reads = 2 },
+        .{ .input = "@r\nRyuN\n+\n!5?~", .reads = 1, .alphabet = "iupac" },
+        .{ .input = "@r opaque\rdata\nA\n+note\rdata\n!\n", .reads = 1 },
+        .{ .input = "@r\r\r\nA\n+\n!\n", .reads = 1 },
+        .{
+            .input = "@r\n?\n+\n!\n",
+            .reads = 1,
+            .check_error = "S002: sequence byte is outside the selected alphabet (record 0, line 2, offset 3)\n",
+        },
+        .{
+            .input = "@r\nA\n+\n \n",
+            .reads = 1,
+            .check_error = "S006: quality byte must be ASCII 33 through 126 (record 0, line 4, offset 7)\n",
+            .stats_ok = false,
+        },
+    };
+    for (cases, 0..) |case, index| {
+        var gzip: std.ArrayList(u8) = .empty;
+        try cli.appendGzipMember(allocator, &gzip, case.input, .{});
+        for ([_][]const u8{ case.input, gzip.items }, 0..) |bytes, encoding| {
+            errdefer std.debug.print("count comparison case={d} encoding={d}\n", .{ index, encoding });
+            try tmp.dir.writeFile(io, .{ .sub_path = "records", .data = bytes });
+            const diagnostic = if (case.check_error.len == 0) "" else try std.fmt.allocPrint(allocator, "error: {s}: {s}", .{ path, case.check_error });
+            try cli.expectResult(
+                try cli.run(allocator, &.{ "check", "--alphabet", case.alphabet, "--max-line-bytes", "64", path }),
+                if (case.check_error.len == 0) 0 else 1,
+                "",
+                diagnostic,
+            );
+            try cli.expectResult(
+                try cli.run(allocator, &.{ "count", "--max-line-bytes", "64", path }),
+                0,
+                try std.fmt.allocPrint(allocator, "{d}\n", .{case.reads}),
+                "",
+            );
+            if (!case.stats_ok) {
+                try cli.expectResult(
+                    try cli.run(allocator, &.{ "stats", "--max-line-bytes", "64", path }),
+                    1,
+                    "",
+                    diagnostic,
+                );
+                continue;
+            }
+            const stats = try cli.run(allocator, &.{ "stats", "--json", "--max-line-bytes", "64", path });
+            try std.testing.expectEqual(@as(u8, 0), stats.exit_code);
+            try std.testing.expectEqualStrings("", stats.stderr);
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, stats.stdout, .{});
+            defer parsed.deinit();
+            const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
+            try std.testing.expectEqual(@as(usize, 1), results.len);
+            try cli.expectJsonString(results[0].object.get("input"), path);
+            try cli.expectJsonString(results[0].object.get("status"), "ok");
+            try cli.expectJsonInteger(results[0].object.get("reads"), case.reads);
+        }
+    }
+}
+
 test "[cli] - [check]: alphabet policy and semantic precedence are exact" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

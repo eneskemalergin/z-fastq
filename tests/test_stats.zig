@@ -419,6 +419,94 @@ test "[cli] - [stats]: empty input and a zero-length record remain distinct" {
         \\
     , zero.stdout);
     try std.testing.expectEqual(@as(usize, 0), zero.stderr.len);
+
+    const json = try runCli(allocator, &.{ "stats", "--json", "-" }, "@z\n\n+\n\n", 1);
+    try std.testing.expectEqual(@as(u8, 0), json.exit_code);
+    try std.testing.expectEqualStrings("", json.stderr);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json.stdout, .{});
+    defer parsed.deinit();
+    const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    const object = results[0].object;
+    try cli.expectJsonObjectKeys(object, &STATS_RESULT_KEYS);
+    try cli.expectJsonString(object.get("input"), "-");
+    try cli.expectJsonString(object.get("status"), "ok");
+    try cli.expectJsonInteger(object.get("reads"), 1);
+    inline for (.{ "bases", "min_length", "max_length", "a", "c", "g", "t", "n", "other_bases", "quality_sum", "q20_bases", "q30_bases" }) |field| {
+        try cli.expectJsonInteger(object.get(field), 0);
+    }
+    try expectJsonNumber(object.get("mean_length"), 0.0);
+    inline for (.{ "gc_fraction", "mean_quality", "q20_fraction", "q30_fraction" }) |field| {
+        try std.testing.expect(object.get(field).? == .null);
+    }
+}
+
+test "[cli] - [stats]: source counts and exact decimal ties agree with human and JSON fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cases = [_]struct {
+        reads: usize,
+        bases: usize,
+        mean_length: []const u8,
+        fraction: []const u8,
+        mean_quality: []const u8,
+    }{
+        .{ .reads = 1, .bases = 127, .mean_length = "127.000000", .fraction = "0.007874", .mean_quality = "0.244094" },
+        .{ .reads = 1, .bases = 128, .mean_length = "128.000000", .fraction = "0.007813", .mean_quality = "0.242188" },
+        .{ .reads = 1, .bases = 129, .mean_length = "129.000000", .fraction = "0.007752", .mean_quality = "0.240310" },
+        .{ .reads = 128, .bases = 1, .mean_length = "0.007813", .fraction = "1.000000", .mean_quality = "31.000000" },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("stats reads={d} bases={d}\n", .{ case.reads, case.bases });
+        var input: std.ArrayList(u8) = .empty;
+        try input.ensureTotalCapacity(allocator, case.bases * 2 + case.reads * 10);
+        // One C and one Phred-31 byte make the ratios exact decimal ties at 128 bases.
+        try input.appendSlice(allocator, "@r\nC");
+        try input.appendNTimes(allocator, 'A', case.bases - 1);
+        try input.appendSlice(allocator, "\n+\n@");
+        try input.appendNTimes(allocator, '!', case.bases - 1);
+        try input.append(allocator, '\n');
+        for (1..case.reads) |_| try input.appendSlice(allocator, "@e\n\n+\n\n");
+        const min_length = if (case.reads == 1) case.bases else 0;
+        const expected = try std.fmt.allocPrint(
+            allocator,
+            "input: -\nreads: {d}\nbases: {d}\nmin_length: {d}\nmax_length: {d}\nmean_length: {s}\n" ++
+                "a: {d}\nc: 1\ng: 0\nt: 0\nn: 0\nother_bases: 0\ngc_fraction: {s}\n" ++
+                "quality_sum: 31\nmean_quality: {s}\nq20_bases: 1\nq20_fraction: {s}\n" ++
+                "q30_bases: 1\nq30_fraction: {s}\n",
+            .{ case.reads, case.bases, min_length, case.bases, case.mean_length, case.bases - 1, case.fraction, case.mean_quality, case.fraction, case.fraction },
+        );
+        var gzip: std.ArrayList(u8) = .empty;
+        try cli.appendGzipMember(allocator, &gzip, input.items, .{});
+        for ([_][]const u8{ input.items, gzip.items }) |bytes| {
+            try cli.expectResult(try runCli(allocator, &.{ "stats", "-" }, bytes, bytes.len), 0, expected, "");
+            const json = try runCli(allocator, &.{ "stats", "--json", "-" }, bytes, bytes.len);
+            try std.testing.expectEqual(@as(u8, 0), json.exit_code);
+            try std.testing.expectEqualStrings("", json.stderr);
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json.stdout, .{});
+            defer parsed.deinit();
+            const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
+            try std.testing.expectEqual(@as(usize, 1), results.len);
+            const object = results[0].object;
+            try cli.expectJsonObjectKeys(object, &STATS_RESULT_KEYS);
+            try cli.expectJsonString(object.get("input"), "-");
+            try cli.expectJsonString(object.get("status"), "ok");
+            inline for (
+                .{ "reads", "bases", "min_length", "max_length", "a", "c", "g", "t", "n", "other_bases", "quality_sum", "q20_bases", "q30_bases" },
+                .{ case.reads, case.bases, min_length, case.bases, case.bases - 1, 1, 0, 0, 0, 0, 31, 1, 1 },
+            ) |field, count| {
+                try cli.expectJsonInteger(object.get(field), count);
+            }
+            const bases: f64 = @floatFromInt(case.bases);
+            const reads: f64 = @floatFromInt(case.reads);
+            try expectJsonNumber(object.get("mean_length"), bases / reads);
+            try expectJsonNumber(object.get("gc_fraction"), 1.0 / bases);
+            try expectJsonNumber(object.get("mean_quality"), 31.0 / bases);
+            try expectJsonNumber(object.get("q20_fraction"), 1.0 / bases);
+            try expectJsonNumber(object.get("q30_fraction"), 1.0 / bases);
+        }
+    }
 }
 
 test "[cli] - [stats]: S006 reports the exact decompressed quality-byte offset" {

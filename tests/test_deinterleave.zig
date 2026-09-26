@@ -63,12 +63,20 @@ test "[cli] - [deinterleave]: fields, order, line endings, and round trip are ex
         "",
         "",
     );
+    const joined = try cli.run(allocator, &.{ "interleave", out1_path, out2_path });
+    try cli.expectResult(joined, 0, expected_interleaved, "");
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = joined.stdout });
+    try tmp.dir.deleteFile(io, "out1.fastq");
+    try tmp.dir.deleteFile(io, "out2.fastq");
     try cli.expectResult(
-        try cli.run(allocator, &.{ "interleave", out1_path, out2_path }),
+        try cli.run(allocator, &.{ "deinterleave", "--out1", out1_path, "--out2", out2_path, input_path }),
         0,
-        expected_interleaved,
+        "",
         "",
     );
+    try expectFile(allocator, out1_path, expected1);
+    try expectFile(allocator, out2_path, expected2);
 }
 
 test "[cli] - [deinterleave]: terminal CR fields leave both outputs empty" {

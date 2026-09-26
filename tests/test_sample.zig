@@ -490,6 +490,61 @@ test "[cli] - [sample]: boundary fractions preserve fields and canonicalize LF" 
     );
 }
 
+test "[cli] - [sample]: selecting all records preserves fields across line endings" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = try cli.tempPath(allocator, &tmp.sub_path, "records");
+    const cases = [_]struct {
+        input: []const u8,
+        canonical: []const u8,
+        count: u64,
+    }{
+        .{ .input = "", .canonical = "", .count = 0 },
+        .{
+            .input = "@empty\r\n\r\n+annotation\r\n\r\n",
+            .canonical = "@empty\n\n+annotation\n\n",
+            .count = 1,
+        },
+        .{
+            .input = "@a opaque\rdata\nAC\r\n+first\rnote\n!~\r\n@b\r\n\n+empty\r\n\n",
+            .canonical = "@a opaque\rdata\nAC\n+first\rnote\n!~\n@b\n\n+empty\n\n",
+            .count = 2,
+        },
+        .{
+            .input = "@a\r\nRyuN\r\n+first\r\n!5?~\r\n@b\nTn\n+last\n!#",
+            .canonical = "@a\nRyuN\n+first\n!5?~\n@b\nTn\n+last\n!#\n",
+            .count = 2,
+        },
+    };
+    for (cases, 0..) |case, index| {
+        var gzip: std.ArrayList(u8) = .empty;
+        try cli.appendGzipMember(allocator, &gzip, case.input, .{});
+        for ([_][]const u8{ case.input, gzip.items }, 0..) |bytes, encoding| {
+            errdefer std.debug.print("sample all case={d} encoding={d}\n", .{ index, encoding });
+            try tmp.dir.writeFile(io, .{ .sub_path = "records", .data = bytes });
+            try cli.expectResult(
+                try cli.run(allocator, &.{ "sample", "--fraction", "1", path }),
+                0,
+                case.canonical,
+                "",
+            );
+            for ([_]u64{ case.count, case.count + 1 }) |count| {
+                const count_arg = try std.fmt.allocPrint(allocator, "{d}", .{count});
+                try cli.expectResult(
+                    try cli.run(allocator, &.{ "sample", "--count", count_arg, path }),
+                    0,
+                    case.canonical,
+                    "",
+                );
+            }
+        }
+    }
+}
+
 test "[cli] - [sample]: selected terminal CR fields fail before output" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1082,7 +1137,7 @@ test "[integration] - [paired exact sample]: gzip and exact-name fields match pl
     );
 }
 
-test "[cli] - [paired fraction sample]: fields, exact names, empty input, and LF output are preserved" {
+test "[cli] - [paired sample]: select-all modes agree with interleave and canonical fields" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1096,42 +1151,70 @@ test "[cli] - [paired fraction sample]: fields, exact names, empty input, and LF
     const expected =
         "@same left opaque\nAC\n+left annotation\n!~\n" ++
         "@same right opaque\nGT\n+right annotation\n#$\n";
-    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = r1 });
-    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = r2 });
-    try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = interleaved });
     const r1_path = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
     const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
     const pairs_path = try cli.tempPath(allocator, &tmp.sub_path, "pairs.fastq");
 
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--paired",
-            "--fraction",
-            "1",
-            "--pair-names",
-            "exact",
-            r1_path,
-            r2_path,
-        }),
-        0,
-        expected,
-        "",
-    );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--fraction",
-            "1",
-            "--pair-names",
-            "exact",
-            pairs_path,
-        }),
-        0,
-        expected,
-        "",
-    );
+    for ([_]bool{ false, true }) |gzip| {
+        errdefer std.debug.print("paired select-all gzip={}\n", .{gzip});
+        for (
+            [_][]const u8{ "r1.fastq", "r2.fastq", "pairs.fastq" },
+            [_][]const u8{ r1, r2, interleaved },
+        ) |name, bytes| {
+            var encoded: std.ArrayList(u8) = .empty;
+            if (gzip) try cli.appendGzipMember(allocator, &encoded, bytes, .{});
+            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = if (gzip) encoded.items else bytes });
+        }
+        try cli.expectResult(
+            try cli.run(allocator, &.{ "interleave", "--pair-names", "exact", r1_path, r2_path }),
+            0,
+            expected,
+            "",
+        );
+        for ([_][]const u8{ "1", "2" }) |count| {
+            try cli.expectResult(
+                try cli.run(allocator, &.{ "sample", "--paired", "--count", count, "--pair-names", "exact", r1_path, r2_path }),
+                0,
+                expected,
+                "",
+            );
+            try cli.expectResult(
+                try cli.run(allocator, &.{ "sample", "--interleaved", "--count", count, "--pair-names", "exact", pairs_path }),
+                0,
+                expected,
+                "",
+            );
+        }
+        try cli.expectResult(
+            try cli.run(allocator, &.{
+                "sample",
+                "--paired",
+                "--fraction",
+                "1",
+                "--pair-names",
+                "exact",
+                r1_path,
+                r2_path,
+            }),
+            0,
+            expected,
+            "",
+        );
+        try cli.expectResult(
+            try cli.run(allocator, &.{
+                "sample",
+                "--interleaved",
+                "--fraction",
+                "1",
+                "--pair-names",
+                "exact",
+                pairs_path,
+            }),
+            0,
+            expected,
+            "",
+        );
+    }
 
     try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "" });
     try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "" });
