@@ -251,7 +251,7 @@ pub const GzipSource = struct {
     decompressor: GzipInflate = if (USE_ISA_L) .{} else undefined,
     decompressor_buffer: [if (USE_ISA_L) 0 else flate.max_window_len]u8 = undefined,
     payload_crc: PayloadCrc32,
-    size: u32 = 0,
+    size: if (USE_ISA_L) void else u32 = if (USE_ISA_L) {} else 0,
     state: State = .between_members,
     member_seen: bool = false,
 
@@ -313,7 +313,6 @@ pub const GzipSource = struct {
                         self.state = .between_members;
                         continue;
                     };
-                    self.size +%= @truncate(decoded.len);
                     written += decoded.len;
                     if (written == dest.len) return written;
                 },
@@ -336,10 +335,10 @@ pub const GzipSource = struct {
         if (USE_ISA_L) {
             self.decompressor.init();
         } else {
-            self.decompressor = .init(self.input, .raw, decompressor_buffer);
+            self.decompressor = .init(self.input, decompressor_buffer);
+            self.payload_crc.reset();
+            self.size = 0;
         }
-        if (!USE_ISA_L) self.payload_crc.reset();
-        self.size = 0;
         self.state = .payload;
         self.member_seen = true;
     }
@@ -458,7 +457,6 @@ pub fn readGzipChunk(
                     self.state = .between_members;
                     continue;
                 };
-                self.size +%= @truncate(decoded.len);
                 return decoded;
             },
         }
@@ -502,7 +500,6 @@ pub const SliceSink = struct {
 
 const SLICE_SINK_VTABLE = ByteSink.VTable{
     .write = sliceWrite,
-    .flush = sliceFlush,
 };
 
 fn sliceWrite(ctx: *anyopaque, data: []const u8) WriteError!void {
@@ -511,10 +508,6 @@ fn sliceWrite(ctx: *anyopaque, data: []const u8) WriteError!void {
     if (end > self.buffer.len) return error.WriteFailed;
     @memcpy(self.buffer[self.pos..end], data);
     self.pos = end;
-}
-
-fn sliceFlush(ctx: *anyopaque) WriteError!void {
-    _ = ctx;
 }
 
 /// Push adapter over a borrowed standard writer.

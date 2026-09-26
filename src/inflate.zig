@@ -7,7 +7,6 @@ const flate = std.compress.flate;
 const testing = std.testing;
 const Writer = std.Io.Writer;
 const Reader = std.Io.Reader;
-const Container = flate.Container;
 
 // --- Token codes ---
 
@@ -154,8 +153,6 @@ consumed_bits: u3,
 
 reader: Reader,
 
-container_metadata: Container.Metadata,
-
 lit_dec: LiteralDecoder,
 dst_dec: DistanceDecoder,
 
@@ -173,7 +170,6 @@ const BlockType = enum(u2) {
 };
 
 const State = union(enum) {
-    protocol_header,
     block_header,
     stored_block: u16,
     fixed_block,
@@ -182,7 +178,7 @@ const State = union(enum) {
     dynamic_block,
     dynamic_block_literal: u8,
     dynamic_block_match: u16,
-    protocol_footer,
+    final_block_end,
     end,
 };
 
@@ -192,7 +188,7 @@ const DynamicFastResult = enum {
     end_block,
 };
 
-pub const Error = Container.Error || error{
+pub const Error = error{
     InvalidCode,
     InvalidMatch,
     WrongStoredBlockNlen,
@@ -212,8 +208,8 @@ const INDIRECT_VTABLE: Reader.VTable = .{
     .readVec = readVec,
 };
 
-/// Initializes a decoder borrowing `input` and at least `flate.max_window_len` buffer bytes.
-pub fn init(input: *Reader, container: Container, buffer: []u8) Decompress {
+/// Initializes a raw DEFLATE decoder borrowing `input` and at least `flate.max_window_len` buffer bytes.
+pub fn init(input: *Reader, buffer: []u8) Decompress {
     assert(buffer.len >= flate.max_window_len);
     return .{
         .reader = .{
@@ -224,11 +220,10 @@ pub fn init(input: *Reader, container: Container, buffer: []u8) Decompress {
         },
         .input = input,
         .consumed_bits = 0,
-        .container_metadata = .init(container),
         .lit_dec = .{},
         .dst_dec = .{},
         .final_block = false,
-        .state = .protocol_header,
+        .state = .block_header,
         .err = null,
         .fast_iterations = if (builtin.is_test) 0 else {},
     };
@@ -236,11 +231,7 @@ pub fn init(input: *Reader, container: Container, buffer: []u8) Decompress {
 
 /// Completes a raw stream whose final decoded bytes are already buffered.
 pub fn finishRawIfReady(d: *Decompress) bool {
-    if (d.state != .protocol_footer) return false;
-    switch (d.container_metadata) {
-        .raw => {},
-        else => return false,
-    }
+    if (d.state != .final_block_end) return false;
     d.alignBitsForward();
     d.state = .end;
     return true;
@@ -376,49 +367,6 @@ fn streamInner(d: *Decompress, w: *Writer, limit: std.Io.Limit) (Error || Reader
     var remaining = @intFromEnum(limit);
     const in = d.input;
     sw: switch (d.state) {
-        .protocol_header => switch (d.container_metadata.container()) {
-            .gzip => {
-                const Header = extern struct {
-                    magic: u16 align(1),
-                    method: u8,
-                    flags: packed struct(u8) {
-                        text: bool,
-                        hcrc: bool,
-                        extra: bool,
-                        name: bool,
-                        comment: bool,
-                        reserved: u3,
-                    },
-                    mtime: u32 align(1),
-                    xfl: u8,
-                    os: u8,
-                };
-                const header = try in.takeStruct(Header, .little);
-                if (header.magic != 0x8b1f or header.method != 0x08)
-                    return error.BadGzipHeader;
-                if (header.flags.extra) {
-                    const extra_len = try in.takeInt(u16, .little);
-                    try in.discardAll(extra_len);
-                }
-                if (header.flags.name) {
-                    _ = try in.discardDelimiterInclusive(0);
-                }
-                if (header.flags.comment) {
-                    _ = try in.discardDelimiterInclusive(0);
-                }
-                if (header.flags.hcrc) {
-                    try in.discardAll(2);
-                }
-                continue :sw .block_header;
-            },
-            .zlib => {
-                const header = try in.takeArray(2);
-                const cmf: packed struct(u8) { cm: u4, cinfo: u4 } = @bitCast(header[0]);
-                if (cmf.cm != 8 or cmf.cinfo > 7) return error.BadZlibHeader;
-                continue :sw .block_header;
-            },
-            .raw => continue :sw .block_header,
-        },
         .block_header => {
             d.final_block = (try d.takeIntBits(u1)) != 0;
             const block_type: BlockType = @enumFromInt(try d.takeIntBits(u2));
@@ -478,7 +426,7 @@ fn streamInner(d: *Decompress, w: *Writer, limit: std.Io.Limit) (Error || Reader
             var limited_out: [1][]u8 = .{limit.min(.limited(remaining_len)).slice(out)};
             const n = try in.readVec(&limited_out);
             if (remaining_len - n == 0) {
-                d.state = if (d.final_block) .protocol_footer else .block_header;
+                d.state = if (d.final_block) .final_block_end else .block_header;
             } else {
                 d.state = .{ .stored_block = @intCast(remaining_len - n) };
             }
@@ -493,7 +441,7 @@ fn streamInner(d: *Decompress, w: *Writer, limit: std.Io.Limit) (Error || Reader
 
                 if (sym == 256) {
                     @branchHint(.unlikely);
-                    d.state = if (d.final_block) .protocol_footer else .block_header;
+                    d.state = if (d.final_block) .final_block_end else .block_header;
                     continue :sw d.state;
                 }
 
@@ -533,7 +481,7 @@ fn streamInner(d: *Decompress, w: *Writer, limit: std.Io.Limit) (Error || Reader
         .dynamic_block => {
             const fast_result = try decodeDynamicFast(d, w, &remaining);
             if (fast_result == .end_block) {
-                d.state = if (d.final_block) .protocol_footer else .block_header;
+                d.state = if (d.final_block) .final_block_end else .block_header;
                 continue :sw d.state;
             }
 
@@ -546,7 +494,7 @@ fn streamInner(d: *Decompress, w: *Writer, limit: std.Io.Limit) (Error || Reader
 
                     if (token.operation == .end) {
                         @branchHint(.unlikely);
-                        d.state = if (d.final_block) .protocol_footer else .block_header;
+                        d.state = if (d.final_block) .final_block_end else .block_header;
                         continue :sw d.state;
                     }
 
@@ -586,18 +534,8 @@ fn streamInner(d: *Decompress, w: *Writer, limit: std.Io.Limit) (Error || Reader
                 return @intFromEnum(limit) - remaining;
             }
         },
-        .protocol_footer => {
+        .final_block_end => {
             d.alignBitsForward();
-            switch (d.container_metadata) {
-                .gzip => |*gzip| {
-                    gzip.crc = try in.takeInt(u32, .little);
-                    gzip.count = try in.takeInt(u32, .little);
-                },
-                .zlib => |*zlib| {
-                    zlib.adler = try in.takeInt(u32, .big);
-                },
-                .raw => {},
-            }
             d.state = .end;
             return @intFromEnum(limit) - remaining;
         },
@@ -1053,24 +991,24 @@ fn HuffmanDecoder(
     };
 }
 
-fn testFailure(container: Container, in: []const u8, expected_err: anyerror) !void {
+fn testFailure(in: []const u8, expected_err: anyerror) !void {
     var reader: Reader = .fixed(in);
     var aw: Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
 
     var history: [flate.max_window_len]u8 = undefined;
-    var decompress: Decompress = .init(&reader, container, &history);
+    var decompress: Decompress = .init(&reader, &history);
     try testing.expectError(error.ReadFailed, decompress.reader.streamRemaining(&aw.writer));
     try testing.expectEqual(expected_err, decompress.err orelse return error.TestFailed);
 }
 
-fn testDecompress(container: Container, compressed: []const u8, expected_plain: []const u8) !void {
+fn testDecompress(compressed: []const u8, expected_plain: []const u8) !void {
     var in: std.Io.Reader = .fixed(compressed);
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
 
     var history: [flate.max_window_len]u8 = undefined;
-    var decompress: Decompress = .init(&in, container, &history);
+    var decompress: Decompress = .init(&in, &history);
     const decompressed_len = try decompress.reader.streamRemaining(&aw.writer);
     try testing.expectEqual(expected_plain.len, decompressed_len);
     try testing.expectEqualSlices(u8, expected_plain, aw.written());
@@ -1324,7 +1262,7 @@ test "[failure] - [inflate Huffman table]: rejects an unused incomplete prefix" 
 // --- Stream verification ---
 
 test "[unit] - [inflate raw stream]: decodes a stored block" {
-    try testDecompress(.raw, &[_]u8{
+    try testDecompress(&[_]u8{
         0b0000_0001, 0b0000_1100, 0x00, 0b1111_0011, 0xff,
         'H',         'e',         'l',  'l',         'o',
         ' ',         'w',         'o',  'r',         'l',
@@ -1333,14 +1271,14 @@ test "[unit] - [inflate raw stream]: decodes a stored block" {
 }
 
 test "[unit] - [inflate raw stream]: decodes a fixed block" {
-    try testDecompress(.raw, &[_]u8{
+    try testDecompress(&[_]u8{
         0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x28, 0xcf,
         0x2f, 0xca, 0x49, 0xe1, 0x02, 0x00,
     }, "Hello world\n");
 }
 
 test "[unit] - [inflate raw stream]: decodes a dynamic block" {
-    try testDecompress(.raw, &[_]u8{
+    try testDecompress(&[_]u8{
         0x3d, 0xc6, 0x39, 0x11, 0x00, 0x00, 0x0c, 0x02,
         0x30, 0x2b, 0xb5, 0x52, 0x1e, 0xff, 0x96, 0x38,
         0x16, 0x96, 0x5c, 0x1e, 0x94, 0xcb, 0x6d, 0x01,
@@ -1355,7 +1293,7 @@ test "[unit] - [dynamic fast loop]: decodes through the bounded path" {
     } ++ [_]u8{0} ** 64;
     var input: Reader = .fixed(&compressed);
     var history: [flate.max_window_len]u8 = undefined;
-    var decompressor: Decompress = .init(&input, .raw, &history);
+    var decompressor: Decompress = .init(&input, &history);
     var output: [512]u8 = undefined;
     var writer: Writer = .fixed(&output);
 
@@ -1372,7 +1310,7 @@ test "[unit] - [dynamic fast loop]: resumes across fragmented input" {
     var input = testing.Reader.init(&input_buffer, &.{.{ .buffer = &DYNAMIC_FAST_FRAGMENTED }});
     input.artificial_limit = .limited(40);
     var history: [flate.max_window_len]u8 = undefined;
-    var decompressor: Decompress = .init(&input.interface, .raw, &history);
+    var decompressor: Decompress = .init(&input.interface, &history);
     var output: [4096]u8 = undefined;
     var writer: Writer = .fixed(&output);
 
@@ -1389,7 +1327,7 @@ test "[property] - [inflate dynamic stream]: every truncation fails without a pa
     for (0..DYNAMIC_FAST_FRAGMENTED.len) |end| {
         var input: Reader = .fixed(DYNAMIC_FAST_FRAGMENTED[0..end]);
         var history: [flate.max_window_len]u8 = undefined;
-        var decompressor: Decompress = .init(&input, .raw, &history);
+        var decompressor: Decompress = .init(&input, &history);
         var output: [4096]u8 = undefined;
         var writer: Writer = .fixed(&output);
 
@@ -1397,61 +1335,8 @@ test "[property] - [inflate dynamic stream]: every truncation fails without a pa
     }
 }
 
-test "[unit] - [inflate gzip stream]: decodes a stored block" {
-    try testDecompress(.gzip, &[_]u8{
-        0x1f,        0x8b,        0x08, 0x00,        0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
-        0b0000_0001, 0b0000_1100, 0x00, 0b1111_0011, 0xff, 'H',  'e',  'l',  'l',  'o',
-        ' ',         'w',         'o',  'r',         'l',  'd',  0x0a, 0xd5, 0xe0, 0x39,
-        0xb7,        0x0c,        0x00, 0x00,        0x00,
-    }, "Hello world\n");
-}
-
-test "[unit] - [inflate gzip stream]: decodes a fixed block" {
-    try testDecompress(.gzip, &[_]u8{
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x03,
-        0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca,
-        0x49, 0xe1, 0x02, 0x00, 0xd5, 0xe0, 0x39, 0xb7, 0x0c, 0x00,
-        0x00, 0x00,
-    }, "Hello world\n");
-}
-
-test "[unit] - [inflate gzip stream]: decodes a dynamic block" {
-    try testDecompress(.gzip, &[_]u8{
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
-        0x3d, 0xc6, 0x39, 0x11, 0x00, 0x00, 0x0c, 0x02, 0x30, 0x2b,
-        0xb5, 0x52, 0x1e, 0xff, 0x96, 0x38, 0x16, 0x96, 0x5c, 0x1e,
-        0x94, 0xcb, 0x6d, 0x01, 0x17, 0x1c, 0x39, 0xb4, 0x13, 0x00,
-        0x00, 0x00,
-    }, "ABCDEABCD ABCDEABCD");
-}
-
-test "[unit] - [inflate gzip stream]: accepts a named member" {
-    try testDecompress(.gzip, &[_]u8{
-        0x1f, 0x8b, 0x08, 0x08, 0xe5, 0x70, 0xb1, 0x65, 0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
-        0x74, 0x78, 0x74, 0x00, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
-        0x02, 0x00, 0xd5, 0xe0, 0x39, 0xb7, 0x0c, 0x00, 0x00, 0x00,
-    }, "Hello world\n");
-}
-
-test "[unit] - [inflate zlib stream]: decodes a stored block" {
-    try testDecompress(.zlib, &[_]u8{
-        0x78,        0b10_0_11100,
-        0b0000_0001, 0b0000_1100,
-        0x00,        0b1111_0011,
-        0xff,        'H',
-        'e',         'l',
-        'l',         'o',
-        ' ',         'w',
-        'o',         'r',
-        'l',         'd',
-        0x0a,        0x1c,
-        0xf2,        0x04,
-        0x47,
-    }, "Hello world\n");
-}
-
 test "[failure] - [inflate raw stream]: rejects a reserved block type" {
-    try testFailure(.raw, &[_]u8{0b110}, error.InvalidBlockType);
+    try testFailure(&[_]u8{0b110}, error.InvalidBlockType);
 }
 
 test "[edge] - [inflate raw stream]: accepts an empty destination" {
@@ -1463,59 +1348,29 @@ test "[edge] - [inflate raw stream]: accepts an empty destination" {
     };
     var in: Reader = .fixed(input);
     var history: [flate.max_window_len]u8 = undefined;
-    var decomp: Decompress = .init(&in, .raw, &history);
+    var decomp: Decompress = .init(&in, &history);
     const r = &decomp.reader;
     var bufs: [1][]u8 = .{&.{}};
     try testing.expectEqual(0, try r.readVec(&bufs));
 }
 
-test "[failure] - [inflate zlib stream]: rejects malformed framing" {
-    try testFailure(.zlib, &[_]u8{0x78}, error.EndOfStream);
-
-    try testFailure(.zlib, &[_]u8{ 0x79, 0x94 }, error.BadZlibHeader);
-
-    try testFailure(.zlib, &[_]u8{ 0x88, 0x98 }, error.BadZlibHeader);
-
-    try testFailure(.zlib, &[_]u8{ 0x78, 0xda, 0x03, 0x00, 0x00 }, error.EndOfStream);
+test "[edge] - [inflate raw stream]: decodes empty stored and fixed blocks" {
+    try testDecompress(&.{ 0x01, 0x00, 0x00, 0xff, 0xff }, "");
+    try testDecompress(&.{ 0x03, 0x00 }, "");
 }
 
-test "[failure] - [inflate gzip stream]: rejects malformed framing" {
-    try testFailure(.gzip, &[_]u8{ 0x1f, 0x8B }, error.EndOfStream);
-
-    try testFailure(.gzip, &[_]u8{
-        0x1f, 0x8b, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x03,
-    }, error.BadGzipHeader);
-
-    try testFailure(.gzip, &[_]u8{
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00,
-    }, error.EndOfStream);
-
-    try testFailure(.gzip, &[_]u8{
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00,
-    }, error.EndOfStream);
-
-    try testDecompress(.gzip, &[_]u8{
-        0x1f, 0x8b, 0x08, 0x12, 0x00, 0x09, 0x6e, 0x88, 0x00, 0xff, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x00,
-        0x99, 0xd6, 0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    }, "");
-}
-
-test "[edge] - [inflate zlib stream]: leaves trailing bytes unread" {
+test "[edge] - [inflate raw stream]: leaves trailing bytes unread" {
     const data = [_]u8{
-        0x78, 0x9c, 0x73, 0xce, 0x2f, 0xa8, 0x2c, 0xca, 0x4c, 0xcf, 0x28, 0x51, 0x08, 0xcf, 0xcc, 0xc9,
-        0x49, 0xcd, 0x55, 0x28, 0x4b, 0xcc, 0x53, 0x08, 0x4e, 0xce, 0x48, 0xcc, 0xcc, 0xd6, 0x51, 0x08,
-        0xce, 0xcc, 0x4b, 0x4f, 0x2c, 0xc8, 0x2f, 0x4a, 0x55, 0x30, 0xb4, 0xb4, 0x34, 0xd5, 0xb5, 0x34,
-        0x03, 0x00, 0x8b, 0x61, 0x0f, 0xa4, 0x52, 0x5a, 0x94, 0x12,
+        0x73, 0xce, 0x2f, 0xa8, 0x2c, 0xca, 0x4c, 0xcf, 0x28, 0x51, 0x08, 0xcf, 0xcc, 0xc9,
+        0x49, 0xcd, 0x55, 0x28, 0x4b, 0xcc, 0x53, 0x08, 0x4e, 0xce, 0x48, 0xcc, 0xcc, 0xd6,
+        0x51, 0x08, 0xce, 0xcc, 0x4b, 0x4f, 0x2c, 0xc8, 0x2f, 0x4a, 0x55, 0x30, 0xb4, 0xb4,
+        0x34, 0xd5, 0xb5, 0x34, 0x03, 0x00, 0x52, 0x5a, 0x94, 0x12,
     };
 
     var reader: std.Io.Reader = .fixed(&data);
 
     var decompress_buffer: [flate.max_window_len]u8 = undefined;
-    var decompress: Decompress = .init(&reader, .zlib, &decompress_buffer);
+    var decompress: Decompress = .init(&reader, &decompress_buffer);
     var out: [128]u8 = undefined;
 
     {

@@ -1876,22 +1876,7 @@ fn collectStats(
                             .line_in_record = 4,
                         }) };
                     },
-                    error.S005LengthMismatch => {
-                        const offsets = reader.currentRecordOffsets() orelse {
-                            return .{ .failure = CommandFailure.plain(
-                                "io_error",
-                                "record location is unavailable",
-                                3,
-                            ) };
-                        };
-                        return .{ .failure = CommandFailure.lint(.{
-                            .code = .s005_length_mismatch,
-                            .message = "sequence and quality lengths differ",
-                            .record_index = reader.recordIndex() - 1,
-                            .byte_offset = offsets.quality,
-                            .line_in_record = 4,
-                        }) };
-                    },
+                    error.S005LengthMismatch => @panic("Reader returned unequal sequence and quality lengths"),
                     error.Overflow => return .{ .failure = CommandFailure.plain(
                         "arithmetic_limit",
                         "statistics arithmetic limit exceeded",

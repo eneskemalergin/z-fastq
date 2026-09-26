@@ -2109,13 +2109,6 @@ fn newlineMask(block: *const [STRUCTURAL_BLOCK_BYTES]u8) u64 {
     return @bitCast(bytes == @as(Bytes, @splat('\n')));
 }
 
-fn firstValidSequenceLineEnd(bytes: []const u8, alphabet: Alphabet) ?usize {
-    return switch (alphabet) {
-        .iupac => firstValidSequenceLineEndFor(.iupac, bytes),
-        .acgtn => firstValidSequenceLineEndFor(.acgtn, bytes),
-    };
-}
-
 const SequenceLineScan = union(enum) {
     line_end: usize,
     invalid_start: usize,
@@ -4872,6 +4865,13 @@ test "[property] - [check scanner]: structural masks preserve newline positions"
         expected |= @as(u64, 1) << @intCast(lane);
     }
     try std.testing.expectEqual(expected, newlineMask(&block));
+}
+
+fn firstValidSequenceLineEnd(bytes: []const u8, alphabet: Alphabet) ?usize {
+    return switch (alphabet) {
+        .iupac => firstValidSequenceLineEndFor(.iupac, bytes),
+        .acgtn => firstValidSequenceLineEndFor(.acgtn, bytes),
+    };
 }
 
 test "[property] - [check scanner]: fused sequence scan preserves delimiter boundaries" {
