@@ -1853,12 +1853,13 @@ fn firstInvalidNarrowIupacSequence(
     sequence: []const u8,
     use_full_iupac: *bool,
 ) ?usize {
-    return switch (scanSequenceLineFor(.acgtn, sequence)) {
+    return switch (scanSequenceLineFor(.acgtn, sequence, false)) {
         .incomplete => null,
         .line_end => |line_end| line_end,
         .invalid_start => |start| switch (scanSequenceLineFor(
             .iupac,
             sequence[start..],
+            false,
         )) {
             .incomplete => result: {
                 use_full_iupac.* = true;
@@ -1892,10 +1893,10 @@ fn firstValidNarrowIupacSequenceLineEnd(
     bytes: []const u8,
     use_full_iupac: *bool,
 ) ?usize {
-    return switch (scanSequenceLineFor(.acgtn, bytes)) {
+    return switch (scanSequenceLineFor(.acgtn, bytes, true)) {
         .line_end => |line_end| line_end,
         .incomplete => null,
-        .invalid_start => |start| switch (scanSequenceLineFor(.iupac, bytes[start..])) {
+        .invalid_start => |start| switch (scanSequenceLineFor(.iupac, bytes[start..], true)) {
             .line_end => |line_end| result: {
                 use_full_iupac.* = true;
                 break :result start + line_end;
@@ -1913,7 +1914,7 @@ fn firstValidSequenceLineEndFor(
     comptime alphabet: Alphabet,
     bytes: []const u8,
 ) ?usize {
-    return switch (scanSequenceLineFor(alphabet, bytes)) {
+    return switch (scanSequenceLineFor(alphabet, bytes, true)) {
         .line_end => |line_end| line_end,
         .invalid_start, .incomplete => null,
     };
@@ -1922,28 +1923,36 @@ fn firstValidSequenceLineEndFor(
 fn scanSequenceLineFor(
     comptime alphabet: Alphabet,
     bytes: []const u8,
+    comptime allow_crlf: bool,
 ) SequenceLineScan {
     const Bytes = @Vector(STRUCTURAL_BLOCK_BYTES, u8);
     var block_start: usize = 0;
     while (bytes.len - block_start >= STRUCTURAL_BLOCK_BYTES) {
         const block: Bytes = bytes[block_start..][0..STRUCTURAL_BLOCK_BYTES].*;
-        const line_feeds: u64 = @bitCast(block == @as(Bytes, @splat('\n')));
         const invalid: u64 = @bitCast(invalidSequenceVector(
             STRUCTURAL_BLOCK_BYTES,
             alphabet,
             block,
         ));
-        if (line_feeds != 0) {
-            const lane: u6 = @intCast(@ctz(line_feeds));
-            const preceding = (@as(u64, 1) << lane) -% 1;
-            if (invalid & preceding != 0) return .{ .invalid_start = block_start };
-            return .{ .line_end = block_start + @as(usize, lane) };
+        if (invalid != 0) {
+            const stop = block_start + @as(usize, @intCast(@ctz(invalid)));
+            if (bytes[stop] == '\n') return .{ .line_end = stop };
+            if (allow_crlf and bytes[stop] == '\r' and
+                stop + 1 < bytes.len and bytes[stop + 1] == '\n')
+            {
+                return .{ .line_end = stop + 1 };
+            }
+            return .{ .invalid_start = block_start };
         }
-        if (invalid != 0) return .{ .invalid_start = block_start };
         block_start += STRUCTURAL_BLOCK_BYTES;
     }
     for (bytes[block_start..], block_start..) |byte, byte_index| {
         if (byte == '\n') return .{ .line_end = byte_index };
+        if (allow_crlf and byte == '\r' and
+            byte_index + 1 < bytes.len and bytes[byte_index + 1] == '\n')
+        {
+            return .{ .line_end = byte_index + 1 };
+        }
         if (!alphabetAccepts(alphabet, byte)) return .{ .invalid_start = byte_index };
     }
     return .incomplete;
@@ -2006,9 +2015,9 @@ fn scanCompleteRecord(
     initial_full_iupac: bool,
 ) ?CompleteRecord {
     const header_end = firstLineFeed(data) orelse return null;
-    const header = data[0..header_end];
-    if (header.len > max_line_bytes or
-        (header.len != 0 and header[header.len - 1] == '\r')) return null;
+    const header_len = header_end - @intFromBool(header_end != 0 and data[header_end - 1] == '\r');
+    const header = data[0..header_len];
+    if (header.len > max_line_bytes) return null;
     if (!headerPrefixIsValid(
         if (header.len == 0) null else header[0],
         if (header.len < 2) null else header[1],
@@ -2016,28 +2025,34 @@ fn scanCompleteRecord(
 
     const sequence_start = header_end + 1;
     var use_full_iupac = initial_full_iupac;
-    const sequence_len = firstValidCheckSequenceLineEnd(
+    const sequence_raw_len = firstValidCheckSequenceLineEnd(
         data[sequence_start..],
         alphabet,
         &use_full_iupac,
     ) orelse return null;
+    const sequence_len = sequence_raw_len - @intFromBool(
+        sequence_raw_len != 0 and data[sequence_start + sequence_raw_len - 1] == '\r',
+    );
     if (sequence_len > max_line_bytes) return null;
 
-    const plus_start = sequence_start + sequence_len + 1;
-    const plus_len = firstLineFeed(data[plus_start..]) orelse return null;
+    const plus_start = sequence_start + sequence_raw_len + 1;
+    const plus_raw_len = firstLineFeed(data[plus_start..]) orelse return null;
+    const plus_len = plus_raw_len - @intFromBool(
+        plus_raw_len != 0 and data[plus_start + plus_raw_len - 1] == '\r',
+    );
     const plus = data[plus_start..][0..plus_len];
-    if (plus.len > max_line_bytes or
-        (plus.len != 0 and plus[plus.len - 1] == '\r')) return null;
+    if (plus.len > max_line_bytes) return null;
     if (plus.len == 0 or plus[0] != '+') return null;
 
-    const quality_start = plus_start + plus_len + 1;
+    const quality_start = plus_start + plus_raw_len + 1;
     if (sequence_len >= data.len - quality_start) return null;
     const quality_end = quality_start + sequence_len;
-    if (data[quality_end] != '\n') return null;
+    const quality_lf = quality_end + @intFromBool(data[quality_end] == '\r');
+    if (quality_lf >= data.len or data[quality_lf] != '\n') return null;
     if (firstInvalidQuality(data[quality_start..quality_end]) != null) return null;
 
     return .{
-        .line_ends = .{ header_end, plus_start - 1, quality_start - 1, quality_end },
+        .line_ends = .{ header_end, plus_start - 1, quality_start - 1, quality_lf },
         .use_full_iupac = use_full_iupac,
     };
 }
@@ -3744,6 +3759,37 @@ test "[property] - [check scanner]: fused sequence scan preserves delimiter boun
         firstValidSequenceLineEnd(&bytes, .iupac).?,
     );
     try std.testing.expect(firstValidSequenceLineEnd(&bytes, .acgtn) == null);
+
+    for (0..bytes.len - 1) |cr_index| {
+        @memset(&bytes, 'A');
+        bytes[cr_index] = '\r';
+        bytes[cr_index + 1] = '\n';
+        for ([_]Alphabet{ .iupac, .acgtn }) |alphabet| {
+            try std.testing.expectEqual(cr_index + 1, firstValidSequenceLineEnd(&bytes, alphabet).?);
+            try std.testing.expect(firstValidSequenceLineEnd(bytes[0 .. cr_index + 1], alphabet) == null);
+        }
+        var use_full_iupac = false;
+        try std.testing.expectEqual(
+            cr_index + 1,
+            firstValidCheckSequenceLineEnd(&bytes, .iupac, &use_full_iupac).?,
+        );
+        try std.testing.expect(!use_full_iupac);
+        try std.testing.expectEqual(
+            cr_index,
+            firstInvalidCheckSequence(bytes[0 .. cr_index + 2], .iupac, &use_full_iupac).?,
+        );
+        try std.testing.expect(!use_full_iupac);
+        if (cr_index != 0) {
+            bytes[0] = 'R';
+            try std.testing.expectEqual(
+                cr_index + 1,
+                firstValidCheckSequenceLineEnd(&bytes, .iupac, &use_full_iupac).?,
+            );
+            try std.testing.expect(use_full_iupac);
+            bytes[0] = '.';
+            try std.testing.expect(firstValidSequenceLineEnd(&bytes, .iupac) == null);
+        }
+    }
 }
 
 test "[property] - [check scanner]: adaptive IUPAC validation preserves byte policy" {
@@ -3823,7 +3869,7 @@ test "[unit] - [check scanner]: complete record path commits only proved records
     try std.testing.expectEqual(@as(u64, input.len), scanner.byte_offset);
 
     for ([_][]const u8{
-        "@r\r\nA\r\n+\r\n!\r\n",
+        "@r\r\nA\r\n+\r\n!\r",
         "@r\nA\n+\n",
         "@r\nR\n+\n",
         "r\nA\n+\n!\n",
@@ -3842,9 +3888,11 @@ test "[unit] - [check scanner]: complete record path commits only proved records
     try std.testing.expect(limited.consumeCompleteRecord("@r\nA\n+\n!\n", false) == null);
     try std.testing.expectEqualDeep(before, limited);
 
-    var wide = CheckScanner.init(.{}, .{});
-    try std.testing.expect(wide.consumeCompleteRecord("@r\nR\n+\n!\n", false) != null);
-    try std.testing.expect(wide.use_full_iupac);
+    for ([_][]const u8{ "@r\nR\n+\n!\n", "@r\r\nR\r\n+\r\n!\r\n" }) |data| {
+        var wide = CheckScanner.init(.{}, .{});
+        try std.testing.expectEqual(data.len, wide.consumeCompleteRecord(data, false).?);
+        try std.testing.expect(wide.use_full_iupac);
+    }
 }
 
 test "[unit] - [check scanner]: adaptive IUPAC state survives a chunk seam" {
@@ -3854,6 +3902,49 @@ test "[unit] - [check scanner]: adaptive IUPAC state survives a chunk seam" {
     _ = try scanner.feed("\n+\n!\n");
     try scanner.finishEof();
     try std.testing.expectEqual(@as(u64, 1), scanner.record_index);
+}
+
+test "[property] - [check scanner]: complete records accept mixed LF and CRLF endings" {
+    for (0..16) |ending_mask| {
+        var endings: [4][]const u8 = undefined;
+        for (&endings, 0..) |*ending, index| {
+            ending.* = if (ending_mask & (@as(usize, 1) << @intCast(index)) == 0)
+                "\n"
+            else
+                "\r\n";
+        }
+        var storage: [32]u8 = undefined;
+        const data = try std.fmt.bufPrint(&storage, "@r{s}AC{s}+{s}!~{s}", .{
+            endings[0], endings[1], endings[2], endings[3],
+        });
+        const sequence_start = 2 + endings[0].len;
+        const plus_start = sequence_start + 2 + endings[1].len;
+        const quality_start = plus_start + 1 + endings[2].len;
+        const complete = scanCompleteRecord(data, 2, .iupac, false);
+        try std.testing.expect(complete != null);
+        try std.testing.expectEqualDeep([4]usize{
+            sequence_start - 1, plus_start - 1, quality_start - 1, data.len - 1,
+        }, complete.?.line_ends);
+        try std.testing.expect(!complete.?.use_full_iupac);
+
+        var scanner = CheckScanner.init(.{ .max_line_bytes = 2 }, .{});
+        try std.testing.expectEqual(data.len, scanner.consumeCompleteRecord(data, false).?);
+        try std.testing.expectEqual(@as(u64, 1), scanner.record_index);
+        try std.testing.expectEqual(@as(u64, data.len), scanner.byte_offset);
+        try std.testing.expect(scanner.atRecordBoundary());
+        for (0..data.len) |cut| {
+            try std.testing.expect(scanCompleteRecord(data[0..cut], 2, .iupac, false) == null);
+        }
+        for (1..data.len + 2) |chunk_len| {
+            try expectCheckOutcome(
+                .{ .valid = 1 },
+                directCheckOutcome(data, chunk_len, .{ .max_line_bytes = 2 }, .{}),
+            );
+        }
+        for (0..data.len + 1) |split| {
+            try expectValidatedProjection(data, split, null, .{ .max_line_bytes = 2 }, .{}, .{});
+        }
+    }
 }
 
 test "[property] - [check scanner]: fragmented results match independent expectations and Reader" {
@@ -3867,6 +3958,9 @@ test "[property] - [check scanner]: fragmented results match independent expecta
         .{ .data = "", .expected = .{ .valid = 0 } },
         .{ .data = "@r\nA\n+\n!\n", .expected = .{ .valid = 1 } },
         .{ .data = "@r\r\nA\r\n+\r\n!\r\n", .expected = .{ .valid = 1 } },
+        .{ .data = "@r\r\n\r\n+\r\n\r\n", .expected = .{ .valid = 1 } },
+        .{ .data = "@r\rb\r\nA\r\n+note\rb\r\n!\r\n", .expected = .{ .valid = 1 } },
+        .{ .data = "@\r\r\nA\r\n+\r\r\n!\r\n", .expected = .{ .valid = 1 } },
         .{ .data = "@r\nA\n+\n!", .expected = .{ .valid = 1 } },
         .{ .data = "@r\nR\n+\n!\n", .expected = .{ .valid = 1 } },
         .{
@@ -3881,6 +3975,86 @@ test "[property] - [check scanner]: fragmented results match independent expecta
                 0,
                 3,
                 2,
+            ) },
+        },
+        .{
+            .data = "@r\r\nA\rA\r\n+\r\n!!!\r\n",
+            .expected = .{ .parse_error = expectedCheckError(
+                .s002_invalid_sequence_alphabet,
+                "sequence byte is outside the selected alphabet",
+                0,
+                5,
+                2,
+            ) },
+        },
+        .{
+            .data = "@r\r\nA\r\r\n+\r\n!!\r\n",
+            .expected = .{ .parse_error = expectedCheckError(
+                .s002_invalid_sequence_alphabet,
+                "sequence byte is outside the selected alphabet",
+                0,
+                5,
+                2,
+            ) },
+        },
+        .{
+            .data = "@r\r\nAAA\r\n+\r\n!\r!\r\n",
+            .expected = .{ .parse_error = expectedCheckError(
+                .s006_invalid_quality_range,
+                "quality byte must be ASCII 33 through 126",
+                0,
+                13,
+                4,
+            ) },
+        },
+        .{
+            .data = "@r\r\nAAA\r\n+\r\n!\n!\r\n",
+            .expected = .{ .parse_error = expectedCheckError(
+                .s005_length_mismatch,
+                "sequence and quality lengths differ",
+                0,
+                12,
+                4,
+            ) },
+        },
+        .{
+            .data = "@\r\nA\r\n+\r\n!\r\n",
+            .expected = .{ .parse_error = expectedCheckError(
+                .s003_invalid_header,
+                "header line must start with '@' and contain a nonempty identifier",
+                0,
+                0,
+                1,
+            ) },
+        },
+        .{
+            .data = "@r\r",
+            .expected = .{ .parse_error = expectedCheckError(
+                .s004_truncated_record,
+                "unexpected end of file in sequence line",
+                0,
+                3,
+                2,
+            ) },
+        },
+        .{
+            .data = "@r\r\nA\r",
+            .expected = .{ .parse_error = expectedCheckError(
+                .s004_truncated_record,
+                "unexpected end of file in plus line",
+                0,
+                6,
+                3,
+            ) },
+        },
+        .{
+            .data = "@r\r\nA\r\n+\r",
+            .expected = .{ .parse_error = expectedCheckError(
+                .s004_truncated_record,
+                "unexpected end of file in quality line",
+                0,
+                9,
+                4,
             ) },
         },
         .{

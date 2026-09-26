@@ -682,6 +682,11 @@ test "[cli] - [exact sample]: count boundaries preserve records in input order" 
         .{ .count = "2", .path = BASIC_PATH, .expected = BASIC_EXACT_TWO },
         .{ .count = "5", .path = BASIC_PATH, .expected = basic },
         .{ .count = "8", .path = BASIC_PATH, .expected = basic },
+        .{
+            .count = "2",
+            .path = "tests/data/synthetic/crlf.fastq",
+            .expected = "@crlf_read1\nACGT\n+\nIIII\n@crlf_read2\nTGCA\n+\nJJJJ\n",
+        },
         .{ .count = "18446744073709551615", .path = EMPTY_PATH, .expected = EMPTY_RECORD },
         .{ .count = "18446744073709551615", .path = empty_path, .expected = "" },
     };
