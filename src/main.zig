@@ -8,7 +8,9 @@ const io_layer = @import("io.zig");
 const pairing = @import("pair.zig");
 const sampling = @import("sample.zig");
 
-const PAIR_DIAGNOSTIC_PREFIX_BYTES = 128;
+// --- Arguments ---
+
+const Command = enum { count, stats, check, sample, interleave, deinterleave };
 
 const USAGE =
     \\usage: z-fastq <command> [options] [args...]
@@ -70,6 +72,63 @@ const USAGE =
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
 ;
+
+fn parseMaxLineBytes(value: []const u8) std.fmt.ParseIntError!usize {
+    if (value.len == 0) return error.InvalidCharacter;
+    for (value) |byte| {
+        if (byte < '0' or byte > '9') return error.InvalidCharacter;
+    }
+    return std.fmt.parseInt(usize, value, 10);
+}
+
+fn argumentError(io: std.Io, message: []const u8, exit_code: u8) noreturn {
+    std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
+    std.process.exit(exit_code);
+}
+
+fn printUsageAndExit(io: std.Io) noreturn {
+    argumentError(io, USAGE, 2);
+}
+
+fn printHelpAndExit(io: std.Io) noreturn {
+    std.Io.File.writeStreamingAll(.stdout(), io, USAGE) catch std.process.exit(3);
+    std.process.exit(0);
+}
+
+fn printVersionAndExit(io: std.Io) noreturn {
+    var buf: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "z-fastq {s}\n", .{zfastq.VERSION}) catch "z-fastq\n";
+    std.Io.File.writeStreamingAll(.stdout(), io, line) catch std.process.exit(3);
+    std.process.exit(0);
+}
+
+fn validateRecordCommandInputs(
+    io: std.Io,
+    command: Command,
+    inputs: []const []const u8,
+) ?u8 {
+    if (inputs.len == 0) {
+        std.Io.File.writeStreamingAll(.stderr(), io, "error: ") catch {};
+        std.Io.File.writeStreamingAll(.stderr(), io, @tagName(command)) catch {};
+        std.Io.File.writeStreamingAll(.stderr(), io, " requires at least one input\n") catch {};
+        return 2;
+    }
+
+    var has_stdin = false;
+    for (inputs) |input| {
+        if (!std.mem.eql(u8, input, "-")) continue;
+        if (has_stdin) {
+            std.Io.File.writeStreamingAll(
+                .stderr(),
+                io,
+                "error: standard input may appear at most once\n",
+            ) catch {};
+            return 2;
+        }
+        has_stdin = true;
+    }
+    return null;
+}
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -321,118 +380,7 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(code);
 }
 
-const Command = enum { count, stats, check, sample, interleave, deinterleave };
-
-fn parseMaxLineBytes(value: []const u8) std.fmt.ParseIntError!usize {
-    if (value.len == 0) return error.InvalidCharacter;
-    for (value) |byte| {
-        if (byte < '0' or byte > '9') return error.InvalidCharacter;
-    }
-    return std.fmt.parseInt(usize, value, 10);
-}
-
-fn argumentError(io: std.Io, message: []const u8, exit_code: u8) noreturn {
-    std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
-    std.process.exit(exit_code);
-}
-
-fn printUsageAndExit(io: std.Io) noreturn {
-    argumentError(io, USAGE, 2);
-}
-
-fn printHelpAndExit(io: std.Io) noreturn {
-    std.Io.File.writeStreamingAll(.stdout(), io, USAGE) catch std.process.exit(3);
-    std.process.exit(0);
-}
-
-fn printVersionAndExit(io: std.Io) noreturn {
-    var buf: [64]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "z-fastq {s}\n", .{zfastq.VERSION}) catch "z-fastq\n";
-    std.Io.File.writeStreamingAll(.stdout(), io, line) catch std.process.exit(3);
-    std.process.exit(0);
-}
-
-// --- Count command ---
-
-const InputOptions = struct {
-    max_line_bytes: usize = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-};
-
-fn runCount(
-    io: std.Io,
-    inputs: []const []const u8,
-    options: InputOptions,
-) u8 {
-    if (validateRecordCommandInputs(io, .count, inputs)) |exit_code| return exit_code;
-
-    var exit_code: u8 = 0;
-    for (inputs) |input| {
-        const count = switch (countInput(io, input, options)) {
-            .success => |count| count,
-            .failure => |failure| {
-                if (std.mem.eql(u8, failure.code, "out_of_memory")) {
-                    std.Io.File.writeStreamingAll(.stderr(), io, "error: out of memory\n") catch {};
-                    return 3;
-                }
-                printCommandFailure(io, input, failure);
-                exit_code = @max(exit_code, failure.exit_code);
-                continue;
-            },
-        };
-        printCount(io, count) catch return @max(exit_code, 3);
-    }
-    return exit_code;
-}
-
-const CountOutcome = union(enum) {
-    success: u64,
-    failure: CommandFailure,
-};
-
-fn countInput(io: std.Io, label: []const u8, options: InputOptions) CountOutcome {
-    var input: RecordInput = undefined;
-    if (initRecordInput(&input, io, label, null)) |failure| return .{ .failure = failure };
-    defer input.deinit(io);
-
-    var scanner = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = options.max_line_bytes });
-    var buffer: [io_layer.COUNT_DECOMPRESS_BUFFER_BYTES]u8 = undefined;
-    const read_buffer = if (input.source == .plain)
-        buffer[0..zfastq.limits.DEFAULT_READER_BUFFER_BYTES]
-    else
-        &buffer;
-    while (input.readScannerChunk(read_buffer) catch return .{ .failure = IO_FAILURE }) |decoded| {
-        _ = scanner.feed(decoded) catch |err| return .{ .failure = mapScanFailure(&scanner, err) };
-    }
-    scanner.finishEof() catch |err| return .{ .failure = mapScanFailure(&scanner, err) };
-    return .{ .success = scanner.record_index };
-}
-
-fn mapScanFailure(scanner: *zfastq.count_scan.Scanner, err: zfastq.ReaderError) CommandFailure {
-    return switch (err) {
-        error.S001InvalidPlusLine,
-        error.S003InvalidHeader,
-        error.S004TruncatedRecord,
-        error.S005LengthMismatch,
-        => if (scanner.takeLastError()) |details| CommandFailure.lint(details) else .{
-            .code = "format_error",
-            .message = "",
-            .exit_code = 1,
-            .suppress_diagnostic = true,
-        },
-        error.Io => blk: {
-            var failure = IO_FAILURE;
-            failure.suppress_diagnostic = true;
-            break :blk failure;
-        },
-        else => mapInputFailure(@errorCast(err)),
-    };
-}
-
-fn printCount(io: std.Io, n: u64) !void {
-    var buf: [32]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buf, "{d}\n", .{n});
-    try std.Io.File.writeStreamingAll(.stdout(), io, text);
-}
+// --- Command failures and diagnostics ---
 
 const CommandFailure = struct {
     code: []const u8,
@@ -460,122 +408,16 @@ const CommandFailure = struct {
 };
 
 const OUT_OF_MEMORY = CommandFailure.plain("out_of_memory", "out of memory", 3);
+
 const INPUT_LOCATION_LIMIT = CommandFailure.plain("arithmetic_limit", "input location exceeds supported limit", 4);
+
 const RECORD_STAGING_LIMIT = CommandFailure.plain("arithmetic_limit", "record staging size exceeds supported limit", 4);
+
 const IO_FAILURE = CommandFailure.plain("io_error", "I/O error", 3);
+
 const LINE_LIMIT = CommandFailure.plain("line_limit", "line length limit exceeded", 4);
 
-fn recordHasUnwritableEnding(record: zfastq.Record, canonical_span: ?[]const u8) bool {
-    return canonical_span == null and fastq.recordHasTerminalCr(record);
-}
-
-fn writeCheckedRecord(
-    writer: *zfastq.Writer,
-    direct_writer: ?*std.Io.Writer,
-    record: zfastq.Record,
-    canonical_span: ?[]const u8,
-) error{WriteFailed}!void {
-    if (canonical_span) |span| {
-        if (direct_writer) |output| {
-            try output.writeAll(span);
-        } else {
-            try fastq.writeCanonicalRecordSpan(writer, span);
-        }
-    } else {
-        try fastq.writeRecordFields(writer, record);
-    }
-}
-
-fn unwritableRecordFailure() CommandFailure {
-    return CommandFailure.plain(
-        "unwritable_record",
-        "record fields ending in CR cannot be written with LF endings",
-        1,
-    );
-}
-
-fn mapCurrentSemanticFailure(
-    maybe_error: ?zfastq.SemanticError,
-    reader: *const zfastq.Reader,
-    record_index: u64,
-) ?CommandFailure {
-    const semantic_error = maybe_error orelse return null;
-    const offsets = reader.currentRecordOffsets() orelse return CommandFailure.plain(
-        "io_error",
-        "record location is unavailable",
-        3,
-    );
-    return mapSemanticFailure(semantic_error, offsets, record_index);
-}
-
-fn mapSemanticFailure(
-    maybe_error: ?zfastq.SemanticError,
-    offsets: zfastq.RecordOffsets,
-    record_index: u64,
-) ?CommandFailure {
-    const semantic_error = maybe_error orelse return null;
-    const field_offset = switch (semantic_error.field) {
-        .sequence => offsets.sequence,
-        .quality => offsets.quality,
-    };
-    const details = fastq.semanticParseError(semantic_error, record_index, field_offset) catch {
-        return INPUT_LOCATION_LIMIT;
-    };
-    return CommandFailure.lint(details);
-}
-
-const StatsOutcome = union(enum) {
-    success: zfastq.Stats,
-    failure: CommandFailure,
-};
-
-fn validateRecordCommandInputs(
-    io: std.Io,
-    command: Command,
-    inputs: []const []const u8,
-) ?u8 {
-    if (inputs.len == 0) {
-        std.Io.File.writeStreamingAll(.stderr(), io, "error: ") catch {};
-        std.Io.File.writeStreamingAll(.stderr(), io, @tagName(command)) catch {};
-        std.Io.File.writeStreamingAll(.stderr(), io, " requires at least one input\n") catch {};
-        return 2;
-    }
-
-    var has_stdin = false;
-    for (inputs) |input| {
-        if (!std.mem.eql(u8, input, "-")) continue;
-        if (has_stdin) {
-            std.Io.File.writeStreamingAll(
-                .stderr(),
-                io,
-                "error: standard input may appear at most once\n",
-            ) catch {};
-            return 2;
-        }
-        has_stdin = true;
-    }
-    return null;
-}
-
-// --- Check command ---
-
-const PairMode = enum {
-    none,
-    paired,
-    interleaved,
-};
-
-const CheckOptions = struct {
-    max_line_bytes: usize = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-    alphabet: zfastq.Alphabet = .iupac,
-};
-
-const PairedCheckOptions = struct {
-    max_line_bytes: usize = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-    alphabet: zfastq.Alphabet = .iupac,
-    pair_mode: PairMode = .none,
-    pair_name_policy: pairing.NamePolicy = .illumina,
-};
+const PAIR_DIAGNOSTIC_PREFIX_BYTES = 128;
 
 const BoundedBytes = struct {
     prefix: [PAIR_DIAGNOSTIC_PREFIX_BYTES]u8 = undefined,
@@ -617,6 +459,705 @@ const PairRecordDiagnostic = struct {
             .mate_markers = name.mate_markers,
         };
     }
+};
+
+const PairNameFailure = struct {
+    pair_index: u64,
+    records: [2]PairRecordDiagnostic,
+};
+
+const PairCountFailure = struct {
+    pair_index: u64,
+    remaining_side: u1,
+    record_indexes: [2]?u64,
+};
+
+const PairFailure = union(enum) {
+    name_mismatch: PairNameFailure,
+    count_mismatch: PairCountFailure,
+};
+
+const PairCommandFailure = union(enum) {
+    command: struct {
+        input_index: u1,
+        details: CommandFailure,
+    },
+    pair: PairFailure,
+
+    fn exitCode(self: PairCommandFailure) u8 {
+        return switch (self) {
+            .command => |failure| failure.details.exit_code,
+            .pair => 1,
+        };
+    }
+};
+
+fn mapReaderFailure(reader: *zfastq.Reader, err: zfastq.ReaderError) CommandFailure {
+    return switch (err) {
+        error.S001InvalidPlusLine,
+        error.S003InvalidHeader,
+        error.S004TruncatedRecord,
+        error.S005LengthMismatch,
+        => validationFailure(reader.takeLastError()),
+        else => mapInputFailure(@errorCast(err)),
+    };
+}
+
+fn validationFailure(details: ?zfastq.ParseError) CommandFailure {
+    return if (details) |failure|
+        CommandFailure.lint(failure)
+    else
+        CommandFailure.plain("io_error", "validation failed without details", 3);
+}
+
+fn mapInputFailure(err: error{ LineTooLong, ArithmeticLimit, OutOfMemory, Io }) CommandFailure {
+    return switch (err) {
+        error.LineTooLong => LINE_LIMIT,
+        error.ArithmeticLimit => INPUT_LOCATION_LIMIT,
+        error.OutOfMemory => OUT_OF_MEMORY,
+        error.Io => IO_FAILURE,
+    };
+}
+
+fn mapCurrentSemanticFailure(
+    maybe_error: ?zfastq.SemanticError,
+    reader: *const zfastq.Reader,
+    record_index: u64,
+) ?CommandFailure {
+    const semantic_error = maybe_error orelse return null;
+    const offsets = reader.currentRecordOffsets() orelse return CommandFailure.plain(
+        "io_error",
+        "record location is unavailable",
+        3,
+    );
+    return mapSemanticFailure(semantic_error, offsets, record_index);
+}
+
+fn mapSemanticFailure(
+    maybe_error: ?zfastq.SemanticError,
+    offsets: zfastq.RecordOffsets,
+    record_index: u64,
+) ?CommandFailure {
+    const semantic_error = maybe_error orelse return null;
+    const field_offset = switch (semantic_error.field) {
+        .sequence => offsets.sequence,
+        .quality => offsets.quality,
+    };
+    const details = fastq.semanticParseError(semantic_error, record_index, field_offset) catch {
+        return INPUT_LOCATION_LIMIT;
+    };
+    return CommandFailure.lint(details);
+}
+
+fn pairCommandFailure(input_index: u1, details: CommandFailure) PairCommandFailure {
+    return .{ .command = .{ .input_index = input_index, .details = details } };
+}
+
+fn unwritableRecordFailure() CommandFailure {
+    return CommandFailure.plain(
+        "unwritable_record",
+        "record fields ending in CR cannot be written with LF endings",
+        1,
+    );
+}
+
+fn missingInterleavedMateFailure(record_index1: u64) PairCommandFailure {
+    return .{ .pair = .{ .count_mismatch = .{
+        .pair_index = record_index1 / 2,
+        .remaining_side = 0,
+        .record_indexes = .{ record_index1, if (record_index1 == 0) null else record_index1 - 1 },
+    } } };
+}
+
+fn mapPreservedMateFailure(
+    reader: *zfastq.Reader,
+    err: (zfastq.ReaderError || error{RecordStagingLimit}),
+) PairCommandFailure {
+    return pairCommandFailure(0, switch (err) {
+        error.RecordStagingLimit => RECORD_STAGING_LIMIT,
+        else => mapReaderFailure(reader, @errorCast(err)),
+    });
+}
+
+fn printPathError(io: std.Io, path: []const u8, message: []const u8) void {
+    std.Io.File.writeStreamingAll(.stderr(), io, "error: ") catch {};
+    writeEscaped(.stderr(), io, path);
+    std.Io.File.writeStreamingAll(.stderr(), io, ": ") catch {};
+    std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
+    std.Io.File.writeStreamingAll(.stderr(), io, "\n") catch {};
+}
+
+fn printCommandFailure(io: std.Io, path: []const u8, failure: CommandFailure) void {
+    if (failure.suppress_diagnostic) return;
+    if (failure.record_index == null or
+        failure.byte_offset == null or
+        failure.line_in_record == null)
+    {
+        return printPathError(io, path, failure.message);
+    }
+
+    std.Io.File.writeStreamingAll(.stderr(), io, "error: ") catch {};
+    writeEscaped(.stderr(), io, path);
+    std.Io.File.writeStreamingAll(.stderr(), io, ": ") catch {};
+    std.Io.File.writeStreamingAll(.stderr(), io, failure.code) catch {};
+    std.Io.File.writeStreamingAll(.stderr(), io, ": ") catch {};
+    std.Io.File.writeStreamingAll(.stderr(), io, failure.message) catch {};
+
+    var buf: [96]u8 = undefined;
+    const suffix = std.fmt.bufPrint(
+        &buf,
+        " (record {d}, line {d}, offset {d})\n",
+        .{
+            failure.record_index.?,
+            failure.line_in_record.?,
+            failure.byte_offset.?,
+        },
+    ) catch return;
+    std.Io.File.writeStreamingAll(.stderr(), io, suffix) catch {};
+}
+
+fn printPairCommandFailure(
+    io: std.Io,
+    inputs: []const []const u8,
+    pair_mode: PairMode,
+    failure: PairCommandFailure,
+) void {
+    switch (failure) {
+        .command => |details| printCommandFailure(
+            io,
+            inputs[details.input_index],
+            details.details,
+        ),
+        .pair => |details| printPairFailure(io, inputs, pair_mode, details),
+    }
+}
+
+fn printPairFailure(
+    io: std.Io,
+    inputs: []const []const u8,
+    pair_mode: PairMode,
+    failure: PairFailure,
+) void {
+    std.Io.File.writeStreamingAll(.stderr(), io, "error: ") catch {};
+    writeEscaped(.stderr(), io, inputs[0]);
+    if (pair_mode == .paired) {
+        std.Io.File.writeStreamingAll(.stderr(), io, " + ") catch {};
+        writeEscaped(.stderr(), io, inputs[1]);
+    }
+    switch (failure) {
+        .name_mismatch => |details| {
+            std.Io.File.writeStreamingAll(
+                .stderr(),
+                io,
+                ": P001: paired identifiers or mate markers do not match",
+            ) catch {};
+            var buf: [64]u8 = undefined;
+            const pair = std.fmt.bufPrint(&buf, " (pair {d})\n", .{details.pair_index}) catch
+                return;
+            std.Io.File.writeStreamingAll(.stderr(), io, pair) catch {};
+            for (details.records, 0..) |record, index| {
+                writePairRecordDiagnostic(
+                    io,
+                    inputs[if (pair_mode == .paired) index else 0],
+                    index,
+                    &record,
+                );
+            }
+        },
+        .count_mismatch => |details| {
+            std.Io.File.writeStreamingAll(
+                .stderr(),
+                io,
+                ": P002: paired input is missing a mate",
+            ) catch {};
+            var buf: [96]u8 = undefined;
+            const prefix = std.fmt.bufPrint(
+                &buf,
+                " (pair {d}, remaining R{d}, last R1 record ",
+                .{ details.pair_index, @as(u8, details.remaining_side) + 1 },
+            ) catch return;
+            std.Io.File.writeStreamingAll(.stderr(), io, prefix) catch {};
+            writeOptionalIndex(io, details.record_indexes[0]);
+            std.Io.File.writeStreamingAll(.stderr(), io, ", last R2 record ") catch {};
+            writeOptionalIndex(io, details.record_indexes[1]);
+            std.Io.File.writeStreamingAll(.stderr(), io, ")\n") catch {};
+        },
+    }
+}
+
+fn writePairRecordDiagnostic(
+    io: std.Io,
+    input: []const u8,
+    side_index: usize,
+    record: *const PairRecordDiagnostic,
+) void {
+    var buf: [96]u8 = undefined;
+    const prefix = std.fmt.bufPrint(
+        &buf,
+        "  R{d}: input=",
+        .{side_index + 1},
+    ) catch return;
+    std.Io.File.writeStreamingAll(.stderr(), io, prefix) catch {};
+    writeEscaped(.stderr(), io, input);
+    const location = std.fmt.bufPrint(
+        &buf,
+        ", record={d}, offset={d}, first_token=",
+        .{ record.record_index, record.byte_offset },
+    ) catch return;
+    std.Io.File.writeStreamingAll(.stderr(), io, location) catch {};
+    writeBoundedHuman(io, &record.first_token);
+    std.Io.File.writeStreamingAll(.stderr(), io, ", normalized_id=") catch {};
+    writeBoundedHuman(io, &record.normalized_id);
+    std.Io.File.writeStreamingAll(.stderr(), io, ", mate_markers=") catch {};
+    writeMateMarkersHuman(io, record.mate_markers);
+    std.Io.File.writeStreamingAll(.stderr(), io, "\n") catch {};
+}
+
+fn writeBoundedHuman(io: std.Io, display: *const BoundedBytes) void {
+    writeEscaped(.stderr(), io, display.bytes());
+    var buf: [64]u8 = undefined;
+    const suffix = std.fmt.bufPrint(
+        &buf,
+        " [length={d}, truncated={s}]",
+        .{ display.full_len, if (display.truncated()) "true" else "false" },
+    ) catch return;
+    std.Io.File.writeStreamingAll(.stderr(), io, suffix) catch {};
+}
+
+fn writeMateMarkersHuman(io: std.Io, markers: u2) void {
+    if (markers == 0) {
+        std.Io.File.writeStreamingAll(.stderr(), io, "none") catch {};
+        return;
+    }
+    if (markers & 0b01 != 0) {
+        std.Io.File.writeStreamingAll(.stderr(), io, "1") catch {};
+    }
+    if (markers == 0b11) {
+        std.Io.File.writeStreamingAll(.stderr(), io, ",") catch {};
+    }
+    if (markers & 0b10 != 0) {
+        std.Io.File.writeStreamingAll(.stderr(), io, "2") catch {};
+    }
+}
+
+fn writeOptionalIndex(io: std.Io, record_index: ?u64) void {
+    if (record_index) |value| {
+        var buf: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return;
+        std.Io.File.writeStreamingAll(.stderr(), io, text) catch {};
+    } else {
+        std.Io.File.writeStreamingAll(.stderr(), io, "none") catch {};
+    }
+}
+
+fn printOutputFailure(io: std.Io) void {
+    std.Io.File.writeStreamingAll(
+        .stderr(),
+        io,
+        "error: standard output: I/O error\n",
+    ) catch {};
+}
+
+const HEX = "0123456789ABCDEF";
+
+fn writeEscaped(file: std.Io.File, io: std.Io, bytes: []const u8) void {
+    writeEscapedAll(file, io, bytes) catch {};
+}
+
+fn writeEscapedAll(file: std.Io.File, io: std.Io, bytes: []const u8) !void {
+    var output = file.writerStreaming(io, &.{});
+    try writeEscapedBytes(&output.interface, bytes, false);
+    try output.interface.flush();
+}
+
+fn writeEscapedBytes(output: *std.Io.Writer, bytes: []const u8, comptime json_string: bool) !void {
+    var run_start: usize = 0;
+    for (bytes, 0..) |byte, index| {
+        if (byte >= 0x20 and byte <= 0x7e and byte != '\\') continue;
+
+        try writeDisplayRun(output, bytes[run_start..index], json_string);
+        if (byte == '\\') {
+            try writeDisplayRun(output, "\\\\", json_string);
+        } else {
+            const escaped = [4]u8{ '\\', 'x', HEX[byte >> 4], HEX[byte & 0x0f] };
+            try writeDisplayRun(output, &escaped, json_string);
+        }
+        run_start = index + 1;
+    }
+    try writeDisplayRun(output, bytes[run_start..], json_string);
+}
+
+fn writeDisplayRun(output: *std.Io.Writer, bytes: []const u8, comptime json_string: bool) !void {
+    if (json_string) {
+        try std.json.Stringify.encodeJsonStringChars(bytes, .{}, output);
+    } else {
+        try output.writeAll(bytes);
+    }
+}
+
+// --- Input opening ---
+
+const InputOptions = struct {
+    max_line_bytes: usize = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+};
+
+const FileIdentity = struct {
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
+};
+
+const RecordInput = struct {
+    file: std.Io.File,
+    owns_file: bool,
+    read_buffer: [64 * 1024]u8,
+    file_reader: std.Io.File.Reader,
+    source: union(enum) {
+        plain: io_layer.PlainFileSource,
+        gzip: io_layer.GzipSource,
+    },
+
+    fn init(
+        self: *RecordInput,
+        io: std.Io,
+        file: std.Io.File,
+        owns_file: bool,
+    ) error{Io}!void {
+        self.file = file;
+        self.owns_file = owns_file;
+        self.file_reader = file.readerStreaming(io, &self.read_buffer);
+        const prefix = self.file_reader.interface.peek(2) catch |err| switch (err) {
+            error.EndOfStream => null,
+            error.ReadFailed => return error.Io,
+        };
+        if (prefix) |bytes| {
+            if (std.mem.eql(u8, bytes, &.{ 0x1f, 0x8b })) {
+                self.source = .{ .gzip = io_layer.GzipSource.init(&self.file_reader.interface) };
+                return;
+            }
+        }
+        self.source = .{ .plain = io_layer.PlainFileSource.init(&self.file_reader) };
+    }
+
+    fn deinit(self: *RecordInput, io: std.Io) void {
+        if (self.owns_file) self.file.close(io);
+        self.* = undefined;
+    }
+
+    fn byteSource(self: *RecordInput) zfastq.io.ByteSource {
+        return switch (self.source) {
+            .plain => |*source| source.byteSource(),
+            .gzip => |*source| source.byteSource(),
+        };
+    }
+
+    fn initReader(
+        self: *RecordInput,
+        allocator: std.mem.Allocator,
+        options: fastq.Options,
+    ) !zfastq.Reader {
+        return switch (self.source) {
+            .plain => |*source| zfastq.Reader.init(allocator, source.byteSource(), options),
+            .gzip => |*source| if (build_options.use_isa_l)
+                zfastq.Reader.init(allocator, source.byteSource(), options)
+            else
+                fastq.initBorrowedGzipReader(allocator, source, options),
+        };
+    }
+
+    fn readScannerChunk(self: *RecordInput, buffer: []u8) error{Io}!?[]const u8 {
+        return switch (self.source) {
+            .plain => |*source| plain: {
+                const byte_source = source.byteSource();
+                const count = byte_source.read(buffer) catch return error.Io;
+                break :plain if (count == 0) null else buffer[0..count];
+            },
+            .gzip => |*source| io_layer.readGzipChunk(source, buffer) catch return error.Io,
+        };
+    }
+};
+
+fn initRecordInput(
+    input: *RecordInput,
+    io: std.Io,
+    label: []const u8,
+    output_identity: ?FileIdentity,
+) ?CommandFailure {
+    const file = openRecordFile(io, label) catch |err| return inputOpenFailure(err);
+    const owns_file = !std.mem.eql(u8, label, "-");
+    var transferred = false;
+    defer if (!transferred and owns_file) file.close(io);
+    if (outputFileFailure(io, file, output_identity)) |failure| return failure;
+    input.init(io, file, owns_file) catch
+        return IO_FAILURE;
+    transferred = true;
+    return null;
+}
+
+fn initSourceReader(
+    allocator: std.mem.Allocator,
+    source: anytype,
+    options: fastq.Options,
+) !zfastq.Reader {
+    return if (comptime @TypeOf(source) == zfastq.io.ByteSource)
+        zfastq.Reader.init(allocator, source, options)
+    else
+        source.initReader(allocator, options);
+}
+
+fn openRecordFile(io: std.Io, label: []const u8) std.Io.File.OpenError!std.Io.File {
+    if (std.mem.eql(u8, label, "-")) return .stdin();
+    return std.Io.Dir.cwd().openFile(io, label, .{});
+}
+
+fn inputOpenFailure(err: (std.Io.File.OpenError || std.posix.OpenError)) CommandFailure {
+    return CommandFailure.plain("io_error", if (err == error.FileNotFound)
+        "file not found"
+    else
+        "failed to open file", 3);
+}
+
+fn initPairedRecordInputs(
+    input1: *RecordInput,
+    input2: *RecordInput,
+    io: std.Io,
+    inputs: []const []const u8,
+    output_identity: ?FileIdentity,
+) ?PairCommandFailure {
+    for (inputs, 0..) |label, index| {
+        if (std.mem.eql(u8, label, "-")) {
+            // Opening a path could reuse descriptor 0 if stdin is closed.
+            _ = fileIdentity(io, .stdin()) catch
+                return pairCommandFailure(@intCast(index), IO_FAILURE);
+        }
+    }
+    var transferred = false;
+    const owns1 = !std.mem.eql(u8, inputs[0], "-");
+    const file1 = openRecordFile(io, inputs[0]) catch |err|
+        return pairCommandFailure(0, inputOpenFailure(err));
+    defer if (!transferred and owns1) file1.close(io);
+
+    const owns2 = !std.mem.eql(u8, inputs[1], "-");
+    var file2 = openNonblockingRecordFile(inputs[1]) catch |err|
+        return pairCommandFailure(1, inputOpenFailure(err));
+    defer if (!transferred and owns2) file2.close(io);
+
+    if (pairedFilesFailure(io, file1, file2, output_identity)) |failure| return failure;
+    input1.init(io, file1, owns1) catch return pairCommandFailure(0, IO_FAILURE);
+    if (owns2) {
+        prepareRecordFile(io, &file2) catch return pairCommandFailure(1, IO_FAILURE);
+    }
+    input2.init(io, file2, owns2) catch return pairCommandFailure(1, IO_FAILURE);
+    transferred = true;
+    return null;
+}
+
+fn openNonblockingRecordFile(label: []const u8) std.posix.OpenError!std.Io.File {
+    if (std.mem.eql(u8, label, "-")) return .stdin();
+    // R2's FIFO writer may wait for R1 to drain before opening R2.
+    const handle = try std.posix.openat(std.Io.Dir.cwd().handle, label, .{
+        .ACCMODE = .RDONLY,
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+        .NOCTTY = true,
+    }, 0);
+    return .{ .handle = handle, .flags = .{ .nonblocking = true } };
+}
+
+fn prepareRecordFile(io: std.Io, file: *std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!void {
+    const linux = std.os.linux;
+    const stat = try statRecordFile(io, file.*);
+    if (stat.mode & linux.S.IFMT == linux.S.IFIFO) {
+        // A nonblocking FIFO open can precede its writer; reading now would report early EOF.
+        var poll_fd = [1]linux.pollfd{.{ .fd = file.handle, .events = linux.POLL.IN, .revents = 0 }};
+        while (true) switch (linux.errno(linux.poll(&poll_fd, 1, -1))) {
+            .SUCCESS => break,
+            .INTR => try io.checkCancel(),
+            else => return error.Io,
+        };
+        if (poll_fd[0].revents & (linux.POLL.ERR | linux.POLL.NVAL) != 0) return error.Io;
+    }
+    while (true) switch (linux.errno(linux.fcntl(file.handle, linux.F.SETFL, 0))) {
+        .SUCCESS => break,
+        .INTR => try io.checkCancel(),
+        else => return error.Io,
+    };
+    file.flags.nonblocking = false;
+}
+
+fn fileIdentity(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!FileIdentity {
+    // std.Io.File.Stat does not retain the device containing the inode.
+    const stat = try statRecordFile(io, file);
+    return .{ .device_major = stat.dev_major, .device_minor = stat.dev_minor, .inode = stat.ino };
+}
+
+fn statRecordFile(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!std.os.linux.Statx {
+    const linux = std.os.linux;
+    var stat: linux.Statx = undefined;
+    while (true) switch (linux.errno(linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .{ .INO = true, .TYPE = true }, &stat))) {
+        .SUCCESS => break,
+        .INTR => try io.checkCancel(),
+        .BADF => return error.BadFileDescriptor,
+        else => return error.Io,
+    };
+    if (!stat.mask.INO or !stat.mask.TYPE) return error.Io;
+    return stat;
+}
+
+fn stdoutFileIdentity(io: std.Io) (std.Io.Cancelable || error{Io})!?FileIdentity {
+    const stat = statRecordFile(io, .stdout()) catch |err| switch (err) {
+        // Inspect before opening inputs, which could reuse a closed descriptor 1.
+        error.BadFileDescriptor => return null,
+        else => |other| return other,
+    };
+    if (stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG) return null;
+    return .{ .device_major = stat.dev_major, .device_minor = stat.dev_minor, .inode = stat.ino };
+}
+
+fn outputFileFailure(io: std.Io, file: std.Io.File, output_identity: ?FileIdentity) ?CommandFailure {
+    const output = output_identity orelse return null;
+    const input = fileIdentity(io, file) catch return inputInspectionFailure(io, output_identity);
+    if (std.meta.eql(input, output)) {
+        return outputAliasFailure(io, &.{input});
+    }
+    return null;
+}
+
+fn canReportInputFailure(io: std.Io, known_inputs: ?[]const FileIdentity) bool {
+    const stat = statRecordFile(io, .stderr()) catch return false;
+    // Without input identities, a regular stderr file could be an input.
+    const inputs = known_inputs orelse return stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG;
+    const stderr_identity: FileIdentity = .{
+        .device_major = stat.dev_major,
+        .device_minor = stat.dev_minor,
+        .inode = stat.ino,
+    };
+    for (inputs) |input| {
+        if (std.meta.eql(input, stderr_identity)) return false;
+    }
+    return true;
+}
+
+fn outputAliasFailure(io: std.Io, inputs: []const FileIdentity) CommandFailure {
+    var failure = CommandFailure.plain("same_output", "input file is output file", 2);
+    failure.suppress_diagnostic = !canReportInputFailure(io, inputs);
+    return failure;
+}
+
+fn inputInspectionFailure(io: std.Io, output_identity: ?FileIdentity) CommandFailure {
+    var failure = CommandFailure.plain("io_error", "failed to inspect file", 3);
+    if (output_identity != null) failure.suppress_diagnostic = !canReportInputFailure(io, null);
+    return failure;
+}
+
+fn pairedFilesFailure(io: std.Io, file1: std.Io.File, file2: std.Io.File, output_identity: ?FileIdentity) ?PairCommandFailure {
+    const first = fileIdentity(io, file1) catch
+        return pairCommandFailure(0, inputInspectionFailure(io, output_identity));
+    const second = fileIdentity(io, file2) catch
+        return pairCommandFailure(1, inputInspectionFailure(io, output_identity));
+    if (std.meta.eql(first, second)) {
+        var failure = pairCommandFailure(1, CommandFailure.plain("same_input", "paired inputs refer to the same file", 2));
+        if (output_identity) |output| {
+            if (std.meta.eql(first, output)) {
+                failure.command.details.suppress_diagnostic = !canReportInputFailure(io, &.{first});
+            }
+        }
+        return failure;
+    }
+    if (output_identity) |output| {
+        for ([_]FileIdentity{ first, second }, 0..) |input, index| {
+            if (std.meta.eql(input, output)) {
+                return pairCommandFailure(@intCast(index), outputAliasFailure(io, &.{ first, second }));
+            }
+        }
+    }
+    return null;
+}
+
+// --- Record output ---
+
+fn recordHasUnwritableEnding(record: zfastq.Record, canonical_span: ?[]const u8) bool {
+    return canonical_span == null and fastq.recordHasTerminalCr(record);
+}
+
+fn writeCheckedRecord(
+    writer: *zfastq.Writer,
+    direct_writer: ?*std.Io.Writer,
+    record: zfastq.Record,
+    canonical_span: ?[]const u8,
+) error{WriteFailed}!void {
+    if (canonical_span) |span| {
+        if (direct_writer) |output| {
+            try output.writeAll(span);
+        } else {
+            try fastq.writeCanonicalRecordSpan(writer, span);
+        }
+    } else {
+        try fastq.writeRecordFields(writer, record);
+    }
+}
+
+fn deinterleaveStagingLimit(max_line_bytes: usize) error{ArithmeticLimit}!usize {
+    const fields = std.math.mul(usize, max_line_bytes, 4) catch
+        return error.ArithmeticLimit;
+    return std.math.add(usize, fields, 4) catch error.ArithmeticLimit;
+}
+
+fn canonicalRecordSize(
+    record: zfastq.Record,
+    canonical_span: ?[]const u8,
+) error{RecordStagingLimit}!usize {
+    return if (canonical_span) |span|
+        span.len
+    else blk: {
+        var total: usize = 6;
+        inline for (&.{ record.header, record.sequence, record.plus, record.quality }) |field| {
+            total = std.math.add(usize, total, field.len) catch
+                return error.RecordStagingLimit;
+        }
+        break :blk total;
+    };
+}
+
+fn stageCanonicalRecord(
+    allocator: std.mem.Allocator,
+    staging: *std.ArrayList(u8),
+    record: zfastq.Record,
+    canonical_span: ?[]const u8,
+    staging_limit: usize,
+) error{ OutOfMemory, RecordStagingLimit }!void {
+    const required = try canonicalRecordSize(record, canonical_span);
+    if (required > staging_limit) return error.RecordStagingLimit;
+
+    if (staging.capacity > required and
+        staging.capacity - required > zfastq.limits.DEFAULT_READER_BUFFER_BYTES)
+    {
+        staging.clearAndFree(allocator);
+    } else {
+        staging.clearRetainingCapacity();
+    }
+    staging.ensureTotalCapacityPrecise(allocator, required) catch return error.OutOfMemory;
+    if (canonical_span) |span| {
+        staging.appendSliceAssumeCapacity(span);
+        return;
+    }
+    staging.appendAssumeCapacity('@');
+    staging.appendSliceAssumeCapacity(record.header);
+    staging.appendAssumeCapacity('\n');
+    staging.appendSliceAssumeCapacity(record.sequence);
+    staging.appendSliceAssumeCapacity("\n+");
+    staging.appendSliceAssumeCapacity(record.plus);
+    staging.appendAssumeCapacity('\n');
+    staging.appendSliceAssumeCapacity(record.quality);
+    staging.appendAssumeCapacity('\n');
+}
+
+// --- Pair names and retained mates ---
+
+const PairMode = enum {
+    none,
+    paired,
+    interleaved,
 };
 
 const StoredPairName = struct {
@@ -668,35 +1209,342 @@ const StoredPairName = struct {
     }
 };
 
-const PairNameFailure = struct {
-    pair_index: u64,
-    records: [2]PairRecordDiagnostic,
-};
+fn storeNormalizedId(
+    allocator: std.mem.Allocator,
+    storage: *std.ArrayList(u8),
+    normalized_id: []const u8,
+) std.mem.Allocator.Error!void {
+    storage.clearRetainingCapacity();
+    try storage.ensureTotalCapacityPrecise(allocator, normalized_id.len);
+    storage.appendSliceAssumeCapacity(normalized_id);
+}
 
-const PairCountFailure = struct {
-    pair_index: u64,
-    remaining_side: u1,
-    record_indexes: [2]?u64,
-};
+fn lastRecordIndex(reader: *const zfastq.Reader) ?u64 {
+    return if (reader.recordIndex() == 0) null else reader.recordIndex() - 1;
+}
 
-const PairFailure = union(enum) {
-    name_mismatch: PairNameFailure,
-    count_mismatch: PairCountFailure,
-};
+const PairOutputSelector = union(enum) {
+    all,
+    fraction: *sampling.Selector,
 
-const PairCommandFailure = union(enum) {
-    command: struct {
-        input_index: u1,
-        details: CommandFailure,
-    },
-    pair: PairFailure,
-
-    fn exitCode(self: PairCommandFailure) u8 {
-        return switch (self) {
-            .command => |failure| failure.details.exit_code,
-            .pair => 1,
+    fn selectPair(self: *PairOutputSelector) bool {
+        return switch (self.*) {
+            .all => true,
+            .fraction => |selector| selector.selectRecord(),
         };
     }
+};
+
+const InterleavedFirstRecordStorage = enum {
+    unused,
+    reader,
+    retained,
+    staged,
+};
+
+const RefillSpanningMate = struct {
+    record: ?fastq.ValidatedRecord,
+    first_storage: InterleavedFirstRecordStorage,
+};
+
+fn nextAfterPreservingInterleavedMate1(
+    allocator: std.mem.Allocator,
+    reader: *zfastq.Reader,
+    retained: *fastq.RetainedRecordStorage,
+    staging: *std.ArrayList(u8),
+    record1: zfastq.Record,
+    canonical_span1: ?[]const u8,
+    staging_limit: usize,
+    validator: *fastq.AdaptiveRecordValidator,
+) (zfastq.ReaderError || error{RecordStagingLimit})!RefillSpanningMate {
+    if (fastq.retainFallbackRecordStorage(reader, retained, record1)) {
+        const transferred_record2 = try fastq.nextValidatedAfterFallbackTransfer(
+            reader,
+            validator,
+        );
+        if (transferred_record2) |record2| return .{
+            .record = record2,
+            .first_storage = .retained,
+        };
+        // Reader's four line limits cover CLI staging limits, including markers.
+        // Internal callers can supply a smaller limit and still need its error.
+        if (staging_limit < 4 or (staging_limit - 4) / 4 < reader.options.max_line_bytes) {
+            if (try canonicalRecordSize(record1, canonical_span1) > staging_limit) {
+                return error.RecordStagingLimit;
+            }
+        }
+        return .{
+            .record = try fastq.nextFallbackValidatedRecord(reader, validator),
+            .first_storage = .retained,
+        };
+    }
+
+    try stageCanonicalRecord(
+        allocator,
+        staging,
+        record1,
+        canonical_span1,
+        staging_limit,
+    );
+    return .{
+        .record = try fastq.nextValidatedRecord(reader, validator),
+        .first_storage = .staged,
+    };
+}
+
+fn writePreservedInterleavedMate1(
+    writer: *zfastq.Writer,
+    reader: *zfastq.Reader,
+    retained: *fastq.RetainedRecordStorage,
+    staged: []const u8,
+    record: zfastq.Record,
+    canonical_span: ?[]const u8,
+    storage: InterleavedFirstRecordStorage,
+) error{WriteFailed}!void {
+    switch (storage) {
+        .unused => unreachable,
+        .reader, .retained => try writeCheckedRecord(writer, null, record, canonical_span),
+        .staged => try fastq.writeCanonicalRecordSpan(writer, staged),
+    }
+    if (storage == .retained) {
+        fastq.restoreFallbackRecordStorage(reader, retained);
+    }
+}
+
+// --- Count command ---
+
+const CountOutcome = union(enum) {
+    success: u64,
+    failure: CommandFailure,
+};
+
+fn runCount(
+    io: std.Io,
+    inputs: []const []const u8,
+    options: InputOptions,
+) u8 {
+    if (validateRecordCommandInputs(io, .count, inputs)) |exit_code| return exit_code;
+
+    var exit_code: u8 = 0;
+    for (inputs) |input| {
+        const count = switch (countInput(io, input, options)) {
+            .success => |count| count,
+            .failure => |failure| {
+                if (std.mem.eql(u8, failure.code, "out_of_memory")) {
+                    std.Io.File.writeStreamingAll(.stderr(), io, "error: out of memory\n") catch {};
+                    return 3;
+                }
+                printCommandFailure(io, input, failure);
+                exit_code = @max(exit_code, failure.exit_code);
+                continue;
+            },
+        };
+        printCount(io, count) catch return @max(exit_code, 3);
+    }
+    return exit_code;
+}
+
+fn countInput(io: std.Io, label: []const u8, options: InputOptions) CountOutcome {
+    var input: RecordInput = undefined;
+    if (initRecordInput(&input, io, label, null)) |failure| return .{ .failure = failure };
+    defer input.deinit(io);
+
+    var scanner = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = options.max_line_bytes });
+    var buffer: [io_layer.COUNT_DECOMPRESS_BUFFER_BYTES]u8 = undefined;
+    const read_buffer = if (input.source == .plain)
+        buffer[0..zfastq.limits.DEFAULT_READER_BUFFER_BYTES]
+    else
+        &buffer;
+    while (input.readScannerChunk(read_buffer) catch return .{ .failure = IO_FAILURE }) |decoded| {
+        _ = scanner.feed(decoded) catch |err| return .{ .failure = mapScanFailure(&scanner, err) };
+    }
+    scanner.finishEof() catch |err| return .{ .failure = mapScanFailure(&scanner, err) };
+    return .{ .success = scanner.record_index };
+}
+
+fn mapScanFailure(scanner: *zfastq.count_scan.Scanner, err: zfastq.ReaderError) CommandFailure {
+    return switch (err) {
+        error.S001InvalidPlusLine,
+        error.S003InvalidHeader,
+        error.S004TruncatedRecord,
+        error.S005LengthMismatch,
+        => if (scanner.takeLastError()) |details| CommandFailure.lint(details) else .{
+            .code = "format_error",
+            .message = "",
+            .exit_code = 1,
+            .suppress_diagnostic = true,
+        },
+        error.Io => blk: {
+            var failure = IO_FAILURE;
+            failure.suppress_diagnostic = true;
+            break :blk failure;
+        },
+        else => mapInputFailure(@errorCast(err)),
+    };
+}
+
+// --- Stats command ---
+
+const StatsOutcome = union(enum) {
+    success: zfastq.Stats,
+    failure: CommandFailure,
+};
+
+fn runStats(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    options: InputOptions,
+    json_output: bool,
+) u8 {
+    if (validateRecordCommandInputs(io, .stats, inputs)) |exit_code| return exit_code;
+    if (json_output) return runStatsJson(io, allocator, inputs, options);
+
+    var exit_code: u8 = 0;
+    var printed_block = false;
+    for (inputs) |input| {
+        const outcome = statsInput(io, allocator, input, options);
+        const stats = switch (outcome) {
+            .success => |stats| stats,
+            .failure => |failure| {
+                printCommandFailure(io, input, failure);
+                exit_code = @max(exit_code, failure.exit_code);
+                continue;
+            },
+        };
+
+        printStats(io, input, stats.result(), printed_block) catch
+            return @max(exit_code, 3);
+        printed_block = true;
+    }
+    return exit_code;
+}
+
+fn runStatsJson(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    options: InputOptions,
+) u8 {
+    var stdout_buffer: [16 * 1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    var json: std.json.Stringify = .{ .writer = &stdout_writer.interface };
+
+    beginJsonDocument(&json, "z-fastq/stats-v1") catch return 3;
+    var exit_code: u8 = 0;
+    for (inputs) |input| {
+        const outcome = statsInput(io, allocator, input, options);
+        switch (outcome) {
+            .success => {},
+            .failure => |failure| exit_code = @max(exit_code, failure.exit_code),
+        }
+        writeStatsJsonResult(&json, input, outcome) catch return @max(exit_code, 3);
+    }
+    finishJsonDocument(&json) catch return @max(exit_code, 3);
+    stdout_writer.interface.flush() catch return @max(exit_code, 3);
+    return exit_code;
+}
+
+fn statsInput(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    options: InputOptions,
+) StatsOutcome {
+    var input: RecordInput = undefined;
+    if (initRecordInput(&input, io, label, null)) |failure| return .{ .failure = failure };
+    defer input.deinit(io);
+    return collectStats(allocator, input.byteSource(), options);
+}
+
+fn collectStats(
+    allocator: std.mem.Allocator,
+    source: zfastq.io.ByteSource,
+    options: InputOptions,
+) StatsOutcome {
+    var reader = zfastq.Reader.init(
+        allocator,
+        source,
+        .{ .max_line_bytes = options.max_line_bytes },
+    ) catch return .{ .failure = OUT_OF_MEMORY };
+    defer reader.deinit();
+
+    var stats: zfastq.Stats = .{};
+    while (fastq.nextPredictedPayload(&reader) catch |err| {
+        return .{ .failure = mapReaderFailure(&reader, err) };
+    }) |predicted| {
+        var payload = predicted.payload;
+        var checkpoint = predicted.checkpoint;
+        while (true) {
+            stats.addRecord(.{
+                .header = "",
+                .id = "",
+                .sequence = payload.sequence,
+                .plus = "",
+                .quality = payload.quality,
+            }) catch |err| {
+                if (err == error.S006InvalidQuality) {
+                    if (checkpoint) |saved| {
+                        payload = saved.reread(&reader) catch |reader_error| {
+                            return .{ .failure = mapReaderFailure(&reader, reader_error) };
+                        };
+                        checkpoint = null;
+                        continue;
+                    }
+                }
+                switch (err) {
+                    error.S006InvalidQuality => {
+                        const quality_error = stats.takeLastQualityError() orelse {
+                            return .{ .failure = CommandFailure.plain(
+                                "io_error",
+                                "quality validation failed without details",
+                                3,
+                            ) };
+                        };
+                        const offsets = reader.currentRecordOffsets() orelse {
+                            return .{ .failure = CommandFailure.plain(
+                                "io_error",
+                                "record location is unavailable",
+                                3,
+                            ) };
+                        };
+                        const details = fastq.semanticParseError(
+                            fastq.semanticQualityError(quality_error.byte_index),
+                            reader.recordIndex() - 1,
+                            offsets.quality,
+                        ) catch return .{ .failure = CommandFailure.plain(
+                            "arithmetic_limit",
+                            "statistics arithmetic limit exceeded",
+                            4,
+                        ) };
+                        return .{ .failure = CommandFailure.lint(details) };
+                    },
+                    error.S005LengthMismatch => @panic("Reader returned unequal sequence and quality lengths"),
+                    error.Overflow => return .{ .failure = CommandFailure.plain(
+                        "arithmetic_limit",
+                        "statistics arithmetic limit exceeded",
+                        4,
+                    ) },
+                }
+            };
+            break;
+        }
+    }
+    return .{ .success = stats };
+}
+
+// --- Check command ---
+
+const CheckOptions = struct {
+    max_line_bytes: usize = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+    alphabet: zfastq.Alphabet = .iupac,
+};
+
+const PairedCheckOptions = struct {
+    max_line_bytes: usize = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+    alphabet: zfastq.Alphabet = .iupac,
+    pair_mode: PairMode = .none,
+    pair_name_policy: pairing.NamePolicy = .illumina,
 };
 
 fn runSingleCheckCommand(
@@ -1006,7 +1854,7 @@ fn checkInterleavedSource(
         );
 
         const paired_record2 = (if (semantic1 == null)
-            fastq.nextPairedValidatedHeader(&reader, &record1.header, &validator)
+            fastq.nextValidatedMatePreservingHeader(&reader, &record1.header, &validator)
         else
             fastq.nextBufferedValidatedRecord(&reader, &validator)) catch |err| {
             return pairCommandFailure(0, mapReaderFailure(&reader, err));
@@ -1022,7 +1870,7 @@ fn checkInterleavedSource(
                 stored_name.store(allocator, name1) catch return pairCommandFailure(0, OUT_OF_MEMORY);
             }
             if (semantic1) |failure| {
-                const record2 = fastq.nextRecordWithoutId(&reader) catch |err| {
+                const record2 = fastq.nextRecordFields(&reader) catch |err| {
                     return pairCommandFailure(0, mapReaderFailure(&reader, err));
                 } orelse return missingInterleavedMateFailure(record_index1);
                 _ = record2;
@@ -1082,231 +1930,6 @@ fn checkInterleavedSource(
     }
 }
 
-fn exactPairSelectionFailure(err: sampling.ReservoirError) PairCommandFailure {
-    return pairCommandFailure(0, exactSelectionFailure(err));
-}
-
-fn storeNormalizedId(
-    allocator: std.mem.Allocator,
-    storage: *std.ArrayList(u8),
-    normalized_id: []const u8,
-) std.mem.Allocator.Error!void {
-    storage.clearRetainingCapacity();
-    try storage.ensureTotalCapacityPrecise(allocator, normalized_id.len);
-    storage.appendSliceAssumeCapacity(normalized_id);
-}
-
-fn exactSelectionFailure(err: sampling.ReservoirError) CommandFailure {
-    return switch (err) {
-        error.OutOfMemory => OUT_OF_MEMORY,
-        error.Overflow => CommandFailure.plain(
-            "arithmetic_limit",
-            "sample index storage exceeds supported limit",
-            4,
-        ),
-    };
-}
-
-fn initRecordInput(
-    input: *RecordInput,
-    io: std.Io,
-    label: []const u8,
-    output_identity: ?FileIdentity,
-) ?CommandFailure {
-    const file = openRecordFile(io, label) catch |err| return inputOpenFailure(err);
-    const owns_file = !std.mem.eql(u8, label, "-");
-    var transferred = false;
-    defer if (!transferred and owns_file) file.close(io);
-    if (outputFileFailure(io, file, output_identity)) |failure| return failure;
-    input.init(io, file, owns_file) catch
-        return IO_FAILURE;
-    transferred = true;
-    return null;
-}
-
-fn openRecordFile(io: std.Io, label: []const u8) std.Io.File.OpenError!std.Io.File {
-    if (std.mem.eql(u8, label, "-")) return .stdin();
-    return std.Io.Dir.cwd().openFile(io, label, .{});
-}
-
-fn inputOpenFailure(err: (std.Io.File.OpenError || std.posix.OpenError)) CommandFailure {
-    return CommandFailure.plain("io_error", if (err == error.FileNotFound)
-        "file not found"
-    else
-        "failed to open file", 3);
-}
-
-fn initPairedRecordInputs(
-    input1: *RecordInput,
-    input2: *RecordInput,
-    io: std.Io,
-    inputs: []const []const u8,
-    output_identity: ?FileIdentity,
-) ?PairCommandFailure {
-    for (inputs, 0..) |label, index| {
-        if (std.mem.eql(u8, label, "-")) {
-            // Opening a path could reuse descriptor 0 if stdin is closed.
-            _ = fileIdentity(io, .stdin()) catch
-                return pairCommandFailure(@intCast(index), IO_FAILURE);
-        }
-    }
-    var transferred = false;
-    const owns1 = !std.mem.eql(u8, inputs[0], "-");
-    const file1 = openRecordFile(io, inputs[0]) catch |err|
-        return pairCommandFailure(0, inputOpenFailure(err));
-    defer if (!transferred and owns1) file1.close(io);
-
-    const owns2 = !std.mem.eql(u8, inputs[1], "-");
-    var file2 = openNonblockingRecordFile(inputs[1]) catch |err|
-        return pairCommandFailure(1, inputOpenFailure(err));
-    defer if (!transferred and owns2) file2.close(io);
-
-    if (pairedFilesFailure(io, file1, file2, output_identity)) |failure| return failure;
-    input1.init(io, file1, owns1) catch return pairCommandFailure(0, IO_FAILURE);
-    if (owns2) {
-        prepareRecordFile(io, &file2) catch return pairCommandFailure(1, IO_FAILURE);
-    }
-    input2.init(io, file2, owns2) catch return pairCommandFailure(1, IO_FAILURE);
-    transferred = true;
-    return null;
-}
-
-fn openNonblockingRecordFile(label: []const u8) std.posix.OpenError!std.Io.File {
-    if (std.mem.eql(u8, label, "-")) return .stdin();
-    // R2's FIFO writer may wait for R1 to drain before opening R2.
-    const handle = try std.posix.openat(std.Io.Dir.cwd().handle, label, .{
-        .ACCMODE = .RDONLY,
-        .NONBLOCK = true,
-        .CLOEXEC = true,
-        .NOCTTY = true,
-    }, 0);
-    return .{ .handle = handle, .flags = .{ .nonblocking = true } };
-}
-
-fn prepareRecordFile(io: std.Io, file: *std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!void {
-    const linux = std.os.linux;
-    const stat = try statRecordFile(io, file.*);
-    if (stat.mode & linux.S.IFMT == linux.S.IFIFO) {
-        // A nonblocking FIFO open can precede its writer; reading now would report early EOF.
-        var poll_fd = [1]linux.pollfd{.{ .fd = file.handle, .events = linux.POLL.IN, .revents = 0 }};
-        while (true) switch (linux.errno(linux.poll(&poll_fd, 1, -1))) {
-            .SUCCESS => break,
-            .INTR => try io.checkCancel(),
-            else => return error.Io,
-        };
-        if (poll_fd[0].revents & (linux.POLL.ERR | linux.POLL.NVAL) != 0) return error.Io;
-    }
-    while (true) switch (linux.errno(linux.fcntl(file.handle, linux.F.SETFL, 0))) {
-        .SUCCESS => break,
-        .INTR => try io.checkCancel(),
-        else => return error.Io,
-    };
-    file.flags.nonblocking = false;
-}
-
-const FileIdentity = struct {
-    device_major: u32,
-    device_minor: u32,
-    inode: u64,
-};
-
-fn fileIdentity(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!FileIdentity {
-    // std.Io.File.Stat does not retain the device containing the inode.
-    const stat = try statRecordFile(io, file);
-    return .{ .device_major = stat.dev_major, .device_minor = stat.dev_minor, .inode = stat.ino };
-}
-
-fn statRecordFile(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!std.os.linux.Statx {
-    const linux = std.os.linux;
-    var stat: linux.Statx = undefined;
-    while (true) switch (linux.errno(linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .{ .INO = true, .TYPE = true }, &stat))) {
-        .SUCCESS => break,
-        .INTR => try io.checkCancel(),
-        .BADF => return error.BadFileDescriptor,
-        else => return error.Io,
-    };
-    if (!stat.mask.INO or !stat.mask.TYPE) return error.Io;
-    return stat;
-}
-
-fn stdoutFileIdentity(io: std.Io) (std.Io.Cancelable || error{Io})!?FileIdentity {
-    const stat = statRecordFile(io, .stdout()) catch |err| switch (err) {
-        // Inspect before opening inputs, which could reuse a closed descriptor 1.
-        error.BadFileDescriptor => return null,
-        else => |other| return other,
-    };
-    if (stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG) return null;
-    return .{ .device_major = stat.dev_major, .device_minor = stat.dev_minor, .inode = stat.ino };
-}
-
-fn outputFileFailure(io: std.Io, file: std.Io.File, output_identity: ?FileIdentity) ?CommandFailure {
-    const output = output_identity orelse return null;
-    const input = fileIdentity(io, file) catch return inputInspectionFailure(io, output_identity);
-    if (std.meta.eql(input, output)) {
-        return outputAliasFailure(io, &.{input});
-    }
-    return null;
-}
-
-fn canReportInputFailure(io: std.Io, known_inputs: ?[]const FileIdentity) bool {
-    const stat = statRecordFile(io, .stderr()) catch return false;
-    // Without input identities, a regular stderr file could be an input.
-    const inputs = known_inputs orelse return stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG;
-    const stderr_identity: FileIdentity = .{
-        .device_major = stat.dev_major,
-        .device_minor = stat.dev_minor,
-        .inode = stat.ino,
-    };
-    for (inputs) |input| {
-        if (std.meta.eql(input, stderr_identity)) return false;
-    }
-    return true;
-}
-
-fn outputAliasFailure(io: std.Io, inputs: []const FileIdentity) CommandFailure {
-    var failure = CommandFailure.plain("same_output", "input file is output file", 2);
-    failure.suppress_diagnostic = !canReportInputFailure(io, inputs);
-    return failure;
-}
-
-fn inputInspectionFailure(io: std.Io, output_identity: ?FileIdentity) CommandFailure {
-    var failure = CommandFailure.plain("io_error", "failed to inspect file", 3);
-    if (output_identity != null) failure.suppress_diagnostic = !canReportInputFailure(io, null);
-    return failure;
-}
-
-fn pairedFilesFailure(io: std.Io, file1: std.Io.File, file2: std.Io.File, output_identity: ?FileIdentity) ?PairCommandFailure {
-    const first = fileIdentity(io, file1) catch
-        return pairCommandFailure(0, inputInspectionFailure(io, output_identity));
-    const second = fileIdentity(io, file2) catch
-        return pairCommandFailure(1, inputInspectionFailure(io, output_identity));
-    if (std.meta.eql(first, second)) {
-        var failure = pairCommandFailure(1, CommandFailure.plain("same_input", "paired inputs refer to the same file", 2));
-        if (output_identity) |output| {
-            if (std.meta.eql(first, output)) {
-                failure.command.details.suppress_diagnostic = !canReportInputFailure(io, &.{first});
-            }
-        }
-        return failure;
-    }
-    if (output_identity) |output| {
-        for ([_]FileIdentity{ first, second }, 0..) |input, index| {
-            if (std.meta.eql(input, output)) {
-                return pairCommandFailure(@intCast(index), outputAliasFailure(io, &.{ first, second }));
-            }
-        }
-    }
-    return null;
-}
-
-fn pairCommandFailure(input_index: u1, details: CommandFailure) PairCommandFailure {
-    return .{ .command = .{ .input_index = input_index, .details = details } };
-}
-
-fn lastRecordIndex(reader: *const zfastq.Reader) ?u64 {
-    return if (reader.recordIndex() == 0) null else reader.recordIndex() - 1;
-}
-
 fn checkInput(
     io: std.Io,
     label: []const u8,
@@ -1348,259 +1971,6 @@ fn mapCheckScannerFailure(
     return switch (err) {
         error.Format => validationFailure(scanner.takeLastError()),
         else => mapInputFailure(@errorCast(err)),
-    };
-}
-
-// --- Stats command ---
-
-fn runStats(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    inputs: []const []const u8,
-    options: InputOptions,
-    json_output: bool,
-) u8 {
-    if (validateRecordCommandInputs(io, .stats, inputs)) |exit_code| return exit_code;
-    if (json_output) return runStatsJson(io, allocator, inputs, options);
-
-    var exit_code: u8 = 0;
-    var printed_block = false;
-    for (inputs) |input| {
-        const outcome = statsInput(io, allocator, input, options);
-        const stats = switch (outcome) {
-            .success => |stats| stats,
-            .failure => |failure| {
-                printCommandFailure(io, input, failure);
-                exit_code = @max(exit_code, failure.exit_code);
-                continue;
-            },
-        };
-
-        printStats(io, input, stats.result(), printed_block) catch
-            return @max(exit_code, 3);
-        printed_block = true;
-    }
-    return exit_code;
-}
-
-fn runStatsJson(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    inputs: []const []const u8,
-    options: InputOptions,
-) u8 {
-    var stdout_buffer: [16 * 1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    var json: std.json.Stringify = .{ .writer = &stdout_writer.interface };
-
-    beginJsonDocument(&json, "z-fastq/stats-v1") catch return 3;
-    var exit_code: u8 = 0;
-    for (inputs) |input| {
-        const outcome = statsInput(io, allocator, input, options);
-        switch (outcome) {
-            .success => {},
-            .failure => |failure| exit_code = @max(exit_code, failure.exit_code),
-        }
-        writeStatsJsonResult(&json, input, outcome) catch return @max(exit_code, 3);
-    }
-    finishJsonDocument(&json) catch return @max(exit_code, 3);
-    stdout_writer.interface.flush() catch return @max(exit_code, 3);
-    return exit_code;
-}
-
-fn statsInput(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    label: []const u8,
-    options: InputOptions,
-) StatsOutcome {
-    var input: RecordInput = undefined;
-    if (initRecordInput(&input, io, label, null)) |failure| return .{ .failure = failure };
-    defer input.deinit(io);
-    return collectStats(allocator, input.byteSource(), options);
-}
-
-const RecordInput = struct {
-    file: std.Io.File,
-    owns_file: bool,
-    read_buffer: [64 * 1024]u8,
-    file_reader: std.Io.File.Reader,
-    source: union(enum) {
-        plain: io_layer.PlainFileSource,
-        gzip: io_layer.GzipSource,
-    },
-
-    fn init(
-        self: *RecordInput,
-        io: std.Io,
-        file: std.Io.File,
-        owns_file: bool,
-    ) error{Io}!void {
-        self.file = file;
-        self.owns_file = owns_file;
-        self.file_reader = file.readerStreaming(io, &self.read_buffer);
-        const prefix = self.file_reader.interface.peek(2) catch |err| switch (err) {
-            error.EndOfStream => null,
-            error.ReadFailed => return error.Io,
-        };
-        if (prefix) |bytes| {
-            if (std.mem.eql(u8, bytes, &.{ 0x1f, 0x8b })) {
-                self.source = .{ .gzip = io_layer.GzipSource.init(&self.file_reader.interface) };
-                return;
-            }
-        }
-        self.source = .{ .plain = io_layer.PlainFileSource.init(&self.file_reader) };
-    }
-
-    fn deinit(self: *RecordInput, io: std.Io) void {
-        if (self.owns_file) self.file.close(io);
-        self.* = undefined;
-    }
-
-    fn byteSource(self: *RecordInput) zfastq.io.ByteSource {
-        return switch (self.source) {
-            .plain => |*source| source.byteSource(),
-            .gzip => |*source| source.byteSource(),
-        };
-    }
-
-    fn initReader(
-        self: *RecordInput,
-        allocator: std.mem.Allocator,
-        options: fastq.Options,
-    ) !zfastq.Reader {
-        return switch (self.source) {
-            .plain => |*source| zfastq.Reader.init(allocator, source.byteSource(), options),
-            .gzip => |*source| if (build_options.use_isa_l)
-                zfastq.Reader.init(allocator, source.byteSource(), options)
-            else
-                fastq.initBorrowedGzipReader(allocator, source, options),
-        };
-    }
-
-    fn readScannerChunk(self: *RecordInput, buffer: []u8) error{Io}!?[]const u8 {
-        return switch (self.source) {
-            .plain => |*source| plain: {
-                const byte_source = source.byteSource();
-                const count = byte_source.read(buffer) catch return error.Io;
-                break :plain if (count == 0) null else buffer[0..count];
-            },
-            .gzip => |*source| io_layer.readGzipChunk(source, buffer) catch return error.Io,
-        };
-    }
-};
-
-fn initSourceReader(
-    allocator: std.mem.Allocator,
-    source: anytype,
-    options: fastq.Options,
-) !zfastq.Reader {
-    return if (comptime @TypeOf(source) == zfastq.io.ByteSource)
-        zfastq.Reader.init(allocator, source, options)
-    else
-        source.initReader(allocator, options);
-}
-
-fn collectStats(
-    allocator: std.mem.Allocator,
-    source: zfastq.io.ByteSource,
-    options: InputOptions,
-) StatsOutcome {
-    var reader = zfastq.Reader.init(
-        allocator,
-        source,
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return .{ .failure = OUT_OF_MEMORY };
-    defer reader.deinit();
-
-    var stats: zfastq.Stats = .{};
-    while (fastq.nextPredictedPayload(&reader) catch |err| {
-        return .{ .failure = mapReaderFailure(&reader, err) };
-    }) |predicted| {
-        var payload = predicted.payload;
-        var checkpoint = predicted.checkpoint;
-        while (true) {
-            stats.addRecord(.{
-                .header = "",
-                .id = "",
-                .sequence = payload.sequence,
-                .plus = "",
-                .quality = payload.quality,
-            }) catch |err| {
-                if (err == error.S006InvalidQuality) {
-                    if (checkpoint) |saved| {
-                        payload = saved.reread(&reader) catch |reader_error| {
-                            return .{ .failure = mapReaderFailure(&reader, reader_error) };
-                        };
-                        checkpoint = null;
-                        continue;
-                    }
-                }
-                switch (err) {
-                    error.S006InvalidQuality => {
-                        const quality_error = stats.takeLastQualityError() orelse {
-                            return .{ .failure = CommandFailure.plain(
-                                "io_error",
-                                "quality validation failed without details",
-                                3,
-                            ) };
-                        };
-                        const offsets = reader.currentRecordOffsets() orelse {
-                            return .{ .failure = CommandFailure.plain(
-                                "io_error",
-                                "record location is unavailable",
-                                3,
-                            ) };
-                        };
-                        const details = fastq.semanticParseError(
-                            fastq.semanticQualityError(quality_error.byte_index),
-                            reader.recordIndex() - 1,
-                            offsets.quality,
-                        ) catch return .{ .failure = CommandFailure.plain(
-                            "arithmetic_limit",
-                            "statistics arithmetic limit exceeded",
-                            4,
-                        ) };
-                        return .{ .failure = CommandFailure.lint(details) };
-                    },
-                    error.S005LengthMismatch => @panic("Reader returned unequal sequence and quality lengths"),
-                    error.Overflow => return .{ .failure = CommandFailure.plain(
-                        "arithmetic_limit",
-                        "statistics arithmetic limit exceeded",
-                        4,
-                    ) },
-                }
-            };
-            break;
-        }
-    }
-    return .{ .success = stats };
-}
-
-fn mapReaderFailure(reader: *zfastq.Reader, err: zfastq.ReaderError) CommandFailure {
-    return switch (err) {
-        error.S001InvalidPlusLine,
-        error.S003InvalidHeader,
-        error.S004TruncatedRecord,
-        error.S005LengthMismatch,
-        => validationFailure(reader.takeLastError()),
-        else => mapInputFailure(@errorCast(err)),
-    };
-}
-
-fn validationFailure(details: ?zfastq.ParseError) CommandFailure {
-    return if (details) |failure|
-        CommandFailure.lint(failure)
-    else
-        CommandFailure.plain("io_error", "validation failed without details", 3);
-}
-
-fn mapInputFailure(err: error{ LineTooLong, ArithmeticLimit, OutOfMemory, Io }) CommandFailure {
-    return switch (err) {
-        error.LineTooLong => LINE_LIMIT,
-        error.ArithmeticLimit => INPUT_LOCATION_LIMIT,
-        error.OutOfMemory => OUT_OF_MEMORY,
-        error.Io => IO_FAILURE,
     };
 }
 
@@ -1655,17 +2025,20 @@ const ExactOutputCursor = struct {
     }
 };
 
-const PairOutputSelector = union(enum) {
-    all,
-    fraction: *sampling.Selector,
+fn exactSelectionFailure(err: sampling.ReservoirError) CommandFailure {
+    return switch (err) {
+        error.OutOfMemory => OUT_OF_MEMORY,
+        error.Overflow => CommandFailure.plain(
+            "arithmetic_limit",
+            "sample index storage exceeds supported limit",
+            4,
+        ),
+    };
+}
 
-    fn selectPair(self: *PairOutputSelector) bool {
-        return switch (self.*) {
-            .all => true,
-            .fraction => |selector| selector.selectRecord(),
-        };
-    }
-};
+fn exactPairSelectionFailure(err: sampling.ReservoirError) PairCommandFailure {
+    return pairCommandFailure(0, exactSelectionFailure(err));
+}
 
 fn runSample(
     io: std.Io,
@@ -1908,100 +2281,6 @@ fn sampleInterleavedFractionInput(
     );
 }
 
-const InterleavedFirstRecordStorage = enum {
-    unused,
-    reader,
-    retained,
-    staged,
-};
-
-const RefillSpanningMate = struct {
-    record: ?fastq.ValidatedRecord,
-    first_storage: InterleavedFirstRecordStorage,
-};
-
-fn missingInterleavedMateFailure(record_index1: u64) PairCommandFailure {
-    return .{ .pair = .{ .count_mismatch = .{
-        .pair_index = record_index1 / 2,
-        .remaining_side = 0,
-        .record_indexes = .{ record_index1, if (record_index1 == 0) null else record_index1 - 1 },
-    } } };
-}
-
-fn mapPreservedMateFailure(
-    reader: *zfastq.Reader,
-    err: (zfastq.ReaderError || error{RecordStagingLimit}),
-) PairCommandFailure {
-    return pairCommandFailure(0, switch (err) {
-        error.RecordStagingLimit => RECORD_STAGING_LIMIT,
-        else => mapReaderFailure(reader, @errorCast(err)),
-    });
-}
-
-fn nextAfterPreservingInterleavedMate1(
-    allocator: std.mem.Allocator,
-    reader: *zfastq.Reader,
-    retained: *fastq.RetainedRecordStorage,
-    staging: *std.ArrayList(u8),
-    record1: zfastq.Record,
-    canonical_span1: ?[]const u8,
-    staging_limit: usize,
-    validator: *fastq.AdaptiveRecordValidator,
-) (zfastq.ReaderError || error{RecordStagingLimit})!RefillSpanningMate {
-    if (fastq.retainFallbackRecordStorage(reader, retained, record1)) {
-        const transferred_record2 = try fastq.nextBufferedAfterFallbackTransfer(
-            reader,
-            validator,
-        );
-        if (transferred_record2) |record2| return .{
-            .record = record2,
-            .first_storage = .retained,
-        };
-        // Reader's four line limits cover CLI staging limits, including markers.
-        // Internal callers can supply a smaller limit and still need its error.
-        if (staging_limit < 4 or (staging_limit - 4) / 4 < reader.options.max_line_bytes) {
-            if (try canonicalRecordSize(record1, canonical_span1) > staging_limit) {
-                return error.RecordStagingLimit;
-            }
-        }
-        return .{
-            .record = try fastq.nextFallbackValidatedRecord(reader, validator),
-            .first_storage = .retained,
-        };
-    }
-
-    try stageCanonicalRecord(
-        allocator,
-        staging,
-        record1,
-        canonical_span1,
-        staging_limit,
-    );
-    return .{
-        .record = try fastq.nextValidatedRecord(reader, validator),
-        .first_storage = .staged,
-    };
-}
-
-fn writePreservedInterleavedMate1(
-    writer: *zfastq.Writer,
-    reader: *zfastq.Reader,
-    retained: *fastq.RetainedRecordStorage,
-    staged: []const u8,
-    record: zfastq.Record,
-    canonical_span: ?[]const u8,
-    storage: InterleavedFirstRecordStorage,
-) error{WriteFailed}!void {
-    switch (storage) {
-        .unused => unreachable,
-        .reader, .retained => try writeCheckedRecord(writer, null, record, canonical_span),
-        .staged => try fastq.writeCanonicalRecordSpan(writer, staged),
-    }
-    if (storage == .retained) {
-        fastq.restoreFallbackRecordStorage(reader, retained);
-    }
-}
-
 fn sampleInterleavedSource(
     allocator: std.mem.Allocator,
     source: zfastq.io.ByteSource,
@@ -2041,9 +2320,9 @@ fn sampleInterleavedSource(
 
         var record1_storage: InterleavedFirstRecordStorage = .unused;
         const paired_record2 = (if (selected)
-            fastq.nextPairedValidatedRecord(&reader, &validated1, &validator)
+            fastq.nextValidatedMatePreservingRecord(&reader, &validated1, &validator)
         else if (semantic1 == null)
-            fastq.nextPairedValidatedHeader(&reader, &validated1.record.header, &validator)
+            fastq.nextValidatedMatePreservingHeader(&reader, &validated1.record.header, &validator)
         else
             fastq.nextBufferedValidatedRecord(&reader, &validator)) catch |err| {
             return pairCommandFailure(0, mapReaderFailure(&reader, err));
@@ -2862,7 +3141,7 @@ fn sampleExactInterleavedSecondPass(
         };
         // HACK: Preserve retry diagnostics until the exact-output bug is fixed.
         if (paired_record2 == null and failure == null) {
-            paired_record2 = fastq.nextPairedValidatedRecord(
+            paired_record2 = fastq.nextValidatedMatePreservingRecord(
                 &reader,
                 &validated1,
                 &validator,
@@ -3289,14 +3568,6 @@ fn interleaveSources(
     }
 }
 
-fn printOutputFailure(io: std.Io) void {
-    std.Io.File.writeStreamingAll(
-        .stderr(),
-        io,
-        "error: standard output: I/O error\n",
-    ) catch {};
-}
-
 // --- Deinterleave command ---
 
 const DeinterleaveOptions = struct {
@@ -3455,12 +3726,6 @@ fn validateDeinterleaveArguments(
     return .{ path1, path2 };
 }
 
-fn deinterleaveStagingLimit(max_line_bytes: usize) error{ArithmeticLimit}!usize {
-    const fields = std.math.mul(usize, max_line_bytes, 4) catch
-        return error.ArithmeticLimit;
-    return std.math.add(usize, fields, 4) catch error.ArithmeticLimit;
-}
-
 fn deinterleaveSource(
     allocator: std.mem.Allocator,
     source: zfastq.io.ByteSource,
@@ -3497,7 +3762,7 @@ fn deinterleaveSource(
         const unwritable1 = recordHasUnwritableEnding(validated1.record, validated1.canonical_span);
         var record1_storage: InterleavedFirstRecordStorage = .reader;
         const paired_record2 = (if (semantic1 == null)
-            fastq.nextPairedValidatedRecord(&reader, &validated1, &validator)
+            fastq.nextValidatedMatePreservingRecord(&reader, &validated1, &validator)
         else
             fastq.nextBufferedValidatedRecord(&reader, &validator)) catch |err| {
             return pairCommandFailure(0, mapReaderFailure(&reader, err));
@@ -3579,55 +3844,6 @@ fn deinterleaveSource(
     }
 }
 
-fn canonicalRecordSize(
-    record: zfastq.Record,
-    canonical_span: ?[]const u8,
-) error{RecordStagingLimit}!usize {
-    return if (canonical_span) |span|
-        span.len
-    else blk: {
-        var total: usize = 6;
-        inline for (&.{ record.header, record.sequence, record.plus, record.quality }) |field| {
-            total = std.math.add(usize, total, field.len) catch
-                return error.RecordStagingLimit;
-        }
-        break :blk total;
-    };
-}
-
-fn stageCanonicalRecord(
-    allocator: std.mem.Allocator,
-    staging: *std.ArrayList(u8),
-    record: zfastq.Record,
-    canonical_span: ?[]const u8,
-    staging_limit: usize,
-) error{ OutOfMemory, RecordStagingLimit }!void {
-    const required = try canonicalRecordSize(record, canonical_span);
-    if (required > staging_limit) return error.RecordStagingLimit;
-
-    if (staging.capacity > required and
-        staging.capacity - required > zfastq.limits.DEFAULT_READER_BUFFER_BYTES)
-    {
-        staging.clearAndFree(allocator);
-    } else {
-        staging.clearRetainingCapacity();
-    }
-    staging.ensureTotalCapacityPrecise(allocator, required) catch return error.OutOfMemory;
-    if (canonical_span) |span| {
-        staging.appendSliceAssumeCapacity(span);
-        return;
-    }
-    staging.appendAssumeCapacity('@');
-    staging.appendSliceAssumeCapacity(record.header);
-    staging.appendAssumeCapacity('\n');
-    staging.appendSliceAssumeCapacity(record.sequence);
-    staging.appendSliceAssumeCapacity("\n+");
-    staging.appendSliceAssumeCapacity(record.plus);
-    staging.appendAssumeCapacity('\n');
-    staging.appendSliceAssumeCapacity(record.quality);
-    staging.appendAssumeCapacity('\n');
-}
-
 fn flushDeinterleaveWriters(
     writer1: *zfastq.Writer,
     writer2: *zfastq.Writer,
@@ -3636,7 +3852,7 @@ fn flushDeinterleaveWriters(
     writer2.flush() catch return error.Output2WriteFailed;
 }
 
-// --- Machine output ---
+// --- JSON output ---
 
 fn beginJsonDocument(json: *std.json.Stringify, schema: []const u8) !void {
     try json.beginObject();
@@ -3857,6 +4073,14 @@ fn writeEscapedJsonString(json: *std.json.Stringify, bytes: []const u8) !void {
     json.endWriteRaw();
 }
 
+// --- Human output ---
+
+fn printCount(io: std.Io, n: u64) !void {
+    var buf: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{d}\n", .{n});
+    try std.Io.File.writeStreamingAll(.stdout(), io, text);
+}
+
 fn printStats(
     io: std.Io,
     label: []const u8,
@@ -3924,214 +4148,6 @@ fn writeRatioField(
         .{ name, rounded / scale, rounded % scale },
     );
     try output.writeAll(line);
-}
-
-fn printPathError(io: std.Io, path: []const u8, message: []const u8) void {
-    std.Io.File.writeStreamingAll(.stderr(), io, "error: ") catch {};
-    writeEscaped(.stderr(), io, path);
-    std.Io.File.writeStreamingAll(.stderr(), io, ": ") catch {};
-    std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
-    std.Io.File.writeStreamingAll(.stderr(), io, "\n") catch {};
-}
-
-fn printCommandFailure(io: std.Io, path: []const u8, failure: CommandFailure) void {
-    if (failure.suppress_diagnostic) return;
-    if (failure.record_index == null or
-        failure.byte_offset == null or
-        failure.line_in_record == null)
-    {
-        return printPathError(io, path, failure.message);
-    }
-
-    std.Io.File.writeStreamingAll(.stderr(), io, "error: ") catch {};
-    writeEscaped(.stderr(), io, path);
-    std.Io.File.writeStreamingAll(.stderr(), io, ": ") catch {};
-    std.Io.File.writeStreamingAll(.stderr(), io, failure.code) catch {};
-    std.Io.File.writeStreamingAll(.stderr(), io, ": ") catch {};
-    std.Io.File.writeStreamingAll(.stderr(), io, failure.message) catch {};
-
-    var buf: [96]u8 = undefined;
-    const suffix = std.fmt.bufPrint(
-        &buf,
-        " (record {d}, line {d}, offset {d})\n",
-        .{
-            failure.record_index.?,
-            failure.line_in_record.?,
-            failure.byte_offset.?,
-        },
-    ) catch return;
-    std.Io.File.writeStreamingAll(.stderr(), io, suffix) catch {};
-}
-
-fn printPairCommandFailure(
-    io: std.Io,
-    inputs: []const []const u8,
-    pair_mode: PairMode,
-    failure: PairCommandFailure,
-) void {
-    switch (failure) {
-        .command => |details| printCommandFailure(
-            io,
-            inputs[details.input_index],
-            details.details,
-        ),
-        .pair => |details| printPairFailure(io, inputs, pair_mode, details),
-    }
-}
-
-fn printPairFailure(
-    io: std.Io,
-    inputs: []const []const u8,
-    pair_mode: PairMode,
-    failure: PairFailure,
-) void {
-    std.Io.File.writeStreamingAll(.stderr(), io, "error: ") catch {};
-    writeEscaped(.stderr(), io, inputs[0]);
-    if (pair_mode == .paired) {
-        std.Io.File.writeStreamingAll(.stderr(), io, " + ") catch {};
-        writeEscaped(.stderr(), io, inputs[1]);
-    }
-    switch (failure) {
-        .name_mismatch => |details| {
-            std.Io.File.writeStreamingAll(
-                .stderr(),
-                io,
-                ": P001: paired identifiers or mate markers do not match",
-            ) catch {};
-            var buf: [64]u8 = undefined;
-            const pair = std.fmt.bufPrint(&buf, " (pair {d})\n", .{details.pair_index}) catch
-                return;
-            std.Io.File.writeStreamingAll(.stderr(), io, pair) catch {};
-            for (details.records, 0..) |record, index| {
-                writePairRecordDiagnostic(
-                    io,
-                    inputs[if (pair_mode == .paired) index else 0],
-                    index,
-                    &record,
-                );
-            }
-        },
-        .count_mismatch => |details| {
-            std.Io.File.writeStreamingAll(
-                .stderr(),
-                io,
-                ": P002: paired input is missing a mate",
-            ) catch {};
-            var buf: [96]u8 = undefined;
-            const prefix = std.fmt.bufPrint(
-                &buf,
-                " (pair {d}, remaining R{d}, last R1 record ",
-                .{ details.pair_index, @as(u8, details.remaining_side) + 1 },
-            ) catch return;
-            std.Io.File.writeStreamingAll(.stderr(), io, prefix) catch {};
-            writeOptionalIndex(io, details.record_indexes[0]);
-            std.Io.File.writeStreamingAll(.stderr(), io, ", last R2 record ") catch {};
-            writeOptionalIndex(io, details.record_indexes[1]);
-            std.Io.File.writeStreamingAll(.stderr(), io, ")\n") catch {};
-        },
-    }
-}
-
-fn writePairRecordDiagnostic(
-    io: std.Io,
-    input: []const u8,
-    side_index: usize,
-    record: *const PairRecordDiagnostic,
-) void {
-    var buf: [96]u8 = undefined;
-    const prefix = std.fmt.bufPrint(
-        &buf,
-        "  R{d}: input=",
-        .{side_index + 1},
-    ) catch return;
-    std.Io.File.writeStreamingAll(.stderr(), io, prefix) catch {};
-    writeEscaped(.stderr(), io, input);
-    const location = std.fmt.bufPrint(
-        &buf,
-        ", record={d}, offset={d}, first_token=",
-        .{ record.record_index, record.byte_offset },
-    ) catch return;
-    std.Io.File.writeStreamingAll(.stderr(), io, location) catch {};
-    writeBoundedHuman(io, &record.first_token);
-    std.Io.File.writeStreamingAll(.stderr(), io, ", normalized_id=") catch {};
-    writeBoundedHuman(io, &record.normalized_id);
-    std.Io.File.writeStreamingAll(.stderr(), io, ", mate_markers=") catch {};
-    writeMateMarkersHuman(io, record.mate_markers);
-    std.Io.File.writeStreamingAll(.stderr(), io, "\n") catch {};
-}
-
-fn writeBoundedHuman(io: std.Io, display: *const BoundedBytes) void {
-    writeEscaped(.stderr(), io, display.bytes());
-    var buf: [64]u8 = undefined;
-    const suffix = std.fmt.bufPrint(
-        &buf,
-        " [length={d}, truncated={s}]",
-        .{ display.full_len, if (display.truncated()) "true" else "false" },
-    ) catch return;
-    std.Io.File.writeStreamingAll(.stderr(), io, suffix) catch {};
-}
-
-fn writeMateMarkersHuman(io: std.Io, markers: u2) void {
-    if (markers == 0) {
-        std.Io.File.writeStreamingAll(.stderr(), io, "none") catch {};
-        return;
-    }
-    if (markers & 0b01 != 0) {
-        std.Io.File.writeStreamingAll(.stderr(), io, "1") catch {};
-    }
-    if (markers == 0b11) {
-        std.Io.File.writeStreamingAll(.stderr(), io, ",") catch {};
-    }
-    if (markers & 0b10 != 0) {
-        std.Io.File.writeStreamingAll(.stderr(), io, "2") catch {};
-    }
-}
-
-fn writeOptionalIndex(io: std.Io, record_index: ?u64) void {
-    if (record_index) |value| {
-        var buf: [32]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return;
-        std.Io.File.writeStreamingAll(.stderr(), io, text) catch {};
-    } else {
-        std.Io.File.writeStreamingAll(.stderr(), io, "none") catch {};
-    }
-}
-
-const HEX = "0123456789ABCDEF";
-
-fn writeEscaped(file: std.Io.File, io: std.Io, bytes: []const u8) void {
-    writeEscapedAll(file, io, bytes) catch {};
-}
-
-fn writeEscapedAll(file: std.Io.File, io: std.Io, bytes: []const u8) !void {
-    var output = file.writerStreaming(io, &.{});
-    try writeEscapedBytes(&output.interface, bytes, false);
-    try output.interface.flush();
-}
-
-fn writeEscapedBytes(output: *std.Io.Writer, bytes: []const u8, comptime json_string: bool) !void {
-    var run_start: usize = 0;
-    for (bytes, 0..) |byte, index| {
-        if (byte >= 0x20 and byte <= 0x7e and byte != '\\') continue;
-
-        try writeDisplayRun(output, bytes[run_start..index], json_string);
-        if (byte == '\\') {
-            try writeDisplayRun(output, "\\\\", json_string);
-        } else {
-            const escaped = [4]u8{ '\\', 'x', HEX[byte >> 4], HEX[byte & 0x0f] };
-            try writeDisplayRun(output, &escaped, json_string);
-        }
-        run_start = index + 1;
-    }
-    try writeDisplayRun(output, bytes[run_start..], json_string);
-}
-
-fn writeDisplayRun(output: *std.Io.Writer, bytes: []const u8, comptime json_string: bool) !void {
-    if (json_string) {
-        try std.json.Stringify.encodeJsonStringChars(bytes, .{}, output);
-    } else {
-        try output.writeAll(bytes);
-    }
 }
 
 test "[unit] - [interleaved staging]: releases oversized slack before a smaller mate" {
@@ -4984,7 +5000,7 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
             if (storage == .reader) {
                 try std.testing.expect((try fastq.nextBufferedValidatedRecord(&reader, &validator)) == null);
             }
-            if (try fastq.nextPairedValidatedRecord(&reader, &first_record, &validator)) |_| {
+            if (try fastq.nextValidatedMatePreservingRecord(&reader, &first_record, &validator)) |_| {
                 try std.testing.expectEqual(.reader, storage);
             } else {
                 const next = try nextAfterPreservingInterleavedMate1(
@@ -6364,8 +6380,8 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
         defer staging.deinit(std.testing.allocator);
         var span: ?[]const u8 = null;
         var validator = fastq.AdaptiveRecordValidator.init(.{});
-        const record1 = (try fastq.nextWithoutId(&reader, &span)).?;
-        try std.testing.expect((try fastq.nextBufferedWithoutId(&reader, &span)) == null);
+        const record1 = (try fastq.nextWithSpan(&reader, &span)).?;
+        try std.testing.expect((try fastq.nextBufferedWithSpan(&reader, &span)) == null);
         const next = try nextAfterPreservingInterleavedMate1(
             std.testing.allocator,
             &reader,

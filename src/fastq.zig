@@ -7,6 +7,69 @@ const ByteSource = io_layer.ByteSource;
 const ByteSink = io_layer.ByteSink;
 const WriteError = io_layer.WriteError;
 
+// --- Records ---
+
+/// Borrowed FASTQ fields with structural prefix bytes and line endings removed.
+///
+/// Values returned by `Reader.next` remain valid only until the reader advances
+/// again or is deinitialized. `id` is the first space- or tab-delimited token of
+/// `header` and aliases the same storage.
+pub const Record = struct {
+    header: []const u8,
+    id: []const u8,
+    sequence: []const u8,
+    plus: []const u8,
+    quality: []const u8,
+};
+
+/// Independently allocated fields released together by `deinit`.
+pub const OwnedRecord = struct {
+    allocator: std.mem.Allocator,
+    header: []u8,
+    id: []u8,
+    sequence: []u8,
+    plus: []u8,
+    quality: []u8,
+
+    pub fn deinit(self: *OwnedRecord) void {
+        self.allocator.free(self.header);
+        self.allocator.free(self.id);
+        self.allocator.free(self.sequence);
+        self.allocator.free(self.plus);
+        self.allocator.free(self.quality);
+        self.* = undefined;
+    }
+};
+
+/// Duplicates all record fields; the caller must invoke `OwnedRecord.deinit`.
+pub fn toOwned(allocator: std.mem.Allocator, record: Record) !OwnedRecord {
+    const header = try allocator.dupe(u8, record.header);
+    errdefer allocator.free(header);
+    const id = try allocator.dupe(u8, record.id);
+    errdefer allocator.free(id);
+    const sequence = try allocator.dupe(u8, record.sequence);
+    errdefer allocator.free(sequence);
+    const plus = try allocator.dupe(u8, record.plus);
+    errdefer allocator.free(plus);
+    const quality = try allocator.dupe(u8, record.quality);
+    errdefer allocator.free(quality);
+    return .{
+        .allocator = allocator,
+        .header = header,
+        .id = id,
+        .sequence = sequence,
+        .plus = plus,
+        .quality = quality,
+    };
+}
+
+fn firstToken(header: []const u8) []const u8 {
+    const end = std.mem.findAny(u8, header, "\t ") orelse header.len;
+    return header[0..end];
+}
+
+// --- Structural validation ---
+
 pub const LintCode = enum {
     s001_invalid_plus_line,
     s002_invalid_sequence_alphabet,
@@ -15,6 +78,7 @@ pub const LintCode = enum {
     s005_length_mismatch,
     s006_invalid_quality_range,
 };
+
 pub const ParseError = struct {
     code: LintCode,
     message: []const u8,
@@ -45,56 +109,170 @@ pub const ReaderError = error{
     Io,
 };
 
-/// Borrowed FASTQ fields with structural prefix bytes and line endings removed.
-///
-/// Values returned by `Reader.next` remain valid only until the reader advances
-/// again or is deinitialized. `id` is the first space- or tab-delimited token of
-/// `header` and aliases the same storage.
-pub const Record = struct {
-    header: []const u8,
-    id: []const u8,
-    sequence: []const u8,
-    plus: []const u8,
-    quality: []const u8,
+pub const ExpectedLine = enum {
+    header,
+    sequence,
+    plus,
+    quality,
 };
 
-pub const RecordPayload = struct {
-    sequence: []const u8,
-    quality: []const u8,
+pub const Error = error{
+    S001InvalidPlusLine,
+    S003InvalidHeader,
+    S005LengthMismatch,
 };
 
-pub const PredictedPayload = struct {
-    payload: RecordPayload,
-    checkpoint: ?PayloadCheckpoint = null,
+pub const Diagnostic = struct {
+    code: LintCode,
+    message: []const u8,
+    line: u3,
 };
 
-const PayloadCheckpoint = struct {
-    cursor: usize,
-    byte_offset: u64,
-    record_index: u64,
-    machine: Machine,
-    record_offsets: RecordOffsets,
+pub fn diagnostic(err: Error) Diagnostic {
+    return switch (err) {
+        error.S001InvalidPlusLine => .{
+            .code = .s001_invalid_plus_line,
+            .message = "plus line must start with '+'",
+            .line = 3,
+        },
+        error.S003InvalidHeader => .{
+            .code = .s003_invalid_header,
+            .message = "header line must start with '@' and contain a nonempty identifier",
+            .line = 1,
+        },
+        error.S005LengthMismatch => .{
+            .code = .s005_length_mismatch,
+            .message = "sequence and quality lengths differ",
+            .line = 4,
+        },
+    };
+}
 
-    pub fn reread(self: PayloadCheckpoint, reader: *Reader) ReaderError!RecordPayload {
-        reader.cursor = self.cursor;
-        reader.byte_offset = self.byte_offset;
-        reader.record_index = self.record_index;
-        reader.machine = self.machine;
-        reader.record_offsets = self.record_offsets;
-        return (try reader.nextPayload()).?;
+pub fn truncatedMessage(line: u3) []const u8 {
+    return switch (line) {
+        2 => "unexpected end of file in sequence line",
+        3 => "unexpected end of file in plus line",
+        4 => "unexpected end of file in quality line",
+        else => "unexpected end of file in record",
+    };
+}
+
+pub const Machine = struct {
+    expected: ExpectedLine = .header,
+    sequence_len: usize = 0,
+
+    pub fn push(
+        self: *Machine,
+        line_len: usize,
+        first_byte: ?u8,
+        second_byte: ?u8,
+    ) Error!bool {
+        switch (self.expected) {
+            .header => {
+                if (!headerPrefixIsValid(first_byte, second_byte)) {
+                    return error.S003InvalidHeader;
+                }
+                self.expected = .sequence;
+            },
+            .sequence => {
+                self.sequence_len = line_len;
+                self.expected = .plus;
+            },
+            .plus => {
+                if (first_byte != '+') return error.S001InvalidPlusLine;
+                self.expected = .quality;
+            },
+            .quality => {
+                if (line_len != self.sequence_len) return error.S005LengthMismatch;
+                self.expected = .header;
+                return true;
+            },
+        }
+        return false;
+    }
+
+    pub fn missingLine(self: *const Machine) ?u3 {
+        return switch (self.expected) {
+            .header => null,
+            .sequence => 2,
+            .plus => 3,
+            .quality => 4,
+        };
     }
 };
 
-pub const ValidatedHeader = struct {
-    header: []const u8,
-    semantic_error: ?SemanticError,
+/// Excludes one trailing CR; callers check LF termination and handle EOF separately.
+pub fn lineContentLen(line: []const u8) usize {
+    if (line.len > 0 and line[line.len - 1] == '\r') return line.len - 1;
+    return line.len;
+}
+
+pub fn progressAfter(current: u64, amount: usize) error{ArithmeticLimit}!u64 {
+    const amount_u64 = std.math.cast(u64, amount) orelse return error.ArithmeticLimit;
+    return std.math.add(u64, current, amount_u64) catch error.ArithmeticLimit;
+}
+
+pub fn headerPrefixIsValid(first_byte: ?u8, identifier_first_byte: ?u8) bool {
+    return first_byte == '@' and identifierFirstByteIsValid(identifier_first_byte);
+}
+
+fn identifierFirstByteIsValid(byte: ?u8) bool {
+    return byte != null and byte != ' ' and byte != '\t';
+}
+
+const STRUCTURAL_BLOCK_BYTES = 64;
+
+pub fn newlineMask(comptime lanes: usize, block: *const [lanes]u8) @Int(.unsigned, lanes) {
+    const Bytes = @Vector(lanes, u8);
+    const bytes: Bytes = block.*;
+    return @bitCast(bytes == @as(Bytes, @splat('\n')));
+}
+
+// Saved positions remain valid only while the buffer's bytes and indexes stay unchanged.
+const LineFeedSearch = struct {
+    block_start: usize = 0,
+    block_end: usize = 0,
+    mask: @Int(.unsigned, @max(64, std.simd.suggestVectorLength(u8) orelse 1)) = 0,
+
+    fn find(self: *LineFeedSearch, comptime lanes: usize, bytes: []const u8, start: usize) ?usize {
+        var offset = start;
+        if (start >= self.block_start and start < self.block_end and self.block_end <= bytes.len) {
+            const remaining = self.mask >> @intCast(start - self.block_start);
+            if (remaining != 0) return start + @as(usize, @intCast(@ctz(remaining)));
+            offset = self.block_end;
+        }
+
+        while (bytes.len - offset >= lanes) : (offset += lanes) {
+            self.block_start = offset;
+            self.block_end = offset + lanes;
+            self.mask = newlineMask(lanes, bytes[offset..][0..lanes]);
+            if (self.mask != 0) return offset + @as(usize, @intCast(@ctz(self.mask)));
+        }
+        for (bytes[offset..], offset..) |byte, index| {
+            if (byte == '\n') return index;
+        }
+        return null;
+    }
+
+    fn findLines(
+        self: *LineFeedSearch,
+        comptime line_count: usize,
+        bytes: []const u8,
+        start: usize,
+        ends: *[line_count]usize,
+    ) bool {
+        var offset = start;
+        for (ends) |*end| {
+            const line_end = self.find(std.simd.suggestVectorLength(u8) orelse 1, bytes, offset) orelse
+                return false;
+            end.* = line_end - start;
+            offset = line_end + 1;
+        }
+        return true;
+    }
 };
 
-pub const ValidatedRecord = struct {
-    record: Record,
-    canonical_span: ?[]const u8,
-    semantic_error: ?SemanticError,
-};
+// --- Semantic validation ---
 
 pub const Alphabet = enum {
     iupac,
@@ -469,49 +647,235 @@ fn alphabetAccepts(alphabet: Alphabet, byte: u8) bool {
     };
 }
 
-/// Independently allocated fields released together by `deinit`.
-pub const OwnedRecord = struct {
-    allocator: std.mem.Allocator,
-    header: []u8,
-    id: []u8,
-    sequence: []u8,
-    plus: []u8,
-    quality: []u8,
-
-    pub fn deinit(self: *OwnedRecord) void {
-        self.allocator.free(self.header);
-        self.allocator.free(self.id);
-        self.allocator.free(self.sequence);
-        self.allocator.free(self.plus);
-        self.allocator.free(self.quality);
-        self.* = undefined;
-    }
+const SequenceLineScan = union(enum) {
+    line_end: usize,
+    invalid_start: usize,
+    incomplete,
 };
 
-fn firstToken(header: []const u8) []const u8 {
-    const end = std.mem.findAny(u8, header, "\t ") orelse header.len;
-    return header[0..end];
+fn firstInvalidCheckSequence(
+    sequence: []const u8,
+    alphabet: Alphabet,
+    use_full_iupac: *bool,
+) ?usize {
+    return switch (alphabet) {
+        .acgtn => firstInvalidSequence(sequence, .acgtn),
+        .iupac => if (use_full_iupac.*)
+            firstInvalidSequence(sequence, .iupac)
+        else
+            firstInvalidNarrowIupacSequence(sequence, use_full_iupac),
+    };
 }
 
-/// Duplicates all record fields; the caller must invoke `OwnedRecord.deinit`.
-pub fn toOwned(allocator: std.mem.Allocator, record: Record) !OwnedRecord {
-    const header = try allocator.dupe(u8, record.header);
-    errdefer allocator.free(header);
-    const id = try allocator.dupe(u8, record.id);
-    errdefer allocator.free(id);
-    const sequence = try allocator.dupe(u8, record.sequence);
-    errdefer allocator.free(sequence);
-    const plus = try allocator.dupe(u8, record.plus);
-    errdefer allocator.free(plus);
-    const quality = try allocator.dupe(u8, record.quality);
-    errdefer allocator.free(quality);
+fn firstInvalidNarrowIupacSequence(
+    sequence: []const u8,
+    use_full_iupac: *bool,
+) ?usize {
+    return switch (scanSequenceLineFor(.acgtn, sequence, false)) {
+        .incomplete => null,
+        .line_end => |line_end| line_end,
+        .invalid_start => |start| switch (scanSequenceLineFor(
+            .iupac,
+            sequence[start..],
+            false,
+        )) {
+            .incomplete => result: {
+                use_full_iupac.* = true;
+                break :result null;
+            },
+            .line_end => |line_end| start + line_end,
+            .invalid_start => firstInvalidSequenceScalar(
+                sequence[start..],
+                .iupac,
+                start,
+            ),
+        },
+    };
+}
+
+fn firstValidCheckSequenceLineEnd(
+    bytes: []const u8,
+    alphabet: Alphabet,
+    use_full_iupac: *bool,
+) ?usize {
+    return switch (alphabet) {
+        .acgtn => firstValidSequenceLineEndFor(.acgtn, bytes),
+        .iupac => if (use_full_iupac.*)
+            firstValidSequenceLineEndFor(.iupac, bytes)
+        else
+            firstValidNarrowIupacSequenceLineEnd(bytes, use_full_iupac),
+    };
+}
+
+fn firstValidNarrowIupacSequenceLineEnd(
+    bytes: []const u8,
+    use_full_iupac: *bool,
+) ?usize {
+    return switch (scanSequenceLineFor(.acgtn, bytes, true)) {
+        .line_end => |line_end| line_end,
+        .incomplete => null,
+        .invalid_start => |start| switch (scanSequenceLineFor(.iupac, bytes[start..], true)) {
+            .line_end => |line_end| result: {
+                use_full_iupac.* = true;
+                break :result start + line_end;
+            },
+            .incomplete => result: {
+                use_full_iupac.* = true;
+                break :result null;
+            },
+            .invalid_start => null,
+        },
+    };
+}
+
+fn firstValidSequenceLineEndFor(
+    comptime alphabet: Alphabet,
+    bytes: []const u8,
+) ?usize {
+    return switch (scanSequenceLineFor(alphabet, bytes, true)) {
+        .line_end => |line_end| line_end,
+        .invalid_start, .incomplete => null,
+    };
+}
+
+fn scanSequenceLineFor(
+    comptime alphabet: Alphabet,
+    bytes: []const u8,
+    comptime allow_crlf: bool,
+) SequenceLineScan {
+    const Bytes = @Vector(STRUCTURAL_BLOCK_BYTES, u8);
+    var block_start: usize = 0;
+    while (bytes.len - block_start >= STRUCTURAL_BLOCK_BYTES) {
+        const block: Bytes = bytes[block_start..][0..STRUCTURAL_BLOCK_BYTES].*;
+        const invalid: u64 = @bitCast(invalidSequenceVector(
+            STRUCTURAL_BLOCK_BYTES,
+            alphabet,
+            block,
+        ));
+        if (invalid != 0) {
+            const stop = block_start + @as(usize, @intCast(@ctz(invalid)));
+            if (bytes[stop] == '\n') return .{ .line_end = stop };
+            if (allow_crlf and bytes[stop] == '\r' and
+                stop + 1 < bytes.len and bytes[stop + 1] == '\n')
+            {
+                return .{ .line_end = stop + 1 };
+            }
+            return .{ .invalid_start = block_start };
+        }
+        block_start += STRUCTURAL_BLOCK_BYTES;
+    }
+    for (bytes[block_start..], block_start..) |byte, byte_index| {
+        if (byte == '\n') return .{ .line_end = byte_index };
+        if (allow_crlf and byte == '\r' and
+            byte_index + 1 < bytes.len and bytes[byte_index + 1] == '\n')
+        {
+            return .{ .line_end = byte_index + 1 };
+        }
+        if (!alphabetAccepts(alphabet, byte)) return .{ .invalid_start = byte_index };
+    }
+    return .incomplete;
+}
+
+fn classifySemanticBytes(
+    comptime field: SemanticField,
+    alphabet: Alphabet,
+    use_full_iupac: *bool,
+    failure: *?usize,
+    bytes: []const u8,
+    start_index: usize,
+) error{ArithmeticLimit}!void {
+    if (failure.* != null) return;
+    const relative = switch (field) {
+        .sequence => firstInvalidCheckSequence(bytes, alphabet, use_full_iupac),
+        .quality => firstInvalidQuality(bytes),
+    } orelse return;
+    failure.* = std.math.add(usize, start_index, relative) catch
+        return error.ArithmeticLimit;
+}
+
+fn classifySemanticByte(
+    comptime field: SemanticField,
+    alphabet: Alphabet,
+    use_full_iupac: *bool,
+    failure: *?usize,
+    byte: u8,
+    byte_index: usize,
+) void {
+    if (failure.* != null) return;
+    switch (field) {
+        .sequence => {
+            if (alphabet == .acgtn or use_full_iupac.*) {
+                if (!alphabetAccepts(alphabet, byte)) failure.* = byte_index;
+                return;
+            }
+            if (alphabetAccepts(.acgtn, byte)) return;
+            if (alphabetAccepts(.iupac, byte)) {
+                use_full_iupac.* = true;
+                return;
+            }
+            failure.* = byte_index;
+        },
+        .quality => {
+            _ = decodePhred33(byte) catch {
+                failure.* = byte_index;
+            };
+        },
+    }
+}
+
+// --- Buffered record validation ---
+
+const CompleteRecord = struct {
+    line_ends: [4]usize,
+    use_full_iupac: bool,
+};
+
+fn scanCompleteRecord(
+    buffer: []const u8,
+    start: usize,
+    line_feeds: *LineFeedSearch,
+    max_line_bytes: usize,
+    alphabet: Alphabet,
+    initial_full_iupac: bool,
+) ?CompleteRecord {
+    const data = buffer[start..];
+    const header_end = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start) orelse return null) - start;
+    const header_len = lineContentLen(data[0..header_end]);
+    const header = data[0..header_len];
+    if (header.len > max_line_bytes) return null;
+    if (!headerPrefixIsValid(
+        if (header.len == 0) null else header[0],
+        if (header.len < 2) null else header[1],
+    )) return null;
+
+    const sequence_start = header_end + 1;
+    var use_full_iupac = initial_full_iupac;
+    const sequence_raw_len = firstValidCheckSequenceLineEnd(
+        data[sequence_start..],
+        alphabet,
+        &use_full_iupac,
+    ) orelse return null;
+    const sequence_len = lineContentLen(data[sequence_start..][0..sequence_raw_len]);
+    if (sequence_len > max_line_bytes) return null;
+
+    const plus_start = sequence_start + sequence_raw_len + 1;
+    const plus_raw_len = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start + plus_start) orelse
+        return null) - start - plus_start;
+    const plus_len = lineContentLen(data[plus_start..][0..plus_raw_len]);
+    const plus = data[plus_start..][0..plus_len];
+    if (plus.len > max_line_bytes) return null;
+    if (plus.len == 0 or plus[0] != '+') return null;
+
+    const quality_start = plus_start + plus_raw_len + 1;
+    if (sequence_len >= data.len - quality_start) return null;
+    const quality_end = quality_start + sequence_len;
+    const quality_lf = quality_end + @intFromBool(data[quality_end] == '\r');
+    if (quality_lf >= data.len or data[quality_lf] != '\n') return null;
+    if (firstInvalidQuality(data[quality_start..quality_end]) != null) return null;
+
     return .{
-        .allocator = allocator,
-        .header = header,
-        .id = id,
-        .sequence = sequence,
-        .plus = plus,
-        .quality = quality,
+        .line_ends = .{ header_end, plus_start - 1, quality_start - 1, quality_lf },
+        .use_full_iupac = use_full_iupac,
     };
 }
 
@@ -660,17 +1024,6 @@ const FallbackField = struct {
     len: usize = 0,
 };
 
-pub const RetainedRecordStorage = struct {
-    fields: [4]FallbackField = .{ .{}, .{}, .{}, .{} },
-
-    pub fn deinit(self: *RetainedRecordStorage, allocator: std.mem.Allocator) void {
-        for (self.fields) |field| {
-            if (field.storage.len != 0) allocator.free(field.storage);
-        }
-        self.* = undefined;
-    }
-};
-
 const BufferedRecord = struct {
     bytes: []const u8,
     ranges: [4]Range,
@@ -703,56 +1056,16 @@ fn BufferedRecordResult(comptime projection: BufferedProjection) type {
     };
 }
 
-// Saved positions remain valid only while the buffer's bytes and indexes stay unchanged.
-const LineFeedSearch = struct {
-    block_start: usize = 0,
-    block_end: usize = 0,
-    mask: @Int(.unsigned, @max(64, std.simd.suggestVectorLength(u8) orelse 1)) = 0,
-
-    fn find(self: *LineFeedSearch, comptime lanes: usize, bytes: []const u8, start: usize) ?usize {
-        var offset = start;
-        if (start >= self.block_start and start < self.block_end and self.block_end <= bytes.len) {
-            const remaining = self.mask >> @intCast(start - self.block_start);
-            if (remaining != 0) return start + @as(usize, @intCast(@ctz(remaining)));
-            offset = self.block_end;
-        }
-
-        while (bytes.len - offset >= lanes) : (offset += lanes) {
-            self.block_start = offset;
-            self.block_end = offset + lanes;
-            self.mask = newlineMask(lanes, bytes[offset..][0..lanes]);
-            if (self.mask != 0) return offset + @as(usize, @intCast(@ctz(self.mask)));
-        }
-        for (bytes[offset..], offset..) |byte, index| {
-            if (byte == '\n') return index;
-        }
-        return null;
-    }
-
-    fn findLines(
-        self: *LineFeedSearch,
-        comptime line_count: usize,
-        bytes: []const u8,
-        start: usize,
-        ends: *[line_count]usize,
-    ) bool {
-        var offset = start;
-        for (ends) |*end| {
-            const line_end = self.find(std.simd.suggestVectorLength(u8) orelse 1, bytes, offset) orelse
-                return false;
-            end.* = line_end - start;
-            offset = line_end + 1;
-        }
-        return true;
-    }
-};
-
 pub const RecordOffsets = struct {
     header: u64,
     sequence: u64,
     plus: u64,
     quality: u64,
 };
+
+fn fieldStorageLimit(max_line_bytes: usize) usize {
+    return std.math.add(usize, max_line_bytes, 1) catch std.math.maxInt(usize);
+}
 
 /// Streaming parser constructed with `init`; fields are implementation state.
 /// The copied source wrapper's referenced adapter must outlive the reader.
@@ -890,7 +1203,7 @@ pub const Reader = struct {
         };
     }
 
-    fn nextPayload(self: *Reader) ReaderError!?RecordPayload {
+    fn readPayload(self: *Reader) ReaderError!?RecordPayload {
         self.beginRecord();
         switch (try self.readBufferedRecord(.payload, false, null, false)) {
             .incomplete => return self.nextFallbackPayload(),
@@ -905,7 +1218,7 @@ pub const Reader = struct {
         }
     }
 
-    fn nextPredictedPayload(self: *Reader) ReaderError!?PredictedPayload {
+    fn readPredictedPayload(self: *Reader) ReaderError!?PredictedPayload {
         self.beginRecord();
         switch (try self.readBufferedRecord(.predicted_payload, false, null, false)) {
             .incomplete => return if (try self.nextFallbackPayload()) |payload|
@@ -926,7 +1239,7 @@ pub const Reader = struct {
         }
     }
 
-    fn nextValidatedHeader(
+    fn readValidatedHeader(
         self: *Reader,
         validator: *AdaptiveRecordValidator,
     ) ReaderError!?ValidatedHeader {
@@ -1675,6 +1988,57 @@ pub const Reader = struct {
     }
 };
 
+// --- Record delivery ---
+
+pub const RecordPayload = struct {
+    sequence: []const u8,
+    quality: []const u8,
+};
+
+pub const PredictedPayload = struct {
+    payload: RecordPayload,
+    checkpoint: ?PayloadCheckpoint = null,
+};
+
+const PayloadCheckpoint = struct {
+    cursor: usize,
+    byte_offset: u64,
+    record_index: u64,
+    machine: Machine,
+    record_offsets: RecordOffsets,
+
+    pub fn reread(self: PayloadCheckpoint, reader: *Reader) ReaderError!RecordPayload {
+        reader.cursor = self.cursor;
+        reader.byte_offset = self.byte_offset;
+        reader.record_index = self.record_index;
+        reader.machine = self.machine;
+        reader.record_offsets = self.record_offsets;
+        return (try reader.readPayload()).?;
+    }
+};
+
+pub const ValidatedHeader = struct {
+    header: []const u8,
+    semantic_error: ?SemanticError,
+};
+
+pub const ValidatedRecord = struct {
+    record: Record,
+    canonical_span: ?[]const u8,
+    semantic_error: ?SemanticError,
+};
+
+pub const RetainedRecordStorage = struct {
+    fields: [4]FallbackField = .{ .{}, .{}, .{}, .{} },
+
+    pub fn deinit(self: *RetainedRecordStorage, allocator: std.mem.Allocator) void {
+        for (self.fields) |field| {
+            if (field.storage.len != 0) allocator.free(field.storage);
+        }
+        self.* = undefined;
+    }
+};
+
 pub fn initBorrowedGzipReader(
     allocator: std.mem.Allocator,
     source: *io_layer.GzipSource,
@@ -1686,15 +2050,35 @@ pub fn initBorrowedGzipReader(
     return reader;
 }
 
-fn fieldStorageLimit(max_line_bytes: usize) usize {
-    return std.math.add(usize, max_line_bytes, 1) catch std.math.maxInt(usize);
-}
-
-pub fn nextWithoutId(
+/// Leaves id empty; canonical_span is null when the record needs field-by-field output.
+pub fn nextWithSpan(
     reader: *Reader,
     canonical_span: *?[]const u8,
 ) ReaderError!?Record {
     return reader.nextWithCanonicalSpan(canonical_span, false);
+}
+
+/// Leaves id empty and does not prepare a canonical output span.
+pub fn nextRecordFields(reader: *Reader) ReaderError!?Record {
+    var unused_canonical_span: ?[]const u8 = null;
+    return reader.nextRecord(&unused_canonical_span, false, false);
+}
+
+pub fn nextPayload(reader: *Reader) ReaderError!?RecordPayload {
+    return reader.readPayload();
+}
+
+/// Validate predicted quality as Phred+33 before advancing the reader again.
+/// On rejection, reread from the checkpoint to recover structural errors first.
+pub fn nextPredictedPayload(reader: *Reader) ReaderError!?PredictedPayload {
+    return reader.readPredictedPayload();
+}
+
+pub fn nextValidatedHeader(
+    reader: *Reader,
+    validator: *AdaptiveRecordValidator,
+) ReaderError!?ValidatedHeader {
+    return reader.readValidatedHeader(validator);
 }
 
 pub fn nextValidatedRecord(
@@ -1722,40 +2106,15 @@ fn finishValidatedRecord(
     };
 }
 
-pub fn nextRecordWithoutId(reader: *Reader) ReaderError!?Record {
-    var unused_canonical_span: ?[]const u8 = null;
-    return reader.nextRecord(&unused_canonical_span, false, false);
-}
-
-pub fn nextPayload(reader: *Reader) ReaderError!?RecordPayload {
-    return reader.nextPayload();
-}
-
-/// Validate predicted quality as Phred+33 before advancing the reader again.
-/// On rejection, reread from the checkpoint to recover structural errors first.
-pub fn nextPredictedPayload(reader: *Reader) ReaderError!?PredictedPayload {
-    return reader.nextPredictedPayload();
-}
-
-pub fn nextValidatedHeader(
-    reader: *Reader,
-    validator: *AdaptiveRecordValidator,
-) ReaderError!?ValidatedHeader {
-    return reader.nextValidatedHeader(validator);
-}
-
-pub fn nextBufferedWithoutId(
+/// Never refills; null means no complete buffered record. Leaves id empty.
+pub fn nextBufferedWithSpan(
     reader: *Reader,
     canonical_span: *?[]const u8,
 ) ReaderError!?Record {
     return nextBufferedRecord(reader, canonical_span, true);
 }
 
-pub fn nextBufferedRecordWithoutId(reader: *Reader) ReaderError!?Record {
-    var unused_canonical_span: ?[]const u8 = null;
-    return nextBufferedRecord(reader, &unused_canonical_span, false);
-}
-
+/// Never refills; null means no complete buffered record.
 pub fn nextBufferedValidatedRecord(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
@@ -1768,9 +2127,28 @@ pub fn nextBufferedValidatedRecord(
     };
 }
 
-/// Updates mate 1's views when moving it; both mates borrow until the next advance.
+fn nextBufferedRecord(
+    reader: *Reader,
+    canonical_span: *?[]const u8,
+    comptime include_canonical_span: bool,
+) ReaderError!?Record {
+    canonical_span.* = null;
+    reader.beginRecord();
+    if (reader.cursor == reader.fill_end) return null;
+    return switch (try reader.readBufferedRecord(.full, include_canonical_span, null, false)) {
+        .incomplete => null,
+        .eof => unreachable,
+        .record => |buffered| reader.finishBufferedRecord(
+            buffered,
+            canonical_span,
+            false,
+        ),
+    };
+}
+
+/// May refill and update mate 1's views; both mates borrow until the next advance.
 /// On null, preserve the updated mate 1 before continuing with ordinary reads.
-pub fn nextPairedValidatedRecord(
+pub fn nextValidatedMatePreservingRecord(
     reader: *Reader,
     first: *ValidatedRecord,
     validator: *AdaptiveRecordValidator,
@@ -1818,9 +2196,9 @@ pub fn nextPairedValidatedRecord(
     return nextSavedPairMate(reader, size, validator);
 }
 
-/// Keeps only mate 1's updated header alive through the mate-2 read.
+/// May refill while keeping only mate 1's updated header alive through the mate-2 read.
 /// On null, preserve that header before continuing with ordinary reads.
-pub fn nextPairedValidatedHeader(
+pub fn nextValidatedMatePreservingHeader(
     reader: *Reader,
     first_header: *[]const u8,
     validator: *AdaptiveRecordValidator,
@@ -1844,25 +2222,6 @@ fn nextSavedPairMate(
     const buffered = try reader.readSavedRecord(bytes, .validated, true, validator);
     std.debug.assert(buffered == .record);
     return finishValidatedRecord(reader, buffered.record);
-}
-
-fn nextBufferedRecord(
-    reader: *Reader,
-    canonical_span: *?[]const u8,
-    comptime include_canonical_span: bool,
-) ReaderError!?Record {
-    canonical_span.* = null;
-    reader.beginRecord();
-    if (reader.cursor == reader.fill_end) return null;
-    return switch (try reader.readBufferedRecord(.full, include_canonical_span, null, false)) {
-        .incomplete => null,
-        .eof => unreachable,
-        .record => |buffered| reader.finishBufferedRecord(
-            buffered,
-            canonical_span,
-            false,
-        ),
-    };
 }
 
 pub fn retainFallbackRecordStorage(
@@ -1895,7 +2254,8 @@ pub fn restoreFallbackRecordStorage(
     std.mem.swap([4]FallbackField, &reader.fallback_fields, &retained.fields);
 }
 
-pub fn nextBufferedAfterFallbackTransfer(
+/// May refill after field storage moves out; on null, continue with the fallback read.
+pub fn nextValidatedAfterFallbackTransfer(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
 ) ReaderError!?ValidatedRecord {
@@ -1987,362 +2347,13 @@ fn isWritableField(bytes: []const u8) bool {
         (bytes.len == 0 or bytes[bytes.len - 1] != '\r');
 }
 
-// --- Structural validation ---
-
-pub const ExpectedLine = enum {
-    header,
-    sequence,
-    plus,
-    quality,
-};
-
-pub const Error = error{
-    S001InvalidPlusLine,
-    S003InvalidHeader,
-    S005LengthMismatch,
-};
-
-pub const Diagnostic = struct {
-    code: LintCode,
-    message: []const u8,
-    line: u3,
-};
-
-pub fn diagnostic(err: Error) Diagnostic {
-    return switch (err) {
-        error.S001InvalidPlusLine => .{
-            .code = .s001_invalid_plus_line,
-            .message = "plus line must start with '+'",
-            .line = 3,
-        },
-        error.S003InvalidHeader => .{
-            .code = .s003_invalid_header,
-            .message = "header line must start with '@' and contain a nonempty identifier",
-            .line = 1,
-        },
-        error.S005LengthMismatch => .{
-            .code = .s005_length_mismatch,
-            .message = "sequence and quality lengths differ",
-            .line = 4,
-        },
-    };
-}
-
-pub fn truncatedMessage(line: u3) []const u8 {
-    return switch (line) {
-        2 => "unexpected end of file in sequence line",
-        3 => "unexpected end of file in plus line",
-        4 => "unexpected end of file in quality line",
-        else => "unexpected end of file in record",
-    };
-}
-
-pub const Machine = struct {
-    expected: ExpectedLine = .header,
-    sequence_len: usize = 0,
-
-    pub fn push(
-        self: *Machine,
-        line_len: usize,
-        first_byte: ?u8,
-        second_byte: ?u8,
-    ) Error!bool {
-        switch (self.expected) {
-            .header => {
-                if (!headerPrefixIsValid(first_byte, second_byte)) {
-                    return error.S003InvalidHeader;
-                }
-                self.expected = .sequence;
-            },
-            .sequence => {
-                self.sequence_len = line_len;
-                self.expected = .plus;
-            },
-            .plus => {
-                if (first_byte != '+') return error.S001InvalidPlusLine;
-                self.expected = .quality;
-            },
-            .quality => {
-                if (line_len != self.sequence_len) return error.S005LengthMismatch;
-                self.expected = .header;
-                return true;
-            },
-        }
-        return false;
-    }
-
-    pub fn missingLine(self: *const Machine) ?u3 {
-        return switch (self.expected) {
-            .header => null,
-            .sequence => 2,
-            .plus => 3,
-            .quality => 4,
-        };
-    }
-};
-
-/// Excludes one trailing CR; callers check LF termination and handle EOF separately.
-pub fn lineContentLen(line: []const u8) usize {
-    if (line.len > 0 and line[line.len - 1] == '\r') return line.len - 1;
-    return line.len;
-}
-
-pub fn progressAfter(current: u64, amount: usize) error{ArithmeticLimit}!u64 {
-    const amount_u64 = std.math.cast(u64, amount) orelse return error.ArithmeticLimit;
-    return std.math.add(u64, current, amount_u64) catch error.ArithmeticLimit;
-}
-
-pub fn headerPrefixIsValid(first_byte: ?u8, identifier_first_byte: ?u8) bool {
-    return first_byte == '@' and identifierFirstByteIsValid(identifier_first_byte);
-}
-
-fn identifierFirstByteIsValid(byte: ?u8) bool {
-    return byte != null and byte != ' ' and byte != '\t';
-}
+// --- Check scanner ---
 
 pub const CheckScannerError = error{
     Format,
     LineTooLong,
     ArithmeticLimit,
 };
-
-const STRUCTURAL_BLOCK_BYTES = 64;
-
-pub fn newlineMask(comptime lanes: usize, block: *const [lanes]u8) @Int(.unsigned, lanes) {
-    const Bytes = @Vector(lanes, u8);
-    const bytes: Bytes = block.*;
-    return @bitCast(bytes == @as(Bytes, @splat('\n')));
-}
-
-const SequenceLineScan = union(enum) {
-    line_end: usize,
-    invalid_start: usize,
-    incomplete,
-};
-
-fn firstInvalidCheckSequence(
-    sequence: []const u8,
-    alphabet: Alphabet,
-    use_full_iupac: *bool,
-) ?usize {
-    return switch (alphabet) {
-        .acgtn => firstInvalidSequence(sequence, .acgtn),
-        .iupac => if (use_full_iupac.*)
-            firstInvalidSequence(sequence, .iupac)
-        else
-            firstInvalidNarrowIupacSequence(sequence, use_full_iupac),
-    };
-}
-
-fn firstInvalidNarrowIupacSequence(
-    sequence: []const u8,
-    use_full_iupac: *bool,
-) ?usize {
-    return switch (scanSequenceLineFor(.acgtn, sequence, false)) {
-        .incomplete => null,
-        .line_end => |line_end| line_end,
-        .invalid_start => |start| switch (scanSequenceLineFor(
-            .iupac,
-            sequence[start..],
-            false,
-        )) {
-            .incomplete => result: {
-                use_full_iupac.* = true;
-                break :result null;
-            },
-            .line_end => |line_end| start + line_end,
-            .invalid_start => firstInvalidSequenceScalar(
-                sequence[start..],
-                .iupac,
-                start,
-            ),
-        },
-    };
-}
-
-fn firstValidCheckSequenceLineEnd(
-    bytes: []const u8,
-    alphabet: Alphabet,
-    use_full_iupac: *bool,
-) ?usize {
-    return switch (alphabet) {
-        .acgtn => firstValidSequenceLineEndFor(.acgtn, bytes),
-        .iupac => if (use_full_iupac.*)
-            firstValidSequenceLineEndFor(.iupac, bytes)
-        else
-            firstValidNarrowIupacSequenceLineEnd(bytes, use_full_iupac),
-    };
-}
-
-fn firstValidNarrowIupacSequenceLineEnd(
-    bytes: []const u8,
-    use_full_iupac: *bool,
-) ?usize {
-    return switch (scanSequenceLineFor(.acgtn, bytes, true)) {
-        .line_end => |line_end| line_end,
-        .incomplete => null,
-        .invalid_start => |start| switch (scanSequenceLineFor(.iupac, bytes[start..], true)) {
-            .line_end => |line_end| result: {
-                use_full_iupac.* = true;
-                break :result start + line_end;
-            },
-            .incomplete => result: {
-                use_full_iupac.* = true;
-                break :result null;
-            },
-            .invalid_start => null,
-        },
-    };
-}
-
-fn firstValidSequenceLineEndFor(
-    comptime alphabet: Alphabet,
-    bytes: []const u8,
-) ?usize {
-    return switch (scanSequenceLineFor(alphabet, bytes, true)) {
-        .line_end => |line_end| line_end,
-        .invalid_start, .incomplete => null,
-    };
-}
-
-fn scanSequenceLineFor(
-    comptime alphabet: Alphabet,
-    bytes: []const u8,
-    comptime allow_crlf: bool,
-) SequenceLineScan {
-    const Bytes = @Vector(STRUCTURAL_BLOCK_BYTES, u8);
-    var block_start: usize = 0;
-    while (bytes.len - block_start >= STRUCTURAL_BLOCK_BYTES) {
-        const block: Bytes = bytes[block_start..][0..STRUCTURAL_BLOCK_BYTES].*;
-        const invalid: u64 = @bitCast(invalidSequenceVector(
-            STRUCTURAL_BLOCK_BYTES,
-            alphabet,
-            block,
-        ));
-        if (invalid != 0) {
-            const stop = block_start + @as(usize, @intCast(@ctz(invalid)));
-            if (bytes[stop] == '\n') return .{ .line_end = stop };
-            if (allow_crlf and bytes[stop] == '\r' and
-                stop + 1 < bytes.len and bytes[stop + 1] == '\n')
-            {
-                return .{ .line_end = stop + 1 };
-            }
-            return .{ .invalid_start = block_start };
-        }
-        block_start += STRUCTURAL_BLOCK_BYTES;
-    }
-    for (bytes[block_start..], block_start..) |byte, byte_index| {
-        if (byte == '\n') return .{ .line_end = byte_index };
-        if (allow_crlf and byte == '\r' and
-            byte_index + 1 < bytes.len and bytes[byte_index + 1] == '\n')
-        {
-            return .{ .line_end = byte_index + 1 };
-        }
-        if (!alphabetAccepts(alphabet, byte)) return .{ .invalid_start = byte_index };
-    }
-    return .incomplete;
-}
-
-fn classifySemanticBytes(
-    comptime field: SemanticField,
-    alphabet: Alphabet,
-    use_full_iupac: *bool,
-    failure: *?usize,
-    bytes: []const u8,
-    start_index: usize,
-) error{ArithmeticLimit}!void {
-    if (failure.* != null) return;
-    const relative = switch (field) {
-        .sequence => firstInvalidCheckSequence(bytes, alphabet, use_full_iupac),
-        .quality => firstInvalidQuality(bytes),
-    } orelse return;
-    failure.* = std.math.add(usize, start_index, relative) catch
-        return error.ArithmeticLimit;
-}
-
-fn classifySemanticByte(
-    comptime field: SemanticField,
-    alphabet: Alphabet,
-    use_full_iupac: *bool,
-    failure: *?usize,
-    byte: u8,
-    byte_index: usize,
-) void {
-    if (failure.* != null) return;
-    switch (field) {
-        .sequence => {
-            if (alphabet == .acgtn or use_full_iupac.*) {
-                if (!alphabetAccepts(alphabet, byte)) failure.* = byte_index;
-                return;
-            }
-            if (alphabetAccepts(.acgtn, byte)) return;
-            if (alphabetAccepts(.iupac, byte)) {
-                use_full_iupac.* = true;
-                return;
-            }
-            failure.* = byte_index;
-        },
-        .quality => {
-            _ = decodePhred33(byte) catch {
-                failure.* = byte_index;
-            };
-        },
-    }
-}
-
-const CompleteRecord = struct {
-    line_ends: [4]usize,
-    use_full_iupac: bool,
-};
-
-fn scanCompleteRecord(
-    buffer: []const u8,
-    start: usize,
-    line_feeds: *LineFeedSearch,
-    max_line_bytes: usize,
-    alphabet: Alphabet,
-    initial_full_iupac: bool,
-) ?CompleteRecord {
-    const data = buffer[start..];
-    const header_end = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start) orelse return null) - start;
-    const header_len = lineContentLen(data[0..header_end]);
-    const header = data[0..header_len];
-    if (header.len > max_line_bytes) return null;
-    if (!headerPrefixIsValid(
-        if (header.len == 0) null else header[0],
-        if (header.len < 2) null else header[1],
-    )) return null;
-
-    const sequence_start = header_end + 1;
-    var use_full_iupac = initial_full_iupac;
-    const sequence_raw_len = firstValidCheckSequenceLineEnd(
-        data[sequence_start..],
-        alphabet,
-        &use_full_iupac,
-    ) orelse return null;
-    const sequence_len = lineContentLen(data[sequence_start..][0..sequence_raw_len]);
-    if (sequence_len > max_line_bytes) return null;
-
-    const plus_start = sequence_start + sequence_raw_len + 1;
-    const plus_raw_len = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start + plus_start) orelse
-        return null) - start - plus_start;
-    const plus_len = lineContentLen(data[plus_start..][0..plus_raw_len]);
-    const plus = data[plus_start..][0..plus_len];
-    if (plus.len > max_line_bytes) return null;
-    if (plus.len == 0 or plus[0] != '+') return null;
-
-    const quality_start = plus_start + plus_raw_len + 1;
-    if (sequence_len >= data.len - quality_start) return null;
-    const quality_end = quality_start + sequence_len;
-    const quality_lf = quality_end + @intFromBool(data[quality_end] == '\r');
-    if (quality_lf >= data.len or data[quality_lf] != '\n') return null;
-    if (firstInvalidQuality(data[quality_start..quality_end]) != null) return null;
-
-    return .{
-        .line_ends = .{ header_end, plus_start - 1, quality_start - 1, quality_lf },
-        .use_full_iupac = use_full_iupac,
-    };
-}
 
 pub const CheckScanner = struct {
     max_line_bytes: usize,
@@ -2783,7 +2794,7 @@ fn expectPayloadProjection(
     while (true) {
         const full_result = full_reader.next();
         const payload_result = nextPayload(&payload_reader);
-        const record_result = nextRecordWithoutId(&record_reader);
+        const record_result = nextRecordFields(&record_reader);
         const advance_result = advance_reader.advance();
         const validated_result = nextValidatedHeader(&validated_reader, &projected_validator);
         if (full_result) |full_record| {
@@ -2934,7 +2945,7 @@ fn expectBufferedLineProgress(
                     break :result record.record;
                 }
                 break :result null;
-            } else nextWithoutId(&reader, &span);
+            } else nextWithSpan(&reader, &span);
             if (expected) |record| {
                 try std.testing.expectEqualDeep(record, try actual);
                 if (record) |fields| {
@@ -3220,7 +3231,7 @@ fn expectValidatedProjection(
 
     while (true) {
         var expected_span: ?[]const u8 = null;
-        const expected_result = nextWithoutId(&reference, &expected_span);
+        const expected_result = nextWithSpan(&reference, &expected_span);
         const actual_result = nextValidatedRecord(&reader, &validator);
         var finished = false;
         if (expected_result) |expected_record| {
@@ -3372,9 +3383,9 @@ fn expectPairedRefill(
             defer saved.deinit();
             const expected_second = nextValidatedRecord(&reference, &reference_validator);
             const paired_second = if (header_only)
-                nextPairedValidatedHeader(&reader, &delivered.?.record.header, &validator)
+                nextValidatedMatePreservingHeader(&reader, &delivered.?.record.header, &validator)
             else
-                nextPairedValidatedRecord(&reader, &delivered.?, &validator);
+                nextValidatedMatePreservingRecord(&reader, &delivered.?, &validator);
             const actual_second: ReaderError!?ValidatedRecord = second: {
                 const buffered = paired_second catch |err| break :second err;
                 try std.testing.expectEqualStrings(saved.header, delivered.?.record.header);
@@ -3467,9 +3478,9 @@ test "[property] - [reader]: paired refills retain oversized and EOF fallbacks" 
                 var validator = AdaptiveRecordValidator.init(.{});
                 var mate1 = (try nextValidatedRecord(&reader, &validator)).?;
                 const mate2 = (try if (header_only)
-                    nextPairedValidatedHeader(&reader, &mate1.record.header, &validator)
+                    nextValidatedMatePreservingHeader(&reader, &mate1.record.header, &validator)
                 else
-                    nextPairedValidatedRecord(&reader, &mate1, &validator)).?;
+                    nextValidatedMatePreservingRecord(&reader, &mate1, &validator)).?;
                 try std.testing.expectEqualStrings("r/1", mate1.record.header);
                 try std.testing.expectEqual(field_len, mate2.record.sequence.len);
                 try std.testing.expectEqualStrings(input[first.len .. first.len + record_len], mate2.canonical_span.?);
@@ -3503,8 +3514,8 @@ test "[failure] - [reader]: lazy refill allocation preserves progress and buffer
         try std.testing.expect(!failing.has_induced_failure);
         const result = switch (delivery) {
             0 => nextValidatedRecord(&reader, &validator),
-            1 => nextPairedValidatedRecord(&reader, &mate1, &validator),
-            2 => nextPairedValidatedHeader(&reader, &mate1.record.header, &validator),
+            1 => nextValidatedMatePreservingRecord(&reader, &mate1, &validator),
+            2 => nextValidatedMatePreservingHeader(&reader, &mate1.record.header, &validator),
             else => unreachable,
         };
         try std.testing.expectError(error.OutOfMemory, result);
@@ -3523,8 +3534,8 @@ test "[failure] - [reader]: lazy refill allocation preserves progress and buffer
         failing.fail_index = std.math.maxInt(usize);
         const mate2 = (try switch (delivery) {
             0 => nextValidatedRecord(&reader, &validator),
-            1 => nextPairedValidatedRecord(&reader, &mate1, &validator),
-            2 => nextPairedValidatedHeader(&reader, &mate1.record.header, &validator),
+            1 => nextValidatedMatePreservingRecord(&reader, &mate1, &validator),
+            2 => nextValidatedMatePreservingHeader(&reader, &mate1.record.header, &validator),
             else => unreachable,
         }).?;
         try std.testing.expectEqualStrings(second, mate2.canonical_span.?);
@@ -3554,7 +3565,7 @@ test "[edge] - [reader]: refill reserve grows from projected fields and retains 
     var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{ .max_line_bytes = 8 });
     defer reader.deinit();
-    const payload = (try reader.nextPayload()).?;
+    const payload = (try reader.readPayload()).?;
     try std.testing.expectEqualStrings("AC", payload.sequence);
     try std.testing.expectEqualStrings("!!", payload.quality);
     try std.testing.expectEqual(@as(usize, 2), reader.fallback_fields[1].storage.len);
@@ -3578,7 +3589,7 @@ test "[edge] - [reader]: refill reserve grows from projected fields and retains 
     source.chunk_limit = 3;
     var mate1 = (try nextValidatedRecord(&reader, &validator)).?;
     const allocations = tracking.allocations;
-    const mate2 = (try nextPairedValidatedRecord(&reader, &mate1, &validator)).?;
+    const mate2 = (try nextValidatedMatePreservingRecord(&reader, &mate1, &validator)).?;
     try std.testing.expectEqualStrings(first, mate1.canonical_span.?);
     try std.testing.expectEqualStrings(second, mate2.canonical_span.?);
     try std.testing.expect(mate1.semantic_error == null and mate2.semantic_error == null);
@@ -3755,7 +3766,7 @@ test "[property] - [reader]: refill retries cover the transport capacity and ove
             defer reader.deinit();
             try std.testing.expect(try reader.advance());
             var span: ?[]const u8 = null;
-            const parsed = (try nextWithoutId(&reader, &span)).?;
+            const parsed = (try nextWithSpan(&reader, &span)).?;
             try std.testing.expectEqual(sequence_len, parsed.sequence.len);
             try std.testing.expectEqual(sequence_len, parsed.quality.len);
             try std.testing.expectEqualStrings(record, span.?);
@@ -3984,7 +3995,7 @@ test "[edge] - [reader]: fallback projections retain only requested fields" {
     );
     defer payload_reader.deinit();
 
-    const payload = (try payload_reader.nextPayload()).?;
+    const payload = (try payload_reader.readPayload()).?;
     try std.testing.expectEqual(field_len, payload.sequence.len);
     try std.testing.expectEqual(field_len, payload.quality.len);
     try std.testing.expectEqual(@as(usize, 0), payload_reader.fallback_fields[0].len);
@@ -4001,7 +4012,7 @@ test "[edge] - [reader]: fallback projections retain only requested fields" {
     defer validated_reader.deinit();
     var validator = AdaptiveRecordValidator.init(.{});
 
-    const validated = (try validated_reader.nextValidatedHeader(&validator)).?;
+    const validated = (try validated_reader.readValidatedHeader(&validator)).?;
     try std.testing.expectEqualStrings("abc", validated.header);
     try std.testing.expect(validated.semantic_error == null);
     try std.testing.expectEqual(@as(usize, 0), validated_reader.fallback_fields[1].storage.len);
@@ -4630,7 +4641,7 @@ test "[property] - [record delivery]: omits identifiers and preserves buffered c
         var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
         defer reader.deinit();
         var canonical_span: ?[]const u8 = null;
-        const record = (try nextWithoutId(&reader, &canonical_span)).?;
+        const record = (try nextWithSpan(&reader, &canonical_span)).?;
         try std.testing.expect(validateRecord(record, .{}) == null);
         try std.testing.expectEqual(@as(usize, 0), record.id.len);
         try std.testing.expectEqual(case.has_span, canonical_span != null);
@@ -4645,7 +4656,7 @@ test "[property] - [record delivery]: omits identifiers and preserves buffered c
             try writeRecordFields(&writer, record);
         }
         try std.testing.expectEqualStrings(case.expected_output, sink.written());
-        try std.testing.expect((try nextWithoutId(&reader, &canonical_span)) == null);
+        try std.testing.expect((try nextWithSpan(&reader, &canonical_span)) == null);
         try std.testing.expect(canonical_span == null);
     }
 
@@ -4657,9 +4668,9 @@ test "[property] - [record delivery]: omits identifiers and preserves buffered c
         var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
         defer reader.deinit();
         var canonical_span1: ?[]const u8 = null;
-        const record1 = (try nextWithoutId(&reader, &canonical_span1)).?;
+        const record1 = (try nextWithSpan(&reader, &canonical_span1)).?;
         var canonical_span2: ?[]const u8 = null;
-        const record2 = (try nextBufferedWithoutId(&reader, &canonical_span2)).?;
+        const record2 = (try nextBufferedWithSpan(&reader, &canonical_span2)).?;
 
         try std.testing.expectEqualStrings("pair/1", record1.header);
         try std.testing.expectEqualStrings("AC", record1.sequence);
@@ -4680,19 +4691,19 @@ test "[property] - [record delivery]: omits identifiers and preserves buffered c
         var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
         defer reader.deinit();
         var canonical_span1: ?[]const u8 = null;
-        const record1 = (try nextWithoutId(&reader, &canonical_span1)).?;
+        const record1 = (try nextWithSpan(&reader, &canonical_span1)).?;
         source.data = complete_input;
         const source_position = source.pos;
         var canonical_span2: ?[]const u8 = null;
 
         try std.testing.expect(
-            (try nextBufferedWithoutId(&reader, &canonical_span2)) == null,
+            (try nextBufferedWithSpan(&reader, &canonical_span2)) == null,
         );
         try std.testing.expectEqual(source_position, source.pos);
         try std.testing.expectEqualStrings("pair/1", record1.header);
         try std.testing.expectEqualStrings(input1, canonical_span1.?);
 
-        const record2 = (try nextWithoutId(&reader, &canonical_span2)).?;
+        const record2 = (try nextWithSpan(&reader, &canonical_span2)).?;
         try std.testing.expectEqualStrings("pair/2", record2.header);
         try std.testing.expectEqualStrings("GT", record2.sequence);
         try std.testing.expectEqualStrings("right", record2.plus);
@@ -4717,7 +4728,7 @@ test "[property] - [record delivery]: omits identifiers and preserves buffered c
     var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
     defer reader.deinit();
     var canonical_span: ?[]const u8 = null;
-    const record = (try nextWithoutId(&reader, &canonical_span)).?;
+    const record = (try nextWithSpan(&reader, &canonical_span)).?;
     try std.testing.expectEqual(header_len, record.header.len);
     try std.testing.expectEqual(@as(usize, 0), record.id.len);
     try std.testing.expect(canonical_span == null);
@@ -4747,21 +4758,21 @@ test "[integration] - [record delivery]: retained fallback storage survives a re
             defer retained.deinit(tracking.allocator());
 
             var canonical_span1: ?[]const u8 = null;
-            const record1 = (try nextWithoutId(&reader, &canonical_span1)).?;
+            const record1 = (try nextWithSpan(&reader, &canonical_span1)).?;
             try std.testing.expect(canonical_span1 == null);
             try std.testing.expectEqual(field_len, record1.sequence.len);
             try std.testing.expectEqual(field_len, record1.quality.len);
 
             var canonical_span2: ?[]const u8 = null;
             try std.testing.expect(
-                (try nextBufferedWithoutId(&reader, &canonical_span2)) == null,
+                (try nextBufferedWithSpan(&reader, &canonical_span2)) == null,
             );
             const sequence_ptr = record1.sequence.ptr;
             try std.testing.expect(retainFallbackRecordStorage(&reader, &retained, record1));
             const allocations_before_refill = tracking.allocations;
 
             var validator = AdaptiveRecordValidator.init(.{});
-            const buffered2 = try nextBufferedAfterFallbackTransfer(
+            const buffered2 = try nextValidatedAfterFallbackTransfer(
                 &reader,
                 &validator,
             );
@@ -4783,7 +4794,7 @@ test "[integration] - [record delivery]: retained fallback storage survives a re
             try std.testing.expectEqualStrings("pair/2", record2.header);
             try std.testing.expect(std.mem.allEqual(u8, record2.sequence, 'T'));
             try std.testing.expect(std.mem.allEqual(u8, record2.quality, '#'));
-            try std.testing.expect((try nextWithoutId(&reader, &canonical_span2)) == null);
+            try std.testing.expect((try nextWithSpan(&reader, &canonical_span2)) == null);
         }
         try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
     }
