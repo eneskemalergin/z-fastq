@@ -686,53 +686,55 @@ fn BufferedRecordResult(comptime projection: BufferedProjection) type {
     };
 }
 
-fn findLineEnds(comptime line_count: usize, bytes: []const u8, ends: *[line_count]usize) bool {
-    if (std.simd.suggestVectorLength(u8)) |vector_len| {
-        return findLineEndsVector(line_count, vector_len, bytes, ends);
-    }
-    return findLineEndsScalar(line_count, bytes, 0, ends, 0);
-}
+// Saved positions remain valid only while the buffer's bytes and indexes stay unchanged.
+const LineFeedSearch = struct {
+    block_start: usize = 0,
+    block_end: usize = 0,
+    mask: @Int(.unsigned, @max(64, std.simd.suggestVectorLength(u8) orelse 1)) = 0,
 
-fn findLineEndsVector(
-    comptime line_count: usize,
-    comptime vector_len: comptime_int,
-    bytes: []const u8,
-    ends: *[line_count]usize,
-) bool {
-    const Bytes = @Vector(vector_len, u8);
-    const Mask = @Int(.unsigned, vector_len);
-
-    var found: usize = 0;
-    var block_start: usize = 0;
-    while (bytes.len - block_start >= vector_len) : (block_start += vector_len) {
-        const block: Bytes = bytes[block_start..][0..vector_len].*;
-        var line_feeds: Mask = @bitCast(block == @as(Bytes, @splat('\n')));
-        while (line_feeds != 0) {
-            ends[found] = block_start + @as(usize, @intCast(@ctz(line_feeds)));
-            found += 1;
-            if (found == ends.len) return true;
-            line_feeds &= line_feeds - 1;
+    fn find(self: *LineFeedSearch, comptime lanes: usize, bytes: []const u8, start: usize) ?usize {
+        var offset = start;
+        if (start >= self.block_start and start < self.block_end and self.block_end <= bytes.len) {
+            const remaining = self.mask >> @intCast(start - self.block_start);
+            if (remaining != 0) return start + @as(usize, @intCast(@ctz(remaining)));
+            offset = self.block_end;
         }
-    }
-    return findLineEndsScalar(line_count, bytes[block_start..], block_start, ends, found);
-}
 
-fn findLineEndsScalar(
-    comptime line_count: usize,
-    bytes: []const u8,
-    base: usize,
-    ends: *[line_count]usize,
-    initial_found: usize,
-) bool {
-    var found = initial_found;
-    for (bytes, 0..) |byte, index| {
-        if (byte != '\n') continue;
-        ends[found] = base + index;
-        found += 1;
-        if (found == ends.len) return true;
+        const Bytes = @Vector(lanes, u8);
+        const Mask = @Int(.unsigned, lanes);
+        while (bytes.len - offset >= lanes) : (offset += lanes) {
+            const block: Bytes = bytes[offset..][0..lanes].*;
+            self.block_start = offset;
+            self.block_end = offset + lanes;
+            self.mask = if (lanes == STRUCTURAL_BLOCK_BYTES)
+                newlineMask(bytes[offset..][0..STRUCTURAL_BLOCK_BYTES])
+            else
+                @as(Mask, @bitCast(block == @as(Bytes, @splat('\n'))));
+            if (self.mask != 0) return offset + @as(usize, @intCast(@ctz(self.mask)));
+        }
+        for (bytes[offset..], offset..) |byte, index| {
+            if (byte == '\n') return index;
+        }
+        return null;
     }
-    return false;
-}
+
+    fn findLines(
+        self: *LineFeedSearch,
+        comptime line_count: usize,
+        bytes: []const u8,
+        start: usize,
+        ends: *[line_count]usize,
+    ) bool {
+        var offset = start;
+        for (ends) |*end| {
+            const line_end = self.find(std.simd.suggestVectorLength(u8) orelse 1, bytes, offset) orelse
+                return false;
+            end.* = line_end - start;
+            offset = line_end + 1;
+        }
+        return true;
+    }
+};
 
 pub const RecordOffsets = struct {
     header: u64,
@@ -749,6 +751,7 @@ pub const Reader = struct {
     buf: []u8,
     fill_end: usize,
     cursor: usize,
+    line_feeds: LineFeedSearch = .{},
     fallback_fields: [4]FallbackField,
     record_index: u64,
     byte_offset: u64,
@@ -1044,7 +1047,9 @@ pub const Reader = struct {
         var checkpoint: ?PayloadCheckpoint = null;
         const complete = if (projection == .validated or projection == .validated_header)
             scanCompleteRecord(
-                self.buf[self.cursor..self.fill_end],
+                self.buf[0..self.fill_end],
+                self.cursor,
+                &self.line_feeds,
                 self.options.max_line_bytes,
                 validator.?.alphabet,
                 validator.?.use_full_iupac,
@@ -1053,7 +1058,7 @@ pub const Reader = struct {
             null;
         if (projection == .predicted_payload) {
             const bytes = self.buf[self.cursor..self.fill_end];
-            if (!findLineEnds(3, bytes, relative_ends[0..3])) return .incomplete;
+            if (!self.line_feeds.findLines(3, self.buf[0..self.fill_end], self.cursor, relative_ends[0..3])) return .incomplete;
             if (self.predictQualityEnd(&relative_ends)) {
                 checkpoint = .{
                     .cursor = self.cursor,
@@ -1070,7 +1075,7 @@ pub const Reader = struct {
             }
         } else if (complete) |checked| {
             relative_ends = checked.line_ends;
-        } else if (!findLineEnds(4, self.buf[self.cursor..self.fill_end], &relative_ends)) {
+        } else if (!self.line_feeds.findLines(4, self.buf[0..self.fill_end], self.cursor, &relative_ends)) {
             if (allow_refill) {
                 if (try self.bufferIncompleteRecord(0)) |bytes| {
                     return self.readSavedRecord(bytes, projection, include_canonical_span, validator);
@@ -1230,10 +1235,12 @@ pub const Reader = struct {
         const cursor = self.cursor;
         const fill_end = self.fill_end;
         self.buf = bytes;
+        self.line_feeds = .{};
         self.cursor = 0;
         self.fill_end = bytes.len;
         defer {
             self.buf = buf;
+            self.line_feeds = .{};
             self.cursor = cursor;
             self.fill_end = fill_end;
         }
@@ -1270,6 +1277,7 @@ pub const Reader = struct {
         if (record.len != 0) {
             self.pending_refill = .{ .bytes = self.buf, .cursor = self.cursor, .end = self.fill_end };
             self.buf = bytes;
+            self.line_feeds = .{};
             self.cursor = prefix_len;
             self.fill_end = bytes.len;
         }
@@ -1375,6 +1383,7 @@ pub const Reader = struct {
     }
 
     fn refill(self: *Reader) ReaderError!bool {
+        self.line_feeds = .{};
         if (self.pending_refill) |pending| {
             std.debug.assert(self.cursor == self.fill_end);
             self.buf = pending.bytes;
@@ -1963,16 +1972,12 @@ pub fn recordHasTerminalCr(record: Record) bool {
     return false;
 }
 
-pub fn writeValidatedRecord(writer: *Writer, record: Record) WriterError!void {
-    if (recordHasTerminalCr(record)) return error.InvalidRecord;
-    return writeRecordFields(writer, record);
-}
-
 pub fn writeCanonicalRecordSpan(writer: *Writer, span: []const u8) WriteError!void {
     return writer.sink.write(span);
 }
 
-fn writeRecordFields(writer: *Writer, record: Record) WriteError!void {
+// CLI callers check both mates, including terminal CR, before writing either record.
+pub fn writeRecordFields(writer: *Writer, record: Record) WriteError!void {
     const fields = [_][]const u8{
         "@",
         record.header,
@@ -2106,21 +2111,6 @@ fn newlineMask(block: *const [STRUCTURAL_BLOCK_BYTES]u8) u64 {
     const Bytes = @Vector(STRUCTURAL_BLOCK_BYTES, u8);
     const bytes: Bytes = block.*;
     return @bitCast(bytes == @as(Bytes, @splat('\n')));
-}
-
-fn firstLineFeed(bytes: []const u8) ?usize {
-    var block_start: usize = 0;
-    while (bytes.len - block_start >= STRUCTURAL_BLOCK_BYTES) {
-        const line_feeds = newlineMask(bytes[block_start..][0..STRUCTURAL_BLOCK_BYTES]);
-        if (line_feeds != 0) {
-            return block_start + @as(usize, @intCast(@ctz(line_feeds)));
-        }
-        block_start += STRUCTURAL_BLOCK_BYTES;
-    }
-    for (bytes[block_start..], block_start..) |byte, byte_index| {
-        if (byte == '\n') return byte_index;
-    }
-    return null;
 }
 
 fn firstValidSequenceLineEnd(bytes: []const u8, alphabet: Alphabet) ?usize {
@@ -2310,12 +2300,15 @@ const CompleteRecord = struct {
 };
 
 fn scanCompleteRecord(
-    data: []const u8,
+    buffer: []const u8,
+    start: usize,
+    line_feeds: *LineFeedSearch,
     max_line_bytes: usize,
     alphabet: Alphabet,
     initial_full_iupac: bool,
 ) ?CompleteRecord {
-    const header_end = firstLineFeed(data) orelse return null;
+    const data = buffer[start..];
+    const header_end = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start) orelse return null) - start;
     const header_len = header_end - @intFromBool(header_end != 0 and data[header_end - 1] == '\r');
     const header = data[0..header_len];
     if (header.len > max_line_bytes) return null;
@@ -2337,7 +2330,8 @@ fn scanCompleteRecord(
     if (sequence_len > max_line_bytes) return null;
 
     const plus_start = sequence_start + sequence_raw_len + 1;
-    const plus_raw_len = firstLineFeed(data[plus_start..]) orelse return null;
+    const plus_raw_len = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start + plus_start) orelse
+        return null) - start - plus_start;
     const plus_len = plus_raw_len - @intFromBool(
         plus_raw_len != 0 and data[plus_start + plus_raw_len - 1] == '\r',
     );
@@ -2386,14 +2380,15 @@ pub const CheckScanner = struct {
     pub fn feed(self: *CheckScanner, data: []const u8) CheckScannerError!usize {
         var consumed: usize = 0;
         var boundary_proved = false;
+        var line_feeds: LineFeedSearch = .{};
         while (consumed < data.len) {
-            if (self.consumeCompleteRecord(data[consumed..], boundary_proved)) |record_len| {
+            if (self.consumeCompleteRecord(data, consumed, &line_feeds, boundary_proved)) |record_len| {
                 boundary_proved = true;
                 consumed += record_len;
                 continue;
             }
             boundary_proved = false;
-            consumed += try self.consumeIncrementalRecord(data[consumed..]);
+            consumed += try self.consumeIncrementalRecord(data, consumed, &line_feeds);
         }
         return data.len;
     }
@@ -2401,12 +2396,16 @@ pub const CheckScanner = struct {
     fn consumeCompleteRecord(
         self: *CheckScanner,
         data: []const u8,
+        start: usize,
+        line_feeds: *LineFeedSearch,
         boundary_proved: bool,
     ) ?usize {
         if (!boundary_proved and !self.atRecordBoundary()) return null;
 
         const complete = scanCompleteRecord(
             data,
+            start,
+            line_feeds,
             self.max_line_bytes,
             self.alphabet,
             self.use_full_iupac,
@@ -2438,37 +2437,23 @@ pub const CheckScanner = struct {
     fn consumeIncrementalRecord(
         self: *CheckScanner,
         data: []const u8,
+        start: usize,
+        line_feeds: *LineFeedSearch,
     ) CheckScannerError!usize {
         const initial_record_index = self.record_index;
-        var segment_start: usize = 0;
-        var block_start: usize = 0;
-        while (data.len - block_start >= STRUCTURAL_BLOCK_BYTES) {
-            var line_feeds = newlineMask(data[block_start..][0..STRUCTURAL_BLOCK_BYTES]);
-            while (line_feeds != 0) {
-                const line_end = block_start + @as(usize, @intCast(@ctz(line_feeds)));
-                try self.consumeLineBytes(data[segment_start..line_end]);
-                try self.advanceOffset(line_end - segment_start + 1);
-                try self.finishLine(true);
-                segment_start = line_end + 1;
-                if (self.record_index != initial_record_index) return segment_start;
-                line_feeds &= line_feeds - 1;
-            }
-            block_start += STRUCTURAL_BLOCK_BYTES;
-        }
-
-        for (data[block_start..], block_start..) |byte, line_end| {
-            if (byte != '\n') continue;
+        var segment_start = start;
+        while (line_feeds.find(STRUCTURAL_BLOCK_BYTES, data, segment_start)) |line_end| {
             try self.consumeLineBytes(data[segment_start..line_end]);
             try self.advanceOffset(line_end - segment_start + 1);
             try self.finishLine(true);
             segment_start = line_end + 1;
-            if (self.record_index != initial_record_index) return segment_start;
+            if (self.record_index != initial_record_index) return segment_start - start;
         }
         if (segment_start < data.len) {
             try self.consumeLineBytes(data[segment_start..]);
             try self.advanceOffset(data.len - segment_start);
         }
-        return data.len;
+        return data.len - start;
     }
 
     pub fn finishEof(self: *CheckScanner) CheckScannerError!void {
@@ -3561,13 +3546,42 @@ test "[property] - [reader]: structural masks match scalar line boundaries" {
             }
 
             var actual: [4]usize = undefined;
-            try std.testing.expect(findLineEnds(4, input, &actual));
+            var line_feeds: LineFeedSearch = .{};
+            try std.testing.expect(line_feeds.findLines(4, input, 0, &actual));
             try std.testing.expectEqual(expected, actual);
         }
     }
 
     var incomplete_ends: [4]usize = undefined;
-    try std.testing.expect(!findLineEnds(4, "a\nb\nc\n", &incomplete_ends));
+    var line_feeds: LineFeedSearch = .{};
+    try std.testing.expect(!line_feeds.findLines(4, "a\nb\nc\n", 0, &incomplete_ends));
+}
+
+test "[property] - [reader]: saved LF masks preserve searches after skips and rewinds" {
+    var storage: [193]u8 = undefined;
+    inline for (.{ std.simd.suggestVectorLength(u8) orelse 1, STRUCTURAL_BLOCK_BYTES }) |lanes| {
+        for (0..storage.len) |newline| {
+            @memset(&storage, 'x');
+            storage[newline] = '\n';
+            storage[storage.len - 1] = '\n';
+            var line_feeds: LineFeedSearch = .{};
+            for (0..storage.len + 1) |start| {
+                const expected = if (std.mem.findScalar(u8, storage[start..], '\n')) |end|
+                    start + end
+                else
+                    null;
+                try std.testing.expectEqual(expected, line_feeds.find(lanes, &storage, start));
+                try std.testing.expectEqual(expected, line_feeds.find(1, &storage, start));
+                try std.testing.expectEqual(@as(?usize, newline), line_feeds.find(lanes, &storage, 0));
+            }
+        }
+        @memset(&storage, '\n');
+        var line_feeds: LineFeedSearch = .{};
+        for (0..lanes) |start| {
+            try std.testing.expectEqual(@as(?usize, start), line_feeds.find(lanes, &storage, start));
+            try std.testing.expectEqual(@as(usize, lanes), line_feeds.block_end);
+        }
+    }
 }
 
 test "[property] - [reader]: short reads borrow complete records without field allocations" {
@@ -4499,7 +4513,8 @@ test "[property] - [record delivery]: omits identifiers and preserves buffered c
         if (canonical_span) |span| {
             try writeCanonicalRecordSpan(&writer, span);
         } else {
-            try writeValidatedRecord(&writer, record);
+            try std.testing.expect(!recordHasTerminalCr(record));
+            try writeRecordFields(&writer, record);
         }
         try std.testing.expectEqualStrings(case.expected_output, sink.written());
         try std.testing.expect((try nextWithoutId(&reader, &canonical_span)) == null);
@@ -4646,7 +4661,7 @@ test "[integration] - [record delivery]: retained fallback storage survives a re
     }
 }
 
-test "[integration] - [writer]: trusted Reader records match checked serialization" {
+test "[integration] - [writer]: prechecked Reader records match checked serialization" {
     const cases = [_]struct { input: []const u8, expected: ?[]const u8 }{
         .{
             .input = "@r\rdesc\r\nACGT\r\n+note\rx\r\n!#$%\r\n",
@@ -4672,11 +4687,12 @@ test "[integration] - [writer]: trusted Reader records match checked serializati
         var trusted_writer = Writer.init(trusted_sink.byteSink());
         if (case.expected) |expected| {
             try checked_writer.writeRecord(record);
-            try writeValidatedRecord(&trusted_writer, record);
+            try std.testing.expect(!recordHasTerminalCr(record));
+            try writeRecordFields(&trusted_writer, record);
             try std.testing.expectEqualStrings(expected, checked_sink.written());
         } else {
             try std.testing.expectError(error.InvalidRecord, checked_writer.writeRecord(record));
-            try std.testing.expectError(error.InvalidRecord, writeValidatedRecord(&trusted_writer, record));
+            try std.testing.expect(recordHasTerminalCr(record));
             try std.testing.expectEqualStrings("", trusted_sink.written());
         }
         try std.testing.expectEqualStrings(checked_sink.written(), trusted_sink.written());
@@ -4837,13 +4853,14 @@ test "[unit] - [check scanner]: complete record path commits only proved records
     const record2 = "@s\n\n+\n\n";
     const input = record1 ++ record2;
     var scanner = CheckScanner.init(.{}, .{});
+    var line_feeds: LineFeedSearch = .{};
 
-    try std.testing.expectEqual(record1.len, scanner.consumeCompleteRecord(input, false).?);
+    try std.testing.expectEqual(record1.len, scanner.consumeCompleteRecord(input, 0, &line_feeds, false).?);
     try std.testing.expectEqual(@as(u64, 1), scanner.record_index);
     try std.testing.expectEqual(@as(u64, record1.len), scanner.byte_offset);
     try std.testing.expectEqual(
         record2.len,
-        scanner.consumeCompleteRecord(input[record1.len..], false).?,
+        scanner.consumeCompleteRecord(input, record1.len, &line_feeds, false).?,
     );
     try std.testing.expectEqual(@as(u64, 2), scanner.record_index);
     try std.testing.expectEqual(@as(u64, input.len), scanner.byte_offset);
@@ -4859,18 +4876,21 @@ test "[unit] - [check scanner]: complete record path commits only proved records
     }) |data| {
         var fallback = CheckScanner.init(.{}, .{});
         const before = fallback;
-        try std.testing.expect(fallback.consumeCompleteRecord(data, false) == null);
+        line_feeds = .{};
+        try std.testing.expect(fallback.consumeCompleteRecord(data, 0, &line_feeds, false) == null);
         try std.testing.expectEqualDeep(before, fallback);
     }
 
     var limited = CheckScanner.init(.{ .max_line_bytes = 1 }, .{});
     const before = limited;
-    try std.testing.expect(limited.consumeCompleteRecord("@r\nA\n+\n!\n", false) == null);
+    line_feeds = .{};
+    try std.testing.expect(limited.consumeCompleteRecord("@r\nA\n+\n!\n", 0, &line_feeds, false) == null);
     try std.testing.expectEqualDeep(before, limited);
 
     for ([_][]const u8{ "@r\nR\n+\n!\n", "@r\r\nR\r\n+\r\n!\r\n" }) |data| {
         var wide = CheckScanner.init(.{}, .{});
-        try std.testing.expectEqual(data.len, wide.consumeCompleteRecord(data, false).?);
+        line_feeds = .{};
+        try std.testing.expectEqual(data.len, wide.consumeCompleteRecord(data, 0, &line_feeds, false).?);
         try std.testing.expect(wide.use_full_iupac);
     }
 }
@@ -4900,7 +4920,8 @@ test "[property] - [check scanner]: complete records accept mixed LF and CRLF en
         const sequence_start = 2 + endings[0].len;
         const plus_start = sequence_start + 2 + endings[1].len;
         const quality_start = plus_start + 1 + endings[2].len;
-        const complete = scanCompleteRecord(data, 2, .iupac, false);
+        var line_feeds: LineFeedSearch = .{};
+        const complete = scanCompleteRecord(data, 0, &line_feeds, 2, .iupac, false);
         try std.testing.expect(complete != null);
         try std.testing.expectEqualDeep([4]usize{
             sequence_start - 1, plus_start - 1, quality_start - 1, data.len - 1,
@@ -4908,12 +4929,13 @@ test "[property] - [check scanner]: complete records accept mixed LF and CRLF en
         try std.testing.expect(!complete.?.use_full_iupac);
 
         var scanner = CheckScanner.init(.{ .max_line_bytes = 2 }, .{});
-        try std.testing.expectEqual(data.len, scanner.consumeCompleteRecord(data, false).?);
+        try std.testing.expectEqual(data.len, scanner.consumeCompleteRecord(data, 0, &line_feeds, false).?);
         try std.testing.expectEqual(@as(u64, 1), scanner.record_index);
         try std.testing.expectEqual(@as(u64, data.len), scanner.byte_offset);
         try std.testing.expect(scanner.atRecordBoundary());
         for (0..data.len) |cut| {
-            try std.testing.expect(scanCompleteRecord(data[0..cut], 2, .iupac, false) == null);
+            line_feeds = .{};
+            try std.testing.expect(scanCompleteRecord(data[0..cut], 0, &line_feeds, 2, .iupac, false) == null);
         }
         for (1..data.len + 2) |chunk_len| {
             try expectCheckOutcome(

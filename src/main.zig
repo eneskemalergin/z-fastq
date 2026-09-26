@@ -691,6 +691,23 @@ fn recordHasUnwritableEnding(record: zfastq.Record, canonical_span: ?[]const u8)
     return canonical_span == null and fastq.recordHasTerminalCr(record);
 }
 
+fn writeCheckedRecord(
+    writer: *zfastq.Writer,
+    direct_writer: ?*std.Io.Writer,
+    record: zfastq.Record,
+    canonical_span: ?[]const u8,
+) error{WriteFailed}!void {
+    if (canonical_span) |span| {
+        if (direct_writer) |output| {
+            try output.writeAll(span);
+        } else {
+            try fastq.writeCanonicalRecordSpan(writer, span);
+        }
+    } else {
+        try fastq.writeRecordFields(writer, record);
+    }
+}
+
 fn unwritableRecordFailure() CommandFailure {
     return CommandFailure.plain(
         "unwritable_record",
@@ -2288,11 +2305,7 @@ fn writePreservedInterleavedMate1(
 ) error{WriteFailed}!void {
     switch (storage) {
         .unused => unreachable,
-        .reader, .retained => if (canonical_span) |span| {
-            try fastq.writeCanonicalRecordSpan(writer, span);
-        } else {
-            fastq.writeValidatedRecord(writer, record) catch return error.WriteFailed;
-        },
+        .reader, .retained => try writeCheckedRecord(writer, null, record, canonical_span),
         .staged => try fastq.writeCanonicalRecordSpan(writer, staged),
     }
     if (storage == .retained) {
@@ -2492,11 +2505,7 @@ fn sampleInterleavedSource(
             canonical_span1,
             record1_storage,
         );
-        if (canonical_span2) |span| {
-            fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
-        } else {
-            fastq.writeValidatedRecord(writer, record2) catch return error.WriteFailed;
-        }
+        try writeCheckedRecord(writer, null, record2, canonical_span2);
     }
 }
 
@@ -2544,13 +2553,10 @@ fn sampleFractionSource(
         .failure => |failure| return failure,
         .record => |validated| {
             if (!selector.selectRecord()) continue;
-            if (validated.canonical_span) |span| {
-                fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
-            } else {
-                if (recordHasUnwritableEnding(validated.record, null)) return unwritableRecordFailure();
-                fastq.writeValidatedRecord(writer, validated.record) catch
-                    return error.WriteFailed;
+            if (recordHasUnwritableEnding(validated.record, validated.canonical_span)) {
+                return unwritableRecordFailure();
             }
+            try writeCheckedRecord(writer, null, validated.record, validated.canonical_span);
         },
     };
 }
@@ -2747,16 +2753,11 @@ fn sampleExactSecondPass(
                 break;
             }
             const record = validated.record;
-            if (validated.canonical_span) |span| {
-                fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
-            } else {
-                if (recordHasUnwritableEnding(record, null)) {
-                    failure = unwritableRecordFailure();
-                    break;
-                }
-                fastq.writeValidatedRecord(writer, record) catch
-                    return error.WriteFailed;
+            if (recordHasUnwritableEnding(record, validated.canonical_span)) {
+                failure = unwritableRecordFailure();
+                break;
             }
+            try writeCheckedRecord(writer, null, record, validated.canonical_span);
         } else {
             const advanced = reader.advance() catch |err| {
                 failure = mapReaderFailure(&reader, err);
@@ -3140,16 +3141,8 @@ fn sampleExactPairedSecondPass(
                 failure = .{ .command = .{ .input_index = 1, .details = unwritableRecordFailure() } };
                 break;
             }
-            if (canonical_span1) |span| {
-                fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
-            } else {
-                fastq.writeValidatedRecord(writer, record1.?) catch return error.WriteFailed;
-            }
-            if (canonical_span2) |span| {
-                fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
-            } else {
-                fastq.writeValidatedRecord(writer, record2.?) catch return error.WriteFailed;
-            }
+            try writeCheckedRecord(writer, null, record1.?, canonical_span1);
+            try writeCheckedRecord(writer, null, record2.?, canonical_span2);
         }
         cursor.completeUnit();
     }
@@ -3342,11 +3335,7 @@ fn sampleExactInterleavedSecondPass(
             canonical_span1,
             record1_storage,
         );
-        if (canonical_span2) |span| {
-            fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
-        } else {
-            fastq.writeValidatedRecord(writer, record2) catch return error.WriteFailed;
-        }
+        try writeCheckedRecord(writer, null, record2, canonical_span2);
         cursor.completeUnit();
     }
 
@@ -3734,24 +3723,8 @@ fn interleaveSources(
             return .{ .command = .{ .input_index = 1, .details = unwritableRecordFailure() } };
         }
 
-        if (canonical_span1) |span| {
-            if (direct_writer) |output| {
-                output.writeAll(span) catch return error.WriteFailed;
-            } else {
-                fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
-            }
-        } else {
-            fastq.writeValidatedRecord(writer, record1.?) catch return error.WriteFailed;
-        }
-        if (canonical_span2) |span| {
-            if (direct_writer) |output| {
-                output.writeAll(span) catch return error.WriteFailed;
-            } else {
-                fastq.writeCanonicalRecordSpan(writer, span) catch return error.WriteFailed;
-            }
-        } else {
-            fastq.writeValidatedRecord(writer, record2.?) catch return error.WriteFailed;
-        }
+        try writeCheckedRecord(writer, direct_writer, record1.?, canonical_span1);
+        try writeCheckedRecord(writer, direct_writer, record2.?, canonical_span2);
     }
 }
 
@@ -4086,13 +4059,8 @@ fn deinterleaveSource(
             canonical_span1,
             record1_storage,
         ) catch return error.Output1WriteFailed;
-        if (canonical_span2) |span| {
-            fastq.writeCanonicalRecordSpan(writer2, span) catch
-                return error.Output2WriteFailed;
-        } else {
-            fastq.writeValidatedRecord(writer2, record2) catch
-                return error.Output2WriteFailed;
-        }
+        writeCheckedRecord(writer2, null, record2, canonical_span2) catch
+            return error.Output2WriteFailed;
     }
 }
 

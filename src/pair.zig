@@ -68,6 +68,10 @@ const TOKEN_LANES = 16;
 const TokenVector = @Vector(TOKEN_LANES, u8);
 
 fn exactHeadersMatch(header1: []const u8, header2: []const u8) bool {
+    return matchingTokenEnd(header1, header2) != null;
+}
+
+fn matchingTokenEnd(header1: []const u8, header2: []const u8) ?usize {
     const common_len = @min(header1.len, header2.len);
     const spaces: TokenVector = @splat(' ');
     const tabs: TokenVector = @splat('\t');
@@ -85,22 +89,22 @@ fn exactHeadersMatch(header1: []const u8, header2: []const u8) bool {
             const bit = @as(u16, 1) << @intCast(lane);
             const token_end1 = stop1 & bit != 0;
             const token_end2 = stop2 & bit != 0;
-            return offset + lane != 0 and token_end1 and token_end2;
+            return if (offset + lane != 0 and token_end1 and token_end2) offset + lane else null;
         }
     }
     while (offset < common_len) : (offset += 1) {
         const token_end1 = header1[offset] == ' ' or header1[offset] == '\t';
         const token_end2 = header2[offset] == ' ' or header2[offset] == '\t';
         if (token_end1 or token_end2) {
-            return offset != 0 and token_end1 and token_end2;
+            return if (offset != 0 and token_end1 and token_end2) offset else null;
         }
-        if (header1[offset] != header2[offset]) return false;
+        if (header1[offset] != header2[offset]) return null;
     }
 
-    if (common_len == 0) return false;
-    if (header1.len == header2.len) return true;
+    if (common_len == 0) return null;
+    if (header1.len == header2.len) return common_len;
     const longer = if (header1.len > header2.len) header1 else header2;
-    return longer[common_len] == ' ' or longer[common_len] == '\t';
+    return if (longer[common_len] == ' ' or longer[common_len] == '\t') common_len else null;
 }
 
 fn firstTokenEnd(header: []const u8) usize {
@@ -134,7 +138,17 @@ fn nextToken(header: []const u8, previous_end: usize) []const u8 {
 
 fn illuminaHeadersMatch(header1: []const u8, header2: []const u8) bool {
     return terminalPairHeadersMatch(header1, header2) or
+        casavaHeadersMatch(header1, header2) or
         namesMatch(parseName(header1, .illumina), parseName(header2, .illumina));
+}
+
+fn casavaHeadersMatch(header1: []const u8, header2: []const u8) bool {
+    const end = matchingTokenEnd(header1, header2) orelse return false;
+    if (terminalMateMarker(header1[0..end]) != null) return false;
+    const token1 = nextToken(header1, end);
+    const token2 = nextToken(header2, end);
+    return leadingMateMarker(token1) == 1 and leadingMateMarker(token2) == 2 and
+        terminalMateMarker(token1) != 2 and terminalMateMarker(token2) != 1;
 }
 
 fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
@@ -230,6 +244,16 @@ test "[property] - [paired names]: success-first matching preserves established 
         "cluster\tdescription/2",
         "cluster  1:N:0:1",
         "cluster  2:N:0:1",
+        "cluster 1:N:0:index-a",
+        "cluster 2:N:0:index-b",
+        "cluster\t1:N:0:index-a/1 trailing/2",
+        "cluster  2:N:0:index-b/2 trailing/1",
+        "cluster/1 1:N:0:index-a",
+        "cluster/2 2:N:0:index-b",
+        "cluster/1 2:N:0:index-a",
+        "cluster/2 1:N:0:index-b",
+        "cluster 2:/1",
+        "cluster 2:/2",
         "cluster 1:/1",
         "cluster 1:/2",
         "cluster/1 description/1",
@@ -256,6 +280,44 @@ test "[property] - [paired names]: success-first matching preserves established 
                     headersMatch(header1, header2, policy),
                 );
             }
+        }
+    }
+}
+
+test "[property] - [paired names]: Casava comparison preserves markers and opaque suffixes" {
+    const suffixes = [_][]const u8{
+        " 1:N:0:index-a",    "\t2:N:0:index-b", "  1:/1",         " \t2:/2",
+        " 1:/2",             " 2:/1",           " 1:",            " 2:",
+        " 1",                " 2",              "",               " 1:\x00\xff/1 extra/2",
+        " 2:\x00/2 extra/1", " description/1",  " description/2",
+    };
+    var storage1: [128]u8 = undefined;
+    var storage2: [128]u8 = undefined;
+    for ([_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65 }) |length| {
+        @memset(storage1[0..length], 'x');
+        @memset(storage2[0..length], 'x');
+        for (suffixes) |suffix1| {
+            @memcpy(storage1[length..][0..suffix1.len], suffix1);
+            const header1 = storage1[0 .. length + suffix1.len];
+            for (suffixes) |suffix2| {
+                @memcpy(storage2[length..][0..suffix2.len], suffix2);
+                const header2 = storage2[0 .. length + suffix2.len];
+                const expected = namesMatch(parseName(header1, .illumina), parseName(header2, .illumina));
+                try std.testing.expectEqual(expected, headersMatch(header1, header2, .illumina));
+                if (casavaHeadersMatch(header1, header2)) try std.testing.expect(expected);
+            }
+        }
+        const left = " 1:N:0:left";
+        const right = "\t2:N:0:right/2 ignored/1";
+        @memcpy(storage1[length..][0..left.len], left);
+        @memcpy(storage2[length..][0..right.len], right);
+        const header1 = storage1[0 .. length + left.len];
+        const header2 = storage2[0 .. length + right.len];
+        try std.testing.expectEqual(length != 0, casavaHeadersMatch(header1, header2));
+        for (0..length) |mismatch| {
+            storage2[mismatch] = 'y';
+            try std.testing.expect(!headersMatch(header1, header2, .illumina));
+            storage2[mismatch] = 'x';
         }
     }
 }
