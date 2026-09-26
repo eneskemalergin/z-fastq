@@ -700,6 +700,33 @@ test "[cli] - [exact sample]: count boundaries preserve records in input order" 
     }
 }
 
+test "[cli] - [interleaved sample]: corrupt gzip refills preserve earlier output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const record = "@r\nAAA\n+\n!!!\n";
+    const input = try allocator.alloc(u8, 524277);
+    for (0..input.len / record.len) |index| {
+        @memcpy(input[index * record.len ..][0..record.len], record);
+    }
+    var gzip: std.ArrayList(u8) = .empty;
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const end = @min(input.len, offset + std.math.maxInt(u16));
+        try cli.appendGzipMember(allocator, &gzip, input[offset..end], .{});
+        offset = end;
+    }
+    gzip.items[gzip.items.len - 8] ^= 1;
+
+    // The first 256 KiB read ends 12 bytes into the next pair.
+    try cli.expectResult(
+        try cli.runWithStdin(allocator, &.{ "sample", "--interleaved", "--fraction", "1", "-" }, gzip.items, gzip.items.len),
+        3,
+        input[0..262132],
+        "error: -: I/O error\n",
+    );
+}
+
 test "[integration] - [sample]: plain and gzip file and stdin select identical records" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
