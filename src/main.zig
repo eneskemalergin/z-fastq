@@ -3135,12 +3135,11 @@ fn sampleExactInterleavedSecondPass(
         var paired_record2 = fastq.nextBufferedValidatedRecord(
             &reader,
             &validator,
-        ) catch |err| failed: {
+        ) catch |err| {
             failure = pairCommandFailure(0, mapReaderFailure(&reader, err));
-            break :failed null;
+            break;
         };
-        // HACK: Preserve retry diagnostics until the exact-output bug is fixed.
-        if (paired_record2 == null and failure == null) {
+        if (paired_record2 == null) {
             paired_record2 = fastq.nextValidatedMatePreservingRecord(
                 &reader,
                 &validated1,
@@ -5076,6 +5075,11 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
                     const details = failure.?.command.details;
                     try std.testing.expectEqualStrings(if (change == .structure) "S001" else "input_changed", details.code);
                     try std.testing.expectEqual(@as(u8, if (change == .structure) 1 else 3), details.exit_code);
+                    if (change == .structure) {
+                        try std.testing.expectEqual(@as(?u64, 3), details.record_index);
+                        try std.testing.expectEqual(@as(?u3, 3), details.line_in_record);
+                        try std.testing.expectEqual(@as(?u64, plus_starts[1]), details.byte_offset);
+                    }
                 }
                 try std.testing.expectEqualStrings(expected_prefix, sink.written());
             }
@@ -5083,7 +5087,28 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
     }
 }
 
-test "[integration] - [interleaved exact sample]: preserves buffered mate failure diagnostics" {
+test "[integration] - [interleaved exact sample]: preserves the first mate parse failure" {
+    const SnapshotChangingSink = struct {
+        inner: io_layer.SliceSink,
+        path: []const u8,
+        mtime: ?i96,
+        changed: bool = false,
+
+        fn write(ctx: *anyopaque, bytes: []const u8) error{WriteFailed}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.mtime) |mtime| {
+                const file = std.Io.Dir.cwd().openFile(std.testing.io, self.path, .{}) catch
+                    return error.WriteFailed;
+                defer file.close(std.testing.io);
+                file.setTimestamps(std.testing.io, .{
+                    .modify_timestamp = .{ .new = .{ .nanoseconds = mtime } },
+                }) catch return error.WriteFailed;
+                self.mtime = null;
+                self.changed = true;
+            }
+            try self.inner.byteSink().write(bytes);
+        }
+    };
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5092,12 +5117,6 @@ test "[integration] - [interleaved exact sample]: preserves buffered mate failur
     defer allocator.free(path);
     const original = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n@b/1\nA\n+\n!\n@b/2\nT\n+\n#\n";
     const changed = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n@b/1\nA\n+\n!\n@b/2\nT\nx\n#\n";
-    try writeExactTestInput(io, path, original, false, null);
-    const snapshot = try snapshotTestFile(io, path);
-    try writeExactTestInput(io, path, changed, false, snapshot);
-    var output: [original.len]u8 = undefined;
-    var sink = io_layer.SliceSink.init(&output);
-    var writer = zfastq.Writer.init(sink.byteSink());
     const options = SampleOptions{
         .max_line_bytes = 64,
         .alphabet = .iupac,
@@ -5106,27 +5125,57 @@ test "[integration] - [interleaved exact sample]: preserves buffered mate failur
         .seed = 11,
         .pair_mode = .interleaved,
     };
-    const failure = (try sampleExactInterleavedSecondPass(
-        true,
-        io,
-        allocator,
-        path,
-        &writer,
-        .empty,
-        snapshot,
-        2,
-        260,
-        options,
-    )).?;
-    try std.testing.expect(failure == .command);
-    const details = failure.command.details;
-    try std.testing.expectEqualStrings("S001", details.code);
-    try std.testing.expectEqual(@as(u8, 1), details.exit_code);
-    try std.testing.expectEqual(@as(?u64, 3), details.record_index);
-    try std.testing.expectEqual(@as(?u3, 3), details.line_in_record);
-    // The existing buffered-error path retries at quality and replaces offset 40.
-    try std.testing.expectEqual(@as(?u64, 42), details.byte_offset);
-    try std.testing.expectEqualStrings(original[0..22], sink.written());
+    const Case = enum { all, second_only, metadata_changed };
+    for ([_]bool{ false, true }) |gzip| {
+        for (std.enums.values(Case)) |case| {
+            errdefer std.debug.print("gzip={} case={s}\n", .{ gzip, @tagName(case) });
+            try writeExactTestInput(io, path, original, gzip, null);
+            const snapshot = try snapshotTestFile(io, path);
+            try writeExactTestInput(io, path, changed, gzip, snapshot);
+            var output: [original.len]u8 = undefined;
+            var sink = SnapshotChangingSink{
+                .inner = io_layer.SliceSink.init(&output),
+                .path = path,
+                .mtime = if (case == .metadata_changed) snapshot.mtime_nanoseconds + 1_000_000_000 else null,
+            };
+            var writer = zfastq.Writer.init(.{
+                .ctx = &sink,
+                .vtable = &.{ .write = SnapshotChangingSink.write },
+            });
+            const select_all = case != .second_only;
+            const failure = (try sampleExactInterleavedSecondPass(
+                select_all,
+                io,
+                allocator,
+                path,
+                &writer,
+                if (select_all) .empty else .{ .low_words = &.{2}, .middle_bytes = &.{0} },
+                snapshot,
+                2,
+                260,
+                options,
+            )).?;
+            try std.testing.expect(failure == .command);
+            try std.testing.expectEqual(@as(u1, 0), failure.command.input_index);
+            const details = failure.command.details;
+            if (case == .metadata_changed) {
+                try std.testing.expect(sink.changed);
+                try std.testing.expectEqualStrings("input_changed", details.code);
+                try std.testing.expectEqual(@as(u8, 3), details.exit_code);
+                try std.testing.expect(details.record_index == null);
+                try std.testing.expect(details.line_in_record == null);
+                try std.testing.expect(details.byte_offset == null);
+            } else {
+                try std.testing.expectEqualStrings("S001", details.code);
+                try std.testing.expectEqualStrings("plus line must start with '+'", details.message);
+                try std.testing.expectEqual(@as(u8, 1), details.exit_code);
+                try std.testing.expectEqual(@as(?u64, 3), details.record_index);
+                try std.testing.expectEqual(@as(?u3, 3), details.line_in_record);
+                try std.testing.expectEqual(@as(?u64, 40), details.byte_offset);
+            }
+            try std.testing.expectEqualStrings(if (select_all) original[0..22] else "", sink.inner.written());
+        }
+    }
 }
 
 test "[failure] - [paired exact sample]: each input snapshot is checked independently" {
