@@ -397,7 +397,7 @@ fn countInput(io: std.Io, label: []const u8, options: InputOptions) CountOutcome
     var scanner = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = options.max_line_bytes });
     var buffer: [io_layer.COUNT_DECOMPRESS_BUFFER_BYTES]u8 = undefined;
     const read_buffer = if (input.source == .plain)
-        buffer[0..zfastq.limits.COUNT_READ_BUFFER_BYTES]
+        buffer[0..zfastq.limits.DEFAULT_READER_BUFFER_BYTES]
     else
         &buffer;
     while (input.readScannerChunk(read_buffer) catch return .{ .failure = IO_FAILURE }) |decoded| {
@@ -1326,7 +1326,7 @@ fn checkRecordInput(
         .{ .max_line_bytes = options.max_line_bytes },
         .{ .alphabet = options.alphabet },
     );
-    var buf: [zfastq.limits.COUNT_READ_BUFFER_BYTES]u8 = undefined;
+    var buf: [zfastq.limits.DEFAULT_READER_BUFFER_BYTES]u8 = undefined;
     while (true) {
         const chunk = input.readScannerChunk(&buf) catch
             return IO_FAILURE;

@@ -58,10 +58,18 @@ test "[unit] - [root]: every exported declaration is analyzable" {
     std.testing.refAllDecls(zfastq);
 }
 
-test "[unit] - [root]: library and package versions match the current checkpoint" {
-    const expected = @import("utilities.zig").EXPECTED_VERSION;
+test "[unit] - [root]: limit namespaces and the count buffer name remain aliases" {
+    try std.testing.expect(zfastq.limits == zfastq.io.limits);
+    try std.testing.expectEqual(
+        zfastq.limits.DEFAULT_READER_BUFFER_BYTES,
+        zfastq.io.limits.COUNT_READ_BUFFER_BYTES,
+    );
+}
+
+test "[unit] - [root]: library version matches the manifest and retains its sentinel" {
+    const expected = @import("test_options").package_version;
     try std.testing.expectEqualStrings(expected, zfastq.VERSION);
-    try std.testing.expectEqualStrings(expected, @import("test_options").package_version);
+    try std.testing.expect(@TypeOf(zfastq.VERSION) == *const [expected.len:0]u8);
 }
 
 test "[property] - [gzip source]: optional member chains decode at every input chunk size" {

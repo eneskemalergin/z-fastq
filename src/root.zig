@@ -1,5 +1,6 @@
 //! Public library surface for z-fastq.
 
+const build_options = @import("build_options");
 const fastq = @import("fastq.zig");
 const io_layer = @import("io.zig");
 const statistics = @import("stats.zig");
@@ -53,4 +54,4 @@ const Limits = struct {
 pub const limits = Limits;
 pub const count_scan = @import("count_scan.zig");
 
-pub const VERSION = "0.0.18";
+pub const VERSION = build_options.version[0..build_options.version.len :0];

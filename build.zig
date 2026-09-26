@@ -58,8 +58,10 @@ pub fn build(b: *std.Build) void {
         std.debug.print("error: ISA-L requires a supported Linux x86-64 target\n", .{});
         std.process.exit(1);
     }
+    const package_version = @import("build.zig.zon").version;
     const build_options = b.addOptions();
     build_options.addOption(bool, "use_isa_l", use_isa_l);
+    build_options.addOption([:0]const u8, "version", package_version);
 
     const lib_module = b.addModule("z-fastq", .{
         .root_source_file = b.path("src/root.zig"),
@@ -117,9 +119,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &import_lib,
     });
-    const reader_test_options = b.addOptions();
-    reader_test_options.addOption([]const u8, "package_version", @import("build.zig.zon").version);
-    reader_test_module.addOptions("test_options", reader_test_options);
+    const test_options = b.addOptions();
+    test_options.addOption([]const u8, "package_version", package_version);
 
     const writer_test_module = b.createModule(.{
         .root_source_file = b.path("tests/test_writer.zig"),
@@ -178,6 +179,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     deinterleave_test_module.link_libc = true;
+
+    for ([_]*std.Build.Module{
+        reader_test_module,
+        count_test_module,
+        stats_test_module,
+        check_test_module,
+        sample_test_module,
+        interleave_test_module,
+        deinterleave_test_module,
+    }) |module| {
+        module.addOptions("test_options", test_options);
+    }
 
     const run_fastq_test = b.addRunArtifact(b.addTest(.{ .root_module = fastq_test_module }));
     const run_main_test = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));

@@ -2,7 +2,7 @@
 
 const std = @import("std");
 
-pub const EXPECTED_VERSION = "0.0.18";
+pub const EXPECTED_VERSION = @import("test_options").package_version;
 const ZFASTQ_BIN = "zig-out/bin/z-fastq";
 const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
 pub const PROCESS_TIMEOUT = std.Io.Duration.fromSeconds(30);

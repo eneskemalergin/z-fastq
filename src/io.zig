@@ -20,9 +20,9 @@ pub const DEFAULT_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_READER_BUFFER_BYTES: usize = 256 * 1024;
 pub const COUNT_READ_BUFFER_BYTES: usize = DEFAULT_READER_BUFFER_BYTES;
 pub const COUNT_DECOMPRESS_BUFFER_BYTES: usize = if (USE_ISA_L)
-    COUNT_READ_BUFFER_BYTES
+    DEFAULT_READER_BUFFER_BYTES
 else
-    flate.history_len + COUNT_READ_BUFFER_BYTES;
+    flate.history_len + DEFAULT_READER_BUFFER_BYTES;
 const GZIP_OPTIONAL_HEADER_BYTES_MAX: usize = 64 * 1024;
 
 /// Copied pull interface whose adapter must remain at a stable address and outlive it.
