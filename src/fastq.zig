@@ -1080,8 +1080,6 @@ pub const Reader = struct {
         }
 
         var ranges: [4]Range = undefined;
-        var header: Range = undefined;
-        var payload: BufferedPayload = undefined;
         var canonical = true;
         const record_start = self.cursor;
         for (0..4) |line_index| {
@@ -1095,42 +1093,10 @@ pub const Reader = struct {
             else
                 raw_end;
             if (include_canonical_span) canonical = canonical and end == raw_end;
-            if (end - start > self.options.max_line_bytes) return error.LineTooLong;
-
-            const start_offset = self.byte_offset;
-            const next_offset = try self.offsetAfter(raw_end + 1 - start);
-            self.cursor = raw_end + 1;
-            self.byte_offset = next_offset;
-
-            const line_kind = self.machine.expected;
-            const content = self.buf[start..end];
-            const first_byte = if (content.len == 0) null else content[0];
-            const second_byte = if (content.len < 2) null else content[1];
-            const record_ready = self.machine.push(content.len, first_byte, second_byte) catch |err| {
-                return self.structuralError(err, start_offset);
-            };
-            const range: Range = .{ .start = start, .end = end };
-            if (projection == .full or projection == .validated) ranges[line_index] = range;
-            switch (line_kind) {
-                .header => {
-                    self.record_offsets.header = start_offset;
-                    if (projection == .validated_header) header = range;
-                },
-                .sequence => {
-                    self.record_offsets.sequence = start_offset;
-                    if (projection != .full) payload.sequence = range;
-                },
-                .plus => self.record_offsets.plus = start_offset,
-                .quality => {
-                    self.record_offsets.quality = start_offset;
-                    if (projection != .full) payload.quality = range;
-                },
-            }
-            std.debug.assert(record_ready == (line_index == 3));
+            ranges[line_index] = .{ .start = start, .end = end };
         }
 
-        self.record_index = std.math.add(u64, self.record_index, 1) catch
-            return error.ArithmeticLimit;
+        try self.consumeBufferedRecord(ranges, relative_ends, complete != null);
         const semantic_error = if (projection == .validated or projection == .validated_header) result: {
             if (complete) |checked| {
                 validator.?.use_full_iupac = checked.use_full_iupac;
@@ -1139,9 +1105,9 @@ pub const Reader = struct {
             break :result validator.?.validate(.{
                 .header = "",
                 .id = "",
-                .sequence = payload.sequence.slice(self.buf),
+                .sequence = ranges[1].slice(self.buf),
                 .plus = "",
-                .quality = payload.quality.slice(self.buf),
+                .quality = ranges[3].slice(self.buf),
             });
         } else null;
         if (projection == .full or projection == .validated) {
@@ -1158,12 +1124,69 @@ pub const Reader = struct {
             else
                 .{ .record = record };
         }
+        const payload: BufferedPayload = .{ .sequence = ranges[1], .quality = ranges[3] };
         return if (projection == .validated_header)
-            .{ .record = .{ .header = header, .semantic_error = semantic_error } }
+            .{ .record = .{ .header = ranges[0], .semantic_error = semantic_error } }
         else if (projection == .predicted_payload)
             .{ .record = .{ .payload = payload, .checkpoint = checkpoint } }
         else
             .{ .record = payload };
+    }
+
+    fn consumeBufferedRecord(
+        self: *Reader,
+        ranges: [4]Range,
+        relative_ends: [4]usize,
+        already_validated: bool,
+    ) ReaderError!void {
+        const record_start = self.cursor;
+        const record_len = relative_ends[3] + 1;
+        const sequence_len = ranges[1].end - ranges[1].start;
+        const valid = already_validated or valid: {
+            const header = ranges[0].slice(self.buf);
+            const plus = ranges[2].slice(self.buf);
+            break :valid header.len <= self.options.max_line_bytes and
+                sequence_len <= self.options.max_line_bytes and
+                plus.len <= self.options.max_line_bytes and
+                headerPrefixIsValid(
+                    if (header.len == 0) null else header[0],
+                    if (header.len < 2) null else header[1],
+                ) and plus.len != 0 and plus[0] == '+' and
+                sequence_len == ranges[3].end - ranges[3].start;
+        };
+        const next_offset = if (valid) self.offsetAfter(record_len) catch null else null;
+        if (next_offset) |end_offset| {
+            // The checked end also bounds every intermediate line offset.
+            self.record_offsets = .{
+                .header = self.byte_offset,
+                .sequence = self.byte_offset + relative_ends[0] + 1,
+                .plus = self.byte_offset + relative_ends[1] + 1,
+                .quality = self.byte_offset + relative_ends[2] + 1,
+            };
+            self.cursor = record_start + record_len;
+            self.byte_offset = end_offset;
+            self.machine.sequence_len = sequence_len;
+            self.record_index = std.math.add(u64, self.record_index, 1) catch
+                return error.ArithmeticLimit;
+            return;
+        }
+
+        // Replay rejected records in line order to preserve errors and partial progress.
+        for (ranges, relative_ends) |range, relative_end| {
+            const content = range.slice(self.buf);
+            if (content.len > self.options.max_line_bytes) return error.LineTooLong;
+            const raw_end = record_start + relative_end;
+            const start_offset = self.byte_offset;
+            const line_end_offset = try self.offsetAfter(raw_end + 1 - range.start);
+            self.cursor = raw_end + 1;
+            self.byte_offset = line_end_offset;
+            _ = try self.ingestLine(.{
+                .content_len = content.len,
+                .first_byte = if (content.len == 0) null else content[0],
+                .second_byte = if (content.len < 2) null else content[1],
+                .start_offset = start_offset,
+            });
+        }
     }
 
     fn predictQualityEnd(self: *const Reader, ends: *[4]usize) bool {
@@ -2887,6 +2910,171 @@ fn expectPayloadProjection(
             );
             try expectProjectionErrorEqual(full_error, validated_reader.takeLastError());
             return;
+        }
+    }
+}
+
+fn expectBufferedLineProgress(
+    input: []const u8,
+    max_line_bytes: usize,
+    progress: struct { records: u64 = 0, bytes: u64 = 0 },
+    comptime delivery: enum { record, validated, advance },
+) !void {
+    errdefer std.debug.print("buffered lines: input {any}, limit {d}, progress {any}, delivery {t}\n", .{
+        input, max_line_bytes, progress, delivery,
+    });
+    var reference_source = ProjectionTestSource.init(input, 0, null);
+    var source = reference_source;
+    var reference = try Reader.init(std.testing.allocator, reference_source.byteSource(), .{
+        .max_line_bytes = max_line_bytes,
+    });
+    defer reference.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    var reader = try Reader.init(failing.allocator(), source.byteSource(), .{
+        .max_line_bytes = max_line_bytes,
+    });
+    defer reader.deinit();
+    for ([_]*Reader{ &reference, &reader }) |current| {
+        current.record_index = progress.records;
+        current.byte_offset = progress.bytes;
+        current.machine.sequence_len = 123;
+        current.record_offsets = .{ .header = 1, .sequence = 2, .plus = 3, .quality = 4 };
+        current.current_record_offsets = current.record_offsets;
+        current.last_error = .{
+            .code = .s005_length_mismatch,
+            .message = "earlier error",
+            .record_index = 0,
+            .byte_offset = 0,
+            .line_in_record = 4,
+        };
+        // Complete records avoid the different progress rules for an incomplete line.
+        try std.testing.expect(try current.refill());
+        try std.testing.expectEqual(input.len, current.fill_end);
+    }
+    var reference_validator = AdaptiveRecordValidator.init(.{});
+    var validator = AdaptiveRecordValidator.init(.{});
+    while (true) {
+        const record_start = reader.cursor;
+        reference.beginRecord();
+        var finished = false;
+        if (delivery == .advance) {
+            const expected = reference.advanceFallback();
+            const actual = reader.advance();
+            if (expected) |has_record| {
+                try std.testing.expectEqual(has_record, try actual);
+                finished = !has_record;
+            } else |err| {
+                try std.testing.expectError(err, actual);
+                finished = true;
+            }
+        } else {
+            const expected = reference.nextFallback(false);
+            var span: ?[]const u8 = null;
+            var semantic_error: ?SemanticError = null;
+            const actual: ReaderError!?Record = if (delivery == .validated) result: {
+                const validated = nextValidatedRecord(&reader, &validator) catch |err|
+                    break :result err;
+                if (validated) |record| {
+                    span = record.canonical_span;
+                    semantic_error = record.semantic_error;
+                    break :result record.record;
+                }
+                break :result null;
+            } else nextWithoutId(&reader, &span);
+            if (expected) |record| {
+                try std.testing.expectEqualDeep(record, try actual);
+                if (record) |fields| {
+                    if (delivery == .validated) {
+                        try expectSemanticErrorEqual(reference_validator.validate(fields), semantic_error);
+                    }
+                    const raw = input[record_start..reader.cursor];
+                    var canonical = true;
+                    var line_start: usize = 0;
+                    for (raw, 0..) |byte, index| {
+                        if (byte != '\n') continue;
+                        if (index > line_start and raw[index - 1] == '\r') canonical = false;
+                        line_start = index + 1;
+                    }
+                    if (canonical) {
+                        try std.testing.expectEqualStrings(raw, span.?);
+                    } else try std.testing.expect(span == null);
+                } else finished = true;
+            } else |err| {
+                try std.testing.expectError(err, actual);
+                try std.testing.expect(span == null);
+                finished = true;
+            }
+        }
+        try std.testing.expectEqual(reference.cursor, reader.cursor);
+        try std.testing.expectEqual(reference.fill_end, reader.fill_end);
+        try std.testing.expectEqual(reference.recordIndex(), reader.recordIndex());
+        try std.testing.expectEqual(reference.byteOffset(), reader.byteOffset());
+        try std.testing.expectEqual(reference.currentRecordOffsets(), reader.currentRecordOffsets());
+        try std.testing.expectEqualDeep(reference.record_offsets, reader.record_offsets);
+        try std.testing.expectEqualDeep(reference.machine, reader.machine);
+        try std.testing.expectEqualDeep(reference_validator, validator);
+        try expectProjectionErrorEqual(reference.last_error, reader.last_error);
+        try std.testing.expectEqual(reference_source.pos, source.pos);
+        try std.testing.expectEqual(reference_source.read_count, source.read_count);
+        try std.testing.expect(!failing.has_induced_failure);
+        if (finished) return;
+    }
+}
+
+test "[property] - [reader]: complete buffered records preserve per-line results and progress" {
+    const cases = [_][4][]const u8{
+        .{ "@r note", "AC", "+note", "!~" },
+        .{ "@r", "R", "+", "~" },
+        .{ "@r", "", "+", "" },
+        .{ "@r", "A\rA", "+text\rinside", "!\r!" },
+        .{ "@\x00", "?\xff", "+", " \x7f" },
+        .{ "", "AC", "+", "!!" },
+        .{ "@", "AC", "+", "!!" },
+        .{ "@ r", "AC", "+", "!!" },
+        .{ "@\tr", "AC", "+", "!!" },
+        .{ "bad", "AC", "bad", "!" },
+        .{ "@r", "AC", "", "!!" },
+        .{ "@r", "AC", "bad", "!" },
+        .{ "@r", "AC", "+", "!" },
+        .{ "@r", "A\r", "+", "!!" },
+        .{ "@r", "AA", "+", "!\r" },
+    };
+    const prefix = "@previous\nN\n+\nI\n";
+    var storage: [128]u8 = undefined;
+    @memcpy(storage[0..prefix.len], prefix);
+    for (cases) |fields| {
+        for (0..16) |mask| {
+            var end: usize = prefix.len;
+            for (fields, 0..) |field, index| {
+                @memcpy(storage[end..][0..field.len], field);
+                end += field.len;
+                if (mask & (@as(usize, 1) << @intCast(index)) != 0) {
+                    storage[end] = '\r';
+                    end += 1;
+                }
+                storage[end] = '\n';
+                end += 1;
+            }
+            const input = storage[prefix.len..end];
+            inline for (.{ .record, .validated, .advance }) |delivery| {
+                for ([_]usize{ 0, 1, 2, 3, 4, 7, std.math.maxInt(usize) }) |limit| {
+                    try expectBufferedLineProgress(input, limit, .{}, delivery);
+                }
+                try expectBufferedLineProgress(storage[0..end], 128, .{}, delivery);
+                try expectBufferedLineProgress(input, 128, .{ .bytes = (1 << 32) - 3 }, delivery);
+                for ([_]u64{ (1 << 32) - 1, std.math.maxInt(u64) - 1, std.math.maxInt(u64) }) |count| {
+                    try expectBufferedLineProgress(input, 128, .{ .records = count }, delivery);
+                }
+                if (mask == 0 or mask == 15) {
+                    for (0..input.len + 1) |remaining| {
+                        for ([_]usize{ 2, 128 }) |limit| {
+                            try expectBufferedLineProgress(input, limit, .{
+                                .bytes = std.math.maxInt(u64) - remaining,
+                            }, delivery);
+                        }
+                    }
+                }
+            }
         }
     }
 }
