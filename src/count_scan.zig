@@ -5,7 +5,7 @@
 const std = @import("std");
 const fastq = @import("fastq.zig");
 
-pub const Options = fastq.Options;
+pub const Options = fastq.ReaderOptions;
 
 // Bare plus lines let the fast path derive every tail offset from the sequence length.
 const DenseLayout = struct {
@@ -411,7 +411,7 @@ pub const Scanner = struct {
 
     fn structuralError(
         self: *Scanner,
-        err: fastq.Error,
+        err: fastq.StructuralError,
         offset: u64,
     ) fastq.ReaderError {
         const details = fastq.diagnostic(err);

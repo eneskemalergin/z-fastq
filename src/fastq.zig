@@ -116,7 +116,7 @@ pub const ExpectedLine = enum {
     quality,
 };
 
-pub const Error = error{
+pub const StructuralError = error{
     S001InvalidPlusLine,
     S003InvalidHeader,
     S005LengthMismatch,
@@ -128,7 +128,7 @@ pub const Diagnostic = struct {
     line: u3,
 };
 
-pub fn diagnostic(err: Error) Diagnostic {
+pub fn diagnostic(err: StructuralError) Diagnostic {
     return switch (err) {
         error.S001InvalidPlusLine => .{
             .code = .s001_invalid_plus_line,
@@ -166,7 +166,7 @@ pub const Machine = struct {
         line_len: usize,
         first_byte: ?u8,
         second_byte: ?u8,
-    ) Error!bool {
+    ) StructuralError!bool {
         switch (self.expected) {
             .header => {
                 if (!headerPrefixIsValid(first_byte, second_byte)) {
@@ -881,7 +881,7 @@ fn scanCompleteRecord(
 
 // --- Reader ---
 
-pub const Options = struct {
+pub const ReaderOptions = struct {
     /// Maximum content bytes in one logical line, excluding LF and the optional CR.
     max_line_bytes: usize = io_layer.DEFAULT_MAX_LINE_BYTES,
 };
@@ -1079,7 +1079,7 @@ pub const Reader = struct {
     fallback_fields: [4]FallbackField,
     record_index: u64,
     byte_offset: u64,
-    options: Options,
+    options: ReaderOptions,
     machine: Machine,
     last_error: ?ParseError,
     record_offsets: RecordOffsets = undefined,
@@ -1091,7 +1091,7 @@ pub const Reader = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         source: ByteSource,
-        options: Options,
+        options: ReaderOptions,
     ) !Reader {
         const buf = try allocator.alloc(u8, io_layer.DEFAULT_READER_BUFFER_BYTES);
         return initBuffer(allocator, source, options, buf);
@@ -1100,7 +1100,7 @@ pub const Reader = struct {
     fn initBuffer(
         allocator: std.mem.Allocator,
         source: ByteSource,
-        options: Options,
+        options: ReaderOptions,
         buf: []u8,
     ) Reader {
         return .{
@@ -1665,7 +1665,7 @@ pub const Reader = struct {
 
     fn structuralError(
         self: *Reader,
-        err: Error,
+        err: StructuralError,
         offset: u64,
     ) ReaderError {
         const details = diagnostic(err);
@@ -2042,7 +2042,7 @@ pub const RetainedRecordStorage = struct {
 pub fn initBorrowedGzipReader(
     allocator: std.mem.Allocator,
     source: *io_layer.GzipSource,
-    options: Options,
+    options: ReaderOptions,
 ) !Reader {
     std.debug.assert(source.decompressor_buffer.len != 0);
     var reader = Reader.initBuffer(allocator, source.byteSource(), options, source.decompressor_buffer[0..0]);
@@ -2373,7 +2373,7 @@ pub const CheckScanner = struct {
     byte_offset: u64 = 0,
     last_error: ?ParseError = null,
 
-    pub fn init(options: Options, validation_options: ValidationOptions) CheckScanner {
+    pub fn init(options: ReaderOptions, validation_options: ValidationOptions) CheckScanner {
         return .{
             .max_line_bytes = options.max_line_bytes,
             .alphabet = validation_options.alphabet,
@@ -2746,7 +2746,7 @@ fn expectPayloadProjection(
     input: []const u8,
     split: usize,
     fail_at: ?usize,
-    options: Options,
+    options: ReaderOptions,
     validation_options: ValidationOptions,
 ) !void {
     var full_source = ProjectionTestSource.init(input, split, fail_at);
@@ -3060,7 +3060,7 @@ fn expectPredictedPayloads(
     split: usize,
     chunk_limit: usize,
     fail_at: ?usize,
-    options: Options,
+    options: ReaderOptions,
     progress: struct { records: u64 = 0, bytes: u64 = 0 },
 ) !void {
     var reference_source = ProjectionTestSource.init(input, split, fail_at);
@@ -3212,7 +3212,7 @@ fn expectValidatedProjection(
     input: []const u8,
     split: usize,
     fail_at: ?usize,
-    options: Options,
+    options: ReaderOptions,
     validation_options: ValidationOptions,
     progress: struct { records: u64 = 0, bytes: u64 = 0 },
 ) !void {
@@ -3273,7 +3273,7 @@ fn expectRefillDelivery(
     split: usize,
     chunk_limit: usize,
     fail_at: ?usize,
-    options: Options,
+    options: ReaderOptions,
     progress: struct { records: u64 = 0, bytes: u64 = 0 },
 ) !void {
     errdefer std.debug.print("refill comparison: bytes {d}, split {d}, chunk {d}, failure {?d}, limit {d}, progress {any}\n", .{
@@ -3342,7 +3342,7 @@ fn expectPairedRefill(
     split: usize,
     chunk_limit: usize,
     fail_at: ?usize,
-    options: Options,
+    options: ReaderOptions,
     progress: struct { records: u64 = 0, bytes: u64 = 0 },
 ) !void {
     errdefer std.debug.print("pair refill: header {}, bytes {d}, split {d}, chunk {d}, failure {?d}, progress {any}\n", .{
@@ -3713,7 +3713,7 @@ test "[property] - [reader]: refill retries preserve records, progress, and fail
         "@r\nR\n+\n \n",         "@r\n?\n-\n \n",      "@r\nAAA\n+\n!\n!\n",          "@r\nA\n+\n!\r",
         "@r\r\r\nA\n+\r\r\n!\n", "@r\nR\rA\n+\n!!!\n",
     }) |input| {
-        for ([_]Options{ .{}, .{ .max_line_bytes = 2 } }) |options| {
+        for ([_]ReaderOptions{ .{}, .{ .max_line_bytes = 2 } }) |options| {
             for (0..input.len + 1) |split| {
                 try expectRefillDelivery(input, split, unlimited, null, options, .{});
                 try expectRefillDelivery(input[0..split], 0, 1, null, options, .{});
@@ -3827,7 +3827,7 @@ test "[property] - [reader]: field projections preserve delivery and failures" {
     const malformed = [_]struct {
         input: []const u8,
         split: usize,
-        options: Options = .{},
+        options: ReaderOptions = .{},
     }{
         .{ .input = "@r\nAC\n+\n", .split = 5 },
         .{ .input = "r\nA\n+\n!\n", .split = 3 },
@@ -5103,7 +5103,7 @@ test "[property] - [check scanner]: complete records accept mixed LF and CRLF en
 test "[property] - [check scanner]: fragmented results match independent expectations and Reader" {
     const Case = struct {
         data: []const u8,
-        options: Options = .{},
+        options: ReaderOptions = .{},
         validation_options: ValidationOptions = .{},
         expected: CheckTestOutcome,
     };
@@ -5541,7 +5541,7 @@ test "[edge] - [check scanner]: arithmetic limits fail explicitly" {
 fn directCheckOutcome(
     data: []const u8,
     chunk_len: usize,
-    options: Options,
+    options: ReaderOptions,
     validation_options: ValidationOptions,
 ) CheckTestOutcome {
     var scanner = CheckScanner.init(options, validation_options);
@@ -5560,7 +5560,7 @@ fn directCheckOutcome(
 
 fn referenceCheckOutcome(
     data: []const u8,
-    options: Options,
+    options: ReaderOptions,
     validation_options: ValidationOptions,
 ) !CheckTestOutcome {
     var source = io_layer.SliceSource.init(data);

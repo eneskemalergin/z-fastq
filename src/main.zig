@@ -854,7 +854,7 @@ const RecordInput = struct {
     fn initReader(
         self: *RecordInput,
         allocator: std.mem.Allocator,
-        options: fastq.Options,
+        options: fastq.ReaderOptions,
     ) !zfastq.Reader {
         return switch (self.source) {
             .plain => |*source| zfastq.Reader.init(allocator, source.byteSource(), options),
@@ -897,7 +897,7 @@ fn initRecordInput(
 fn initSourceReader(
     allocator: std.mem.Allocator,
     source: anytype,
-    options: fastq.Options,
+    options: fastq.ReaderOptions,
 ) !zfastq.Reader {
     return if (comptime @TypeOf(source) == zfastq.io.ByteSource)
         zfastq.Reader.init(allocator, source, options)
@@ -1097,7 +1097,7 @@ fn writeCheckedRecord(
     }
 }
 
-fn deinterleaveStagingLimit(max_line_bytes: usize) error{ArithmeticLimit}!usize {
+fn recordStagingLimit(max_line_bytes: usize) error{ArithmeticLimit}!usize {
     const fields = std.math.mul(usize, max_line_bytes, 4) catch
         return error.ArithmeticLimit;
     return std.math.add(usize, fields, 4) catch error.ArithmeticLimit;
@@ -1727,7 +1727,7 @@ fn checkPairedSources(
     options: PairedCheckOptions,
     exact_selector: ?*sampling.ExactSelector,
 ) ?PairCommandFailure {
-    const reader_options: fastq.Options = .{ .max_line_bytes = options.max_line_bytes };
+    const reader_options: fastq.ReaderOptions = .{ .max_line_bytes = options.max_line_bytes };
     var reader1 = initSourceReader(allocator, source1, reader_options) catch
         return pairCommandFailure(0, OUT_OF_MEMORY);
     defer reader1.deinit();
@@ -2187,7 +2187,7 @@ fn runPairSampleCommand(
         .count => |count| count != 0,
     };
     const staging_limit = if (needs_staging)
-        deinterleaveStagingLimit(options.max_line_bytes) catch {
+        recordStagingLimit(options.max_line_bytes) catch {
             if (canReportInputFailure(io, null)) {
                 std.Io.File.writeStreamingAll(
                     .stderr(),
@@ -2452,7 +2452,7 @@ fn sampleFractionSource(
     selector: *sampling.Selector,
     options: SampleOptions,
 ) error{WriteFailed}!?CommandFailure {
-    const reader_options: fastq.Options = .{ .max_line_bytes = options.max_line_bytes };
+    const reader_options: fastq.ReaderOptions = .{ .max_line_bytes = options.max_line_bytes };
     var reader = initSourceReader(allocator, source, reader_options) catch
         return OUT_OF_MEMORY;
     defer reader.deinit();
@@ -3481,7 +3481,7 @@ fn interleaveSources(
     selection: *PairOutputSelector,
     options: InterleaveOptions,
 ) error{WriteFailed}!?PairCommandFailure {
-    const reader_options: fastq.Options = .{ .max_line_bytes = options.max_line_bytes };
+    const reader_options: fastq.ReaderOptions = .{ .max_line_bytes = options.max_line_bytes };
     var reader1 = initSourceReader(allocator, source1, reader_options) catch
         return pairCommandFailure(0, OUT_OF_MEMORY);
     defer reader1.deinit();
@@ -3621,7 +3621,7 @@ fn runDeinterleave(
 ) u8 {
     const paths = validateDeinterleaveArguments(io, inputs, output1_path, output2_path) orelse
         return 2;
-    const staging_limit = deinterleaveStagingLimit(options.max_line_bytes) catch {
+    const staging_limit = recordStagingLimit(options.max_line_bytes) catch {
         std.Io.File.writeStreamingAll(
             .stderr(),
             io,
@@ -4906,7 +4906,7 @@ test "[integration] - [paired exact sample]: selected pairs are revalidated afte
                         },
                         snapshots,
                         selector.record_count,
-                        try deinterleaveStagingLimit(options.max_line_bytes),
+                        try recordStagingLimit(options.max_line_bytes),
                         options,
                     );
                     const reject = case.failed_input != null and
@@ -4950,7 +4950,7 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
         .seed = 11,
         .pair_mode = .interleaved,
     };
-    const staging_limit = try deinterleaveStagingLimit(options.max_line_bytes);
+    const staging_limit = try recordStagingLimit(options.max_line_bytes);
     const Change = enum { valid, alphabet1, quality1, alphabet2, quality2, name, structure, write };
     for ([_]InterleavedFirstRecordStorage{ .reader, .staged, .retained }) |storage| {
         var input: std.ArrayList(u8) = .empty;
@@ -5212,7 +5212,7 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
         .empty,
         changed_pair_snapshot,
         1,
-        try deinterleaveStagingLimit(zfastq.limits.DEFAULT_MAX_LINE_BYTES),
+        try recordStagingLimit(zfastq.limits.DEFAULT_MAX_LINE_BYTES),
         .{
             .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
             .alphabet = .iupac,
@@ -5306,7 +5306,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         .empty,
         pair_snapshot,
         1,
-        try deinterleaveStagingLimit(zfastq.limits.DEFAULT_MAX_LINE_BYTES),
+        try recordStagingLimit(zfastq.limits.DEFAULT_MAX_LINE_BYTES),
         .{
             .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
             .alphabet = .iupac,
@@ -5420,7 +5420,7 @@ fn exerciseExactAllocations(allocator: std.mem.Allocator) !void {
                 }
             } else {
                 const inputs = if (mode == .paired) paths[0..2] else paths[2..3];
-                if (try sampleExactPairs(io, allocator, inputs, &writer, count, try deinterleaveStagingLimit(options.max_line_bytes), options)) |failure| {
+                if (try sampleExactPairs(io, allocator, inputs, &writer, count, try recordStagingLimit(options.max_line_bytes), options)) |failure| {
                     try std.testing.expectEqual(descriptors, try openDescriptorCount());
                     return pairAllocationFailure(failure);
                 }
@@ -5576,7 +5576,7 @@ test "[integration] - [output aliases]: rejection closes inputs on both exact pa
         const single_failure = (try sampleExactSecondPass(true, io, allocator, paths[0], &writer, .empty, snapshots[0], 1, options)).?;
         try std.testing.expectEqualStrings("input_changed", single_failure.code);
         try std.testing.expectEqual(@as(u8, 3), single_failure.exit_code);
-        const interleaved_failure = (try sampleExactInterleavedSecondPass(true, io, allocator, paths[0], &writer, .empty, snapshots[0], 1, try deinterleaveStagingLimit(options.max_line_bytes), options)).?;
+        const interleaved_failure = (try sampleExactInterleavedSecondPass(true, io, allocator, paths[0], &writer, .empty, snapshots[0], 1, try recordStagingLimit(options.max_line_bytes), options)).?;
         try std.testing.expectEqualStrings("input_changed", interleaved_failure.command.details.code);
         try std.testing.expectEqual(@as(u8, 3), interleaved_failure.exitCode());
         try std.testing.expectEqual(descriptors, try openDescriptorCount());
@@ -6091,7 +6091,7 @@ test "[failure] - [deinterleave]: identifies both output write positions" {
         .alphabet = .iupac,
         .pair_name_policy = .illumina,
     };
-    const staging_limit = try deinterleaveStagingLimit(options.max_line_bytes);
+    const staging_limit = try recordStagingLimit(options.max_line_bytes);
 
     {
         var source = io_layer.SliceSource.init(input);
@@ -6335,7 +6335,7 @@ test "[failure] - [deinterleave]: staging allocation failure emits no output" {
         source.byteSource(),
         &writer1,
         &writer2,
-        try deinterleaveStagingLimit(options.max_line_bytes),
+        try recordStagingLimit(options.max_line_bytes),
         options,
     )).?;
 
@@ -6389,7 +6389,7 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
             &staging,
             record1,
             null,
-            try deinterleaveStagingLimit(reader.options.max_line_bytes),
+            try recordStagingLimit(reader.options.max_line_bytes),
             &validator,
         );
         try std.testing.expect(next.first_storage == .retained);
@@ -6425,7 +6425,7 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
             source.byteSource(),
             &writer1,
             &writer2,
-            if (failure_mode == 2) 1 else try deinterleaveStagingLimit(options.max_line_bytes),
+            if (failure_mode == 2) 1 else try recordStagingLimit(options.max_line_bytes),
             options,
         );
         if (failure_mode < 2) {
@@ -6465,7 +6465,7 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
             source.byteSource(),
             &writer1,
             &writer2,
-            try deinterleaveStagingLimit(options.max_line_bytes),
+            try recordStagingLimit(options.max_line_bytes),
             options,
         )).?;
         switch (failure_mode) {
