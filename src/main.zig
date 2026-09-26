@@ -1798,76 +1798,92 @@ fn collectStats(
     defer reader.deinit();
 
     var stats: zfastq.Stats = .{};
-    while (fastq.nextPayload(&reader) catch |err| {
+    while (fastq.nextPredictedPayload(&reader) catch |err| {
         return .{ .failure = mapReaderFailure(&reader, err) };
-    }) |payload| {
-        stats.addRecord(.{
-            .header = "",
-            .id = "",
-            .sequence = payload.sequence,
-            .plus = "",
-            .quality = payload.quality,
-        }) catch |err| switch (err) {
-            error.S006InvalidQuality => {
-                const quality_error = stats.takeLastQualityError() orelse {
-                    return .{ .failure = CommandFailure.plain(
-                        "io_error",
-                        "quality validation failed without details",
-                        3,
-                    ) };
-                };
-                const offsets = reader.currentRecordOffsets() orelse {
-                    return .{ .failure = CommandFailure.plain(
-                        "io_error",
-                        "record location is unavailable",
-                        3,
-                    ) };
-                };
-                const relative_offset = std.math.cast(u64, quality_error.byte_index) orelse
-                    return .{ .failure = CommandFailure.plain(
+    }) |predicted| {
+        var payload = predicted.payload;
+        var checkpoint = predicted.checkpoint;
+        while (true) {
+            stats.addRecord(.{
+                .header = "",
+                .id = "",
+                .sequence = payload.sequence,
+                .plus = "",
+                .quality = payload.quality,
+            }) catch |err| {
+                if (err == error.S006InvalidQuality) {
+                    if (checkpoint) |saved| {
+                        payload = saved.reread(&reader) catch |reader_error| {
+                            return .{ .failure = mapReaderFailure(&reader, reader_error) };
+                        };
+                        checkpoint = null;
+                        continue;
+                    }
+                }
+                switch (err) {
+                    error.S006InvalidQuality => {
+                        const quality_error = stats.takeLastQualityError() orelse {
+                            return .{ .failure = CommandFailure.plain(
+                                "io_error",
+                                "quality validation failed without details",
+                                3,
+                            ) };
+                        };
+                        const offsets = reader.currentRecordOffsets() orelse {
+                            return .{ .failure = CommandFailure.plain(
+                                "io_error",
+                                "record location is unavailable",
+                                3,
+                            ) };
+                        };
+                        const relative_offset = std.math.cast(u64, quality_error.byte_index) orelse
+                            return .{ .failure = CommandFailure.plain(
+                                "arithmetic_limit",
+                                "statistics arithmetic limit exceeded",
+                                4,
+                            ) };
+                        const byte_offset = std.math.add(
+                            u64,
+                            offsets.quality,
+                            relative_offset,
+                        ) catch return .{ .failure = CommandFailure.plain(
+                            "arithmetic_limit",
+                            "statistics arithmetic limit exceeded",
+                            4,
+                        ) };
+                        return .{ .failure = CommandFailure.lint(.{
+                            .code = .s006_invalid_quality_range,
+                            .message = INVALID_QUALITY_MESSAGE,
+                            .record_index = reader.recordIndex() - 1,
+                            .byte_offset = byte_offset,
+                            .line_in_record = 4,
+                        }) };
+                    },
+                    error.S005LengthMismatch => {
+                        const offsets = reader.currentRecordOffsets() orelse {
+                            return .{ .failure = CommandFailure.plain(
+                                "io_error",
+                                "record location is unavailable",
+                                3,
+                            ) };
+                        };
+                        return .{ .failure = CommandFailure.lint(.{
+                            .code = .s005_length_mismatch,
+                            .message = "sequence and quality lengths differ",
+                            .record_index = reader.recordIndex() - 1,
+                            .byte_offset = offsets.quality,
+                            .line_in_record = 4,
+                        }) };
+                    },
+                    error.Overflow => return .{ .failure = CommandFailure.plain(
                         "arithmetic_limit",
                         "statistics arithmetic limit exceeded",
                         4,
-                    ) };
-                const byte_offset = std.math.add(
-                    u64,
-                    offsets.quality,
-                    relative_offset,
-                ) catch return .{ .failure = CommandFailure.plain(
-                    "arithmetic_limit",
-                    "statistics arithmetic limit exceeded",
-                    4,
-                ) };
-                return .{ .failure = CommandFailure.lint(.{
-                    .code = .s006_invalid_quality_range,
-                    .message = INVALID_QUALITY_MESSAGE,
-                    .record_index = reader.recordIndex() - 1,
-                    .byte_offset = byte_offset,
-                    .line_in_record = 4,
-                }) };
-            },
-            error.S005LengthMismatch => {
-                const offsets = reader.currentRecordOffsets() orelse {
-                    return .{ .failure = CommandFailure.plain(
-                        "io_error",
-                        "record location is unavailable",
-                        3,
-                    ) };
-                };
-                return .{ .failure = CommandFailure.lint(.{
-                    .code = .s005_length_mismatch,
-                    .message = "sequence and quality lengths differ",
-                    .record_index = reader.recordIndex() - 1,
-                    .byte_offset = offsets.quality,
-                    .line_in_record = 4,
-                }) };
-            },
-            error.Overflow => return .{ .failure = CommandFailure.plain(
-                "arithmetic_limit",
-                "statistics arithmetic limit exceeded",
-                4,
-            ) },
-        };
+                    ) },
+                }
+            };
+            break;
+        }
     }
     return .{ .success = stats };
 }

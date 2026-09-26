@@ -467,6 +467,46 @@ test "[cli] - [stats]: S006 reports the exact decompressed quality-byte offset" 
     );
 }
 
+test "[cli] - [stats]: embedded quality endings preserve structural error precedence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cases = [_]struct { input: []const u8, code: []const u8, offset: usize }{
+        .{ .input = "@r\nACG\n+\n!\n!\n", .code = "S005", .offset = 9 },
+        .{ .input = "@r\nACG\n+\n \n!\n", .code = "S005", .offset = 9 },
+        .{ .input = "@r\nACG\n+\n!\n!\r\n", .code = "S005", .offset = 9 },
+        .{ .input = "@r\nACG\n+\n!\n\r\n", .code = "S005", .offset = 9 },
+        .{ .input = "@r\nAC\n+\n!\r\r\n", .code = "S006", .offset = 9 },
+        .{ .input = "@r\r\nACG\r\n+\r\n!\x7f!\r\n", .code = "S006", .offset = 13 },
+    };
+    for (cases) |case| {
+        for ([_][]const u8{ "", "@ok\nA\n+\n!\n" }) |prefix| {
+            const input = try std.mem.concat(allocator, u8, &.{ prefix, case.input });
+            const record_index: u64 = @intFromBool(prefix.len != 0);
+            const offset = prefix.len + case.offset;
+            const message = if (std.mem.eql(u8, case.code, "S005"))
+                "sequence and quality lengths differ"
+            else
+                "quality byte must be ASCII 33 through 126";
+            const expected = try std.fmt.allocPrint(
+                allocator,
+                "error: -: {s}: {s} (record {d}, line 4, offset {d})\n",
+                .{ case.code, message, record_index, offset },
+            );
+            const human = try runCli(allocator, &.{ "stats", "-" }, input, input.len);
+            try cli.expectResult(human, 1, "", expected);
+            const json = try runCli(allocator, &.{ "stats", "--json", "-" }, input, input.len);
+            try std.testing.expectEqual(@as(u8, 1), json.exit_code);
+            try std.testing.expectEqualStrings("", json.stderr);
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json.stdout, .{});
+            defer parsed.deinit();
+            const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
+            try std.testing.expectEqual(@as(usize, 1), results.len);
+            try expectJsonFailure(results[0], "-", case.code, record_index, offset, 4);
+        }
+    }
+}
+
 test "[cli] - [stats]: successful blocks survive independent higher-class failures" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

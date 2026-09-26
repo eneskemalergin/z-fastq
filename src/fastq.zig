@@ -63,6 +63,28 @@ pub const RecordPayload = struct {
     quality: []const u8,
 };
 
+pub const PredictedPayload = struct {
+    payload: RecordPayload,
+    checkpoint: ?PayloadCheckpoint = null,
+};
+
+const PayloadCheckpoint = struct {
+    cursor: usize,
+    byte_offset: u64,
+    record_index: u64,
+    machine: Machine,
+    record_offsets: RecordOffsets,
+
+    pub fn reread(self: PayloadCheckpoint, reader: *Reader) ReaderError!RecordPayload {
+        reader.cursor = self.cursor;
+        reader.byte_offset = self.byte_offset;
+        reader.record_index = self.record_index;
+        reader.machine = self.machine;
+        reader.record_offsets = self.record_offsets;
+        return (try reader.nextPayload()).?;
+    }
+};
+
 pub const ValidatedHeader = struct {
     header: []const u8,
     semantic_error: ?SemanticError,
@@ -648,7 +670,7 @@ const BufferedPayload = struct {
     quality: Range,
 };
 
-const BufferedProjection = enum { full, payload, validated_header, validated };
+const BufferedProjection = enum { full, payload, predicted_payload, validated_header, validated };
 
 fn BufferedRecordResult(comptime projection: BufferedProjection) type {
     return union(enum) {
@@ -657,23 +679,25 @@ fn BufferedRecordResult(comptime projection: BufferedProjection) type {
         record: switch (projection) {
             .full => BufferedRecord,
             .payload => BufferedPayload,
+            .predicted_payload => struct { payload: BufferedPayload, checkpoint: ?PayloadCheckpoint },
             .validated_header => struct { header: Range, semantic_error: ?SemanticError },
             .validated => BufferedValidatedRecord,
         },
     };
 }
 
-fn findLineEnds(bytes: []const u8, ends: *[4]usize) bool {
+fn findLineEnds(comptime line_count: usize, bytes: []const u8, ends: *[line_count]usize) bool {
     if (std.simd.suggestVectorLength(u8)) |vector_len| {
-        return findLineEndsVector(vector_len, bytes, ends);
+        return findLineEndsVector(line_count, vector_len, bytes, ends);
     }
-    return findLineEndsScalar(bytes, 0, ends, 0);
+    return findLineEndsScalar(line_count, bytes, 0, ends, 0);
 }
 
 fn findLineEndsVector(
+    comptime line_count: usize,
     comptime vector_len: comptime_int,
     bytes: []const u8,
-    ends: *[4]usize,
+    ends: *[line_count]usize,
 ) bool {
     const Bytes = @Vector(vector_len, u8);
     const Mask = @Int(.unsigned, vector_len);
@@ -690,13 +714,14 @@ fn findLineEndsVector(
             line_feeds &= line_feeds - 1;
         }
     }
-    return findLineEndsScalar(bytes[block_start..], block_start, ends, found);
+    return findLineEndsScalar(line_count, bytes[block_start..], block_start, ends, found);
 }
 
 fn findLineEndsScalar(
+    comptime line_count: usize,
     bytes: []const u8,
     base: usize,
-    ends: *[4]usize,
+    ends: *[line_count]usize,
     initial_found: usize,
 ) bool {
     var found = initial_found;
@@ -864,6 +889,27 @@ pub const Reader = struct {
         }
     }
 
+    fn nextPredictedPayload(self: *Reader) ReaderError!?PredictedPayload {
+        self.beginRecord();
+        switch (try self.readBufferedRecord(.predicted_payload, false, null, false)) {
+            .incomplete => return if (try self.nextFallbackPayload()) |payload|
+                .{ .payload = payload }
+            else
+                null,
+            .eof => return null,
+            .record => |buffered| {
+                self.current_record_offsets = self.record_offsets;
+                return .{
+                    .payload = .{
+                        .sequence = buffered.payload.sequence.slice(self.buf),
+                        .quality = buffered.payload.quality.slice(self.buf),
+                    },
+                    .checkpoint = buffered.checkpoint,
+                };
+            },
+        }
+    }
+
     fn nextValidatedHeader(
         self: *Reader,
         validator: *AdaptiveRecordValidator,
@@ -995,6 +1041,7 @@ pub const Reader = struct {
         if (self.cursor == self.fill_end and !try self.refill()) return .eof;
 
         var relative_ends: [4]usize = undefined;
+        var checkpoint: ?PayloadCheckpoint = null;
         const complete = if (projection == .validated or projection == .validated_header)
             scanCompleteRecord(
                 self.buf[self.cursor..self.fill_end],
@@ -1004,9 +1051,26 @@ pub const Reader = struct {
             )
         else
             null;
-        if (complete) |checked| {
+        if (projection == .predicted_payload) {
+            const bytes = self.buf[self.cursor..self.fill_end];
+            if (!findLineEnds(3, bytes, relative_ends[0..3])) return .incomplete;
+            if (self.predictQualityEnd(&relative_ends)) {
+                checkpoint = .{
+                    .cursor = self.cursor,
+                    .byte_offset = self.byte_offset,
+                    .record_index = self.record_index,
+                    .machine = self.machine,
+                    .record_offsets = self.record_offsets,
+                };
+            } else {
+                const quality_start = relative_ends[2] + 1;
+                const quality_lf = std.mem.findScalar(u8, bytes[quality_start..], '\n') orelse
+                    return .incomplete;
+                relative_ends[3] = quality_start + quality_lf;
+            }
+        } else if (complete) |checked| {
             relative_ends = checked.line_ends;
-        } else if (!findLineEnds(self.buf[self.cursor..self.fill_end], &relative_ends)) {
+        } else if (!findLineEnds(4, self.buf[self.cursor..self.fill_end], &relative_ends)) {
             if (allow_refill) {
                 if (try self.bufferIncompleteRecord(0)) |bytes| {
                     return self.readSavedRecord(bytes, projection, include_canonical_span, validator);
@@ -1096,8 +1160,34 @@ pub const Reader = struct {
         }
         return if (projection == .validated_header)
             .{ .record = .{ .header = header, .semantic_error = semantic_error } }
+        else if (projection == .predicted_payload)
+            .{ .record = .{ .payload = payload, .checkpoint = checkpoint } }
         else
             .{ .record = payload };
+    }
+
+    fn predictQualityEnd(self: *const Reader, ends: *[4]usize) bool {
+        const bytes = self.buf[self.cursor..self.fill_end];
+        const sequence_start = ends[0] + 1;
+        const sequence_end = ends[1] - @intFromBool(
+            ends[1] > sequence_start and bytes[ends[1] - 1] == '\r',
+        );
+        const sequence_len = sequence_end - sequence_start;
+        const quality_start = ends[2] + 1;
+        if (sequence_len >= bytes.len - quality_start) return false;
+        const quality_end = quality_start + sequence_len;
+        const quality_lf = quality_end + @intFromBool(bytes[quality_end] == '\r');
+        if (quality_lf == bytes.len or bytes[quality_lf] != '\n') return false;
+        // Stripping a guessed CR could reject the length before quality validation can retry.
+        if (quality_lf == quality_end and sequence_len != 0 and bytes[quality_end - 1] == '\r')
+            return false;
+
+        // A guessed end must not hide an earlier length error with counter overflow.
+        if (self.record_index == std.math.maxInt(u64)) return false;
+        const consumed = std.math.cast(u64, quality_lf + 1) orelse return false;
+        _ = std.math.add(u64, self.byte_offset, consumed) catch return false;
+        ends[3] = quality_lf;
+        return true;
     }
 
     const RefillRecord = struct {
@@ -1619,6 +1709,12 @@ pub fn nextRecordWithoutId(reader: *Reader) ReaderError!?Record {
 
 pub fn nextPayload(reader: *Reader) ReaderError!?RecordPayload {
     return reader.nextPayload();
+}
+
+/// Validate predicted quality as Phred+33 before advancing the reader again.
+/// On rejection, reread from the checkpoint to recover structural errors first.
+pub fn nextPredictedPayload(reader: *Reader) ReaderError!?PredictedPayload {
+    return reader.nextPredictedPayload();
 }
 
 pub fn nextValidatedHeader(
@@ -2795,6 +2891,170 @@ fn expectPayloadProjection(
     }
 }
 
+fn readPredictedPayloadForTest(reader: *Reader) ReaderError!?RecordPayload {
+    const predicted = try nextPredictedPayload(reader) orelse return null;
+    for (predicted.payload.quality) |byte| {
+        if (byte < 33 or byte > 126) {
+            if (predicted.checkpoint) |checkpoint| return try checkpoint.reread(reader);
+            break;
+        }
+    }
+    return predicted.payload;
+}
+
+fn expectPredictedPayloads(
+    input: []const u8,
+    split: usize,
+    chunk_limit: usize,
+    fail_at: ?usize,
+    options: Options,
+    progress: struct { records: u64 = 0, bytes: u64 = 0 },
+) !void {
+    var reference_source = ProjectionTestSource.init(input, split, fail_at);
+    reference_source.chunk_limit = chunk_limit;
+    var reference = try Reader.init(std.testing.allocator, reference_source.byteSource(), options);
+    defer reference.deinit();
+    var source = ProjectionTestSource.init(input, split, fail_at);
+    source.chunk_limit = chunk_limit;
+    var reader = try Reader.init(std.testing.allocator, source.byteSource(), options);
+    defer reader.deinit();
+    for ([_]*Reader{ &reference, &reader }) |current| {
+        current.record_index = progress.records;
+        current.byte_offset = progress.bytes;
+        current.record_offsets = .{ .header = 1, .sequence = 2, .plus = 3, .quality = 4 };
+        current.last_error = .{
+            .code = .s005_length_mismatch,
+            .message = "earlier error",
+            .record_index = 0,
+            .byte_offset = 0,
+            .line_in_record = 4,
+        };
+    }
+
+    while (true) {
+        const expected_result = nextPayload(&reference);
+        const actual_result = readPredictedPayloadForTest(&reader);
+        var finished = false;
+        if (expected_result) |expected| {
+            try std.testing.expectEqualDeep(expected, try actual_result);
+            finished = expected == null;
+        } else |err| {
+            try std.testing.expectError(err, actual_result);
+            finished = true;
+        }
+        try std.testing.expectEqual(reference.cursor, reader.cursor);
+        try std.testing.expectEqual(reference.fill_end, reader.fill_end);
+        try std.testing.expectEqual(reference.recordIndex(), reader.recordIndex());
+        try std.testing.expectEqual(reference.byteOffset(), reader.byteOffset());
+        try std.testing.expectEqual(reference.currentRecordOffsets(), reader.currentRecordOffsets());
+        try std.testing.expectEqualDeep(reference.record_offsets, reader.record_offsets);
+        try std.testing.expectEqualDeep(reference.machine, reader.machine);
+        try expectProjectionErrorEqual(reference.last_error, reader.last_error);
+        try std.testing.expectEqual(reference_source.pos, source.pos);
+        try std.testing.expectEqual(reference_source.read_count, source.read_count);
+        if (finished) return;
+    }
+}
+
+test "[property] - [reader]: predicted payloads preserve parsing and source progress" {
+    const first = "@r\nAC\n+\n!~\n";
+    const unlimited = std.math.maxInt(usize);
+    for ([_][]const u8{
+        first,
+        "@empty\n\n+\n\n",
+        "@r\r\nac?\r\n+note\r\n!~I\r\n",
+        "@r\n\x00\x7f\r\n+\r\n!~\n",
+        "@r\nAC\n+\n!!",
+        "@r\nAC\n+\n \n\n",
+        "@r\nACG\n+\n!\n!\n",
+        "@r\nACG\n+\n!\n\r\n",
+        "@r\nACG\n+\n!\n!\r\n",
+        "@r\nAC\n+\n!\x7f\r\n",
+        "@r\nAC\n+\n!\r\r\n",
+        "@r\nAC\n+\n!\r\n",
+        "@r\nAC\n+\n!!!\n",
+        "bad\nAC\n+\n!~\n",
+        "@r\nAC\nbad\n!~\n",
+        first ++ "@r\nACG\n+\n!\n!\n",
+        first ++ "@r\r\nAC\r\n+\r\n!\x7f\r\n",
+    }) |input| {
+        for (0..input.len + 1) |position| {
+            try expectPredictedPayloads(input, position, unlimited, null, .{}, .{});
+            try expectPredictedPayloads(input[0..position], 0, unlimited, null, .{}, .{});
+            try expectPredictedPayloads(input, 0, unlimited, position, .{}, .{});
+        }
+        for (1..input.len + 1) |chunk_limit| {
+            try expectPredictedPayloads(input, 0, chunk_limit, null, .{}, .{});
+        }
+        for (0..9) |limit| {
+            try expectPredictedPayloads(input, 0, unlimited, null, .{ .max_line_bytes = limit }, .{});
+        }
+        for ([_]u64{ (1 << 32) - 1, std.math.maxInt(u64) - 1, std.math.maxInt(u64) }) |counter| {
+            try expectPredictedPayloads(input, 0, unlimited, null, .{}, .{ .records = counter });
+        }
+        for (0..input.len + 1) |remaining| {
+            try expectPredictedPayloads(input, 0, unlimited, null, .{}, .{
+                .bytes = std.math.maxInt(u64) - remaining,
+            });
+        }
+        try expectPredictedPayloads(input, 0, unlimited, null, .{}, .{ .bytes = (1 << 32) - 1 });
+    }
+}
+
+test "[property] - [reader]: predicted payloads retain refill and oversized fallbacks" {
+    const capacity = io_layer.DEFAULT_READER_BUFFER_BYTES;
+    for ([_]usize{ capacity / 2 - 8, capacity / 2, capacity + 1 }) |len| {
+        for ([_][]const u8{ "\n", "\r\n" }) |ending| {
+            const input = try ReaderSpillFixture.init(std.testing.allocator, len, len, ending, true);
+            defer std.testing.allocator.free(input);
+            for ([_]usize{ 0, 5, len + 5, capacity - 1, capacity, input.len - 1 }) |split| {
+                try expectPredictedPayloads(input, split, capacity, null, .{}, .{});
+            }
+            try expectPredictedPayloads(input, 0, capacity - 1, capacity, .{}, .{});
+            try expectPredictedPayloads(input, 0, capacity, null, .{ .max_line_bytes = len - 1 }, .{});
+            try expectPredictedPayloads(input[0 .. input.len - ending.len], 0, capacity, null, .{}, .{});
+        }
+    }
+}
+
+test "[unit] - [reader]: prediction and retry use the current buffer without allocating" {
+    for ([_][]const u8{ "\n", "\r\n" }) |ending| {
+        for ([_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129 }) |len| {
+            const input = try ReaderSpillFixture.init(std.testing.allocator, len, len, ending, true);
+            defer std.testing.allocator.free(input);
+            var source = ProjectionTestSource.init(input, 0, null);
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+            var reader = try Reader.init(failing.allocator(), source.byteSource(), .{});
+            defer reader.deinit();
+            const predicted = (try nextPredictedPayload(&reader)).?;
+            try std.testing.expect(predicted.checkpoint != null);
+            try std.testing.expectEqual(len, predicted.payload.sequence.len);
+            try std.testing.expectEqual(len, predicted.payload.quality.len);
+            const buffer = reader.buf.ptr;
+            const offset = reader.byteOffset();
+            const actual = try predicted.checkpoint.?.reread(&reader);
+            try std.testing.expectEqualDeep(predicted.payload, actual);
+            try std.testing.expectEqual(buffer, reader.buf.ptr);
+            try std.testing.expectEqual(offset, reader.byteOffset());
+            try std.testing.expectEqual(@as(usize, 1), source.read_count);
+            try std.testing.expect(!failing.has_induced_failure);
+        }
+    }
+
+    const input = "@r\nACG\n+\n!\n!\n";
+    var source = ProjectionTestSource.init(input, 0, null);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    var reader = try Reader.init(failing.allocator(), source.byteSource(), .{});
+    defer reader.deinit();
+    const predicted = (try nextPredictedPayload(&reader)).?;
+    try std.testing.expectEqualStrings("!\n!", predicted.payload.quality);
+    try std.testing.expectError(error.S005LengthMismatch, predicted.checkpoint.?.reread(&reader));
+    try std.testing.expectEqual(@as(u64, 9), reader.takeLastError().?.byte_offset);
+    try std.testing.expectEqual(@as(u64, 11), reader.byteOffset());
+    try std.testing.expectEqual(@as(usize, 1), source.read_count);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
 fn expectValidatedProjection(
     input: []const u8,
     split: usize,
@@ -3113,13 +3373,13 @@ test "[property] - [reader]: structural masks match scalar line boundaries" {
             }
 
             var actual: [4]usize = undefined;
-            try std.testing.expect(findLineEnds(input, &actual));
+            try std.testing.expect(findLineEnds(4, input, &actual));
             try std.testing.expectEqual(expected, actual);
         }
     }
 
     var incomplete_ends: [4]usize = undefined;
-    try std.testing.expect(!findLineEnds("a\nb\nc\n", &incomplete_ends));
+    try std.testing.expect(!findLineEnds(4, "a\nb\nc\n", &incomplete_ends));
 }
 
 test "[property] - [reader]: short reads borrow complete records without field allocations" {
