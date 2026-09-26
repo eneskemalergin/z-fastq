@@ -252,12 +252,29 @@ fn semanticSequenceError(byte_index: usize) SemanticError {
     };
 }
 
-fn semanticQualityError(byte_index: usize) SemanticError {
+pub fn semanticQualityError(byte_index: usize) SemanticError {
     return .{
         .code = .s006_invalid_quality_range,
         .message = "quality byte must be ASCII 33 through 126",
         .field = .quality,
         .byte_index = byte_index,
+    };
+}
+
+pub fn semanticParseError(
+    semantic_error: SemanticError,
+    record_index: u64,
+    field_offset: u64,
+) error{ArithmeticLimit}!ParseError {
+    return .{
+        .code = semantic_error.code,
+        .message = semantic_error.message,
+        .record_index = record_index,
+        .byte_offset = try progressAfter(field_offset, semantic_error.byte_index),
+        .line_in_record = switch (semantic_error.field) {
+            .sequence => 2,
+            .quality => 4,
+        },
     };
 }
 
@@ -1540,8 +1557,7 @@ pub const Reader = struct {
     }
 
     fn offsetAfter(self: *const Reader, amount: usize) ReaderError!u64 {
-        const amount_u64 = std.math.cast(u64, amount) orelse return error.ArithmeticLimit;
-        return std.math.add(u64, self.byte_offset, amount_u64) catch error.ArithmeticLimit;
+        return progressAfter(self.byte_offset, amount);
     }
 
     fn appendLineBytes(
@@ -2074,6 +2090,11 @@ pub fn lineContentLen(line: []const u8) usize {
     return line.len;
 }
 
+pub fn progressAfter(current: u64, amount: usize) error{ArithmeticLimit}!u64 {
+    const amount_u64 = std.math.cast(u64, amount) orelse return error.ArithmeticLimit;
+    return std.math.add(u64, current, amount_u64) catch error.ArithmeticLimit;
+}
+
 pub fn headerPrefixIsValid(first_byte: ?u8, identifier_first_byte: ?u8) bool {
     return first_byte == '@' and identifierFirstByteIsValid(identifier_first_byte);
 }
@@ -2264,8 +2285,10 @@ fn classifySemanticByte(
             }
             failure.* = byte_index;
         },
-        .quality => if (byte < 33 or byte > 126) {
-            failure.* = byte_index;
+        .quality => {
+            _ = decodePhred33(byte) catch {
+                failure.* = byte_index;
+            };
         },
     }
 }
@@ -2383,9 +2406,7 @@ pub const CheckScanner = struct {
             self.use_full_iupac,
         ) orelse return null;
         const record_len = complete.line_ends[3] + 1;
-        const record_len_u64 = std.math.cast(u64, record_len) orelse return null;
-        const next_offset = std.math.add(u64, self.byte_offset, record_len_u64) catch
-            return null;
+        const next_offset = progressAfter(self.byte_offset, record_len) catch return null;
         const next_record_index = std.math.add(u64, self.record_index, 1) catch return null;
 
         self.use_full_iupac = complete.use_full_iupac;
@@ -2560,22 +2581,18 @@ pub const CheckScanner = struct {
 
     fn finishRecord(self: *CheckScanner) CheckScannerError!void {
         if (self.sequence_failure) |relative_offset| {
-            try self.storeSemanticError(
-                .s002_invalid_sequence_alphabet,
-                "sequence byte is outside the selected alphabet",
-                2,
+            self.last_error = try semanticParseError(
+                semanticSequenceError(relative_offset),
+                self.record_index,
                 self.sequence_start_offset,
-                relative_offset,
             );
             return error.Format;
         }
         if (self.quality_failure) |relative_offset| {
-            try self.storeSemanticError(
-                .s006_invalid_quality_range,
-                "quality byte must be ASCII 33 through 126",
-                4,
+            self.last_error = try semanticParseError(
+                semanticQualityError(relative_offset),
+                self.record_index,
                 self.quality_start_offset,
-                relative_offset,
             );
             return error.Format;
         }
@@ -2583,21 +2600,6 @@ pub const CheckScanner = struct {
             return error.ArithmeticLimit;
         self.sequence_failure = null;
         self.quality_failure = null;
-    }
-
-    fn storeSemanticError(
-        self: *CheckScanner,
-        code: LintCode,
-        message: []const u8,
-        line: u3,
-        field_offset: u64,
-        relative_offset: usize,
-    ) CheckScannerError!void {
-        const relative_u64 = std.math.cast(u64, relative_offset) orelse
-            return error.ArithmeticLimit;
-        const byte_offset = std.math.add(u64, field_offset, relative_u64) catch
-            return error.ArithmeticLimit;
-        self.storeError(code, message, line, byte_offset);
     }
 
     fn storeError(
@@ -2617,9 +2619,7 @@ pub const CheckScanner = struct {
     }
 
     fn advanceOffset(self: *CheckScanner, amount: usize) CheckScannerError!void {
-        const amount_u64 = std.math.cast(u64, amount) orelse return error.ArithmeticLimit;
-        self.byte_offset = std.math.add(u64, self.byte_offset, amount_u64) catch
-            return error.ArithmeticLimit;
+        self.byte_offset = try progressAfter(self.byte_offset, amount);
     }
 };
 
@@ -5624,7 +5624,7 @@ fn expectCheckOutcome(expected: CheckTestOutcome, actual: CheckTestOutcome) !voi
     }
 }
 
-test "[property] - [record validation]: vector quality validation matches scalar results" {
+test "[property] - [record validation]: quality checks match scalar results" {
     const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
     const max_len = 4 * vector_len - 1;
     const quality = try std.testing.allocator.alloc(u8, max_len);
@@ -5641,6 +5641,10 @@ test "[property] - [record validation]: vector quality validation matches scalar
         const expected: ?usize = if (value < 33 or value > 126) 0 else null;
         try std.testing.expectEqual(expected, firstInvalidQualityScalar(quality, 0));
         try std.testing.expectEqual(expected, firstInvalidQuality(quality));
+        var failure: ?usize = null;
+        var use_full_iupac = false;
+        classifySemanticByte(.quality, .iupac, &use_full_iupac, &failure, @intCast(value), 0);
+        try std.testing.expectEqual(expected, failure);
     }
 
     @memset(quality, '!');

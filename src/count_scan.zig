@@ -3,13 +3,9 @@
 //! Zero heap allocations with incremental byte-slice input.
 
 const std = @import("std");
-const io_layer = @import("io.zig");
 const fastq = @import("fastq.zig");
 
-pub const Options = struct {
-    /// Maximum content bytes in each logical FASTQ line, excluding CRLF or LF.
-    max_line_bytes: usize = io_layer.DEFAULT_MAX_LINE_BYTES,
-};
+pub const Options = fastq.Options;
 
 // Bare plus lines let the fast path derive every tail offset from the sequence length.
 const DenseLayout = struct {
@@ -133,8 +129,8 @@ pub const Scanner = struct {
             {
                 const progress = try self.feedFast(data[pos..]);
                 if (progress.bytes > 0) {
-                    const next_offset = try progressAfter(self.byte_offset, progress.bytes);
-                    const next_record_index = try progressAfter(
+                    const next_offset = try fastq.progressAfter(self.byte_offset, progress.bytes);
+                    const next_record_index = try fastq.progressAfter(
                         self.record_index,
                         progress.records,
                     );
@@ -296,13 +292,13 @@ pub const Scanner = struct {
             const rel = std.mem.findScalar(u8, data[pos..], '\n');
             if (rel == null) {
                 try self.consumeLineBytes(data[pos..]);
-                self.byte_offset = try progressAfter(self.byte_offset, data.len - pos);
+                self.byte_offset = try fastq.progressAfter(self.byte_offset, data.len - pos);
                 return data.len;
             }
 
             const segment = data[pos .. pos + rel.?];
             try self.consumeLineBytes(segment);
-            self.byte_offset = try progressAfter(self.byte_offset, segment.len + 1);
+            self.byte_offset = try fastq.progressAfter(self.byte_offset, segment.len + 1);
             pos += segment.len + 1;
             try self.finishLine(true);
 
@@ -389,7 +385,7 @@ pub const Scanner = struct {
             return self.structuralError(err, self.line_start_offset);
         };
         const next_record_index = if (record_ready)
-            try progressAfter(self.record_index, 1)
+            try fastq.progressAfter(self.record_index, 1)
         else
             self.record_index;
         self.machine = machine;
@@ -439,11 +435,6 @@ pub const Scanner = struct {
         };
     }
 };
-
-fn progressAfter(current: u64, amount: usize) fastq.ReaderError!u64 {
-    const amount_u64 = std.math.cast(u64, amount) orelse return error.ArithmeticLimit;
-    return std.math.add(u64, current, amount_u64) catch error.ArithmeticLimit;
-}
 
 fn containsNewline(comptime slice_count: usize, slices: [slice_count][]const u8) bool {
     const len = slices[0].len;

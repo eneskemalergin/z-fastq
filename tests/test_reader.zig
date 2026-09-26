@@ -1003,9 +1003,10 @@ test "[unit] - [count slice]: reuse replaces progress, options, and old diagnost
     );
 
     const valid = "@r\nA\n+\n!\n";
+    const options: zfastq.count_scan.Options = .{ .max_line_bytes = 2 };
     try std.testing.expectEqual(
         @as(u64, 1),
-        try zfastq.count_scan.countSlice(valid, .{ .max_line_bytes = 2 }, &scan),
+        try zfastq.count_scan.countSlice(valid, options, &scan),
     );
     try std.testing.expectEqual(@as(u64, valid.len), scan.byte_offset);
     try std.testing.expect(scan.takeLastError() == null);

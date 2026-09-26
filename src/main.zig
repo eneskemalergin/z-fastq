@@ -8,7 +8,6 @@ const io_layer = @import("io.zig");
 const pairing = @import("pair.zig");
 const sampling = @import("sample.zig");
 
-const INVALID_QUALITY_MESSAGE = "quality byte must be ASCII 33 through 126";
 const PAIR_DIAGNOSTIC_PREFIX_BYTES = 128;
 
 const USAGE =
@@ -740,30 +739,14 @@ fn mapSemanticFailure(
         .sequence => offsets.sequence,
         .quality => offsets.quality,
     };
-    const relative_offset = std.math.cast(u64, semantic_error.byte_index) orelse {
+    const details = fastq.semanticParseError(semantic_error, record_index, field_offset) catch {
         return CommandFailure.plain(
             "arithmetic_limit",
             "input location exceeds supported limit",
             4,
         );
     };
-    const byte_offset = std.math.add(u64, field_offset, relative_offset) catch {
-        return CommandFailure.plain(
-            "arithmetic_limit",
-            "input location exceeds supported limit",
-            4,
-        );
-    };
-    return CommandFailure.lint(.{
-        .code = semantic_error.code,
-        .message = semantic_error.message,
-        .record_index = record_index,
-        .byte_offset = byte_offset,
-        .line_in_record = switch (semantic_error.field) {
-            .sequence => 2,
-            .quality => 4,
-        },
-    });
+    return CommandFailure.lint(details);
 }
 
 const StatsOutcome = union(enum) {
@@ -1853,28 +1836,16 @@ fn collectStats(
                                 3,
                             ) };
                         };
-                        const relative_offset = std.math.cast(u64, quality_error.byte_index) orelse
-                            return .{ .failure = CommandFailure.plain(
-                                "arithmetic_limit",
-                                "statistics arithmetic limit exceeded",
-                                4,
-                            ) };
-                        const byte_offset = std.math.add(
-                            u64,
+                        const details = fastq.semanticParseError(
+                            fastq.semanticQualityError(quality_error.byte_index),
+                            reader.recordIndex() - 1,
                             offsets.quality,
-                            relative_offset,
                         ) catch return .{ .failure = CommandFailure.plain(
                             "arithmetic_limit",
                             "statistics arithmetic limit exceeded",
                             4,
                         ) };
-                        return .{ .failure = CommandFailure.lint(.{
-                            .code = .s006_invalid_quality_range,
-                            .message = INVALID_QUALITY_MESSAGE,
-                            .record_index = reader.recordIndex() - 1,
-                            .byte_offset = byte_offset,
-                            .line_in_record = 4,
-                        }) };
+                        return .{ .failure = CommandFailure.lint(details) };
                     },
                     error.S005LengthMismatch => @panic("Reader returned unequal sequence and quality lengths"),
                     error.Overflow => return .{ .failure = CommandFailure.plain(
@@ -4716,6 +4687,64 @@ test "[unit] - [structural arithmetic]: Reader and count preserve the CLI limit 
         CountError.ArithmeticLimit,
         mapScanError(std.testing.io, "-", &scanner, error.ArithmeticLimit),
     );
+}
+
+test "[edge] - [semantic diagnostics]: field locations cross 32 bits and reject overflow" {
+    const cases = [_]struct {
+        semantic_error: zfastq.SemanticError,
+        code: []const u8,
+        line: u3,
+    }{
+        .{
+            .semantic_error = .{
+                .code = .s002_invalid_sequence_alphabet,
+                .message = "sequence byte is outside the selected alphabet",
+                .field = .sequence,
+                .byte_index = 1,
+            },
+            .code = "S002",
+            .line = 2,
+        },
+        .{
+            .semantic_error = .{
+                .code = .s006_invalid_quality_range,
+                .message = "quality byte must be ASCII 33 through 126",
+                .field = .quality,
+                .byte_index = 1,
+            },
+            .code = "S006",
+            .line = 4,
+        },
+    };
+    const maximum = std.math.maxInt(u64);
+    for (cases) |case| {
+        for ([_]u64{ (1 << 32) - 1, maximum - 1, maximum }) |field_offset| {
+            var offsets: zfastq.RecordOffsets = .{
+                .header = 0,
+                .sequence = 7,
+                .plus = 9,
+                .quality = 11,
+            };
+            switch (case.semantic_error.field) {
+                .sequence => offsets.sequence = field_offset,
+                .quality => offsets.quality = field_offset,
+            }
+            const actual = mapSemanticFailure(case.semantic_error, offsets, maximum).?;
+            const expected: CommandFailure = if (field_offset == maximum) .{
+                .code = "arithmetic_limit",
+                .message = "input location exceeds supported limit",
+                .exit_code = 4,
+            } else .{
+                .code = case.code,
+                .message = case.semantic_error.message,
+                .exit_code = 1,
+                .record_index = maximum,
+                .byte_offset = field_offset + 1,
+                .line_in_record = case.line,
+            };
+            try std.testing.expectEqualDeep(expected, actual);
+        }
+    }
 }
 
 test "[edge] - [stats-json]: preserves the maximum u64 counter" {
