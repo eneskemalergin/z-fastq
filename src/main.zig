@@ -813,7 +813,10 @@ const RecordInput = struct {
     owns_file: bool,
     read_buffer: [zfastq.limits.DEFAULT_READER_BUFFER_BYTES]u8,
     file_reader: std.Io.File.Reader,
-    gzip: ?io_layer.GzipSource,
+    kind: enum { plain, gzip },
+    // Set only when `kind` is gzip. A separate tag keeps plain input from touching this
+    // decoder workspace: assigning null or a payload-free union tag zeroes the whole field.
+    gzip: io_layer.GzipSource,
 
     fn init(
         self: *RecordInput,
@@ -831,6 +834,7 @@ const RecordInput = struct {
         if (prefix) |bytes| {
             if (std.mem.eql(u8, bytes, &.{ 0x1f, 0x8b })) {
                 self.gzip = io_layer.GzipSource.init(&self.file_reader.interface);
+                self.kind = .gzip;
                 return;
             }
         }
@@ -846,7 +850,7 @@ const RecordInput = struct {
                 error.ReadFailed => return error.Io,
             };
         }
-        self.gzip = null;
+        self.kind = .plain;
     }
 
     fn deinit(self: *RecordInput, io: std.Io) void {
@@ -855,8 +859,10 @@ const RecordInput = struct {
     }
 
     fn stream(self: *RecordInput) *std.Io.Reader {
-        if (self.gzip) |*gzip| return io_layer.gzipReader(gzip);
-        return &self.file_reader.interface;
+        return switch (self.kind) {
+            .plain => &self.file_reader.interface,
+            .gzip => io_layer.gzipReader(&self.gzip),
+        };
     }
 
     fn readScannerChunk(self: *RecordInput) error{Io}!?[]const u8 {
