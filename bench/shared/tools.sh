@@ -25,7 +25,6 @@ source "$BENCH_SHARED_DIR/catalog.sh"
 source "$TOOLS_DIR/versions.sh"
 
 ZFASTQ="${ZFASTQ:-$PROJECT_ROOT/zig-out/bin/z-fastq}"
-ZFASTQ_NATIVE="${ZFASTQ_NATIVE:-$PROJECT_ROOT/zig-out/bin/z-fastq-native}"
 ZEBRAC="${ZEBRAC:-$TOOLS_DIR/zebrac}"
 SEQTK="${SEQTK:-$TOOLS_BIN_DIR/seqtk}"
 FQTOOLS="${FQTOOLS:-$TOOLS_BIN_DIR/fqtools}"
@@ -54,7 +53,6 @@ bench_tool_path() {
     local name="$1"
     case "$name" in
         z-fastq) echo "$ZFASTQ" ;;
-        z-fastq-native) echo "$ZFASTQ_NATIVE" ;;
         zebrac) echo "$ZEBRAC" ;;
         seqtk) echo "$SEQTK" ;;
         fqtools) echo "$FQTOOLS" ;;
@@ -88,12 +86,19 @@ bench_require_tool() {
     fi
 }
 
+bench_build_zfastq() {
+    echo "Building z-fastq ReleaseFast..."
+    (cd "$PROJECT_ROOT" && zig build -j4 -Doptimize=ReleaseFast)
+    bench_require_tool z-fastq
+    echo "  z-fastq: $ZFASTQ"
+}
+
 bench_tool_version() {
     local name="$1"
     local path
     path="$(bench_tool_path "$name")" || return 1
     case "$name" in
-        z-fastq|z-fastq-native|zebrac)
+        z-fastq|zebrac)
             [[ -x "$path" ]] && "$path" --version 2>&1 | awk 'NR==1{print; exit}'
             ;;
         seqtk)

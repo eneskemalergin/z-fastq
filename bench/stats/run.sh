@@ -138,24 +138,6 @@ run_zebrac_tool() {
     echo "  << $section $workload $tool  ${elapsed}s"
 }
 
-build_subjects() {
-    echo "Building z-fastq native inflate, then ISA-L product binary..."
-    (
-        cd "$PROJECT_ROOT"
-        zig build -Doptimize=ReleaseFast -Disa-l=false
-    )
-    cp -f -- "$PROJECT_ROOT/zig-out/bin/z-fastq" "$ZFASTQ_NATIVE"
-    chmod +x "$ZFASTQ_NATIVE"
-    (
-        cd "$PROJECT_ROOT"
-        zig build -Doptimize=ReleaseFast
-    )
-    bench_require_tool z-fastq
-    bench_require_tool z-fastq-native
-    echo "  ISA-L:  $ZFASTQ"
-    echo "  native: $ZFASTQ_NATIVE"
-}
-
 bind_dataset() {
     local id="$1"
     local filename
@@ -265,7 +247,7 @@ overlap_or_fail() {
 }
 
 check_same_stats() {
-    local file="$1" expected="$2" run_native="$3" run_oracle="$4"
+    local file="$1" expected="$2" run_oracle="$3"
     local out status gold
     log_verify "  file $file  expected_records $expected"
 
@@ -281,12 +263,6 @@ check_same_stats() {
         out="$CHECK_DIR/oracle.out"
         status="$(capture_out "$out" "$PYTHON" "$ORACLE" "$file")"
         agree_or_fail "$file" "oracle.py $file" "$status" "$gold" "$out"
-    fi
-
-    if [[ "$run_native" == "true" ]]; then
-        out="$CHECK_DIR/native.out"
-        status="$(capture_out "$out" "$ZFASTQ_NATIVE" stats "$file")"
-        agree_or_fail "$file" "z-fastq-native stats $file" "$status" "$gold" "$out"
     fi
 
     out="$CHECK_DIR/needletail.out"
@@ -331,25 +307,24 @@ run_tests() {
     local fixture_gz="$CHECK_DIR/basic_valid.fastq.gz"
     gzip -c -- "$fixture" >"$fixture_gz"
     log_verify "--- fixtures ---"
-    check_same_stats "$fixture" 5 true true
-    check_same_stats "$fixture_gz" 5 true true
+    check_same_stats "$fixture" 5 true
+    check_same_stats "$fixture_gz" 5 true
 
     log_verify "--- malformed (z-fastq must reject; SeqKit/SeqFu are not compared) ---"
     local bad
     for bad in bad_header.fastq bad_plus.fastq truncated_record.fastq bad_qual_length.fastq; do
         expect_stats_fail "$FIXTURE_DIR/$bad" "$ZFASTQ" "z-fastq"
-        expect_stats_fail "$FIXTURE_DIR/$bad" "$ZFASTQ_NATIVE" "z-fastq-native"
     done
 
     local id
     log_verify "--- REAL plain ---"
     for id in "${TIME_IDS[@]}"; do
-        check_same_stats "${REAL_PLAIN[$id]}" "${REAL_EXPECTED[$id]}" false \
+        check_same_stats "${REAL_PLAIN[$id]}" "${REAL_EXPECTED[$id]}" \
             "$(should_run_oracle "${REAL_EXPECTED[$id]}" && echo true || echo false)"
     done
     log_verify "--- REAL gzip ---"
     for id in "${TIME_IDS[@]}"; do
-        check_same_stats "${REAL_GZ[$id]}" "${REAL_EXPECTED[$id]}" true \
+        check_same_stats "${REAL_GZ[$id]}" "${REAL_EXPECTED[$id]}" \
             "$(should_run_oracle "${REAL_EXPECTED[$id]}" && echo true || echo false)"
     done
 
@@ -358,8 +333,8 @@ run_tests() {
 
 run_stats_tools() {
     local section="$1" workload="$2" file="$3" out_dir="$4"
-    local include_native="$5" include_hatched="$6"
-    local decoded_bytes="$7"
+    local include_hatched="$5"
+    local decoded_bytes="$6"
 
     local nbytes json
     nbytes="$(file_size_bytes "$file")"
@@ -367,12 +342,6 @@ run_stats_tools() {
     json="$out_dir/${workload}__z-fastq.json"
     run_zebrac_tool "$section" "$workload" z-fastq z-fastq "$json" \
         "$(zebrac_command "$ZFASTQ" stats "$file")" "$nbytes" "$decoded_bytes"
-
-    if [[ "$include_native" == "true" ]]; then
-        json="$out_dir/${workload}__z-fastq-native.json"
-        run_zebrac_tool "$section" "$workload" z-fastq-native z-fastq "$json" \
-            "$(zebrac_command "$ZFASTQ_NATIVE" stats "$file")" "$nbytes" "$decoded_bytes"
-    fi
 
     json="$out_dir/${workload}__needletail.json"
     run_zebrac_tool "$section" "$workload" needletail needletail "$json" \
@@ -403,12 +372,12 @@ run_perf() {
         echo "=== perf_plain ==="
         for id in "${TIME_IDS[@]}"; do
             decoded="${REAL_DECODED[$id]}"
-            run_stats_tools perf_plain "$id" "${REAL_PLAIN[$id]}" "$plain_dir" false true "$decoded"
+            run_stats_tools perf_plain "$id" "${REAL_PLAIN[$id]}" "$plain_dir" true "$decoded"
         done
         echo "=== perf_gzip ==="
         for id in "${TIME_IDS[@]}"; do
             decoded="${REAL_DECODED[$id]}"
-            run_stats_tools perf_gzip "$id" "${REAL_GZ[$id]}" "$gzip_dir" true true "$decoded"
+            run_stats_tools perf_gzip "$id" "${REAL_GZ[$id]}" "$gzip_dir" true "$decoded"
         done
     fi
 }
@@ -441,9 +410,7 @@ write_manifest() {
         printf '  "datasets": %s,\n' "$STATS_DATASETS_JSON"
         printf '  "zebrac": %s,\n' "$(zebrac_json_string "${STATS_ZEBRAC_VER}")"
         printf '  "z_fastq": %s,\n' "$(zebrac_json_string "${STATS_ZFASTQ_VER}")"
-        printf '  "z_fastq_native": %s,\n' "$(zebrac_json_string "${STATS_ZFASTQ_NATIVE_VER}")"
         printf '  "z_fastq_bytes": %s,\n' "$(zebrac_json_number_or_null "${STATS_ZFASTQ_BYTES}")"
-        printf '  "z_fastq_native_bytes": %s,\n' "$(zebrac_json_number_or_null "${STATS_ZFASTQ_NATIVE_BYTES}")"
         printf '  "runs": %s,\n' "$(zebrac_json_number_or_null "$RUNS")"
         printf '  "warmup": %s,\n' "$(zebrac_json_number_or_null "$WARMUP")"
         printf '  "duration_ms": %s,\n' "$(zebrac_json_number_or_null "$ZEBRAC_DURATION_MS")"
@@ -481,7 +448,7 @@ write_manifest() {
 echo "z-fastq stats bench  $TIMESTAMP"
 echo
 
-build_subjects
+bench_build_zfastq
 ensure_real_data
 
 VERIFY_PASS=""
@@ -505,9 +472,7 @@ fi
 STATS_DATASETS_JSON="$(stats_datasets_json)"
 STATS_ZEBRAC_VER="$(bench_tool_version zebrac || true)"
 STATS_ZFASTQ_VER="$(bench_tool_version z-fastq || true)"
-STATS_ZFASTQ_NATIVE_VER="$(bench_tool_version z-fastq-native || true)"
 STATS_ZFASTQ_BYTES="$(file_size_bytes "$ZFASTQ")"
-STATS_ZFASTQ_NATIVE_BYTES="$(file_size_bytes "$ZFASTQ_NATIVE")"
 STATS_NEEDLETAIL_VER="$(bench_tool_version needletail || true)"
 STATS_HELICASE_VER="$(bench_tool_version helicase || true)"
 STATS_SEQKIT_VER="$(bench_tool_version seqkit || true)"

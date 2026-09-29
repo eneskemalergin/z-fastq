@@ -394,9 +394,8 @@ build_sample_args() {
     result=()
 
     case "$tool" in
-        z-fastq|z-fastq-native)
+        z-fastq)
             local binary="$ZFASTQ"
-            [[ "$tool" == z-fastq-native ]] && binary="$ZFASTQ_NATIVE"
             result=("$binary" sample --seed "$SAMPLE_SEED")
             case "$mode" in
                 se_fraction) result+=(--fraction "$SAMPLE_FRACTION" "${paths[0]}") ;;
@@ -698,12 +697,8 @@ expect_ok_stdin() {
 }
 
 real_sample_out() {
-    local compression="$1" mode="$2" kind="${3:-isa-l}"
-    if [[ "$kind" == native ]]; then
-        printf '%s' "$CHECK_DIR/real_${compression}_${mode}_native.out"
-    else
-        printf '%s' "$CHECK_DIR/real_${compression}_${mode}.out"
-    fi
+    local compression="$1" mode="$2"
+    printf '%s' "$CHECK_DIR/real_${compression}_${mode}.out"
 }
 
 expect_empty_stdout() {
@@ -759,21 +754,20 @@ run_contract_tests() {
 
     local binary out err status
     log_verify "--- valid fixtures ---"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        expect_empty_stdout "$binary" "$(basename "$binary") fraction 0" \
-            sample --fraction 0 --seed "$SAMPLE_SEED" "$FIXTURE_DIR/acgtn_valid.fastq"
-        expect_ok_binary "$binary" "$(basename "$binary") fraction 1" \
-            sample --fraction 1 --seed "$SAMPLE_SEED" "$FIXTURE_DIR/acgtn_valid.fastq"
-        expect_empty_stdout "$binary" "$(basename "$binary") count 0" \
-            sample --count 0 --seed "$SAMPLE_SEED" "$FIXTURE_DIR/acgtn_valid.fastq"
-        expect_ok_binary "$binary" "$(basename "$binary") count 1" \
-            sample --count 1 --seed "$SAMPLE_SEED" "$FIXTURE_DIR/acgtn_valid.fastq"
-        expect_ok_binary "$binary" "$(basename "$binary") gzip fraction" \
-            sample --fraction "$SAMPLE_FRACTION" --seed "$SAMPLE_SEED" "$screened_gz"
-        expect_ok_stdin "$binary" "$(basename "$binary") stdin fraction 1" \
-            "$FIXTURE_DIR/acgtn_valid.fastq" \
-            sample --fraction 1 --seed "$SAMPLE_SEED" -
-    done
+    binary="$ZFASTQ"
+    expect_empty_stdout "$binary" "$(basename "$binary") fraction 0" \
+        sample --fraction 0 --seed "$SAMPLE_SEED" "$FIXTURE_DIR/acgtn_valid.fastq"
+    expect_ok_binary "$binary" "$(basename "$binary") fraction 1" \
+        sample --fraction 1 --seed "$SAMPLE_SEED" "$FIXTURE_DIR/acgtn_valid.fastq"
+    expect_empty_stdout "$binary" "$(basename "$binary") count 0" \
+        sample --count 0 --seed "$SAMPLE_SEED" "$FIXTURE_DIR/acgtn_valid.fastq"
+    expect_ok_binary "$binary" "$(basename "$binary") count 1" \
+        sample --count 1 --seed "$SAMPLE_SEED" "$FIXTURE_DIR/acgtn_valid.fastq"
+    expect_ok_binary "$binary" "$(basename "$binary") gzip fraction" \
+        sample --fraction "$SAMPLE_FRACTION" --seed "$SAMPLE_SEED" "$screened_gz"
+    expect_ok_stdin "$binary" "$(basename "$binary") stdin fraction 1" \
+        "$FIXTURE_DIR/acgtn_valid.fastq" \
+        sample --fraction 1 --seed "$SAMPLE_SEED" -
 
     log_verify "--- screened seqtk exact reference ---"
     bench_require_tool seqtk
@@ -797,37 +791,35 @@ run_contract_tests() {
     expect_record_count "screened exact count 3" 3 "$out"
 
     log_verify "--- paired and interleaved select the same pairs ---"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        run_zfastq_to "$CHECK_DIR/paired.frac.out" "$binary" sample --paired --fraction 0.5 --seed 11 \
-            "$pair_r1" "$pair_r2"
-        run_zfastq_to "$CHECK_DIR/inter.frac.out" "$binary" sample --interleaved --fraction 0.5 --seed 11 \
-            "$interleaved"
-        cmp_or_fail "$(basename "$binary") paired vs interleaved fraction 0.5" \
-            "$CHECK_DIR/paired.frac.out" "$CHECK_DIR/inter.frac.out"
-        local n
-        n="$(count_fastq_records "$CHECK_DIR/paired.frac.out")"
-        ((n % 2 == 0)) ||
-            sample_fail "$(basename "$binary") paired fraction pair completeness" "even record count" "$n"
+    binary="$ZFASTQ"
+    run_zfastq_to "$CHECK_DIR/paired.frac.out" "$binary" sample --paired --fraction 0.5 --seed 11 \
+        "$pair_r1" "$pair_r2"
+    run_zfastq_to "$CHECK_DIR/inter.frac.out" "$binary" sample --interleaved --fraction 0.5 --seed 11 \
+        "$interleaved"
+    cmp_or_fail "$(basename "$binary") paired vs interleaved fraction 0.5" \
+        "$CHECK_DIR/paired.frac.out" "$CHECK_DIR/inter.frac.out"
+    local n
+    n="$(count_fastq_records "$CHECK_DIR/paired.frac.out")"
+    ((n % 2 == 0)) ||
+        sample_fail "$(basename "$binary") paired fraction pair completeness" "even record count" "$n"
 
-        run_zfastq_to "$CHECK_DIR/paired.count.out" "$binary" sample --paired --count 3 --seed 11 \
-            "$pair_r1" "$pair_r2"
-        run_zfastq_to "$CHECK_DIR/inter.count.out" "$binary" sample --interleaved --count 3 --seed 11 \
-            "$interleaved"
-        cmp_or_fail "$(basename "$binary") paired vs interleaved count 3" \
-            "$CHECK_DIR/paired.count.out" "$CHECK_DIR/inter.count.out"
-        expect_record_count "$(basename "$binary") paired exact 3 pairs" 6 "$CHECK_DIR/paired.count.out"
-    done
+    run_zfastq_to "$CHECK_DIR/paired.count.out" "$binary" sample --paired --count 3 --seed 11 \
+        "$pair_r1" "$pair_r2"
+    run_zfastq_to "$CHECK_DIR/inter.count.out" "$binary" sample --interleaved --count 3 --seed 11 \
+        "$interleaved"
+    cmp_or_fail "$(basename "$binary") paired vs interleaved count 3" \
+        "$CHECK_DIR/paired.count.out" "$CHECK_DIR/inter.count.out"
+    expect_record_count "$(basename "$binary") paired exact 3 pairs" 6 "$CHECK_DIR/paired.count.out"
 
     log_verify "--- invocation rejects ---"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        local reject_out="$CHECK_DIR/reject.out" reject_err="$CHECK_DIR/reject.err"
-        status="$(capture_command "$reject_out" "$reject_err" "$binary" sample --count 1 -)"
-        [[ "$status" == 2 ]] ||
-            sample_fail "$(basename "$binary") stdin exact-count" "exit 2" "exit=$status"
-        status="$(capture_command "$reject_out" "$reject_err" "$binary" sample --json "$screened")"
-        [[ "$status" == 2 ]] ||
-            sample_fail "$(basename "$binary") --json" "exit 2" "exit=$status"
-    done
+    binary="$ZFASTQ"
+    local reject_out="$CHECK_DIR/reject.out" reject_err="$CHECK_DIR/reject.err"
+    status="$(capture_command "$reject_out" "$reject_err" "$binary" sample --count 1 -)"
+    [[ "$status" == 2 ]] ||
+        sample_fail "$(basename "$binary") stdin exact-count" "exit 2" "exit=$status"
+    status="$(capture_command "$reject_out" "$reject_err" "$binary" sample --json "$screened")"
+    [[ "$status" == 2 ]] ||
+        sample_fail "$(basename "$binary") --json" "exit 2" "exit=$status"
 
     run_peer_fixture_probes
 
@@ -882,7 +874,7 @@ qualify_zfastq_exact() {
     local compression="$1" mode="$2"
     shift 2
     local -a ids=("$@")
-    local expected out err status got native_out native_err
+    local expected out err status got
     expected="$(exact_output_records "$mode" "${ids[@]}")"
     local -a args=() paths=()
     resolve_dataset_paths paths "$compression" "${ids[@]}"
@@ -898,17 +890,7 @@ qualify_zfastq_exact() {
         sample_fail "$compression $mode z-fastq exact size" "$expected records" "count=${got:-?}"
 
     if [[ "$compression" == gzip ]]; then
-        build_sample_args args z-fastq-native "$mode" "${paths[@]}"
-        native_out="$(real_sample_out "$compression" "$mode" native)"
-        native_err="$CHECK_DIR/native_exact.err"
-        status="$(capture_command "$native_out" "$native_err" "${args[@]}")"
-        [[ "$status" == 0 ]] ||
-            sample_fail "$compression $mode z-fastq-native" "exit 0" \
-                "exit=$status stderr=$(summarize_output "$native_err")"
-        got="$(count_fastq_records "$native_out" || true)"
-        [[ "$got" == "$expected" ]] ||
-            sample_fail "$compression $mode z-fastq-native exact size" "$expected records" "count=${got:-?}"
-        cmp_or_fail "$compression $mode ISA-L vs native exact" "$out" "$native_out"
+        cmp_or_fail "$mode gzip vs plain exact" "$out" "$(real_sample_out plain "$mode")"
     fi
 }
 
@@ -927,7 +909,7 @@ qualify_zfastq_fraction() {
     local -a args=() paths=()
     resolve_dataset_paths paths "$compression" "${ids[@]}"
     build_sample_args args z-fastq "$mode" "${paths[@]}"
-    local out err status n native_out
+    local out err status n plain_out
     out="$(real_sample_out "$compression" "$mode")"
     err="$CHECK_DIR/zfastq_frac.err"
     if fraction_output_is_large "${ids[@]}"; then
@@ -950,21 +932,9 @@ qualify_zfastq_fraction() {
         fi
     fi
 
-    if [[ "$compression" == gzip ]]; then
-        build_sample_args args z-fastq-native "$mode" "${paths[@]}"
-        native_out="$(real_sample_out "$compression" "$mode" native)"
-        if fraction_output_is_large "${ids[@]}"; then
-            status="$(capture_command /dev/null "$CHECK_DIR/native_frac.err" "${args[@]}")"
-            rm -f -- "$native_out"
-        else
-            status="$(capture_command "$native_out" "$CHECK_DIR/native_frac.err" "${args[@]}")"
-        fi
-        [[ "$status" == 0 ]] ||
-            sample_fail "$compression $mode z-fastq-native" "exit 0" \
-                "exit=$status stderr=$(summarize_output "$CHECK_DIR/native_frac.err")"
-        if [[ -f "$out" && -f "$native_out" ]]; then
-            cmp_or_fail "$compression $mode ISA-L vs native fraction" "$out" "$native_out"
-        fi
+    plain_out="$(real_sample_out plain "$mode")"
+    if [[ "$compression" == gzip && -f "$out" && -f "$plain_out" ]]; then
+        cmp_or_fail "$mode gzip vs plain fraction" "$out" "$plain_out"
     fi
 }
 
@@ -1100,14 +1070,6 @@ run_timed_workload() {
     run_zebrac_tool "$section" "$key" z-fastq z-fastq "$json" \
         "$command" "$input_bytes" "$decoded_bytes"
 
-    if [[ "$compression" == gzip ]]; then
-        build_sample_args args z-fastq-native "$mode" "${paths[@]}"
-        command="$(zebrac_command "${args[@]}")"
-        json="$RESULTS_DIR/${section}_${TIMESTAMP}/${key}__z-fastq-native.json"
-        run_zebrac_tool "$section" "$key" z-fastq-native z-fastq "$json" \
-            "$command" "$input_bytes" "$decoded_bytes"
-    fi
-
     for tool in "${SAMPLE_PEER_ORDER[@]}"; do
         [[ "${LANE_ENABLED[$section|$key|$tool]:-0}" == 1 ]] || continue
         build_sample_args args "$tool" "$mode" "${paths[@]}"
@@ -1169,9 +1131,7 @@ write_manifest() {
         printf '  "workloads": %s,\n' "$(workloads_json)"
         printf '  "zebrac": %s,\n' "$(zebrac_json_string "${SAMPLE_ZEBRAC_VER}")"
         printf '  "z_fastq": %s,\n' "$(zebrac_json_string "${SAMPLE_ZFASTQ_VER}")"
-        printf '  "z_fastq_native": %s,\n' "$(zebrac_json_string "${SAMPLE_ZFASTQ_NATIVE_VER}")"
         printf '  "z_fastq_bytes": %s,\n' "$(zebrac_json_number_or_null "${SAMPLE_ZFASTQ_BYTES}")"
-        printf '  "z_fastq_native_bytes": %s,\n' "$(zebrac_json_number_or_null "${SAMPLE_ZFASTQ_NATIVE_BYTES}")"
         printf '  "runs": %s,\n' "$(zebrac_json_number_or_null "$RUNS")"
         printf '  "warmup": %s,\n' "$(zebrac_json_number_or_null "$WARMUP")"
         printf '  "duration_ms": %s,\n' "$(zebrac_json_number_or_null "$ZEBRAC_DURATION_MS")"
@@ -1218,25 +1178,7 @@ write_manifest() {
 echo "z-fastq sample bench  $TIMESTAMP"
 echo
 
-build_subjects() {
-    echo "Building z-fastq native inflate, then ISA-L product binary..."
-    (
-        cd "$PROJECT_ROOT"
-        zig build -Doptimize=ReleaseFast -Disa-l=false
-    )
-    cp -f -- "$PROJECT_ROOT/zig-out/bin/z-fastq" "$ZFASTQ_NATIVE"
-    chmod +x "$ZFASTQ_NATIVE"
-    (
-        cd "$PROJECT_ROOT"
-        zig build -Doptimize=ReleaseFast
-    )
-    bench_require_tool z-fastq
-    bench_require_tool z-fastq-native
-    echo "  ISA-L:  $ZFASTQ"
-    echo "  native: $ZFASTQ_NATIVE"
-}
-
-build_subjects
+bench_build_zfastq
 ensure_real_data
 
 VERIFY_PASS=""
@@ -1263,9 +1205,7 @@ fi
 
 SAMPLE_ZEBRAC_VER="$(bench_tool_version zebrac || true)"
 SAMPLE_ZFASTQ_VER="$(bench_tool_version z-fastq || true)"
-SAMPLE_ZFASTQ_NATIVE_VER="$(bench_tool_version z-fastq-native || true)"
 SAMPLE_ZFASTQ_BYTES="$(file_size_bytes "$ZFASTQ")"
-SAMPLE_ZFASTQ_NATIVE_BYTES="$(file_size_bytes "$ZFASTQ_NATIVE")"
 SAMPLE_TOOLS_JSON="$(
     printf '{'
     printf '"seqtk":%s,' "$(zebrac_json_string "$(bench_tool_version seqtk || true)")"

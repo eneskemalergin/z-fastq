@@ -19,7 +19,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_ROOT="$(dirname "$SCRIPT_DIR")"
-PROJECT_ROOT="$(dirname "$BENCH_ROOT")"
 RESULTS_DIR="$SCRIPT_DIR/results"
 DATA_DIR="$BENCH_ROOT/shared/data"
 PLAIN_DIR="$BENCH_ROOT/shared/cache/plain"
@@ -322,9 +321,8 @@ build_interleave_args() {
     local -a paths=("$@")
     result=()
     case "$tool" in
-        z-fastq|z-fastq-native)
+        z-fastq)
             local binary="$ZFASTQ"
-            [[ "$tool" == z-fastq-native ]] && binary="$ZFASTQ_NATIVE"
             result=("$binary" interleave "${paths[0]}" "${paths[1]}")
             ;;
         seqtk)
@@ -409,12 +407,8 @@ write_casava_pair() {
 }
 
 real_interleave_out() {
-    local compression="$1" kind="${2:-isa-l}"
-    if [[ "$kind" == native ]]; then
-        printf '%s' "$CHECK_DIR/real_${compression}_native.out"
-    else
-        printf '%s' "$CHECK_DIR/real_${compression}.out"
-    fi
+    local compression="$1"
+    printf '%s' "$CHECK_DIR/real_${compression}.out"
 }
 
 record_peer_fixture() {
@@ -607,26 +601,25 @@ run_contract_tests() {
 
     local binary
     log_verify "--- valid fixtures ---"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        expect_empty_stdout "$binary" "$(basename "$binary") empty pair" \
-            interleave "$empty_r1" "$empty_r2"
-        expect_ok_binary "$binary" "$(basename "$binary") slash pair" \
-            interleave "$slash_r1" "$slash_r2"
-        expect_ok_binary "$binary" "$(basename "$binary") casava pair" \
-            interleave "$casava_r1" "$casava_r2"
-        expect_ok_binary "$binary" "$(basename "$binary") gzip pair" \
-            interleave "$slash_gz1" "$slash_gz2"
-        expect_ok_binary "$binary" "$(basename "$binary") mixed gzip R2" \
-            interleave "$slash_r1" "$slash_gz2"
-        expect_ok_binary "$binary" "$(basename "$binary") mixed gzip R1" \
-            interleave "$slash_gz1" "$slash_r2"
-        expect_ok_binary "$binary" "$(basename "$binary") --pair-names exact" \
-            interleave --pair-names exact "$exact_r1" "$exact_r2"
-        expect_ok_stdin "$binary" "$(basename "$binary") stdin R1" \
-            "$slash_r1" interleave - "$slash_r2"
-        expect_ok_stdin "$binary" "$(basename "$binary") stdin R2" \
-            "$slash_r2" interleave "$slash_r1" -
-    done
+    binary="$ZFASTQ"
+    expect_empty_stdout "$binary" "$(basename "$binary") empty pair" \
+        interleave "$empty_r1" "$empty_r2"
+    expect_ok_binary "$binary" "$(basename "$binary") slash pair" \
+        interleave "$slash_r1" "$slash_r2"
+    expect_ok_binary "$binary" "$(basename "$binary") casava pair" \
+        interleave "$casava_r1" "$casava_r2"
+    expect_ok_binary "$binary" "$(basename "$binary") gzip pair" \
+        interleave "$slash_gz1" "$slash_gz2"
+    expect_ok_binary "$binary" "$(basename "$binary") mixed gzip R2" \
+        interleave "$slash_r1" "$slash_gz2"
+    expect_ok_binary "$binary" "$(basename "$binary") mixed gzip R1" \
+        interleave "$slash_gz1" "$slash_r2"
+    expect_ok_binary "$binary" "$(basename "$binary") --pair-names exact" \
+        interleave --pair-names exact "$exact_r1" "$exact_r2"
+    expect_ok_stdin "$binary" "$(basename "$binary") stdin R1" \
+        "$slash_r1" interleave - "$slash_r2"
+    expect_ok_stdin "$binary" "$(basename "$binary") stdin R2" \
+        "$slash_r2" interleave "$slash_r1" -
 
     log_verify "--- screened seqtk exact layout ---"
     bench_require_tool seqtk
@@ -657,8 +650,6 @@ run_contract_tests() {
     cmp_or_fail "z-fastq vs seqtk gzip slash pair" \
         "$CHECK_DIR/zf.gz.out" "$CHECK_DIR/seqtk.gz.out"
     cmp_or_fail "gzip vs plain slash interleave" "$z_out" "$CHECK_DIR/zf.gz.out"
-    run_zfastq_to "$CHECK_DIR/zf.native.gz.out" "$ZFASTQ_NATIVE" interleave "$slash_gz1" "$slash_gz2"
-    cmp_or_fail "native gzip slash vs LF" "$z_out" "$CHECK_DIR/zf.native.gz.out"
 
     if tool_ready irma; then
         status="$(capture_command "$CHECK_DIR/irma.slash.out" "$CHECK_DIR/irma.slash.err" \
@@ -675,31 +666,27 @@ run_contract_tests() {
         fi
     fi
 
-    log_verify "--- mixed gzip, stdin, and native match LF ---"
-    run_zfastq_to "$CHECK_DIR/zf.native.slash.out" "$ZFASTQ_NATIVE" interleave "$slash_r1" "$slash_r2"
-    cmp_or_fail "native vs ISA-L slash pair" "$z_out" "$CHECK_DIR/zf.native.slash.out"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        local tag
-        tag="$(basename "$binary")"
-        run_zfastq_to "$CHECK_DIR/${tag}.mixed_r2.out" "$binary" interleave "$slash_r1" "$slash_gz2"
-        cmp_or_fail "$tag mixed gzip R2 vs LF" "$z_out" "$CHECK_DIR/${tag}.mixed_r2.out"
-        run_zfastq_to "$CHECK_DIR/${tag}.mixed_r1.out" "$binary" interleave "$slash_gz1" "$slash_r2"
-        cmp_or_fail "$tag mixed gzip R1 vs LF" "$z_out" "$CHECK_DIR/${tag}.mixed_r1.out"
-        expect_ok_stdin "$binary" "$tag stdin R1 bytes" "$slash_r1" interleave - "$slash_r2"
-        cmp_or_fail "$tag stdin R1 vs files" "$z_out" "$CHECK_DIR/contract.out"
-        expect_ok_stdin "$binary" "$tag stdin R2 bytes" "$slash_r2" interleave "$slash_r1" -
-        cmp_or_fail "$tag stdin R2 vs files" "$z_out" "$CHECK_DIR/contract.out"
-    done
+    log_verify "--- mixed gzip and stdin match LF ---"
+    binary="$ZFASTQ"
+    local tag
+    tag="$(basename "$binary")"
+    run_zfastq_to "$CHECK_DIR/${tag}.mixed_r2.out" "$binary" interleave "$slash_r1" "$slash_gz2"
+    cmp_or_fail "$tag mixed gzip R2 vs LF" "$z_out" "$CHECK_DIR/${tag}.mixed_r2.out"
+    run_zfastq_to "$CHECK_DIR/${tag}.mixed_r1.out" "$binary" interleave "$slash_gz1" "$slash_r2"
+    cmp_or_fail "$tag mixed gzip R1 vs LF" "$z_out" "$CHECK_DIR/${tag}.mixed_r1.out"
+    expect_ok_stdin "$binary" "$tag stdin R1 bytes" "$slash_r1" interleave - "$slash_r2"
+    cmp_or_fail "$tag stdin R1 vs files" "$z_out" "$CHECK_DIR/contract.out"
+    expect_ok_stdin "$binary" "$tag stdin R2 bytes" "$slash_r2" interleave "$slash_r1" -
+    cmp_or_fail "$tag stdin R2 vs files" "$z_out" "$CHECK_DIR/contract.out"
 
     log_verify "--- CRLF to LF ---"
     local crlf_r1="$CHECK_DIR/crlf_r1.fastq"
     local crlf_r2="$CHECK_DIR/crlf_r2.fastq"
     write_slash_pair "$crlf_r1" "$crlf_r2" 4 $'\r\n'
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        run_zfastq_to "$CHECK_DIR/$(basename "$binary").crlf.out" "$binary" interleave "$crlf_r1" "$crlf_r2"
-        cmp_or_fail "$(basename "$binary") CRLF slash vs LF slash" \
-            "$z_out" "$CHECK_DIR/$(basename "$binary").crlf.out"
-    done
+    binary="$ZFASTQ"
+    run_zfastq_to "$CHECK_DIR/$(basename "$binary").crlf.out" "$binary" interleave "$crlf_r1" "$crlf_r2"
+    cmp_or_fail "$(basename "$binary") CRLF slash vs LF slash" \
+        "$z_out" "$CHECK_DIR/$(basename "$binary").crlf.out"
     status="$(capture_command "$CHECK_DIR/seqtk.crlf.out" "$CHECK_DIR/seqtk.crlf.err" \
         "$SEQTK" mergepe "$crlf_r1" "$crlf_r2")"
     [[ "$status" == 0 ]] ||
@@ -708,48 +695,45 @@ run_contract_tests() {
         "$z_out" "$CHECK_DIR/seqtk.crlf.out"
 
     log_verify "--- name policy ---"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        local exact_out="$CHECK_DIR/exact_slash.out" exact_err="$CHECK_DIR/exact_slash.err"
-        status="$(capture_command "$exact_out" "$exact_err" \
-            "$binary" interleave --pair-names exact "$slash_r1" "$slash_r2")"
-        [[ "$status" == 1 && ! -s "$exact_out" ]] ||
-            interleave_fail "$(basename "$binary") exact on slash names" \
-                "exit 1 and empty stdout" \
-                "exit=$status stdout=$(summarize_output "$exact_out")"
-    done
+    binary="$ZFASTQ"
+    local exact_out="$CHECK_DIR/exact_slash.out" exact_err="$CHECK_DIR/exact_slash.err"
+    status="$(capture_command "$exact_out" "$exact_err" \
+        "$binary" interleave --pair-names exact "$slash_r1" "$slash_r2")"
+    [[ "$status" == 1 && ! -s "$exact_out" ]] ||
+        interleave_fail "$(basename "$binary") exact on slash names" \
+            "exit 1 and empty stdout" \
+            "exit=$status stdout=$(summarize_output "$exact_out")"
 
     log_verify "--- invocation rejects ---"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        expect_status "$binary" "$(basename "$binary") no inputs" 2 interleave
-        expect_status "$binary" "$(basename "$binary") one input" 2 interleave "$slash_r1"
-        expect_status "$binary" "$(basename "$binary") three inputs" 2 \
-            interleave "$slash_r1" "$slash_r2" "$slash_r1"
-        expect_status "$binary" "$(basename "$binary") double stdin" 2 interleave - -
-        expect_status "$binary" "$(basename "$binary") --json" 2 \
-            interleave --json "$slash_r1" "$slash_r2"
-        expect_status "$binary" "$(basename "$binary") --paired" 2 \
-            interleave --paired "$slash_r1" "$slash_r2"
-        expect_status "$binary" "$(basename "$binary") --pair-names other" 2 \
-            interleave --pair-names other "$slash_r1" "$slash_r2"
-        expect_status "$binary" "$(basename "$binary") --alphabet dna" 2 \
-            interleave --alphabet dna "$slash_r1" "$slash_r2"
-    done
+    binary="$ZFASTQ"
+    expect_status "$binary" "$(basename "$binary") no inputs" 2 interleave
+    expect_status "$binary" "$(basename "$binary") one input" 2 interleave "$slash_r1"
+    expect_status "$binary" "$(basename "$binary") three inputs" 2 \
+        interleave "$slash_r1" "$slash_r2" "$slash_r1"
+    expect_status "$binary" "$(basename "$binary") double stdin" 2 interleave - -
+    expect_status "$binary" "$(basename "$binary") --json" 2 \
+        interleave --json "$slash_r1" "$slash_r2"
+    expect_status "$binary" "$(basename "$binary") --paired" 2 \
+        interleave --paired "$slash_r1" "$slash_r2"
+    expect_status "$binary" "$(basename "$binary") --pair-names other" 2 \
+        interleave --pair-names other "$slash_r1" "$slash_r2"
+    expect_status "$binary" "$(basename "$binary") --alphabet dna" 2 \
+        interleave --alphabet dna "$slash_r1" "$slash_r2"
 
     log_verify "--- pair mismatch writes no records ---"
     local bad1="$CHECK_DIR/bad_r1.fastq" bad2="$CHECK_DIR/bad_r2.fastq"
     printf '@left/1\nA\n+\n!\n' >"$bad1"
     printf '@right/2\nT\n+\n#\n' >"$bad2"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        local out="$CHECK_DIR/mismatch.out" err="$CHECK_DIR/mismatch.err"
-        status="$(capture_command "$out" "$err" "$binary" interleave "$bad1" "$bad2")"
-        [[ "$status" == 1 && ! -s "$out" ]] ||
-            interleave_fail "$(basename "$binary") P001 stdout" \
-                "exit 1 and empty stdout" \
-                "exit=$status stdout=$(summarize_output "$out")"
-        grep -Fq 'P001' "$err" ||
-            interleave_fail "$(basename "$binary") P001 diagnostic" \
-                "stderr contains P001" "stderr=$(summarize_output "$err")"
-    done
+    binary="$ZFASTQ"
+    local out="$CHECK_DIR/mismatch.out" err="$CHECK_DIR/mismatch.err"
+    status="$(capture_command "$out" "$err" "$binary" interleave "$bad1" "$bad2")"
+    [[ "$status" == 1 && ! -s "$out" ]] ||
+        interleave_fail "$(basename "$binary") P001 stdout" \
+            "exit 1 and empty stdout" \
+            "exit=$status stdout=$(summarize_output "$out")"
+    grep -Fq 'P001' "$err" ||
+        interleave_fail "$(basename "$binary") P001 diagnostic" \
+            "stderr contains P001" "stderr=$(summarize_output "$err")"
 
     log_verify "--- unequal counts keep complete earlier pairs ---"
     local extra1="$CHECK_DIR/p002_r1.fastq" extra2="$CHECK_DIR/p002_r2.fastq"
@@ -757,43 +741,40 @@ run_contract_tests() {
     printf '@ok/1\nA\n+\n!\n@extra/1\nA\n+\n!\n' >"$extra1"
     printf '@ok/2\nT\n+\n#\n' >"$extra2"
     printf '@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n' >"$first_pair"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        local out="$CHECK_DIR/p002.out" err="$CHECK_DIR/p002.err"
-        status="$(capture_command "$out" "$err" "$binary" interleave "$extra1" "$extra2")"
-        [[ "$status" == 1 ]] ||
-            interleave_fail "$(basename "$binary") P002 extra R1 exit" \
-                "exit 1" "exit=$status stdout=$(summarize_output "$out")"
-        cmp_or_fail "$(basename "$binary") P002 kept first pair" "$first_pair" "$out"
-        grep -Fq 'P002' "$err" ||
-            interleave_fail "$(basename "$binary") P002 extra R1 diagnostic" \
-                "stderr contains P002" "stderr=$(summarize_output "$err")"
-    done
+    binary="$ZFASTQ"
+    local out="$CHECK_DIR/p002.out" err="$CHECK_DIR/p002.err"
+    status="$(capture_command "$out" "$err" "$binary" interleave "$extra1" "$extra2")"
+    [[ "$status" == 1 ]] ||
+        interleave_fail "$(basename "$binary") P002 extra R1 exit" \
+            "exit 1" "exit=$status stdout=$(summarize_output "$out")"
+    cmp_or_fail "$(basename "$binary") P002 kept first pair" "$first_pair" "$out"
+    grep -Fq 'P002' "$err" ||
+        interleave_fail "$(basename "$binary") P002 extra R1 diagnostic" \
+            "stderr contains P002" "stderr=$(summarize_output "$err")"
     printf '@ok/1\nA\n+\n!\n' >"$extra1"
     printf '@ok/2\nT\n+\n#\n@extra/2\nT\n+\n#\n' >"$extra2"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        local out="$CHECK_DIR/p002_extra_r2.out" err="$CHECK_DIR/p002_extra_r2.err"
-        status="$(capture_command "$out" "$err" "$binary" interleave "$extra1" "$extra2")"
-        [[ "$status" == 1 ]] ||
-            interleave_fail "$(basename "$binary") P002 extra R2 exit" \
-                "exit 1" "exit=$status stdout=$(summarize_output "$out")"
-        cmp_or_fail "$(basename "$binary") P002 extra R2 kept first pair" "$first_pair" "$out"
-        grep -Fq 'P002' "$err" ||
-            interleave_fail "$(basename "$binary") P002 extra R2 diagnostic" \
-                "stderr contains P002" "stderr=$(summarize_output "$err")"
-    done
+    binary="$ZFASTQ"
+    local out="$CHECK_DIR/p002_extra_r2.out" err="$CHECK_DIR/p002_extra_r2.err"
+    status="$(capture_command "$out" "$err" "$binary" interleave "$extra1" "$extra2")"
+    [[ "$status" == 1 ]] ||
+        interleave_fail "$(basename "$binary") P002 extra R2 exit" \
+            "exit 1" "exit=$status stdout=$(summarize_output "$out")"
+    cmp_or_fail "$(basename "$binary") P002 extra R2 kept first pair" "$first_pair" "$out"
+    grep -Fq 'P002' "$err" ||
+        interleave_fail "$(basename "$binary") P002 extra R2 diagnostic" \
+            "stderr contains P002" "stderr=$(summarize_output "$err")"
     : >"$extra1"
     printf '@ok/2\nT\n+\n#\n' >"$extra2"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        local out="$CHECK_DIR/p002_r2.out" err="$CHECK_DIR/p002_r2.err"
-        status="$(capture_command "$out" "$err" "$binary" interleave "$extra1" "$extra2")"
-        [[ "$status" == 1 && ! -s "$out" ]] ||
-            interleave_fail "$(basename "$binary") P002 empty R1 stdout" \
-                "exit 1 and empty stdout" \
-                "exit=$status stdout=$(summarize_output "$out")"
-        grep -Fq 'P002' "$err" ||
-            interleave_fail "$(basename "$binary") P002 empty R1 diagnostic" \
-                "stderr contains P002" "stderr=$(summarize_output "$err")"
-    done
+    binary="$ZFASTQ"
+    local out="$CHECK_DIR/p002_r2.out" err="$CHECK_DIR/p002_r2.err"
+    status="$(capture_command "$out" "$err" "$binary" interleave "$extra1" "$extra2")"
+    [[ "$status" == 1 && ! -s "$out" ]] ||
+        interleave_fail "$(basename "$binary") P002 empty R1 stdout" \
+            "exit 1 and empty stdout" \
+            "exit=$status stdout=$(summarize_output "$out")"
+    grep -Fq 'P002' "$err" ||
+        interleave_fail "$(basename "$binary") P002 empty R1 diagnostic" \
+            "stderr contains P002" "stderr=$(summarize_output "$err")"
 
     run_peer_fixture_probes
 
@@ -837,7 +818,7 @@ qualify_zfastq_real() {
     local compression="$1"
     shift
     local -a ids=("$@")
-    local expected n out err status native_out
+    local expected n out err status
     n="${DATA_EXPECTED[${ids[0]}]}"
     [[ "${DATA_EXPECTED[${ids[1]}]}" == "$n" ]] ||
         interleave_fail "$compression pair counts" "equal mate counts" \
@@ -857,17 +838,6 @@ qualify_zfastq_real() {
     got="$(count_fastq_records "$out")"
     ((got % 2 == 0)) ||
         interleave_fail "$compression pair completeness" "even record count" "$got"
-
-    if [[ "$compression" == gzip ]]; then
-        build_interleave_args args z-fastq-native "${paths[@]}"
-        native_out="$(real_interleave_out "$compression" native)"
-        status="$(capture_command "$native_out" "$CHECK_DIR/native_real.err" "${args[@]}")"
-        [[ "$status" == 0 ]] ||
-            interleave_fail "$compression z-fastq-native" "exit 0" \
-                "exit=$status stderr=$(summarize_output "$CHECK_DIR/native_real.err")"
-        expect_record_count "$compression z-fastq-native pair-complete" "$expected" "$native_out"
-        cmp_or_fail "$compression ISA-L vs native" "$out" "$native_out"
-    fi
 }
 
 qualify_seqtk_bytes() {
@@ -960,14 +930,6 @@ run_timed_workload() {
     run_zebrac_tool "$section" "$key" z-fastq z-fastq "$json" \
         "$command" "$input_bytes" "$decoded_bytes"
 
-    if [[ "$compression" == gzip ]]; then
-        build_interleave_args args z-fastq-native "${paths[@]}"
-        command="$(zebrac_command "${args[@]}")"
-        json="$RESULTS_DIR/${section}_${TIMESTAMP}/${key}__z-fastq-native.json"
-        run_zebrac_tool "$section" "$key" z-fastq-native z-fastq "$json" \
-            "$command" "$input_bytes" "$decoded_bytes"
-    fi
-
     for tool in "${INTERLEAVE_PEER_ORDER[@]}"; do
         [[ "${LANE_ENABLED[$section|$key|$tool]:-0}" == 1 ]] || continue
         build_interleave_args args "$tool" "${paths[@]}"
@@ -1010,9 +972,7 @@ write_manifest() {
         printf '  "workloads": %s,\n' "$(workloads_json)"
         printf '  "zebrac": %s,\n' "$(zebrac_json_string "${INTERLEAVE_ZEBRAC_VER}")"
         printf '  "z_fastq": %s,\n' "$(zebrac_json_string "${INTERLEAVE_ZFASTQ_VER}")"
-        printf '  "z_fastq_native": %s,\n' "$(zebrac_json_string "${INTERLEAVE_ZFASTQ_NATIVE_VER}")"
         printf '  "z_fastq_bytes": %s,\n' "$(zebrac_json_number_or_null "${INTERLEAVE_ZFASTQ_BYTES}")"
-        printf '  "z_fastq_native_bytes": %s,\n' "$(zebrac_json_number_or_null "${INTERLEAVE_ZFASTQ_NATIVE_BYTES}")"
         printf '  "runs": %s,\n' "$(zebrac_json_number_or_null "$RUNS")"
         printf '  "warmup": %s,\n' "$(zebrac_json_number_or_null "$WARMUP")"
         printf '  "duration_ms": %s,\n' "$(zebrac_json_number_or_null "$ZEBRAC_DURATION_MS")"
@@ -1059,25 +1019,7 @@ write_manifest() {
 echo "z-fastq interleave bench  $TIMESTAMP"
 echo
 
-build_subjects() {
-    echo "Building z-fastq native inflate, then ISA-L product binary..."
-    (
-        cd "$PROJECT_ROOT"
-        zig build -Doptimize=ReleaseFast -Disa-l=false
-    )
-    cp -f -- "$PROJECT_ROOT/zig-out/bin/z-fastq" "$ZFASTQ_NATIVE"
-    chmod +x "$ZFASTQ_NATIVE"
-    (
-        cd "$PROJECT_ROOT"
-        zig build -Doptimize=ReleaseFast
-    )
-    bench_require_tool z-fastq
-    bench_require_tool z-fastq-native
-    echo "  ISA-L:  $ZFASTQ"
-    echo "  native: $ZFASTQ_NATIVE"
-}
-
-build_subjects
+bench_build_zfastq
 ensure_real_data
 
 VERIFY_PASS=""
@@ -1104,9 +1046,7 @@ fi
 
 INTERLEAVE_ZEBRAC_VER="$(bench_tool_version zebrac || true)"
 INTERLEAVE_ZFASTQ_VER="$(bench_tool_version z-fastq || true)"
-INTERLEAVE_ZFASTQ_NATIVE_VER="$(bench_tool_version z-fastq-native || true)"
 INTERLEAVE_ZFASTQ_BYTES="$(file_size_bytes "$ZFASTQ")"
-INTERLEAVE_ZFASTQ_NATIVE_BYTES="$(file_size_bytes "$ZFASTQ_NATIVE")"
 INTERLEAVE_TOOLS_JSON="$(
     printf '{'
     printf '"seqtk":%s,' "$(zebrac_json_string "$(bench_tool_version seqtk || true)")"
