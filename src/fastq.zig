@@ -1085,7 +1085,6 @@ pub const Reader = struct {
     record_offsets: RecordOffsets = undefined,
     current_record_offsets: ?RecordOffsets = null,
     transport_storage: []u8,
-    borrowed_gzip: ?*io_layer.GzipSource,
     pending_refill: ?struct { bytes: []u8, cursor: usize, end: usize } = null,
 
     pub fn init(
@@ -1094,21 +1093,11 @@ pub const Reader = struct {
         options: ReaderOptions,
     ) !Reader {
         const buf = try allocator.alloc(u8, io_layer.DEFAULT_READER_BUFFER_BYTES);
-        return initBuffer(allocator, source, options, buf);
-    }
-
-    fn initBuffer(
-        allocator: std.mem.Allocator,
-        source: ByteSource,
-        options: ReaderOptions,
-        buf: []u8,
-    ) Reader {
         return .{
             .allocator = allocator,
             .source = source,
             .buf = buf,
             .transport_storage = buf,
-            .borrowed_gzip = null,
             .fill_end = 0,
             .cursor = 0,
             .fallback_fields = .{ .{}, .{}, .{}, .{} },
@@ -1568,8 +1557,7 @@ pub const Reader = struct {
     }
 
     fn canBufferIncompleteRecord(self: *const Reader) bool {
-        return self.borrowed_gzip == null and self.pending_refill == null and
-            self.fill_end - self.cursor != self.buf.len;
+        return self.pending_refill == null and self.fill_end - self.cursor != self.buf.len;
     }
 
     fn ensureRefillCapacity(self: *Reader) ReaderError!void {
@@ -1690,12 +1678,6 @@ pub const Reader = struct {
     }
 
     fn compactIfNeeded(self: *Reader) void {
-        if (self.borrowed_gzip != null) {
-            std.debug.assert(self.cursor == self.fill_end);
-            self.cursor = 0;
-            self.fill_end = 0;
-            return;
-        }
         if (self.cursor >= self.fill_end) {
             self.cursor = 0;
             self.fill_end = 0;
@@ -1720,18 +1702,6 @@ pub const Reader = struct {
             return self.cursor != self.fill_end;
         }
         self.compactIfNeeded();
-        if (self.borrowed_gzip) |source| {
-            const decoded = io_layer.readGzipChunk(
-                source,
-                &source.decompressor_buffer,
-            ) catch return error.Io;
-            self.buf = if (decoded) |bytes|
-                @constCast(bytes)
-            else
-                source.decompressor_buffer[0..0];
-            self.fill_end = self.buf.len;
-            return self.fill_end != 0;
-        }
         const space = self.buf.len - self.fill_end;
         std.debug.assert(space > 0);
         const n = self.source.read(self.buf[self.fill_end..]) catch return error.Io;
@@ -2039,17 +2009,6 @@ pub const RetainedRecordStorage = struct {
     }
 };
 
-pub fn initBorrowedGzipReader(
-    allocator: std.mem.Allocator,
-    source: *io_layer.GzipSource,
-    options: ReaderOptions,
-) !Reader {
-    std.debug.assert(source.decompressor_buffer.len != 0);
-    var reader = Reader.initBuffer(allocator, source.byteSource(), options, source.decompressor_buffer[0..0]);
-    reader.borrowed_gzip = source;
-    return reader;
-}
-
 /// Leaves id empty; canonical_span is null when the record needs field-by-field output.
 pub fn nextWithSpan(
     reader: *Reader,
@@ -2260,7 +2219,6 @@ pub fn nextValidatedAfterFallbackTransfer(
     validator: *AdaptiveRecordValidator,
 ) ReaderError!?ValidatedRecord {
     reader.beginRecord();
-    if (reader.borrowed_gzip != null) return null;
     if (reader.cursor == 0 and reader.fill_end == reader.buf.len) {
         return null;
     }
@@ -4243,41 +4201,27 @@ test "[edge] - [reader]: spill field capacities stop at the line limit" {
     }
 }
 
-test "[property] - [reader]: repeated initialization releases both source modes at boundary line limits" {
+test "[property] - [reader]: repeated initialization releases the transport buffer at boundary line limits" {
     const Exercise = struct {
-        fn run(allocator: std.mem.Allocator, limit: usize, borrowed: bool) !void {
-            var empty = std.Io.Reader.fixed("");
-            var gzip = io_layer.GzipSource.init(&empty);
+        fn run(allocator: std.mem.Allocator, limit: usize) !void {
             var source = io_layer.SliceSource.init("");
-            var reader = if (borrowed)
-                try initBorrowedGzipReader(allocator, &gzip, .{ .max_line_bytes = limit })
-            else
-                try Reader.init(allocator, source.byteSource(), .{ .max_line_bytes = limit });
+            var reader = try Reader.init(allocator, source.byteSource(), .{ .max_line_bytes = limit });
             defer reader.deinit();
 
             for (reader.fallback_fields) |field| {
                 try std.testing.expectEqual(@as(usize, 0), field.storage.len);
             }
-            try std.testing.expectEqual(
-                @as(usize, if (borrowed) 0 else io_layer.DEFAULT_READER_BUFFER_BYTES),
-                reader.transport_storage.len,
-            );
+            try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.transport_storage.len);
         }
     };
     for ([_]usize{ 0, 8192, 80 * 1024, io_layer.DEFAULT_READER_BUFFER_BYTES - 1, io_layer.DEFAULT_READER_BUFFER_BYTES, std.math.maxInt(usize) }) |limit| {
-        for ([_]bool{ false, true }) |borrowed| {
-            if (borrowed and @sizeOf(@FieldType(io_layer.GzipSource, "decompressor_buffer")) == 0) continue;
-            try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ limit, borrowed });
-            var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-            for (0..3) |iteration| {
-                try Exercise.run(tracking.allocator(), limit, borrowed);
-                try std.testing.expectEqual(@as(usize, if (borrowed) 0 else iteration + 1), tracking.allocations);
-                try std.testing.expectEqual(
-                    @as(usize, if (borrowed) 0 else (iteration + 1) * io_layer.DEFAULT_READER_BUFFER_BYTES),
-                    tracking.allocated_bytes,
-                );
-                try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
-            }
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{limit});
+        var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        for (0..3) |iteration| {
+            try Exercise.run(tracking.allocator(), limit);
+            try std.testing.expectEqual(iteration + 1, tracking.allocations);
+            try std.testing.expectEqual((iteration + 1) * io_layer.DEFAULT_READER_BUFFER_BYTES, tracking.allocated_bytes);
+            try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
         }
     }
 }
@@ -4288,54 +4232,6 @@ test "[edge] - [reader]: field storage limit saturates after checked overflow" {
     try std.testing.expectEqual(1024 * 1024 + 1, fieldStorageLimit(1024 * 1024));
     try std.testing.expectEqual(max, fieldStorageLimit(max - 1));
     try std.testing.expectEqual(max, fieldStorageLimit(max));
-}
-
-test "[property] - [reader]: borrowed gzip allocates only for retained fallback fields" {
-    // The separate parser test executable always uses native gzip.
-    if (@sizeOf(@FieldType(io_layer.GzipSource, "decompressor_buffer")) == 0) return;
-    const Exercise = struct {
-        const bytes = "@r\r\nAR\r\n+left\r\n!~\r\n@next\nC\n+\n#\n";
-
-        fn run(allocator: std.mem.Allocator, split: usize) !void {
-            var compressed: [128]u8 = undefined;
-            var output = std.Io.Writer.fixed(&compressed);
-            for ([_][]const u8{ bytes[0..split], bytes[split..] }) |part| {
-                const len: u16 = @intCast(part.len);
-                try output.writeAll(&.{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255, 1 });
-                try output.writeInt(u16, len, .little);
-                try output.writeInt(u16, ~len, .little);
-                try output.writeAll(part);
-                try output.writeInt(u32, std.hash.Crc32.hash(part), .little);
-                try output.writeInt(u32, len, .little);
-            }
-            var input = std.Io.Reader.fixed(output.buffered());
-            var gzip = io_layer.GzipSource.init(&input);
-            var reader = try initBorrowedGzipReader(allocator, &gzip, .{ .max_line_bytes = 8 });
-            defer reader.deinit();
-            const first = (try reader.next()).?;
-            try std.testing.expectEqualStrings("r", first.header);
-            try std.testing.expectEqualStrings("r", first.id);
-            try std.testing.expectEqualStrings("AR", first.sequence);
-            try std.testing.expectEqualStrings("left", first.plus);
-            try std.testing.expectEqualStrings("!~", first.quality);
-            const second = (try reader.next()).?;
-            try std.testing.expectEqualStrings("next", second.header);
-            try std.testing.expectEqualStrings("C", second.sequence);
-            try std.testing.expectEqualStrings("#", second.quality);
-            try std.testing.expect((try reader.next()) == null);
-            try std.testing.expectEqual(@as(u64, bytes.len), reader.byteOffset());
-            for (reader.fallback_fields) |field| try std.testing.expect(field.storage.len <= 9);
-        }
-    };
-    for ([_]usize{ 0, 1, 5, 14, Exercise.bytes.len - 1 }) |split| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{split});
-        var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-        try Exercise.run(tracking.allocator(), split);
-        try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
-        if (split == 0) {
-            try std.testing.expectEqual(@as(usize, 0), tracking.allocations);
-        } else try std.testing.expect(tracking.allocations > 0);
-    }
 }
 
 test "[unit] - [reader]: field storage exchanges preserve both live prefixes" {
