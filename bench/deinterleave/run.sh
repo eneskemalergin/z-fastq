@@ -118,7 +118,9 @@ declare -A LANE_ENABLED=()
 declare -A LANE_REASON=()
 declare -a PEER_FIXTURE_ROWS=()
 
-DEINTERLEAVE_PEER_ORDER=(seqtk seqfu fqkit irma bbtools)
+# BBTools is disabled: its JVM uses several cores even with threads=1, and it is the slowest peer.
+# DEINTERLEAVE_PEER_ORDER=(seqtk seqfu fqkit irma bbtools)
+DEINTERLEAVE_PEER_ORDER=(seqtk seqfu fqkit irma)
 
 json_string_array() {
     local sep="" value
@@ -777,17 +779,18 @@ run_contract_tests() {
         fi
     fi
 
-    if tool_ready bbtools; then
-        local bb1="$CHECK_DIR/bb.slash.r1" bb2="$CHECK_DIR/bb.slash.r2"
-        status="$(capture_command /dev/null "$CHECK_DIR/bb.slash.err" \
-            "$REFORMAT" -Xmx50m threads=1 qin=33 qout=33 changequality=f overwrite=t \
-            int=t in="$slash" out="$bb1" out2="$bb2")"
-        if [[ "$status" == 0 ]] && grep -Fq '##' "$bb1" && ! grep -Fq '!!' "$bb1"; then
-            log_verify "  BBTools changequality=f rewrote slash R1 !! to ## (descriptive)"
-        else
-            log_verify "  BBTools slash quality rewrite not observed (descriptive; exit=$status)"
-        fi
-    fi
+    # BBTools is disabled with its timed lane above.
+    # if tool_ready bbtools; then
+    #     local bb1="$CHECK_DIR/bb.slash.r1" bb2="$CHECK_DIR/bb.slash.r2"
+    #     status="$(capture_command /dev/null "$CHECK_DIR/bb.slash.err" \
+    #         "$REFORMAT" -Xmx50m threads=1 qin=33 qout=33 changequality=f overwrite=t \
+    #         int=t in="$slash" out="$bb1" out2="$bb2")"
+    #     if [[ "$status" == 0 ]] && grep -Fq '##' "$bb1" && ! grep -Fq '!!' "$bb1"; then
+    #         log_verify "  BBTools changequality=f rewrote slash R1 !! to ## (descriptive)"
+    #     else
+    #         log_verify "  BBTools slash quality rewrite not observed (descriptive; exit=$status)"
+    #     fi
+    # fi
 
     if tool_ready seqfu; then
         local sf_extra="$CHECK_DIR/seqfu_slash_layout"
@@ -1242,8 +1245,8 @@ DEINTERLEAVE_TOOLS_JSON="$(
     printf '"seqtk":%s,' "$(zebrac_json_string "$(bench_tool_version seqtk || true)")"
     printf '"seqfu":%s,' "$(zebrac_json_string "$(bench_tool_version seqfu || true)")"
     printf '"fqkit":%s,' "$(zebrac_json_string "$(bench_tool_version fqkit || true)")"
-    printf '"irma":%s,' "$(zebrac_json_string "$(bench_tool_version irma || true)")"
-    printf '"bbtools":%s' "$(zebrac_json_string "$(bench_tool_version bbtools || true)")"
+    printf '"irma":%s' "$(zebrac_json_string "$(bench_tool_version irma || true)")"
+    # printf '"bbtools":%s' "$(zebrac_json_string "$(bench_tool_version bbtools || true)")"
     printf '}'
 )"
 write_manifest

@@ -94,7 +94,9 @@ declare -A LANE_ENABLED=()
 declare -A LANE_REASON=()
 declare -a PEER_FIXTURE_ROWS=()
 
-INTERLEAVE_PEER_ORDER=(seqtk seqfu fqkit irma bbtools)
+# BBTools is disabled: its JVM uses several cores even with threads=1, and it is the slowest peer.
+# INTERLEAVE_PEER_ORDER=(seqtk seqfu fqkit irma bbtools)
+INTERLEAVE_PEER_ORDER=(seqtk seqfu fqkit irma)
 
 json_string_array() {
     local sep="" value
@@ -1052,8 +1054,8 @@ INTERLEAVE_TOOLS_JSON="$(
     printf '"seqtk":%s,' "$(zebrac_json_string "$(bench_tool_version seqtk || true)")"
     printf '"seqfu":%s,' "$(zebrac_json_string "$(bench_tool_version seqfu || true)")"
     printf '"fqkit":%s,' "$(zebrac_json_string "$(bench_tool_version fqkit || true)")"
-    printf '"irma":%s,' "$(zebrac_json_string "$(bench_tool_version irma || true)")"
-    printf '"bbtools":%s' "$(zebrac_json_string "$(bench_tool_version bbtools || true)")"
+    printf '"irma":%s' "$(zebrac_json_string "$(bench_tool_version irma || true)")"
+    # printf '"bbtools":%s' "$(zebrac_json_string "$(bench_tool_version bbtools || true)")"
     printf '}'
 )"
 write_manifest

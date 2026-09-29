@@ -27,8 +27,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 RESULTS_DIR = SCRIPT_DIR / "results"
 
 BASELINE = "z-fastq"
-PLAIN_TOOLS = ["z-fastq", "seqtk", "seqfu", "fqkit", "irma", "bbtools"]
-GZIP_TOOLS = ["z-fastq", "seqtk", "seqfu", "fqkit", "irma", "bbtools"]
+# BBTools is disabled in run.sh; its JVM uses several cores even with threads=1.
+# PLAIN_TOOLS = ["z-fastq", "seqtk", "seqfu", "fqkit", "irma", "bbtools"]
+PLAIN_TOOLS = ["z-fastq", "seqtk", "seqfu", "fqkit", "irma"]
+# GZIP_TOOLS = ["z-fastq", "seqtk", "seqfu", "fqkit", "irma", "bbtools"]
+GZIP_TOOLS = ["z-fastq", "seqtk", "seqfu", "fqkit", "irma"]
 DESCRIPTIVE_TOOLS = frozenset({"seqfu", "fqkit", "irma", "bbtools"})
 NO_OCCUPANCY = frozenset({"bbtools"})
 ROLE_MATRIX_ORDER = ["time"]
@@ -1168,12 +1171,13 @@ def md_capability(manifest: dict) -> str:
                 "Same interleave job": "no; layout zip; gzip layout matches plain",
                 "Timed as": "hatched; descriptive",
             },
-            {
-                "Tool": "BBTools",
-                "Command": "`reformat.sh in= in2= out=/dev/null`",
-                "Same interleave job": "no; JVM; `changequality=f` still rewrote R1 `!!`→`##` (Phred 0 to 2) on these fixtures",
-                "Timed as": "hatched; RSS not occupancy",
-            },
+            # BBTools is disabled in run.sh.
+            # {
+            #     "Tool": "BBTools",
+            #     "Command": "`reformat.sh in= in2= out=/dev/null`",
+            #     "Same interleave job": "no; JVM; `changequality=f` still rewrote R1 `!!`→`##` (Phred 0 to 2) on these fixtures",
+            #     "Timed as": "hatched; RSS not occupancy",
+            # },
         ]
     )
     omitted = pd.DataFrame(
@@ -1240,7 +1244,7 @@ def md_overview(manifest: dict) -> str:
             "",
             "**What is timed**",
             "",
-            "- One process, one interleave workload. Zebrac starts the argv directly; no shell or pipeline is measured. Stdout writers are discarded by zebrac. BBTools is timed with `out=/dev/null`.",
+            "- One process, one interleave workload. Zebrac starts the argv directly; no shell or pipeline is measured. Stdout writers are discarded by zebrac.",
             "- Plain and gzip inputs are separate sections.",
             "- seqtk `mergepe` is timed as the screened exact layout reference. Other interleavers are descriptive peers and are hatched.",
             "- SeqFu is timed with `-c` so it compares first tokens; that is not z-fastq illumina (slash `/1` `/2` fixtures fail; Casava first tokens match). IRMA Core gzip is timed: layout zip, not a sampler RNG. Mixed gzip is contract-only.",
@@ -1273,7 +1277,7 @@ def md_correctness(manifest: dict) -> str:
             "",
             "**Peer fixture probes**",
             "",
-            "These rows are descriptive. A fail does not stop the run. `pass` is exit 0, and for stdout writers (and BBTools fixture files) an even pair-complete record count; `fail` is a nonzero exit or an odd count on a fixture z-fastq accepts; `unsupported` means that tool is not invoked. SeqFu `-c` failed slash `/1` `/2` (including CRLF) with a first-token mismatch on stdout, not FASTQ records, and passed Casava and empty; IRMA Core failed empty mates.",
+            "These rows are descriptive. A fail does not stop the run. `pass` is exit 0, and for stdout writers an even pair-complete record count; `fail` is a nonzero exit or an odd count on a fixture z-fastq accepts; `unsupported` means that tool is not invoked. SeqFu `-c` failed slash `/1` `/2` (including CRLF) with a first-token mismatch on stdout, not FASTQ records, and passed Casava and empty; IRMA Core failed empty mates.",
             "",
             md_fixture_table(manifest),
         ]
@@ -1411,7 +1415,7 @@ def md_perf_section(
                     if len(workload_ids) == 1
                     else "Color = tool. Shape and line dash = workload; the legend names the catalog mate pair.",
                     "Curves are 1x/2x/4x/8x memory-seconds of that workload's z-fastq lane. Gold 1x, gray 2x/4x/8x.",
-                    "Lower-left is better. Missing points are not treated as zero. BBTools is omitted (JVM RSS).",
+                    "Lower-left is better. Missing points are not treated as zero.",
                 ]
                 if len(workload_ids) == 1:
                     occupancy_eff_bullets = [
@@ -1429,7 +1433,7 @@ def md_perf_section(
                     [
                         "### Occupancy (50/50 wall and RSS)",
                         "",
-                        "Occupancy is mean wall time × peak RSS on the timed pair-interleave family. BBTools stays on the wall/RSS facets and is omitted here because its RSS is a JVM image. SeqFu interleave is a single process (threads share RSS) and is included. Occupancy is descriptive resource accounting, not a semantic-equivalence ranking.",
+                        "Occupancy is mean wall time × peak RSS on the timed pair-interleave family. SeqFu interleave is a single process (threads share RSS) and is included. Occupancy is descriptive resource accounting, not a semantic-equivalence ranking.",
                         "",
                         md_occupancy_tables(occupancy, scored, nums),
                         "",
@@ -1528,12 +1532,12 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
     pair_bullets_plain = [
         "Facets: wall time (log y) | peak RSS (linear) | minor page faults (log y).",
         "X-axis: catalog mate pair. Two files are one workload. Occupancy follows this family.",
-        "Gold bars are z-fastq. Hatched bars are descriptive interleavers. seqtk `mergepe` is the screened exact layout reference and is not hatched. BBTools JVM RSS dominates the memory facet; occupancy omits it.",
+        "Gold bars are z-fastq. Hatched bars are descriptive interleavers. seqtk `mergepe` is the screened exact layout reference and is not hatched.",
     ]
     pair_bullets_gzip = [
         "Facets: wall time (log y) | peak RSS (linear) | minor page faults (log y).",
         "X-axis: catalog mate pair. Two files are one workload. Occupancy follows this family.",
-        "Gold bars are z-fastq. Hatched bars are descriptive interleavers. seqtk `mergepe` is the screened exact layout reference and is not hatched. BBTools JVM RSS dominates the memory facet; occupancy omits it.",
+        "Gold bars are z-fastq. Hatched bars are descriptive interleavers. seqtk `mergepe` is the screened exact layout reference and is not hatched.",
     ]
 
     if plain is not None and not plain.empty:

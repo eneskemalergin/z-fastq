@@ -115,7 +115,9 @@ declare -A LANE_ENABLED=()
 declare -A LANE_REASON=()
 declare -a PEER_FIXTURE_ROWS=()
 
-SAMPLE_PEER_ORDER=(seqtk seqkit rasusa fq fqkit irma bbtools)
+# BBTools is disabled: its JVM uses several cores even with threads=1, and it is the slowest peer.
+# SAMPLE_PEER_ORDER=(seqtk seqkit rasusa fq fqkit irma bbtools)
+SAMPLE_PEER_ORDER=(seqtk seqkit rasusa fq fqkit irma)
 
 json_string_array() {
     local sep="" value
@@ -1213,8 +1215,8 @@ SAMPLE_TOOLS_JSON="$(
     printf '"rasusa":%s,' "$(zebrac_json_string "$(bench_tool_version rasusa || true)")"
     printf '"fq":%s,' "$(zebrac_json_string "$(bench_tool_version fq || true)")"
     printf '"fqkit":%s,' "$(zebrac_json_string "$(bench_tool_version fqkit || true)")"
-    printf '"irma":%s,' "$(zebrac_json_string "$(bench_tool_version irma || true)")"
-    printf '"bbtools":%s' "$(zebrac_json_string "$(bench_tool_version bbtools || true)")"
+    printf '"irma":%s' "$(zebrac_json_string "$(bench_tool_version irma || true)")"
+    # printf '"bbtools":%s' "$(zebrac_json_string "$(bench_tool_version bbtools || true)")"
     printf '}'
 )"
 write_manifest

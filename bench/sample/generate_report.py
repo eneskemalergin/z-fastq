@@ -27,8 +27,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 RESULTS_DIR = SCRIPT_DIR / "results"
 
 BASELINE = "z-fastq"
-PLAIN_TOOLS = ["z-fastq", "seqtk", "seqkit", "rasusa", "fq", "fqkit", "irma", "bbtools"]
-GZIP_TOOLS = ["z-fastq", "seqtk", "seqkit", "rasusa", "fq", "fqkit", "irma", "bbtools"]
+# BBTools is disabled in run.sh; its JVM uses several cores even with threads=1.
+# PLAIN_TOOLS = ["z-fastq", "seqtk", "seqkit", "rasusa", "fq", "fqkit", "irma", "bbtools"]
+PLAIN_TOOLS = ["z-fastq", "seqtk", "seqkit", "rasusa", "fq", "fqkit", "irma"]
+# GZIP_TOOLS = ["z-fastq", "seqtk", "seqkit", "rasusa", "fq", "fqkit", "irma", "bbtools"]
+GZIP_TOOLS = ["z-fastq", "seqtk", "seqkit", "rasusa", "fq", "fqkit", "irma"]
 DESCRIPTIVE_TOOLS = frozenset({"seqkit", "rasusa", "fq", "fqkit", "irma", "bbtools"})
 NO_OCCUPANCY = frozenset({"bbtools", "seqkit"})
 ROLE_MATRIX_ORDER = [
@@ -1239,12 +1242,13 @@ def md_capability(manifest: dict) -> str:
                 "Same sample job": "no; integer percent; gzip and plain select different records; one interleaved file is SE records",
                 "Timed as": "hatched; plain SE and paired only",
             },
-            {
-                "Tool": "BBTools",
-                "Command": "`reformat.sh samplerate=P|samplereadstarget=K sampleseed=11 out=/dev/null`",
-                "Same sample job": "no; JVM; can rewrite qualities",
-                "Timed as": "hatched; RSS not occupancy",
-            },
+            # BBTools is disabled in run.sh.
+            # {
+            #     "Tool": "BBTools",
+            #     "Command": "`reformat.sh samplerate=P|samplereadstarget=K sampleseed=11 out=/dev/null`",
+            #     "Same sample job": "no; JVM; can rewrite qualities",
+            #     "Timed as": "hatched; RSS not occupancy",
+            # },
         ]
     )
     omitted = pd.DataFrame(
@@ -1351,7 +1355,7 @@ def md_correctness(manifest: dict) -> str:
             "",
             "**Peer fixture probes**",
             "",
-            "These rows are descriptive. A fail does not stop the run. `pass` is exit 0, and for stdout writers a matching record count on count fixtures or even pair output on pair-fraction fixtures; `fail` is a nonzero exit or a cardinality mismatch on a fixture z-fastq accepts; `unsupported` means that tool is not invoked for that mode. File-writing peers (`fq`, Rasusa paired, BBTools) are exit 0 only.",
+            "These rows are descriptive. A fail does not stop the run. `pass` is exit 0, and for stdout writers a matching record count on count fixtures or even pair output on pair-fraction fixtures; `fail` is a nonzero exit or a cardinality mismatch on a fixture z-fastq accepts; `unsupported` means that tool is not invoked for that mode. File-writing peers (`fq`, Rasusa paired) are exit 0 only.",
             "",
             md_fixture_table(manifest),
         ]
@@ -1487,7 +1491,7 @@ def md_perf_section(
                     [
                         "### Occupancy (50/50 wall and RSS)",
                         "",
-                        "Occupancy is mean wall time × peak RSS, and only SE families use it (fraction and count separately). These figures use accepted positive lanes; blank cells mean unsupported or rejected. BBTools stays on the wall/RSS facets and is omitted here because its RSS is a JVM image, not a single sampler process. SeqKit stays on the wall/RSS facets and is omitted here because its RSS is the Go image. Occupancy is descriptive resource accounting, not a semantic-equivalence ranking.",
+                        "Occupancy is mean wall time × peak RSS, and only SE families use it (fraction and count separately). These figures use accepted positive lanes; blank cells mean unsupported or rejected. SeqKit stays on the wall/RSS facets and is omitted here because its RSS is the Go image. Occupancy is descriptive resource accounting, not a semantic-equivalence ranking.",
                         "",
                         md_occupancy_tables(occupancy, scored, nums),
                         "",
