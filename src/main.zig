@@ -851,20 +851,6 @@ const RecordInput = struct {
         };
     }
 
-    fn initReader(
-        self: *RecordInput,
-        allocator: std.mem.Allocator,
-        options: fastq.ReaderOptions,
-    ) !zfastq.Reader {
-        return switch (self.source) {
-            .plain => |*source| zfastq.Reader.init(allocator, source.byteSource(), options),
-            .gzip => |*source| if (build_options.use_isa_l)
-                zfastq.Reader.init(allocator, source.byteSource(), options)
-            else
-                fastq.initBorrowedGzipReader(allocator, source, options),
-        };
-    }
-
     fn readScannerChunk(self: *RecordInput, buffer: []u8) error{Io}!?[]const u8 {
         return switch (self.source) {
             .plain => |*source| plain: {
@@ -892,17 +878,6 @@ fn initRecordInput(
         return IO_FAILURE;
     transferred = true;
     return null;
-}
-
-fn initSourceReader(
-    allocator: std.mem.Allocator,
-    source: anytype,
-    options: fastq.ReaderOptions,
-) !zfastq.Reader {
-    return if (comptime @TypeOf(source) == zfastq.io.ByteSource)
-        zfastq.Reader.init(allocator, source, options)
-    else
-        source.initReader(allocator, options);
 }
 
 fn openRecordFile(io: std.Io, label: []const u8) std.Io.File.OpenError!std.Io.File {
@@ -1702,19 +1677,10 @@ fn checkPaired(
     defer input1.deinit(io);
     defer input2.deinit(io);
 
-    if (comptime build_options.use_isa_l) {
-        return checkPairedSources(
-            allocator,
-            input1.byteSource(),
-            input2.byteSource(),
-            options,
-            null,
-        );
-    }
     return checkPairedSources(
         allocator,
-        &input1,
-        &input2,
+        input1.byteSource(),
+        input2.byteSource(),
         options,
         null,
     );
@@ -1722,16 +1688,16 @@ fn checkPaired(
 
 fn checkPairedSources(
     allocator: std.mem.Allocator,
-    source1: anytype,
-    source2: @TypeOf(source1),
+    source1: zfastq.io.ByteSource,
+    source2: zfastq.io.ByteSource,
     options: PairedCheckOptions,
     exact_selector: ?*sampling.ExactSelector,
 ) ?PairCommandFailure {
     const reader_options: fastq.ReaderOptions = .{ .max_line_bytes = options.max_line_bytes };
-    var reader1 = initSourceReader(allocator, source1, reader_options) catch
+    var reader1 = zfastq.Reader.init(allocator, source1, reader_options) catch
         return pairCommandFailure(0, OUT_OF_MEMORY);
     defer reader1.deinit();
-    var reader2 = initSourceReader(allocator, source2, reader_options) catch
+    var reader2 = zfastq.Reader.init(allocator, source2, reader_options) catch
         return pairCommandFailure(1, OUT_OF_MEMORY);
     defer reader2.deinit();
     var validator1 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
@@ -2433,28 +2399,27 @@ fn sampleFractionInput(
     var input: RecordInput = undefined;
     if (initRecordInput(&input, io, label, options.output_identity)) |failure| return failure;
     defer input.deinit(io);
-    if (comptime build_options.use_isa_l) {
-        if (selector.* == .none) {
-            return checkRecordInput(&input, .{
-                .max_line_bytes = options.max_line_bytes,
-                .alphabet = options.alphabet,
-            });
-        }
-        return sampleFractionSource(allocator, input.byteSource(), writer, selector, options);
+    if (selector.* == .none) {
+        return checkRecordInput(&input, .{
+            .max_line_bytes = options.max_line_bytes,
+            .alphabet = options.alphabet,
+        });
     }
-    return sampleFractionSource(allocator, &input, writer, selector, options);
+    return sampleFractionSource(allocator, input.byteSource(), writer, selector, options);
 }
 
 fn sampleFractionSource(
     allocator: std.mem.Allocator,
-    source: anytype,
+    source: zfastq.io.ByteSource,
     writer: *zfastq.Writer,
     selector: *sampling.Selector,
     options: SampleOptions,
 ) error{WriteFailed}!?CommandFailure {
-    const reader_options: fastq.ReaderOptions = .{ .max_line_bytes = options.max_line_bytes };
-    var reader = initSourceReader(allocator, source, reader_options) catch
-        return OUT_OF_MEMORY;
+    var reader = zfastq.Reader.init(
+        allocator,
+        source,
+        .{ .max_line_bytes = options.max_line_bytes },
+    ) catch return OUT_OF_MEMORY;
     defer reader.deinit();
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
@@ -3449,21 +3414,10 @@ fn interleaveInputs(
     defer input2.deinit(io);
 
     var selection = options.selection;
-    if (comptime build_options.use_isa_l) {
-        return interleaveSources(
-            allocator,
-            input1.byteSource(),
-            input2.byteSource(),
-            writer,
-            direct_writer,
-            &selection,
-            options,
-        );
-    }
     return interleaveSources(
         allocator,
-        &input1,
-        &input2,
+        input1.byteSource(),
+        input2.byteSource(),
         writer,
         direct_writer,
         &selection,
@@ -3473,18 +3427,18 @@ fn interleaveInputs(
 
 fn interleaveSources(
     allocator: std.mem.Allocator,
-    source1: anytype,
-    source2: @TypeOf(source1),
+    source1: zfastq.io.ByteSource,
+    source2: zfastq.io.ByteSource,
     writer: *zfastq.Writer,
     direct_writer: ?*std.Io.Writer,
     selection: *PairOutputSelector,
     options: InterleaveOptions,
 ) error{WriteFailed}!?PairCommandFailure {
     const reader_options: fastq.ReaderOptions = .{ .max_line_bytes = options.max_line_bytes };
-    var reader1 = initSourceReader(allocator, source1, reader_options) catch
+    var reader1 = zfastq.Reader.init(allocator, source1, reader_options) catch
         return pairCommandFailure(0, OUT_OF_MEMORY);
     defer reader1.deinit();
-    var reader2 = initSourceReader(allocator, source2, reader_options) catch
+    var reader2 = zfastq.Reader.init(allocator, source2, reader_options) catch
         return pairCommandFailure(1, OUT_OF_MEMORY);
     defer reader2.deinit();
     var validator1 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
@@ -5897,8 +5851,7 @@ test "[property] - [interleaved fraction sample]: source chunks preserve selecte
     }
 }
 
-test "[edge] - [single fraction sample]: fraction zero avoids allocation in the default backend" {
-    if (!build_options.use_isa_l) return error.SkipZigTest;
+test "[edge] - [single fraction sample]: fraction zero reads without a record reader" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
