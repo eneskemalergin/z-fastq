@@ -814,8 +814,7 @@ const RecordInput = struct {
     read_buffer: [zfastq.limits.DEFAULT_READER_BUFFER_BYTES]u8,
     file_reader: std.Io.File.Reader,
     kind: enum { plain, gzip },
-    // Set only when `kind` is gzip. A separate tag keeps plain input from touching this
-    // decoder workspace: assigning null or a payload-free union tag zeroes the whole field.
+    // Kept apart from `kind`: assigning null or a payload-free union tag zeroes this whole field.
     gzip: io_layer.GzipSource,
 
     fn init(
@@ -838,14 +837,13 @@ const RecordInput = struct {
                 return;
             }
         }
-        // Plain records are parsed in place, so the reader grows to the record buffer size;
-        // the sniffed bytes stay put because the smaller buffer is its prefix. A sniff read
-        // that filled its buffer is topped up, so the first chunk matches one full-size read
-        // and records crossing the sniff size need no spill storage.
-        const sniffed = self.file_reader.interface.bufferedLen();
-        self.file_reader.interface.buffer = &self.read_buffer;
-        if (sniffed == GZIP_INPUT_BUFFER_BYTES) {
-            self.file_reader.interface.fillMore() catch |err| switch (err) {
+        const reader = &self.file_reader.interface;
+        const sniff_filled = reader.bufferedLen() == reader.buffer.len;
+        // The sniff buffer is a prefix of `read_buffer`, so widening keeps the sniffed bytes.
+        reader.buffer = &self.read_buffer;
+        // A full sniff read can end inside a record; topping up keeps it out of spill storage.
+        if (sniff_filled) {
+            reader.fillMore() catch |err| switch (err) {
                 error.EndOfStream => {},
                 error.ReadFailed => return error.Io,
             };

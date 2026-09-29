@@ -24,8 +24,6 @@ pub fn expectResult(
     try std.testing.expectEqualStrings(stderr, result.stderr);
 }
 
-/// Checks a command that failed after it began writing. Gzip checks each member only at its end,
-/// so output may run ahead of the failure, but it must be a prefix of the valid output.
 pub fn expectFailedPrefix(
     result: CommandResult,
     exit_code: u8,

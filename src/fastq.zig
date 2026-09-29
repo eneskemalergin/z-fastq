@@ -2014,8 +2014,6 @@ pub const RetainedRecordStorage = struct {
     }
 };
 
-/// Borrows `input`'s buffer, which must stay at a stable address and outlive the reader.
-/// Allocates only for records that span reads or need fallback line storage.
 pub fn initStreamReader(
     allocator: std.mem.Allocator,
     input: *std.Io.Reader,
@@ -4216,16 +4214,28 @@ test "[property] - [reader]: repeated initialization releases the transport buff
     const Exercise = struct {
         fn run(allocator: std.mem.Allocator, limit: usize) !void {
             var source = io_layer.SliceSource.init("");
-            var reader = try Reader.init(allocator, source.byteSource(), .{ .max_line_bytes = limit });
+            var reader = try Reader.init(allocator, source.byteSource(), .{
+                .max_line_bytes = limit,
+            });
             defer reader.deinit();
 
             for (reader.fallback_fields) |field| {
                 try std.testing.expectEqual(@as(usize, 0), field.storage.len);
             }
-            try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.transport_storage.len);
+            try std.testing.expectEqual(
+                io_layer.DEFAULT_READER_BUFFER_BYTES,
+                reader.transport_storage.len,
+            );
         }
     };
-    for ([_]usize{ 0, 8192, 80 * 1024, io_layer.DEFAULT_READER_BUFFER_BYTES - 1, io_layer.DEFAULT_READER_BUFFER_BYTES, std.math.maxInt(usize) }) |limit| {
+    for ([_]usize{
+        0,
+        8192,
+        80 * 1024,
+        io_layer.DEFAULT_READER_BUFFER_BYTES - 1,
+        io_layer.DEFAULT_READER_BUFFER_BYTES,
+        std.math.maxInt(usize),
+    }) |limit| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{limit});
         var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
         for (0..3) |iteration| {

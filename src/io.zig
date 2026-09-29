@@ -119,7 +119,6 @@ fn readShort(reader: *std.Io.Reader, dest: []u8) ReadError!usize {
     return reader.readSliceShort(dest) catch error.ReadFailed;
 }
 
-/// Returns the next buffered chunk, valid until the reader is used again, or null at EOF.
 pub fn readChunk(reader: *std.Io.Reader) ReadError!?[]u8 {
     const chunk = reader.peekGreedy(1) catch |err| switch (err) {
         error.EndOfStream => return null,
@@ -129,9 +128,6 @@ pub fn readChunk(reader: *std.Io.Reader) ReadError!?[]u8 {
     return chunk;
 }
 
-/// Standard reader over a copied byte source, buffering in caller-owned storage.
-/// The source adapter and storage must outlive it; each refill after full consumption
-/// starts at the beginning of the storage.
 pub const ByteSourceReader = struct {
     source: ByteSource,
     interface: std.Io.Reader,

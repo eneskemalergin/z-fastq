@@ -393,8 +393,10 @@ test "[cli] - [deinterleave]: failed input leaves command-created outputs" {
         "",
         expected,
     );
-    try expectFilePrefix(allocator, paths[0], "@ok/1\nA\n+\n!\n");
-    try expectFilePrefix(allocator, paths[1], "@ok/2\nT\n+\n#\n");
+    const output1 = try tmp.dir.readFileAlloc(io, "corrupt-r1.fastq", allocator, .limited(1024));
+    const output2 = try tmp.dir.readFileAlloc(io, "corrupt-r2.fastq", allocator, .limited(1024));
+    try cli.expectPrefix("@ok/1\nA\n+\n!\n", output1);
+    try cli.expectPrefix("@ok/2\nT\n+\n#\n", output2);
 }
 
 test "[cli] - [deinterleave]: late gzip failure retains the same complete prefix in both outputs" {
@@ -1189,20 +1191,6 @@ fn expectFile(
     );
     try std.testing.expectEqual(expected.len, actual.len);
     try std.testing.expectEqualSlices(u8, expected, actual);
-}
-
-fn expectFilePrefix(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    valid: []const u8,
-) !void {
-    const actual = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
-        path,
-        allocator,
-        .limited(4 * 1024 * 1024),
-    );
-    try cli.expectPrefix(valid, actual);
 }
 
 fn expectAbsent(path: []const u8) !void {
