@@ -443,7 +443,7 @@ run_count_tools() {
     if [[ "$include_hatched" == "true" ]] && bench_has_tool seqfu; then
         json="$out_dir/${workload}__seqfu.json"
         run_zebrac_tool "$section" "$workload" seqfu seqfu "$json" \
-            "$(zebrac_command "$SEQFU" count "$file")" "$nbytes" "$decoded_bytes"
+            "$(zebrac_command "$SEQFU" count --threads 1 "$file")" "$nbytes" "$decoded_bytes"
     fi
 
     json="$out_dir/${workload}__fqtools.json"
