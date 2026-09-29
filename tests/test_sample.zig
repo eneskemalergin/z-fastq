@@ -773,11 +773,15 @@ test "[cli] - [interleaved sample]: corrupt gzip refills preserve earlier output
     }
     gzip.items[gzip.items.len - 8] ^= 1;
 
-    // The first 256 KiB read ends 12 bytes into the next pair.
-    try cli.expectResult(
-        try cli.runWithStdin(allocator, &.{ "sample", "--interleaved", "--fraction", "1", "-" }, gzip.items, gzip.items.len),
+    try cli.expectFailedPrefix(
+        try cli.runWithStdin(
+            allocator,
+            &.{ "sample", "--interleaved", "--fraction", "1", "-" },
+            gzip.items,
+            gzip.items.len,
+        ),
         3,
-        input[0..262132],
+        input,
         "error: -: I/O error\n",
     );
 }

@@ -806,15 +806,14 @@ const FileIdentity = struct {
     inode: u64,
 };
 
+const GZIP_INPUT_BUFFER_BYTES = 64 * 1024;
+
 const RecordInput = struct {
     file: std.Io.File,
     owns_file: bool,
-    read_buffer: [64 * 1024]u8,
+    read_buffer: [zfastq.limits.DEFAULT_READER_BUFFER_BYTES]u8,
     file_reader: std.Io.File.Reader,
-    source: union(enum) {
-        plain: io_layer.PlainFileSource,
-        gzip: io_layer.GzipSource,
-    },
+    gzip: ?io_layer.GzipSource,
 
     fn init(
         self: *RecordInput,
@@ -824,18 +823,30 @@ const RecordInput = struct {
     ) error{Io}!void {
         self.file = file;
         self.owns_file = owns_file;
-        self.file_reader = file.readerStreaming(io, &self.read_buffer);
+        self.file_reader = file.readerStreaming(io, self.read_buffer[0..GZIP_INPUT_BUFFER_BYTES]);
         const prefix = self.file_reader.interface.peek(2) catch |err| switch (err) {
             error.EndOfStream => null,
             error.ReadFailed => return error.Io,
         };
         if (prefix) |bytes| {
             if (std.mem.eql(u8, bytes, &.{ 0x1f, 0x8b })) {
-                self.source = .{ .gzip = io_layer.GzipSource.init(&self.file_reader.interface) };
+                self.gzip = io_layer.GzipSource.init(&self.file_reader.interface);
                 return;
             }
         }
-        self.source = .{ .plain = io_layer.PlainFileSource.init(&self.file_reader) };
+        // Plain records are parsed in place, so the reader grows to the record buffer size;
+        // the sniffed bytes stay put because the smaller buffer is its prefix. A sniff read
+        // that filled its buffer is topped up, so the first chunk matches one full-size read
+        // and records crossing the sniff size need no spill storage.
+        const sniffed = self.file_reader.interface.bufferedLen();
+        self.file_reader.interface.buffer = &self.read_buffer;
+        if (sniffed == GZIP_INPUT_BUFFER_BYTES) {
+            self.file_reader.interface.fillMore() catch |err| switch (err) {
+                error.EndOfStream => {},
+                error.ReadFailed => return error.Io,
+            };
+        }
+        self.gzip = null;
     }
 
     fn deinit(self: *RecordInput, io: std.Io) void {
@@ -843,22 +854,13 @@ const RecordInput = struct {
         self.* = undefined;
     }
 
-    fn byteSource(self: *RecordInput) zfastq.io.ByteSource {
-        return switch (self.source) {
-            .plain => |*source| source.byteSource(),
-            .gzip => |*source| source.byteSource(),
-        };
+    fn stream(self: *RecordInput) *std.Io.Reader {
+        if (self.gzip) |*gzip| return io_layer.gzipReader(gzip);
+        return &self.file_reader.interface;
     }
 
-    fn readScannerChunk(self: *RecordInput, buffer: []u8) error{Io}!?[]const u8 {
-        return switch (self.source) {
-            .plain => |*source| plain: {
-                const byte_source = source.byteSource();
-                const count = byte_source.read(buffer) catch return error.Io;
-                break :plain if (count == 0) null else buffer[0..count];
-            },
-            .gzip => |*source| io_layer.readGzipChunk(source) catch return error.Io,
-        };
+    fn readScannerChunk(self: *RecordInput) error{Io}!?[]const u8 {
+        return io_layer.readChunk(self.stream()) catch error.Io;
     }
 };
 
@@ -1324,8 +1326,7 @@ fn countInput(io: std.Io, label: []const u8, options: InputOptions) CountOutcome
     defer input.deinit(io);
 
     var scanner = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = options.max_line_bytes });
-    var buffer: [zfastq.limits.DEFAULT_READER_BUFFER_BYTES]u8 = undefined;
-    while (input.readScannerChunk(&buffer) catch return .{ .failure = IO_FAILURE }) |decoded| {
+    while (input.readScannerChunk() catch return .{ .failure = IO_FAILURE }) |decoded| {
         _ = scanner.feed(decoded) catch |err| return .{ .failure = mapScanFailure(&scanner, err) };
     }
     scanner.finishEof() catch |err| return .{ .failure = mapScanFailure(&scanner, err) };
@@ -1424,19 +1425,17 @@ fn statsInput(
     var input: RecordInput = undefined;
     if (initRecordInput(&input, io, label, null)) |failure| return .{ .failure = failure };
     defer input.deinit(io);
-    return collectStats(allocator, input.byteSource(), options);
+    return collectStats(allocator, input.stream(), options);
 }
 
 fn collectStats(
     allocator: std.mem.Allocator,
-    source: zfastq.io.ByteSource,
+    source: *std.Io.Reader,
     options: InputOptions,
 ) StatsOutcome {
-    var reader = zfastq.Reader.init(
-        allocator,
-        source,
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return .{ .failure = OUT_OF_MEMORY };
+    var reader = fastq.initStreamReader(allocator, source, .{
+        .max_line_bytes = options.max_line_bytes,
+    });
     defer reader.deinit();
 
     var stats: zfastq.Stats = .{};
@@ -1674,8 +1673,8 @@ fn checkPaired(
 
     return checkPairedSources(
         allocator,
-        input1.byteSource(),
-        input2.byteSource(),
+        input1.stream(),
+        input2.stream(),
         options,
         null,
     );
@@ -1683,17 +1682,15 @@ fn checkPaired(
 
 fn checkPairedSources(
     allocator: std.mem.Allocator,
-    source1: zfastq.io.ByteSource,
-    source2: zfastq.io.ByteSource,
+    source1: *std.Io.Reader,
+    source2: *std.Io.Reader,
     options: PairedCheckOptions,
     exact_selector: ?*sampling.ExactSelector,
 ) ?PairCommandFailure {
     const reader_options: fastq.ReaderOptions = .{ .max_line_bytes = options.max_line_bytes };
-    var reader1 = zfastq.Reader.init(allocator, source1, reader_options) catch
-        return pairCommandFailure(0, OUT_OF_MEMORY);
+    var reader1 = fastq.initStreamReader(allocator, source1, reader_options);
     defer reader1.deinit();
-    var reader2 = zfastq.Reader.init(allocator, source2, reader_options) catch
-        return pairCommandFailure(1, OUT_OF_MEMORY);
+    var reader2 = fastq.initStreamReader(allocator, source2, reader_options);
     defer reader2.deinit();
     var validator1 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
     var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
@@ -1780,7 +1777,7 @@ fn checkInterleaved(
 
     return checkInterleavedSource(
         allocator,
-        input.byteSource(),
+        input.stream(),
         options,
         null,
     );
@@ -1788,15 +1785,13 @@ fn checkInterleaved(
 
 fn checkInterleavedSource(
     allocator: std.mem.Allocator,
-    source: zfastq.io.ByteSource,
+    source: *std.Io.Reader,
     options: PairedCheckOptions,
     exact_selector: ?*sampling.ExactSelector,
 ) ?PairCommandFailure {
-    var reader = zfastq.Reader.init(
-        allocator,
-        source,
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return pairCommandFailure(0, OUT_OF_MEMORY);
+    var reader = fastq.initStreamReader(allocator, source, .{
+        .max_line_bytes = options.max_line_bytes,
+    });
     defer reader.deinit();
     var stored_name: StoredPairName = .{};
     defer stored_name.deinit(allocator);
@@ -1910,9 +1905,8 @@ fn checkRecordInput(
         .{ .max_line_bytes = options.max_line_bytes },
         .{ .alphabet = options.alphabet },
     );
-    var buf: [zfastq.limits.DEFAULT_READER_BUFFER_BYTES]u8 = undefined;
     while (true) {
-        const chunk = input.readScannerChunk(&buf) catch
+        const chunk = input.readScannerChunk() catch
             return IO_FAILURE;
         const decoded = chunk orelse break;
         _ = scanner.feed(decoded) catch |err| {
@@ -1936,8 +1930,6 @@ fn mapCheckScannerFailure(
 }
 
 // --- Sample command ---
-
-const SAMPLE_SCAN_BUFFER_BYTES = 64 * 1024;
 
 const SampleOptions = struct {
     max_line_bytes: usize,
@@ -2234,7 +2226,7 @@ fn sampleInterleavedFractionInput(
 
     return sampleInterleavedSource(
         allocator,
-        input.byteSource(),
+        input.stream(),
         writer,
         selection,
         staging_limit,
@@ -2244,17 +2236,15 @@ fn sampleInterleavedFractionInput(
 
 fn sampleInterleavedSource(
     allocator: std.mem.Allocator,
-    source: zfastq.io.ByteSource,
+    source: *std.Io.Reader,
     writer: *zfastq.Writer,
     selection: *PairOutputSelector,
     staging_limit: usize,
     options: SampleOptions,
 ) error{WriteFailed}!?PairCommandFailure {
-    var reader = zfastq.Reader.init(
-        allocator,
-        source,
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return pairCommandFailure(0, OUT_OF_MEMORY);
+    var reader = fastq.initStreamReader(allocator, source, .{
+        .max_line_bytes = options.max_line_bytes,
+    });
     defer reader.deinit();
     var stored_name: StoredPairName = .{};
     defer stored_name.deinit(allocator);
@@ -2400,21 +2390,19 @@ fn sampleFractionInput(
             .alphabet = options.alphabet,
         });
     }
-    return sampleFractionSource(allocator, input.byteSource(), writer, selector, options);
+    return sampleFractionSource(allocator, input.stream(), writer, selector, options);
 }
 
 fn sampleFractionSource(
     allocator: std.mem.Allocator,
-    source: zfastq.io.ByteSource,
+    source: *std.Io.Reader,
     writer: *zfastq.Writer,
     selector: *sampling.Selector,
     options: SampleOptions,
 ) error{WriteFailed}!?CommandFailure {
-    var reader = zfastq.Reader.init(
-        allocator,
-        source,
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return OUT_OF_MEMORY;
+    var reader = fastq.initStreamReader(allocator, source, .{
+        .max_line_bytes = options.max_line_bytes,
+    });
     defer reader.deinit();
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
@@ -2537,9 +2525,8 @@ fn sampleExactFirstPass(
         .{ .max_line_bytes = options.max_line_bytes },
         .{ .alphabet = options.alphabet },
     );
-    var buf: [SAMPLE_SCAN_BUFFER_BYTES]u8 = undefined;
     while (true) {
-        const chunk = input.readScannerChunk(&buf) catch {
+        const chunk = input.readScannerChunk() catch {
             failure = IO_FAILURE;
             break;
         };
@@ -2598,11 +2585,9 @@ fn sampleExactSecondPass(
     }
     defer input.deinit(io);
 
-    var reader = zfastq.Reader.init(
-        allocator,
-        input.byteSource(),
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return OUT_OF_MEMORY;
+    var reader = fastq.initStreamReader(allocator, input.stream(), .{
+        .max_line_bytes = options.max_line_bytes,
+    });
     defer reader.deinit();
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
@@ -2799,8 +2784,8 @@ fn sampleExactPairedFirstPass(
 
     const failure = checkPairedSources(
         allocator,
-        input1.byteSource(),
-        input2.byteSource(),
+        input1.stream(),
+        input2.stream(),
         options,
         selector,
     );
@@ -2833,7 +2818,7 @@ fn sampleExactInterleavedFirstPass(
 
     const failure = checkInterleavedSource(
         allocator,
-        input.byteSource(),
+        input.stream(),
         options,
         selector,
     );
@@ -2905,17 +2890,13 @@ fn sampleExactPairedSecondPass(
     defer input1.deinit(io);
     defer input2.deinit(io);
 
-    var reader1 = zfastq.Reader.init(
-        allocator,
-        input1.byteSource(),
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return pairCommandFailure(0, OUT_OF_MEMORY);
+    var reader1 = fastq.initStreamReader(allocator, input1.stream(), .{
+        .max_line_bytes = options.max_line_bytes,
+    });
     defer reader1.deinit();
-    var reader2 = zfastq.Reader.init(
-        allocator,
-        input2.byteSource(),
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return pairCommandFailure(1, OUT_OF_MEMORY);
+    var reader2 = fastq.initStreamReader(allocator, input2.stream(), .{
+        .max_line_bytes = options.max_line_bytes,
+    });
     defer reader2.deinit();
     var validator1 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
     var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
@@ -3048,11 +3029,9 @@ fn sampleExactInterleavedSecondPass(
     }
     defer input.deinit(io);
 
-    var reader = zfastq.Reader.init(
-        allocator,
-        input.byteSource(),
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return pairCommandFailure(0, OUT_OF_MEMORY);
+    var reader = fastq.initStreamReader(allocator, input.stream(), .{
+        .max_line_bytes = options.max_line_bytes,
+    });
     defer reader.deinit();
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
     var staged_record: std.ArrayList(u8) = .empty;
@@ -3411,8 +3390,8 @@ fn interleaveInputs(
     var selection = options.selection;
     return interleaveSources(
         allocator,
-        input1.byteSource(),
-        input2.byteSource(),
+        input1.stream(),
+        input2.stream(),
         writer,
         direct_writer,
         &selection,
@@ -3422,19 +3401,17 @@ fn interleaveInputs(
 
 fn interleaveSources(
     allocator: std.mem.Allocator,
-    source1: zfastq.io.ByteSource,
-    source2: zfastq.io.ByteSource,
+    source1: *std.Io.Reader,
+    source2: *std.Io.Reader,
     writer: *zfastq.Writer,
     direct_writer: ?*std.Io.Writer,
     selection: *PairOutputSelector,
     options: InterleaveOptions,
 ) error{WriteFailed}!?PairCommandFailure {
     const reader_options: fastq.ReaderOptions = .{ .max_line_bytes = options.max_line_bytes };
-    var reader1 = zfastq.Reader.init(allocator, source1, reader_options) catch
-        return pairCommandFailure(0, OUT_OF_MEMORY);
+    var reader1 = fastq.initStreamReader(allocator, source1, reader_options);
     defer reader1.deinit();
-    var reader2 = zfastq.Reader.init(allocator, source2, reader_options) catch
-        return pairCommandFailure(1, OUT_OF_MEMORY);
+    var reader2 = fastq.initStreamReader(allocator, source2, reader_options);
     defer reader2.deinit();
     var validator1 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
     var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
@@ -3610,7 +3587,7 @@ fn runDeinterleave(
 
     const failure = deinterleaveSource(
         allocator,
-        input.byteSource(),
+        input.stream(),
         &output1.writer,
         &output2.writer,
         staging_limit,
@@ -3676,17 +3653,15 @@ fn validateDeinterleaveArguments(
 
 fn deinterleaveSource(
     allocator: std.mem.Allocator,
-    source: zfastq.io.ByteSource,
+    source: *std.Io.Reader,
     writer1: *zfastq.Writer,
     writer2: *zfastq.Writer,
     staging_limit: usize,
     options: DeinterleaveOptions,
 ) DeinterleaveWriteError!?PairCommandFailure {
-    var reader = zfastq.Reader.init(
-        allocator,
-        source,
-        .{ .max_line_bytes = options.max_line_bytes },
-    ) catch return pairCommandFailure(0, OUT_OF_MEMORY);
+    var reader = fastq.initStreamReader(allocator, source, .{
+        .max_line_bytes = options.max_line_bytes,
+    });
     defer reader.deinit();
     var staged_record: std.ArrayList(u8) = .empty;
     defer staged_record.deinit(allocator);
@@ -4098,6 +4073,23 @@ fn writeRatioField(
     try output.writeAll(line);
 }
 
+const TestStream = struct {
+    buffer: []u8,
+    reader: io_layer.ByteSourceReader,
+
+    fn init(source: zfastq.io.ByteSource) !TestStream {
+        const buffer = try std.testing.allocator.alloc(
+            u8,
+            zfastq.limits.DEFAULT_READER_BUFFER_BYTES,
+        );
+        return .{ .buffer = buffer, .reader = .init(source, buffer) };
+    }
+
+    fn deinit(self: *TestStream) void {
+        std.testing.allocator.free(self.buffer);
+    }
+};
+
 test "[unit] - [interleaved staging]: releases oversized slack before a smaller mate" {
     var staging: std.ArrayList(u8) = .empty;
     defer staging.deinit(std.testing.allocator);
@@ -4267,12 +4259,14 @@ test "[edge] - [stats-json]: preserves the maximum u64 counter" {
 }
 
 test "[failure] - [stats command]: reader allocation failure becomes a handled result" {
-    var source = zfastq.io.plain.SliceSource.init("");
+    var source = zfastq.io.plain.SliceSource.init("@r\nA\n+\n!\n");
+    var buffer: [4]u8 = undefined;
+    var stream = io_layer.ByteSourceReader.init(source.byteSource(), &buffer);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
         .fail_index = 0,
     });
 
-    const outcome = collectStats(failing.allocator(), source.byteSource(), .{});
+    const outcome = collectStats(failing.allocator(), &stream.interface, .{});
     const failure = switch (outcome) {
         .success => return error.ExpectedFailure,
         .failure => |failure| failure,
@@ -5722,10 +5716,14 @@ test "[edge] - [paired exact sample]: target above pair count keeps indexes impl
     var selector = sampling.ExactSelector.init(3, 11);
     defer selector.deinit(std.testing.allocator);
 
+    var stream1 = try TestStream.init(source1.byteSource());
+    defer stream1.deinit();
+    var stream2 = try TestStream.init(source2.byteSource());
+    defer stream2.deinit();
     const failure = checkPairedSources(
         std.testing.allocator,
-        source1.byteSource(),
-        source2.byteSource(),
+        &stream1.reader.interface,
+        &stream2.reader.interface,
         .{
             .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
             .alphabet = .iupac,
@@ -5773,10 +5771,14 @@ test "[failure] - [paired exact sample]: a read failure follows complete earlier
     var selector = sampling.ExactSelector.init(1, 11);
     defer selector.deinit(std.testing.allocator);
 
+    var stream1 = try TestStream.init(source1.byteSource());
+    defer stream1.deinit();
+    var stream2 = try TestStream.init(source2.byteSource());
+    defer stream2.deinit();
     const failure = checkPairedSources(
         std.testing.allocator,
-        source1.byteSource(),
-        source2.byteSource(),
+        &stream1.reader.interface,
+        &stream2.reader.interface,
         .{
             .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
             .alphabet = .iupac,
@@ -5823,9 +5825,14 @@ test "[property] - [interleaved fraction sample]: source chunks preserve selecte
         var selector = sampling.Selector.init(.{ .probability = 0.5 }, 11);
         var selection: PairOutputSelector = .{ .fraction = &selector };
 
+        var stream = try TestStream.init(.{
+            .ctx = &source,
+            .vtable = &.{ .read = ChunkedSource.read },
+        });
+        defer stream.deinit();
         const failure = try sampleInterleavedSource(
             std.testing.allocator,
-            .{ .ctx = &source, .vtable = &.{ .read = ChunkedSource.read } },
+            &stream.reader.interface,
             &writer,
             &selection,
             1024,
@@ -5925,7 +5932,7 @@ test "[edge] - [paired fraction sample]: fraction zero keeps buffered mate one b
     var selector = sampling.Selector.init(.none, 11);
     var output_selector: PairOutputSelector = .{ .fraction = &selector };
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = 1,
+        .fail_index = 0,
     });
 
     const failure = try sampleInterleavedFractionInput(
@@ -5977,8 +5984,15 @@ test "[property] - [interleaved input]: small pairs need no preservation allocat
         for ([_]usize{ mates[0].len, mates[0].len + 7 }) |first_chunk| {
             for (0..4) |command| {
                 var source: InterleavedTestSource = .{ .data = input, .first_chunk = first_chunk };
-                const bytes: zfastq.io.ByteSource = .{ .ctx = &source, .vtable = &.{ .read = InterleavedTestSource.read } };
-                var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+                var stream = try TestStream.init(.{
+                    .ctx = &source,
+                    .vtable = &.{ .read = InterleavedTestSource.read },
+                });
+                defer stream.deinit();
+                const bytes = &stream.reader.interface;
+                var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+                    .fail_index = 1,
+                });
                 var out1: [128]u8 = undefined;
                 var out2: [128]u8 = undefined;
                 var sink1 = io_layer.SliceSink.init(&out1);
@@ -6035,9 +6049,14 @@ test "[failure] - [deinterleave]: preserves CRLF output on a failed write" {
     var writer1 = zfastq.Writer.init(sink1.byteSink());
     var writer2 = zfastq.Writer.init(sink2.byteSink());
 
+    var stream = try TestStream.init(.{
+        .ctx = &source,
+        .vtable = &.{ .read = InterleavedTestSource.read },
+    });
+    defer stream.deinit();
     try std.testing.expectError(error.Output1WriteFailed, deinterleaveSource(
         std.testing.allocator,
-        .{ .ctx = &source, .vtable = &.{ .read = InterleavedTestSource.read } },
+        &stream.reader.interface,
         &writer1,
         &writer2,
         260,
@@ -6092,6 +6111,8 @@ test "[failure] - [deinterleave]: identifies both output write positions" {
 
     {
         var source = io_layer.SliceSource.init(input);
+        var stream = try TestStream.init(source.byteSource());
+        defer stream.deinit();
         var sink1 = DeinterleaveTestSink{ .fail_write = true };
         var sink2 = DeinterleaveTestSink{};
         var writer1 = zfastq.Writer.init(sink1.byteSink());
@@ -6101,7 +6122,7 @@ test "[failure] - [deinterleave]: identifies both output write positions" {
             error.Output1WriteFailed,
             deinterleaveSource(
                 std.testing.allocator,
-                source.byteSource(),
+                &stream.reader.interface,
                 &writer1,
                 &writer2,
                 staging_limit,
@@ -6113,6 +6134,8 @@ test "[failure] - [deinterleave]: identifies both output write positions" {
 
     {
         var source = io_layer.SliceSource.init(input);
+        var stream = try TestStream.init(source.byteSource());
+        defer stream.deinit();
         var sink1 = DeinterleaveTestSink{};
         var sink2 = DeinterleaveTestSink{ .fail_write = true };
         var writer1 = zfastq.Writer.init(sink1.byteSink());
@@ -6122,7 +6145,7 @@ test "[failure] - [deinterleave]: identifies both output write positions" {
             error.Output2WriteFailed,
             deinterleaveSource(
                 std.testing.allocator,
-                source.byteSource(),
+                &stream.reader.interface,
                 &writer1,
                 &writer2,
                 staging_limit,
@@ -6314,12 +6337,14 @@ test "[failure] - [deinterleave]: staging allocation failure emits no output" {
     );
     try input.append(std.testing.allocator, '\n');
     var source = io_layer.SliceSource.init(input.items);
+    var stream = try TestStream.init(source.byteSource());
+    defer stream.deinit();
     var sink1 = DeinterleaveTestSink{};
     var sink2 = DeinterleaveTestSink{};
     var writer1 = zfastq.Writer.init(sink1.byteSink());
     var writer2 = zfastq.Writer.init(sink2.byteSink());
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = 2,
+        .fail_index = 1,
     });
     const options = DeinterleaveOptions{
         .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
@@ -6329,7 +6354,7 @@ test "[failure] - [deinterleave]: staging allocation failure emits no output" {
 
     const failure = (try deinterleaveSource(
         failing.allocator(),
-        source.byteSource(),
+        &stream.reader.interface,
         &writer1,
         &writer2,
         try recordStagingLimit(options.max_line_bytes),
@@ -6413,13 +6438,15 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
 
     for (0..3) |failure_mode| {
         var source = io_layer.SliceSource.init(input.items);
+        var stream = try TestStream.init(source.byteSource());
+        defer stream.deinit();
         var sink1 = io_layer.SliceSink.init(if (failure_mode == 0) output[0..0] else output);
         var sink2 = io_layer.SliceSink.init(output[0..0]);
         var writer1 = zfastq.Writer.init(sink1.byteSink());
         var writer2 = zfastq.Writer.init(sink2.byteSink());
         const result = deinterleaveSource(
             std.testing.allocator,
-            source.byteSource(),
+            &stream.reader.interface,
             &writer1,
             &writer2,
             if (failure_mode == 2) 1 else try recordStagingLimit(options.max_line_bytes),
@@ -6453,13 +6480,15 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
             else => input.items.len,
         };
         var source = io_layer.SliceSource.init(input.items[0..end]);
+        var stream = try TestStream.init(source.byteSource());
+        defer stream.deinit();
         var sink1 = DeinterleaveTestSink{};
         var sink2 = DeinterleaveTestSink{};
         var writer1 = zfastq.Writer.init(sink1.byteSink());
         var writer2 = zfastq.Writer.init(sink2.byteSink());
         const failure = (try deinterleaveSource(
             std.testing.allocator,
-            source.byteSource(),
+            &stream.reader.interface,
             &writer1,
             &writer2,
             try recordStagingLimit(options.max_line_bytes),
@@ -6485,6 +6514,8 @@ fn exerciseRetainedPairAllocations(allocator: std.mem.Allocator, input: []const 
     defer std.testing.allocator.free(output);
     const split = std.mem.find(u8, input, "@pair/2").?;
     var source = io_layer.SliceSource.init(input);
+    var stream = try TestStream.init(source.byteSource());
+    defer stream.deinit();
     var sink1 = io_layer.SliceSink.init(output[0..split]);
     var sink2 = io_layer.SliceSink.init(output[split..]);
     var writer1 = zfastq.Writer.init(sink1.byteSink());
@@ -6496,7 +6527,7 @@ fn exerciseRetainedPairAllocations(allocator: std.mem.Allocator, input: []const 
     };
     if (try deinterleaveSource(
         allocator,
-        source.byteSource(),
+        &stream.reader.interface,
         &writer1,
         &writer2,
         split,

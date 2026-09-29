@@ -176,48 +176,6 @@ fn byteSourceReadVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize 
     return 0;
 }
 
-pub const PlainFileSource = struct {
-    file_reader: *std.Io.File.Reader,
-
-    pub fn init(file_reader: *std.Io.File.Reader) PlainFileSource {
-        return .{ .file_reader = file_reader };
-    }
-
-    pub fn byteSource(self: *PlainFileSource) ByteSource {
-        return .{
-            .vtable = &PLAIN_FILE_VTABLE,
-            .ctx = self,
-        };
-    }
-};
-
-const PLAIN_FILE_VTABLE = ByteSource.VTable{
-    .read = plainFileRead,
-};
-
-fn plainFileRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
-    const self: *PlainFileSource = @ptrCast(@alignCast(ctx));
-    const reader = &self.file_reader.interface;
-    var written: usize = 0;
-
-    const buffered = reader.buffered();
-    if (buffered.len != 0) {
-        const copy_len = @min(buffered.len, dest.len);
-        @memcpy(dest[0..copy_len], buffered[0..copy_len]);
-        reader.toss(copy_len);
-        written = copy_len;
-    }
-    if (reader.bufferedLen() == 0) {
-        reader.buffer = &.{};
-        reader.seek = 0;
-        reader.end = 0;
-    }
-    if (written == dest.len) return written;
-
-    const direct = reader.readSliceShort(dest[written..]) catch return error.ReadFailed;
-    return written + direct;
-}
-
 /// Buffered pull adapter over a borrowed file handle and caller-owned buffer.
 pub const FileSource = struct {
     file_reader: std.Io.File.Reader,
@@ -306,8 +264,8 @@ const SmallInput = struct {
     }
 };
 
-pub fn readGzipChunk(self: *GzipSource) ReadError!?[]const u8 {
-    return readChunk(self.decoded());
+pub fn gzipReader(self: *GzipSource) *std.Io.Reader {
+    return self.decoded();
 }
 
 const GZIP_VTABLE = ByteSource.VTable{
@@ -449,51 +407,6 @@ fn fileSinkFlush(ctx: *anyopaque) WriteError!void {
     self.file_writer.interface.flush() catch return error.WriteFailed;
 }
 
-test "[integration] - [plain file source]: buffered prefixes drain once before direct reads and EOF" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    for ([_][]const u8{ "", "x", "@r", "abcdefgh", "abcdefghijk" }) |data| {
-        try tmp.dir.writeFile(io, .{ .sub_path = "input", .data = data });
-        for ([_]usize{ 2, 4, 8 }) |buffer_len| {
-            for ([_]usize{ 1, 3, 16 }) |output_chunk_len| {
-                errdefer std.debug.print("plain file length {d}, buffer {d}, output {d}\n", .{
-                    data.len, buffer_len, output_chunk_len,
-                });
-                const file = try tmp.dir.openFile(io, "input", .{});
-                defer file.close(io);
-                var input_buffer: [8]u8 = undefined;
-                var reader = file.readerStreaming(io, input_buffer[0..buffer_len]);
-                if (data.len < buffer_len) {
-                    try std.testing.expectError(error.EndOfStream, reader.interface.peek(buffer_len));
-                } else {
-                    try std.testing.expectEqualStrings(
-                        data[0..buffer_len],
-                        try reader.interface.peek(buffer_len),
-                    );
-                }
-
-                var plain = PlainFileSource.init(&reader);
-                const source = plain.byteSource();
-                var output: [16]u8 = undefined;
-                try std.testing.expectEqual(@as(usize, 0), try source.read(output[0..0]));
-                var offset: usize = 0;
-                for (0..data.len + 1) |_| {
-                    const n = try source.read(output[0..output_chunk_len]);
-                    try std.testing.expect(n <= data.len - offset);
-                    try std.testing.expectEqualStrings(data[offset..][0..n], output[0..n]);
-                    offset += n;
-                    try std.testing.expectEqual(@as(u64, @intCast(offset)), reader.logicalPos());
-                    if (n == 0) break;
-                }
-                try std.testing.expectEqual(data.len, offset);
-                try std.testing.expectEqual(@as(usize, 0), try source.read(&output));
-            }
-        }
-    }
-}
-
 test "[property] - [gzip direct delivery]: preserves bytes across members" {
     const gzip_x = [_]u8{
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -506,7 +419,7 @@ test "[property] - [gzip direct delivery]: preserves bytes across members" {
     var output: [2]u8 = undefined;
     var output_len: usize = 0;
 
-    while (try readGzipChunk(&source)) |decoded| {
+    while (try readChunk(gzipReader(&source))) |decoded| {
         @memcpy(output[output_len..][0..decoded.len], decoded);
         output_len += decoded.len;
     }
