@@ -1071,7 +1071,7 @@ fn fieldStorageLimit(max_line_bytes: usize) usize {
 /// The copied source wrapper's referenced adapter must outlive the reader.
 pub const Reader = struct {
     allocator: std.mem.Allocator,
-    source: ByteSource,
+    transport: Transport,
     buf: []u8,
     fill_end: usize,
     cursor: usize,
@@ -1087,17 +1087,32 @@ pub const Reader = struct {
     transport_storage: []u8,
     pending_refill: ?struct { bytes: []u8, cursor: usize, end: usize } = null,
 
+    const Transport = union(enum) {
+        owned: io_layer.ByteSourceReader,
+        borrowed: *std.Io.Reader,
+    };
+
     pub fn init(
         allocator: std.mem.Allocator,
         source: ByteSource,
         options: ReaderOptions,
     ) !Reader {
-        const buf = try allocator.alloc(u8, io_layer.DEFAULT_READER_BUFFER_BYTES);
+        const storage = try allocator.alloc(u8, io_layer.DEFAULT_READER_BUFFER_BYTES);
+        var reader = initTransport(allocator, .{ .owned = .init(source, storage) }, options);
+        reader.transport_storage = storage;
+        return reader;
+    }
+
+    fn initTransport(
+        allocator: std.mem.Allocator,
+        transport: Transport,
+        options: ReaderOptions,
+    ) Reader {
         return .{
             .allocator = allocator,
-            .source = source,
-            .buf = buf,
-            .transport_storage = buf,
+            .transport = transport,
+            .buf = &.{},
+            .transport_storage = &.{},
             .fill_end = 0,
             .cursor = 0,
             .fallback_fields = .{ .{}, .{}, .{}, .{} },
@@ -1557,7 +1572,8 @@ pub const Reader = struct {
     }
 
     fn canBufferIncompleteRecord(self: *const Reader) bool {
-        return self.pending_refill == null and self.fill_end - self.cursor != self.buf.len;
+        return self.pending_refill == null and
+            self.fill_end - self.cursor < io_layer.DEFAULT_READER_BUFFER_BYTES;
     }
 
     fn ensureRefillCapacity(self: *Reader) ReaderError!void {
@@ -1677,20 +1693,6 @@ pub const Reader = struct {
         };
     }
 
-    fn compactIfNeeded(self: *Reader) void {
-        if (self.cursor >= self.fill_end) {
-            self.cursor = 0;
-            self.fill_end = 0;
-            return;
-        }
-        if (self.cursor == 0) return;
-
-        const tail_len = self.fill_end - self.cursor;
-        @memmove(self.buf[0..tail_len], self.buf[self.cursor..self.fill_end]);
-        self.fill_end = tail_len;
-        self.cursor = 0;
-    }
-
     fn refill(self: *Reader) ReaderError!bool {
         self.line_feeds = .{};
         if (self.pending_refill) |pending| {
@@ -1701,12 +1703,15 @@ pub const Reader = struct {
             self.pending_refill = null;
             return self.cursor != self.fill_end;
         }
-        self.compactIfNeeded();
-        const space = self.buf.len - self.fill_end;
-        std.debug.assert(space > 0);
-        const n = self.source.read(self.buf[self.fill_end..]) catch return error.Io;
-        self.fill_end += n;
-        return n > 0;
+        std.debug.assert(self.cursor == self.fill_end);
+        const input = switch (self.transport) {
+            .owned => |*owned| &owned.interface,
+            .borrowed => |borrowed| borrowed,
+        };
+        self.buf = (io_layer.readChunk(input) catch return error.Io) orelse &.{};
+        self.cursor = 0;
+        self.fill_end = self.buf.len;
+        return self.fill_end != 0;
     }
 
     fn readFallbackLine(self: *Reader, comptime retained_fields: u4) ReaderError!?Line {
@@ -2009,6 +2014,16 @@ pub const RetainedRecordStorage = struct {
     }
 };
 
+/// Borrows `input`'s buffer, which must stay at a stable address and outlive the reader.
+/// Allocates only for records that span reads or need fallback line storage.
+pub fn initStreamReader(
+    allocator: std.mem.Allocator,
+    input: *std.Io.Reader,
+    options: ReaderOptions,
+) Reader {
+    return Reader.initTransport(allocator, .{ .borrowed = input }, options);
+}
+
 /// Leaves id empty; canonical_span is null when the record needs field-by-field output.
 pub fn nextWithSpan(
     reader: *Reader,
@@ -2219,11 +2234,7 @@ pub fn nextValidatedAfterFallbackTransfer(
     validator: *AdaptiveRecordValidator,
 ) ReaderError!?ValidatedRecord {
     reader.beginRecord();
-    if (reader.cursor == 0 and reader.fill_end == reader.buf.len) {
-        return null;
-    }
-    const got_data = try reader.refill();
-    if (!got_data and reader.cursor == reader.fill_end) return null;
+    if (reader.cursor == reader.fill_end and !try reader.refill()) return null;
     return nextBufferedValidatedRecord(reader, validator);
 }
 
@@ -4630,6 +4641,83 @@ test "[property] - [record delivery]: omits identifiers and preserves buffered c
     try std.testing.expect(canonical_span == null);
 }
 
+fn expectStreamMatchesOwned(input: []const u8, buffer_len: usize, comptime validated: bool) !void {
+    errdefer std.debug.print("stream reader: input {d} bytes, buffer {d}, validated {}\n", .{
+        input.len, buffer_len, validated,
+    });
+    var owned_source = io_layer.SliceSource.init(input);
+    var owned = try Reader.init(std.testing.allocator, owned_source.byteSource(), .{});
+    defer owned.deinit();
+    const buffer = try std.testing.allocator.alloc(u8, buffer_len);
+    defer std.testing.allocator.free(buffer);
+    var stream_source = io_layer.SliceSource.init(input);
+    var stream = io_layer.ByteSourceReader.init(stream_source.byteSource(), buffer);
+    var borrowed = initStreamReader(std.testing.allocator, &stream.interface, .{});
+    defer borrowed.deinit();
+    var owned_validator = AdaptiveRecordValidator.init(.{});
+    var borrowed_validator = AdaptiveRecordValidator.init(.{});
+
+    while (true) {
+        const expected = if (validated)
+            nextValidatedRecord(&owned, &owned_validator)
+        else
+            owned.next();
+        const actual = if (validated)
+            nextValidatedRecord(&borrowed, &borrowed_validator)
+        else
+            borrowed.next();
+        try std.testing.expectEqual(owned.recordIndex(), borrowed.recordIndex());
+        try std.testing.expectEqual(owned.byteOffset(), borrowed.byteOffset());
+        try std.testing.expectEqual(owned.currentRecordOffsets(), borrowed.currentRecordOffsets());
+        const expected_value = expected catch |err| {
+            try std.testing.expectError(err, actual);
+            try expectProjectionErrorEqual(owned.takeLastError(), borrowed.takeLastError());
+            return;
+        };
+        const actual_value = try actual;
+        if (validated) {
+            const expected_record = expected_value orelse {
+                try std.testing.expect(actual_value == null);
+                return;
+            };
+            const actual_record = actual_value.?;
+            try std.testing.expectEqualDeep(expected_record.record, actual_record.record);
+            try expectSemanticErrorEqual(
+                expected_record.semantic_error,
+                actual_record.semantic_error,
+            );
+            if (expected_record.canonical_span) |span| {
+                try std.testing.expectEqualStrings(span, actual_record.canonical_span.?);
+            } else try std.testing.expect(actual_record.canonical_span == null);
+        } else {
+            const expected_record = expected_value orelse {
+                try std.testing.expect(actual_value == null);
+                return;
+            };
+            try std.testing.expectEqualDeep(expected_record, actual_value.?);
+        }
+    }
+}
+
+test "[property] - [reader]: borrowed stream buffers match owned transport delivery" {
+    const long_record = "@long\n" ++ ("ACGT" ** 75) ++ "\n+\n" ++ ("I" ** 300) ++ "\n";
+    const inputs = [_][]const u8{
+        "",
+        "@r1 d\nACGT\n+\n!!!!\n@r2\r\nAR\r\n+r2\r\n#~\r\n",
+        "@r\nACGT\n+\n!!!!",
+        "@r\nAC\n+\n!\n",
+        "@r\nAC\n-\n!!\n",
+        "@r\nA.\n+\n! \n@s\nA\n+\n!\n",
+        long_record ++ "@short\nC\n+\n#\n" ++ long_record,
+    };
+    for (inputs) |input| {
+        for ([_]usize{ 1, 2, 7, 64, 4096 }) |buffer_len| {
+            try expectStreamMatchesOwned(input, buffer_len, false);
+            try expectStreamMatchesOwned(input, buffer_len, true);
+        }
+    }
+}
+
 test "[integration] - [record delivery]: retained fallback storage survives a refill" {
     for ([_]usize{ 2, io_layer.DEFAULT_READER_BUFFER_BYTES }) |mate2_len| {
         const field_len = io_layer.DEFAULT_READER_BUFFER_BYTES - 7;
@@ -4675,7 +4763,10 @@ test "[integration] - [record delivery]: retained fallback storage survives a re
             const validated2 = buffered2 orelse (try nextFallbackValidatedRecord(&reader, &validator)).?;
             const record2 = validated2.record;
             try std.testing.expect(validated2.semantic_error == null);
-            if (mate2_len == 2) try std.testing.expectEqual(allocations_before_refill, tracking.allocations);
+            // Mate 2 crosses the end of the transport chunk, so its fields use fallback storage.
+            if (mate2_len == 2) {
+                try std.testing.expectEqual(allocations_before_refill + 4, tracking.allocations);
+            }
             try std.testing.expectEqualStrings("pair/1", record1.header);
             try std.testing.expect(std.mem.allEqual(u8, record1.sequence, 'A'));
             try std.testing.expect(std.mem.allEqual(u8, record1.quality, '!'));

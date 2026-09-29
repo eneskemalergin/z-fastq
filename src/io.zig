@@ -119,6 +119,63 @@ fn readShort(reader: *std.Io.Reader, dest: []u8) ReadError!usize {
     return reader.readSliceShort(dest) catch error.ReadFailed;
 }
 
+/// Returns the next buffered chunk, valid until the reader is used again, or null at EOF.
+pub fn readChunk(reader: *std.Io.Reader) ReadError!?[]u8 {
+    const chunk = reader.peekGreedy(1) catch |err| switch (err) {
+        error.EndOfStream => return null,
+        error.ReadFailed => return error.ReadFailed,
+    };
+    reader.toss(chunk.len);
+    return chunk;
+}
+
+/// Standard reader over a copied byte source, buffering in caller-owned storage.
+/// The source adapter and storage must outlive it; each refill after full consumption
+/// starts at the beginning of the storage.
+pub const ByteSourceReader = struct {
+    source: ByteSource,
+    interface: std.Io.Reader,
+
+    pub fn init(source: ByteSource, buffer: []u8) ByteSourceReader {
+        return .{
+            .source = source,
+            .interface = .{
+                .vtable = &.{ .stream = byteSourceStream, .readVec = byteSourceReadVec },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+};
+
+fn byteSourceStream(
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    limit: std.Io.Limit,
+) std.Io.Reader.StreamError!usize {
+    const self: *ByteSourceReader = @alignCast(@fieldParentPtr("interface", r));
+    const dest = limit.slice(try w.writableSliceGreedy(1));
+    const n = self.source.read(dest) catch return error.ReadFailed;
+    if (n == 0) return error.EndOfStream;
+    w.advance(n);
+    return n;
+}
+
+fn byteSourceReadVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+    _ = data;
+    const self: *ByteSourceReader = @alignCast(@fieldParentPtr("interface", r));
+    if (r.seek == r.end) {
+        r.seek = 0;
+        r.end = 0;
+    }
+    std.debug.assert(r.end < r.buffer.len);
+    const n = self.source.read(r.buffer[r.end..]) catch return error.ReadFailed;
+    if (n == 0) return error.EndOfStream;
+    r.end += n;
+    return 0;
+}
+
 pub const PlainFileSource = struct {
     file_reader: *std.Io.File.Reader,
 
@@ -250,13 +307,7 @@ const SmallInput = struct {
 };
 
 pub fn readGzipChunk(self: *GzipSource) ReadError!?[]const u8 {
-    const reader = self.decoded();
-    const chunk = reader.peekGreedy(1) catch |err| switch (err) {
-        error.EndOfStream => return null,
-        error.ReadFailed => return error.ReadFailed,
-    };
-    reader.toss(chunk.len);
-    return chunk;
+    return readChunk(self.decoded());
 }
 
 const GZIP_VTABLE = ByteSource.VTable{
