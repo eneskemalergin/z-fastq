@@ -5696,6 +5696,26 @@ test "[integration] - [input resources]: repeated failures close owned files and
     }
 }
 
+test "[regression] - [input resources]: plain input leaves the gzip decoder field unwritten" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "plain.fastq", .data = "@r\nA\n+\n!\n" });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        ".zig-cache/tmp/{s}/plain.fastq",
+        .{tmp.sub_path},
+    );
+    var input: RecordInput = undefined;
+    const gzip_bytes = std.mem.asBytes(&input.gzip);
+    @memset(gzip_bytes, 0x5a);
+
+    try std.testing.expect(initRecordInput(&input, io, path, null) == null);
+    defer input.deinit(io);
+    try std.testing.expect(std.mem.allEqual(u8, gzip_bytes, 0x5a));
+}
+
 fn pairAllocationFailure(failure: PairCommandFailure) error{ OutOfMemory, UnexpectedFailure } {
     return switch (failure) {
         .command => |details| if (std.mem.eql(u8, details.details.code, "out_of_memory"))
