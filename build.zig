@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
     const kernel_backend = b.option(
         KernelBackend,
         "kernel-backend",
-        "Zipir CPU kernels: dispatch selects for the running CPU; portable forces the portable kernels",
+        "Zipir kernels: dispatch picks them for the running CPU; portable forces portable code",
     ) orelse .dispatch;
     const zipir = b.dependency("zipir", .{
         .target = target,

@@ -239,7 +239,11 @@ const SmallInput = struct {
         };
     }
 
-    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    fn stream(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         const self: *SmallInput = @alignCast(@fieldParentPtr("interface", r));
         return self.inner.stream(w, limit);
     }
