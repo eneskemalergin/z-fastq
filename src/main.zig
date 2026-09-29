@@ -1,7 +1,6 @@
 //! CLI entry and subcommand dispatcher for z-fastq.
 
 const std = @import("std");
-const build_options = @import("build_options");
 const zfastq = @import("root.zig");
 const fastq = @import("fastq.zig");
 const io_layer = @import("io.zig");
@@ -858,7 +857,7 @@ const RecordInput = struct {
                 const count = byte_source.read(buffer) catch return error.Io;
                 break :plain if (count == 0) null else buffer[0..count];
             },
-            .gzip => |*source| io_layer.readGzipChunk(source, buffer) catch return error.Io,
+            .gzip => |*source| io_layer.readGzipChunk(source) catch return error.Io,
         };
     }
 };
@@ -1325,12 +1324,8 @@ fn countInput(io: std.Io, label: []const u8, options: InputOptions) CountOutcome
     defer input.deinit(io);
 
     var scanner = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = options.max_line_bytes });
-    var buffer: [io_layer.COUNT_DECOMPRESS_BUFFER_BYTES]u8 = undefined;
-    const read_buffer = if (input.source == .plain)
-        buffer[0..zfastq.limits.DEFAULT_READER_BUFFER_BYTES]
-    else
-        &buffer;
-    while (input.readScannerChunk(read_buffer) catch return .{ .failure = IO_FAILURE }) |decoded| {
+    var buffer: [zfastq.limits.DEFAULT_READER_BUFFER_BYTES]u8 = undefined;
+    while (input.readScannerChunk(&buffer) catch return .{ .failure = IO_FAILURE }) |decoded| {
         _ = scanner.feed(decoded) catch |err| return .{ .failure = mapScanFailure(&scanner, err) };
     }
     scanner.finishEof() catch |err| return .{ .failure = mapScanFailure(&scanner, err) };

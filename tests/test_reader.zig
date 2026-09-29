@@ -170,7 +170,7 @@ test "[failure] - [gzip source]: header CRC, CRC32, and ISIZE are checked in eve
 }
 
 test "[edge] - [gzip source]: history refills preserve bytes and validate the final trailer" {
-    // Frozen gzip of "ACGT" repeated 16,385 times, beyond the native 64 KiB buffer.
+    // Frozen gzip of "ACGT" repeated 16,385 times, beyond the 32 KiB decoder window.
     const compressed = [_]u8{
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff,
         0xed, 0xc3, 0x31, 0x09, 0x00, 0x00, 0x0c, 0x03, 0x30, 0x6d,
