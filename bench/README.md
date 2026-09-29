@@ -38,7 +38,7 @@ bash bench/shared/download_data.sh --suite deinterleave
 bash bench/deinterleave/run.sh
 ```
 
-Publication sampling (also each `run.sh` default): **5000 ms, 25 runs, 5 warmups**. Zebrac stops when both duration and min-samples are met.
+Publication sampling (also each `run.sh` default): **5000 ms, 25 runs, 5 warmups**. Zebrac stops when both duration and min-samples are met. Zebrac and every timed command run pinned to one CPU with `taskset -c $ZEBRAC_CPU` (default 4). Children inherit the affinity, so runtime and helper threads in peers share that core.
 
 Bring-up:
 

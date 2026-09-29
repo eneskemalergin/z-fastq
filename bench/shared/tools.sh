@@ -45,6 +45,9 @@ ZEBRAC_MIN_SAMPLES="${ZEBRAC_MIN_SAMPLES:-25}"
 ZEBRAC_MAX_SAMPLES="${ZEBRAC_MAX_SAMPLES:-}"
 ZEBRAC_WARMUP="${ZEBRAC_WARMUP:-5}"
 ZEBRAC_ALLOW_FAILURES="${ZEBRAC_ALLOW_FAILURES:-false}"
+# Every timed command runs on this one CPU. Children inherit the affinity, so runtime and
+# helper threads in peers (Go, gzip readers) share the core instead of using idle ones.
+ZEBRAC_CPU="${ZEBRAC_CPU:-4}"
 
 declare -a ZEBRAC_BENCH_COMMANDS=()
 declare -a ZEBRAC_BENCH_METADATA=()
@@ -249,6 +252,7 @@ zebrac_run_current_group() {
     mkdir -p "$(dirname "$raw_json")"
 
     local args=(
+        taskset -c "$ZEBRAC_CPU"
         "$ZEBRAC"
         --quiet
         --duration "$ZEBRAC_DURATION_MS"
