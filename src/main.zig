@@ -7,6 +7,9 @@ const io_layer = @import("io.zig");
 const pairing = @import("pair.zig");
 const sampling = @import("sample.zig");
 
+// z-fastq never opens a network connection; this drops std.Io's DNS and socket code.
+pub const std_options: std.Options = .{ .networking = false };
+
 // --- Arguments ---
 
 const Command = enum { count, stats, check, sample, interleave, deinterleave };
