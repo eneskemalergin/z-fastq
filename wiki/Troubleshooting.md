@@ -10,13 +10,9 @@ Run the binary from the build output:
 
 If that works, place a copy or link in a directory on your `PATH`.
 
-## The build fails while assembling ISA-L
+## The build cannot download Zipir
 
-The default Linux x86-64 release build needs NASM `2.14.01` or newer. Install NASM or use the Zig fallback:
-
-```bash
-zig build -Dstatic=true -Doptimize=ReleaseFast -Disa-l=false
-```
+The first build downloads the Zipir release archive named in `build.zig.zon` and checks it against the pinned package hash. Without network access the build stops at that step. Build once with network access; later builds reuse the downloaded package.
 
 ## A gzip input fails even though the name is unusual
 
@@ -68,7 +64,7 @@ Output files are created exclusively. The command does not truncate or overwrite
 
 ## A FASTQ-producing command failed after writing data
 
-Sampling and interleaving stream output. A late parser, pair, input, or output failure can leave a partial stream. Write to a temporary path and move it only after a zero exit status.
+Sampling and interleaving stream output. A late parser, pair, input, or output failure can leave a partial stream. For gzip input this includes a CRC32 or size mismatch, which z-fastq can only detect at the end of a gzip member, after that member's records were written. Write to a temporary path and move it only after a zero exit status.
 
 ## JSON is missing
 

@@ -65,12 +65,11 @@ Timed argv is the tool. Do not wrap in `bash -c` or a pipeline; that measures th
 
 ## Binaries
 
-Stripped Linux x86-64 sizes on 2026-09-15. Adapters are my wrappers, not upstream CLIs. BBTools is the retained class tree, not one ELF.
+Stripped Linux x86-64 sizes on 2026-09-15; the z-fastq row is from 2026-09-29, after gzip moved to Zipir. Adapters are my wrappers, not upstream CLIs. BBTools is the retained class tree, not one ELF.
 
 | Binary | Version | Bytes | This host |
 | ------ | ------- | ----: | --------- |
-| z-fastq (native) | 0.0.18 | 535,088 | static |
-| z-fastq (ISA-L) | 0.0.18 | 754,560 | static |
+| z-fastq | 0.0.18 | 600,576 | static |
 | seqtk | 1.5-r133 | 77,600 | `libz`, `libm`, `libc` |
 | FastQValidator | 0.1.1a | 169,120 | `libz`, `libstdc++`, `libgcc_s`, `libm`, `libc` |
 | Needletail adapter | 0.7.3 | 425,896 | `libgcc_s`, `libc` |
@@ -86,7 +85,7 @@ Stripped Linux x86-64 sizes on 2026-09-15. Adapters are my wrappers, not upstrea
 | SeqKit | 2.13.0 | 20,076,696 | static |
 | BBTools | 40.02 | 19,359,140 | Java class tree; needs a JVM |
 
-seqtk is the smallest file (`libz` at runtime). z-fastq is larger because it is static. Native is 219,472 bytes smaller than ISA-L.
+seqtk is the smallest file (`libz` at runtime). z-fastq is larger because it is static, with the Zipir gzip decoder compiled in. The ISA-L build it replaced was 783,168 bytes.
 
 ## Targets
 
@@ -94,8 +93,7 @@ seqtk is the smallest file (`libz` at runtime). z-fastq is larger because it is 
 
 | Binary | linux amd64 | linux arm64 | macOS amd64 | macOS arm64 | Windows |
 | ------ | ----------- | ----------- | ----------- | ----------- | ------- |
-| z-fastq (ISA-L) | yes | no | no | no | no |
-| z-fastq (native) | yes | no | no | no | no |
+| z-fastq | yes | no | no | no | no |
 | seqtk | yes | pkg | — | pkg | — |
 | FastQValidator | yes | — | — | — | — |
 | Needletail | yes | — | CI wheels | CI wheels | — |
@@ -111,7 +109,7 @@ seqtk is the smallest file (`libz` at runtime). z-fastq is larger because it is 
 | SeqKit | yes | yes | yes | yes | yes |
 | BBTools | JVM | JVM | JVM | JVM | JVM |
 
-Needletail and Helicase are libraries; I time Linux x86-64 adapters. Helicase wants AVX2, SSE3, or NEON. fastp's Linux binary is the documented prebuilt; macOS is compile/conda. Intel ISA-L also documents Windows; that is ISA-L, not z-fastq.
+Needletail and Helicase are libraries; I time Linux x86-64 adapters. Helicase wants AVX2, SSE3, or NEON. fastp's Linux binary is the documented prebuilt; macOS is compile/conda.
 
 ## Dependencies
 
@@ -119,8 +117,7 @@ Runtime shared libraries on this install, then what the build actually pulls in.
 
 | Binary | Runtime libs | Stack |
 | ------ | ------------ | ----- |
-| z-fastq (native) | none | Zig std inflate |
-| z-fastq (ISA-L) | none | Zig std + vendored ISA-L inflate/CRC (NASM at build) |
+| z-fastq | none | Zig std + Zipir 0.2.0 gzip (Zig package pinned by hash) |
 | seqtk | `libz` | one C file |
 | FastQValidator | `libz`, libstdc++ | libStatGen |
 | Needletail adapter | libc, libgcc | 11 crates (`flate2`) |
@@ -136,7 +133,7 @@ Runtime shared libraries on this install, then what the build actually pulls in.
 | SeqKit | none (static) | Go, many codecs in-binary |
 | BBTools | JVM | Java runtime + class tree |
 
-Native z-fastq: no loader, no third-party lock. ISA-L stays static. seqtk is the shallowest dynamic C peer. fqtools is HTSlib. fqkit and SeqFu are the heavy package graphs. BBTools is a JVM.
+z-fastq: no loader; Zipir is a pinned Zig package compiled into the static binary. seqtk is the shallowest dynamic C peer. fqtools is HTSlib. fqkit and SeqFu are the heavy package graphs. BBTools is a JVM.
 
 ## Files
 

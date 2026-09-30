@@ -13,6 +13,8 @@ If the first bytes identify gzip, z-fastq commits to gzip decoding. A damaged gz
 
 The gzip reader checks the gzip header, DEFLATE stream, CRC32, and uncompressed size. Concatenated gzip members are supported.
 
+CRC32 and uncompressed size are stored at the end of each gzip member, so they are checked after that member has been decoded. A command can process and write records from a member before it finds that the member's check fails. It still exits with status `3`, and the FASTQ it wrote is the beginning of the output a valid input would give. See [Automation](Automation) for handling partial output.
+
 ## Standard input
 
 Use `-` explicitly:

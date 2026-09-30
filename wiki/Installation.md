@@ -2,13 +2,13 @@
 
 ## Supported build
 
-The current build contract is:
+The supported build is:
 
 - Linux x86-64.
 - Zig `0.16.0`.
-- NASM `2.14.01` or newer for the default ISA-L build.
+- Network access for the first build, which downloads the pinned Zipir package.
 
-Release builds are static. The default Linux x86-64 release path uses the vendored ISA-L implementation for gzip and CRC work. You can build without ISA-L when NASM is unavailable or when you want to exercise the Zig implementation.
+Release builds are static. gzip input is decoded by [Zipir](https://github.com/eneskemalergin/zipir), a Zig package that `build.zig.zon` pins to its `v0.2.0` release archive and package hash. The build needs no NASM, C compiler, or system zlib.
 
 ## Build a release binary
 
@@ -37,15 +37,15 @@ Use `Debug` while changing the project:
 zig build
 ```
 
-## Build without ISA-L
+## Portable decoder kernels
 
-The fallback path uses the Zig DEFLATE and CRC implementations:
+By default Zipir picks its decoder kernels for the CPU the binary runs on. To build only the portable kernels:
 
 ```bash
-zig build -Dstatic=true -Doptimize=ReleaseFast -Disa-l=false
+zig build -Dstatic=true -Doptimize=ReleaseFast -Dkernel-backend=portable
 ```
 
-This does not change the supported target. It changes the gzip and CRC implementation used by the build.
+The default is `-Dkernel-backend=dispatch`. This does not change the supported target or the output; the test suite passes with both settings.
 
 ## Run the tests
 
