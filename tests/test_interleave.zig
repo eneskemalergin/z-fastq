@@ -377,10 +377,10 @@ test "[cli] - [interleave]: stdin and mixed plain or gzip inputs preserve output
         "error: {s}: I/O error\n",
         .{r2_path},
     );
-    try cli.expectResult(
+    try cli.expectFailedPrefix(
         try cli.run(allocator, &.{ "interleave", r1_path, r2_path }),
         3,
-        "",
+        expected,
         error_text,
     );
 }

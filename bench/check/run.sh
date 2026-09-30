@@ -322,9 +322,8 @@ build_check_args() {
     result=()
 
     case "$tool" in
-        z-fastq|z-fastq-native)
+        z-fastq)
             local binary="$ZFASTQ"
-            [[ "$tool" == z-fastq-native ]] && binary="$ZFASTQ_NATIVE"
             result=("$binary" check)
             case "$role" in
                 paired|casava|slash)
@@ -528,23 +527,20 @@ run_contract_tests() {
         missing_final_newline.fastq \
         empty_valid.fastq \
         iupac_valid.fastq; do
-        for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-            expect_ok_binary "$binary" "$(basename "$binary") $fixture" \
-                check "$FIXTURE_DIR/$fixture"
-        done
+        binary="$ZFASTQ"
+        expect_ok_binary "$binary" "$(basename "$binary") $fixture" \
+            check "$FIXTURE_DIR/$fixture"
     done
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        expect_ok_binary "$binary" "$(basename "$binary") basic_valid.fastq.gz" \
-            check "$fixture_gz"
-    done
+    binary="$ZFASTQ"
+    expect_ok_binary "$binary" "$(basename "$binary") basic_valid.fastq.gz" \
+        check "$fixture_gz"
 
     log_verify "--- S001-S006 rejection contract ---"
     while IFS=$'\t' read -r bad code message; do
         [[ -n "$bad" ]] || continue
-        for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-            expect_code_binary "$binary" "$(basename "$binary") $bad" "$code" "$message" \
-                check "$FIXTURE_DIR/$bad"
-        done
+        binary="$ZFASTQ"
+        expect_code_binary "$binary" "$(basename "$binary") $bad" "$code" "$message" \
+            check "$FIXTURE_DIR/$bad"
     done <<'EOF'
 bad_plus.fastq	S001	plus line must start with '+'
 bad_alphabet.fastq	S002	sequence byte is outside the selected alphabet
@@ -555,13 +551,12 @@ bad_quality_range.fastq	S006	quality byte must be ASCII 33 through 126
 EOF
 
     log_verify "--- alphabet and precedence contract ---"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        expect_ok_binary "$binary" "$(basename "$binary") explicit iupac" \
-            check --alphabet iupac "$FIXTURE_DIR/iupac_valid.fastq"
-        expect_code_binary "$binary" "$(basename "$binary") narrow alphabet" S002 \
-            "sequence byte is outside the selected alphabet" \
-            check --alphabet acgtn "$FIXTURE_DIR/iupac_valid.fastq"
-    done
+    binary="$ZFASTQ"
+    expect_ok_binary "$binary" "$(basename "$binary") explicit iupac" \
+        check --alphabet iupac "$FIXTURE_DIR/iupac_valid.fastq"
+    expect_code_binary "$binary" "$(basename "$binary") narrow alphabet" S002 \
+        "sequence byte is outside the selected alphabet" \
+        check --alphabet acgtn "$FIXTURE_DIR/iupac_valid.fastq"
 
     log_verify "--- pair-name and pair-count contract ---"
     local pair_r1="$CHECK_DIR/pair_r1.fastq"
@@ -574,44 +569,42 @@ EOF
     printf '@cluster/1\nA\n+\n!\n' >"$odd"
     printf '@cluster 1:N:0:ATCACG\nA\n+\n!\n' >"$casava_r1"
     printf '@cluster 2:N:0:ATCACG\nA\n+\n!\n' >"$casava_r2"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        expect_ok_binary "$binary" "$(basename "$binary") slash pair" \
-            check --paired "$pair_r1" "$pair_r2"
-        expect_pair_code "$binary" "$(basename "$binary") exact slash pair" P001 \
-            check --paired --pair-names exact "$pair_r1" "$pair_r2"
-        expect_ok_binary "$binary" "$(basename "$binary") casava pair" \
-            check --paired "$casava_r1" "$casava_r2"
-        expect_ok_binary "$binary" "$(basename "$binary") exact casava pair" \
-            check --paired --pair-names exact "$casava_r1" "$casava_r2"
-        printf '@other/2\nA\n+\n!\n' >"$pair_r2"
-        expect_pair_code "$binary" "$(basename "$binary") name mismatch" P001 \
-            check --paired "$pair_r1" "$pair_r2"
-        : >"$pair_r2"
-        expect_pair_code "$binary" "$(basename "$binary") count mismatch" P002 \
-            check --paired "$pair_r1" "$pair_r2"
-        expect_pair_code "$binary" "$(basename "$binary") odd interleaved" P002 \
-            check --interleaved "$odd"
-        printf '@cluster/2\nA\n+\n!\n' >"$pair_r2"
-    done
+    binary="$ZFASTQ"
+    expect_ok_binary "$binary" "$(basename "$binary") slash pair" \
+        check --paired "$pair_r1" "$pair_r2"
+    expect_pair_code "$binary" "$(basename "$binary") exact slash pair" P001 \
+        check --paired --pair-names exact "$pair_r1" "$pair_r2"
+    expect_ok_binary "$binary" "$(basename "$binary") casava pair" \
+        check --paired "$casava_r1" "$casava_r2"
+    expect_ok_binary "$binary" "$(basename "$binary") exact casava pair" \
+        check --paired --pair-names exact "$casava_r1" "$casava_r2"
+    printf '@other/2\nA\n+\n!\n' >"$pair_r2"
+    expect_pair_code "$binary" "$(basename "$binary") name mismatch" P001 \
+        check --paired "$pair_r1" "$pair_r2"
+    : >"$pair_r2"
+    expect_pair_code "$binary" "$(basename "$binary") count mismatch" P002 \
+        check --paired "$pair_r1" "$pair_r2"
+    expect_pair_code "$binary" "$(basename "$binary") odd interleaved" P002 \
+        check --interleaved "$odd"
+    printf '@cluster/2\nA\n+\n!\n' >"$pair_r2"
 
     log_verify "--- concat gzip member traversal ---"
     local gzip_id gzip_path expected_records binary out err status got
     gzip_id="${GZIP_IDS[0]}"
     gzip_path="${DATA_GZ[$gzip_id]}"
     expected_records="${DATA_EXPECTED[$gzip_id]}"
-    for binary in "$ZFASTQ" "$ZFASTQ_NATIVE"; do
-        expect_ok_binary "$binary" "$(basename "$binary") ConcatGzip check" \
-            check "$gzip_path"
-        out="$CHECK_DIR/concat.count.out"
-        err="$CHECK_DIR/concat.count.err"
-        status="$(capture_command "$out" "$err" "$binary" count "$gzip_path")"
-        got="$(parse_single_int "$(cat "$out")" || true)"
-        [[ "$status" == 0 && "$got" == "$expected_records" ]] ||
-            check_fail "$(basename "$binary") ConcatGzip count" \
-                "exit 0 and $expected_records records" \
-                "exit=$status count=${got:-?} stdout=$(summarize_output "$out") stderr=$(summarize_output "$err")"
-        log_verify "  $(basename "$binary") ConcatGzip count $got"
-    done
+    binary="$ZFASTQ"
+    expect_ok_binary "$binary" "$(basename "$binary") ConcatGzip check" \
+        check "$gzip_path"
+    out="$CHECK_DIR/concat.count.out"
+    err="$CHECK_DIR/concat.count.err"
+    status="$(capture_command "$out" "$err" "$binary" count "$gzip_path")"
+    got="$(parse_single_int "$(cat "$out")" || true)"
+    [[ "$status" == 0 && "$got" == "$expected_records" ]] ||
+        check_fail "$(basename "$binary") ConcatGzip count" \
+            "exit 0 and $expected_records records" \
+            "exit=$status count=${got:-?} stdout=$(summarize_output "$out") stderr=$(summarize_output "$err")"
+    log_verify "  $(basename "$binary") ConcatGzip count $got"
 
     run_peer_fixture_probes
 
@@ -672,16 +665,6 @@ prepare_workload_lanes() {
     [[ "$status" == 0 ]] ||
         check_fail "$section $key z-fastq" "exit 0" \
             "exit=$status stdout=$(summarize_output "$out") stderr=$(summarize_output "$err")"
-
-    if [[ "$compression" == gzip ]]; then
-        build_check_args args z-fastq-native "$role" "${paths[@]}"
-        out="$CHECK_DIR/native_${section}_${key}.out"
-        err="$CHECK_DIR/native_${section}_${key}.err"
-        status="$(capture_command "$out" "$err" "${args[@]}")"
-        [[ "$status" == 0 ]] ||
-            check_fail "$section $key z-fastq-native" "exit 0" \
-                "exit=$status stdout=$(summarize_output "$out") stderr=$(summarize_output "$err")"
-    fi
 
     local tool
     for tool in "${CHECK_PEER_ORDER[@]}"; do
@@ -751,14 +734,6 @@ run_timed_workload() {
     run_zebrac_tool "$section" "$key" z-fastq z-fastq "$json" \
         "$command" "$input_bytes" "$decoded_bytes"
 
-    if [[ "$compression" == gzip ]]; then
-        build_check_args args z-fastq-native "$role" "${paths[@]}"
-        command="$(zebrac_command "${args[@]}")"
-        json="$RESULTS_DIR/${section}_${TIMESTAMP}/${key}__z-fastq-native.json"
-        run_zebrac_tool "$section" "$key" z-fastq-native z-fastq "$json" \
-            "$command" "$input_bytes" "$decoded_bytes"
-    fi
-
     for tool in "${CHECK_PEER_ORDER[@]}"; do
         [[ "${LANE_ENABLED[$section|$key|$tool]:-0}" == 1 ]] || continue
         build_check_args args "$tool" "$role" "${paths[@]}"
@@ -816,9 +791,7 @@ write_manifest() {
         printf '  "workloads": %s,\n' "$(workloads_json)"
         printf '  "zebrac": %s,\n' "$(zebrac_json_string "${CHECK_ZEBRAC_VER}")"
         printf '  "z_fastq": %s,\n' "$(zebrac_json_string "${CHECK_ZFASTQ_VER}")"
-        printf '  "z_fastq_native": %s,\n' "$(zebrac_json_string "${CHECK_ZFASTQ_NATIVE_VER}")"
         printf '  "z_fastq_bytes": %s,\n' "$(zebrac_json_number_or_null "${CHECK_ZFASTQ_BYTES}")"
-        printf '  "z_fastq_native_bytes": %s,\n' "$(zebrac_json_number_or_null "${CHECK_ZFASTQ_NATIVE_BYTES}")"
         printf '  "runs": %s,\n' "$(zebrac_json_number_or_null "$RUNS")"
         printf '  "warmup": %s,\n' "$(zebrac_json_number_or_null "$WARMUP")"
         printf '  "duration_ms": %s,\n' "$(zebrac_json_number_or_null "$ZEBRAC_DURATION_MS")"
@@ -866,25 +839,7 @@ write_manifest() {
 echo "z-fastq check bench  $TIMESTAMP"
 echo
 
-build_subjects() {
-    echo "Building z-fastq native inflate, then ISA-L product binary..."
-    (
-        cd "$PROJECT_ROOT"
-        zig build -Doptimize=ReleaseFast -Disa-l=false
-    )
-    cp -f -- "$PROJECT_ROOT/zig-out/bin/z-fastq" "$ZFASTQ_NATIVE"
-    chmod +x "$ZFASTQ_NATIVE"
-    (
-        cd "$PROJECT_ROOT"
-        zig build -Doptimize=ReleaseFast
-    )
-    bench_require_tool z-fastq
-    bench_require_tool z-fastq-native
-    echo "  ISA-L:  $ZFASTQ"
-    echo "  native: $ZFASTQ_NATIVE"
-}
-
-build_subjects
+bench_build_zfastq
 ensure_real_data
 
 VERIFY_PASS=""
@@ -922,9 +877,7 @@ fi
 CHECK_WORKLOADS_JSON="$(workloads_json)"
 CHECK_ZEBRAC_VER="$(bench_tool_version zebrac || true)"
 CHECK_ZFASTQ_VER="$(bench_tool_version z-fastq || true)"
-CHECK_ZFASTQ_NATIVE_VER="$(bench_tool_version z-fastq-native || true)"
 CHECK_ZFASTQ_BYTES="$(file_size_bytes "$ZFASTQ")"
-CHECK_ZFASTQ_NATIVE_BYTES="$(file_size_bytes "$ZFASTQ_NATIVE")"
 CHECK_FQ_VER="$(bench_tool_version fq || true)"
 CHECK_FASTQVALIDATOR_VER="$(bench_tool_version fastqvalidator || true)"
 CHECK_SEQFU_VER="$(bench_tool_version seqfu || true)"

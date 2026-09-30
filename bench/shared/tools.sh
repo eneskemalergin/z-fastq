@@ -25,7 +25,6 @@ source "$BENCH_SHARED_DIR/catalog.sh"
 source "$TOOLS_DIR/versions.sh"
 
 ZFASTQ="${ZFASTQ:-$PROJECT_ROOT/zig-out/bin/z-fastq}"
-ZFASTQ_NATIVE="${ZFASTQ_NATIVE:-$PROJECT_ROOT/zig-out/bin/z-fastq-native}"
 ZEBRAC="${ZEBRAC:-$TOOLS_DIR/zebrac}"
 SEQTK="${SEQTK:-$TOOLS_BIN_DIR/seqtk}"
 FQTOOLS="${FQTOOLS:-$TOOLS_BIN_DIR/fqtools}"
@@ -46,6 +45,9 @@ ZEBRAC_MIN_SAMPLES="${ZEBRAC_MIN_SAMPLES:-25}"
 ZEBRAC_MAX_SAMPLES="${ZEBRAC_MAX_SAMPLES:-}"
 ZEBRAC_WARMUP="${ZEBRAC_WARMUP:-5}"
 ZEBRAC_ALLOW_FAILURES="${ZEBRAC_ALLOW_FAILURES:-false}"
+# Every timed command runs on this one CPU. Children inherit the affinity, so runtime and
+# helper threads in peers (Go, gzip readers) share the core instead of using idle ones.
+ZEBRAC_CPU="${ZEBRAC_CPU:-4}"
 
 declare -a ZEBRAC_BENCH_COMMANDS=()
 declare -a ZEBRAC_BENCH_METADATA=()
@@ -54,7 +56,6 @@ bench_tool_path() {
     local name="$1"
     case "$name" in
         z-fastq) echo "$ZFASTQ" ;;
-        z-fastq-native) echo "$ZFASTQ_NATIVE" ;;
         zebrac) echo "$ZEBRAC" ;;
         seqtk) echo "$SEQTK" ;;
         fqtools) echo "$FQTOOLS" ;;
@@ -88,12 +89,19 @@ bench_require_tool() {
     fi
 }
 
+bench_build_zfastq() {
+    echo "Building z-fastq ReleaseFast..."
+    (cd "$PROJECT_ROOT" && zig build -j4 -Doptimize=ReleaseFast)
+    bench_require_tool z-fastq
+    echo "  z-fastq: $ZFASTQ"
+}
+
 bench_tool_version() {
     local name="$1"
     local path
     path="$(bench_tool_path "$name")" || return 1
     case "$name" in
-        z-fastq|z-fastq-native|zebrac)
+        z-fastq|zebrac)
             [[ -x "$path" ]] && "$path" --version 2>&1 | awk 'NR==1{print; exit}'
             ;;
         seqtk)
@@ -244,6 +252,7 @@ zebrac_run_current_group() {
     mkdir -p "$(dirname "$raw_json")"
 
     local args=(
+        taskset -c "$ZEBRAC_CPU"
         "$ZEBRAC"
         --quiet
         --duration "$ZEBRAC_DURATION_MS"

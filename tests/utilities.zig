@@ -24,6 +24,22 @@ pub fn expectResult(
     try std.testing.expectEqualStrings(stderr, result.stderr);
 }
 
+pub fn expectFailedPrefix(
+    result: CommandResult,
+    exit_code: u8,
+    valid_stdout: []const u8,
+    stderr: []const u8,
+) !void {
+    try std.testing.expectEqual(exit_code, result.exit_code);
+    try expectPrefix(valid_stdout, result.stdout);
+    try std.testing.expectEqualStrings(stderr, result.stderr);
+}
+
+pub fn expectPrefix(valid: []const u8, actual: []const u8) !void {
+    try std.testing.expect(actual.len <= valid.len);
+    try std.testing.expectEqualSlices(u8, valid[0..actual.len], actual);
+}
+
 pub fn tempPath(
     allocator: std.mem.Allocator,
     sub_path: []const u8,

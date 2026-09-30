@@ -2,6 +2,8 @@
 
 const std = @import("std");
 
+const KernelBackend = enum { dispatch, portable };
+
 pub fn build(b: *std.Build) void {
     const requested_target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -43,24 +45,18 @@ pub fn build(b: *std.Build) void {
     else
         requested_target;
     const strip = optimize == .ReleaseFast;
-    const isa_l_supported = target.result.cpu.arch == .x86_64 and
-        target.result.os.tag == .linux and
-        switch (target.result.abi) {
-            .gnu, .musl => true,
-            else => false,
-        };
-    const use_isa_l = b.option(
-        bool,
-        "isa-l",
-        "Use the vendored ISA-L gzip engine",
-    ) orelse isa_l_supported;
-    if (use_isa_l and !isa_l_supported) {
-        std.debug.print("error: ISA-L requires a supported Linux x86-64 target\n", .{});
-        std.process.exit(1);
-    }
+    const kernel_backend = b.option(
+        KernelBackend,
+        "kernel-backend",
+        "Zipir kernels: dispatch picks them for the running CPU; portable forces portable code",
+    ) orelse .dispatch;
+    const zipir = b.dependency("zipir", .{
+        .target = target,
+        .optimize = optimize,
+        .@"kernel-backend" = kernel_backend,
+    }).module("zipir");
     const package_version = @import("build.zig.zon").version;
     const build_options = b.addOptions();
-    build_options.addOption(bool, "use_isa_l", use_isa_l);
     build_options.addOption([:0]const u8, "version", package_version);
 
     const lib_module = b.addModule("z-fastq", .{
@@ -82,14 +78,6 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addOptions("build_options", build_options);
 
-    if (use_isa_l) {
-        const isal = addIsaL(b, target, optimize);
-        lib_module.addIncludePath(b.path("vendor/ISA-L/include"));
-        lib_module.linkLibrary(isal);
-        exe.root_module.addIncludePath(b.path("vendor/ISA-L/include"));
-        exe.root_module.linkLibrary(isal);
-    }
-
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -109,9 +97,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const fastq_test_options = b.addOptions();
-    fastq_test_options.addOption(bool, "use_isa_l", false);
-    fastq_test_module.addOptions("build_options", fastq_test_options);
+    for ([_]*std.Build.Module{ lib_module, exe.root_module, fastq_test_module }) |module| {
+        module.addImport("zipir", zipir);
+    }
 
     const reader_test_module = b.createModule(.{
         .root_source_file = b.path("tests/test_reader.zig"),
@@ -225,118 +213,4 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_sample_test.step);
     test_step.dependOn(&run_interleave_test.step);
     test_step.dependOn(&run_deinterleave_test.step);
-}
-
-fn addIsaL(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-) *std.Build.Step.Compile {
-    const module = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-    });
-    module.addIncludePath(b.path("vendor/ISA-L/include"));
-    module.addIncludePath(b.path("vendor/ISA-L/igzip"));
-    module.addIncludePath(b.path("vendor/ISA-L/crc"));
-    module.link_libc = true;
-    module.addCSourceFiles(.{
-        .root = b.path("vendor/ISA-L"),
-        .files = &.{
-            "crc/crc_base.c",
-            "crc/crc64_base.c",
-            "igzip/adler32_base.c",
-            "igzip/hufftables_c.c",
-            "igzip/igzip_inflate.c",
-            "igzip/inflate_helpers.c",
-        },
-        .flags = &.{ "-O2", "-DNDEBUG", "-Wall", "-ffunction-sections" },
-    });
-    module.addObjectFile(addIsaLAssembly(b, "isa-l-rfc1951-lookup.o", "igzip/rfc1951_lookup.asm"));
-    module.addObjectFile(addIsaLAssembly(b, "isa-l-inflate-dispatch.o", "igzip/igzip_inflate_multibinary.asm"));
-    module.addObjectFile(addIsaLAssembly(b, "isa-l-inflate-01.o", "igzip/igzip_decode_block_stateless_01.asm"));
-    module.addObjectFile(addIsaLAssembly(b, "isa-l-inflate-04.o", "igzip/igzip_decode_block_stateless_04.asm"));
-    const crc_assembly = [_][]const u8{
-        "crc16_t10dif_01.asm",
-        "crc16_t10dif_avx2.asm",
-        "crc16_t10dif_by16_10.asm",
-        "crc16_t10dif_copy_by4.asm",
-        "crc16_t10dif_copy_by4_02.asm",
-        "crc32_gzip_refl_avx2.asm",
-        "crc32_gzip_refl_by16_10.asm",
-        "crc32_gzip_refl_by8.asm",
-        "crc32_ieee_01.asm",
-        "crc32_ieee_avx2.asm",
-        "crc32_ieee_by16_10.asm",
-        "crc32_iscsi_01.asm",
-        "crc32_iscsi_avx2.asm",
-        "crc32_iscsi_by16_10.asm",
-        "crc32_iscsi_by8_02.asm",
-        "crc64_ecma_norm_avx2.asm",
-        "crc64_ecma_norm_by16_10.asm",
-        "crc64_ecma_norm_by8.asm",
-        "crc64_ecma_refl_avx2.asm",
-        "crc64_ecma_refl_by16_10.asm",
-        "crc64_ecma_refl_by8.asm",
-        "crc64_iso_norm_avx2.asm",
-        "crc64_iso_norm_by16_10.asm",
-        "crc64_iso_norm_by8.asm",
-        "crc64_iso_refl_avx2.asm",
-        "crc64_iso_refl_by16_10.asm",
-        "crc64_iso_refl_by8.asm",
-        "crc64_jones_norm_avx2.asm",
-        "crc64_jones_norm_by16_10.asm",
-        "crc64_jones_norm_by8.asm",
-        "crc64_jones_refl_avx2.asm",
-        "crc64_jones_refl_by16_10.asm",
-        "crc64_jones_refl_by8.asm",
-        "crc64_rocksoft_norm_avx2.asm",
-        "crc64_rocksoft_norm_by16_10.asm",
-        "crc64_rocksoft_norm_by8.asm",
-        "crc64_rocksoft_refl_avx2.asm",
-        "crc64_rocksoft_refl_by16_10.asm",
-        "crc64_rocksoft_refl_by8.asm",
-        "crc_const.asm",
-        "crc_multibinary.asm",
-    };
-    for (crc_assembly) |file| {
-        module.addObjectFile(addIsaLAssembly(
-            b,
-            b.fmt("isa-l-{s}.o", .{file[0 .. file.len - ".asm".len]}),
-            b.fmt("crc/{s}", .{file}),
-        ));
-    }
-
-    return b.addLibrary(.{
-        .name = "isa-l",
-        .root_module = module,
-    });
-}
-
-fn addIsaLAssembly(b: *std.Build, output_name: []const u8, source: []const u8) std.Build.LazyPath {
-    const assemble = b.addSystemCommand(&.{
-        "nasm",
-        "-f",
-        "elf64",
-        "-DINTEL_CET_ENABLED",
-    });
-    assemble.addPrefixedDirectoryArg("-I", b.path("vendor/ISA-L"));
-    assemble.addPrefixedDirectoryArg("-I", b.path("vendor/ISA-L/crc"));
-    assemble.addPrefixedDirectoryArg("-I", b.path("vendor/ISA-L/igzip"));
-    assemble.addPrefixedDirectoryArg("-I", b.path("vendor/ISA-L/include"));
-    assemble.addArg("-o");
-    const output = assemble.addOutputFileArg(output_name);
-    assemble.addFileArg(b.path(b.fmt("vendor/ISA-L/{s}", .{source})));
-    const includes = [_][]const u8{
-        "vendor/ISA-L/include/multibinary.asm",
-        "vendor/ISA-L/include/reg_sizes.asm",
-        "vendor/ISA-L/crc/crc_const_extern.asm",
-        "vendor/ISA-L/include/crc.inc",
-        "vendor/ISA-L/include/memcpy.asm",
-        "vendor/ISA-L/igzip/igzip_decode_block_stateless.asm",
-        "vendor/ISA-L/igzip/inflate_data_structs.asm",
-        "vendor/ISA-L/igzip/stdmac.asm",
-    };
-    for (includes) |path| assemble.addFileInput(b.path(path));
-    return output;
 }

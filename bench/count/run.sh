@@ -166,24 +166,6 @@ run_zebrac_tool() {
     echo "  << $section $workload $tool  ${elapsed}s"
 }
 
-build_subjects() {
-    echo "Building z-fastq native inflate, then ISA-L product binary..."
-    (
-        cd "$PROJECT_ROOT"
-        zig build -Doptimize=ReleaseFast -Disa-l=false
-    )
-    cp -f -- "$PROJECT_ROOT/zig-out/bin/z-fastq" "$ZFASTQ_NATIVE"
-    chmod +x "$ZFASTQ_NATIVE"
-    (
-        cd "$PROJECT_ROOT"
-        zig build -Doptimize=ReleaseFast
-    )
-    bench_require_tool z-fastq
-    bench_require_tool z-fastq-native
-    echo "  ISA-L:  $ZFASTQ"
-    echo "  native: $ZFASTQ_NATIVE"
-}
-
 bind_dataset() {
     local slot="$1" id="$2"
     local filename
@@ -322,7 +304,7 @@ should_run_oracle() {
 }
 
 check_same_count() {
-    local file="$1" expected="$2" run_native="$3" run_oracle="$4"
+    local file="$1" expected="$2" run_oracle="$3"
     local out status got
     log_verify "  file $file  expected $expected"
 
@@ -342,16 +324,6 @@ check_same_count() {
     if [[ "$status" != "0" || "$got" != "$expected" ]]; then
         gold_fail "$file" "z-fastq count $file" "$status" "$expected" \
             "$(summarize_output "$out"; printf '\n'; summarize_output "$out.err")"
-    fi
-
-    if [[ "$run_native" == "true" ]]; then
-        out="$CHECK_DIR/native.out"
-        status="$(capture_count "$out" "$ZFASTQ_NATIVE" count "$file")"
-        got="$(parse_single_int "$(cat "$out")" || true)"
-        if [[ "$status" != "0" || "$got" != "$expected" ]]; then
-            gold_fail "$file" "z-fastq-native count $file" "$status" "$expected" \
-                "$(summarize_output "$out"; printf '\n'; summarize_output "$out.err")"
-        fi
     fi
 
     out="$CHECK_DIR/seqtk.out"
@@ -412,33 +384,32 @@ run_tests() {
     fixture_n="$("$PYTHON" "$ORACLE" "$fixture")"
     fixture_n="$(parse_single_int "$fixture_n")"
     log_verify "--- fixtures ---"
-    check_same_count "$fixture" "$fixture_n" true true
-    check_same_count "$fixture_gz" "$fixture_n" true true
+    check_same_count "$fixture" "$fixture_n" true
+    check_same_count "$fixture_gz" "$fixture_n" true
 
     log_verify "--- malformed (z-fastq must reject; seqtk is not compared) ---"
     local bad
     for bad in bad_header.fastq bad_plus.fastq truncated_record.fastq bad_qual_length.fastq; do
         expect_count_fail "$FIXTURE_DIR/$bad" "$ZFASTQ" "z-fastq"
-        expect_count_fail "$FIXTURE_DIR/$bad" "$ZFASTQ_NATIVE" "z-fastq-native"
     done
 
     local name id
     log_verify "--- REAL plain ---"
     for name in "${REAL_ORDER[@]}"; do
-        check_same_count "${REAL_PLAIN[$name]}" "${REAL_EXPECTED[$name]}" false \
+        check_same_count "${REAL_PLAIN[$name]}" "${REAL_EXPECTED[$name]}" \
             "$(should_run_oracle "${REAL_EXPECTED[$name]}" && echo true || echo false)"
     done
     log_verify "--- REAL gzip ---"
     for name in "${REAL_ORDER[@]}"; do
-        check_same_count "${REAL_GZ[$name]}" "${REAL_EXPECTED[$name]}" true \
+        check_same_count "${REAL_GZ[$name]}" "${REAL_EXPECTED[$name]}" \
             "$(should_run_oracle "${REAL_EXPECTED[$name]}" && echo true || echo false)"
     done
 
     for id in "${EXTRA_ORDER[@]}"; do
         log_verify "--- extra check $id ---"
-        check_same_count "${EXTRA_PLAIN[$id]}" "${EXTRA_EXPECTED[$id]}" false \
+        check_same_count "${EXTRA_PLAIN[$id]}" "${EXTRA_EXPECTED[$id]}" \
             "$(should_run_oracle "${EXTRA_EXPECTED[$id]}" && echo true || echo false)"
-        check_same_count "${EXTRA_GZ[$id]}" "${EXTRA_EXPECTED[$id]}" true \
+        check_same_count "${EXTRA_GZ[$id]}" "${EXTRA_EXPECTED[$id]}" \
             "$(should_run_oracle "${EXTRA_EXPECTED[$id]}" && echo true || echo false)"
     done
 
@@ -447,8 +418,8 @@ run_tests() {
 
 run_count_tools() {
     local section="$1" workload="$2" file="$3" out_dir="$4"
-    local include_native="$5" include_hatched="$6"
-    local decoded_bytes="$7"
+    local include_hatched="$5"
+    local decoded_bytes="$6"
 
     local nbytes json
     nbytes="$(file_size_bytes "$file")"
@@ -456,12 +427,6 @@ run_count_tools() {
     json="$out_dir/${workload}__z-fastq.json"
     run_zebrac_tool "$section" "$workload" z-fastq z-fastq "$json" \
         "$(zebrac_command "$ZFASTQ" count "$file")" "$nbytes" "$decoded_bytes"
-
-    if [[ "$include_native" == "true" ]]; then
-        json="$out_dir/${workload}__z-fastq-native.json"
-        run_zebrac_tool "$section" "$workload" z-fastq-native z-fastq "$json" \
-            "$(zebrac_command "$ZFASTQ_NATIVE" count "$file")" "$nbytes" "$decoded_bytes"
-    fi
 
     json="$out_dir/${workload}__needletail.json"
     run_zebrac_tool "$section" "$workload" needletail needletail "$json" \
@@ -478,7 +443,7 @@ run_count_tools() {
     if [[ "$include_hatched" == "true" ]] && bench_has_tool seqfu; then
         json="$out_dir/${workload}__seqfu.json"
         run_zebrac_tool "$section" "$workload" seqfu seqfu "$json" \
-            "$(zebrac_command "$SEQFU" count "$file")" "$nbytes" "$decoded_bytes"
+            "$(zebrac_command "$SEQFU" count --threads 1 "$file")" "$nbytes" "$decoded_bytes"
     fi
 
     json="$out_dir/${workload}__fqtools.json"
@@ -496,12 +461,12 @@ run_perf() {
         echo "=== perf_plain ==="
         for name in "${REAL_ORDER[@]}"; do
             decoded="${REAL_DECODED[$name]}"
-            run_count_tools perf_plain "$name" "${REAL_PLAIN[$name]}" "$plain_dir" false true "$decoded"
+            run_count_tools perf_plain "$name" "${REAL_PLAIN[$name]}" "$plain_dir" true "$decoded"
         done
         echo "=== perf_gzip ==="
         for name in "${REAL_ORDER[@]}"; do
             decoded="${REAL_DECODED[$name]}"
-            run_count_tools perf_gzip "$name" "${REAL_GZ[$name]}" "$gzip_dir" true true "$decoded"
+            run_count_tools perf_gzip "$name" "${REAL_GZ[$name]}" "$gzip_dir" true "$decoded"
         done
     fi
 }
@@ -534,9 +499,7 @@ write_manifest() {
         printf '  "datasets": %s,\n' "$COUNT_DATASETS_JSON"
         printf '  "zebrac": %s,\n' "$(zebrac_json_string "${COUNT_ZEBRAC_VER}")"
         printf '  "z_fastq": %s,\n' "$(zebrac_json_string "${COUNT_ZFASTQ_VER}")"
-        printf '  "z_fastq_native": %s,\n' "$(zebrac_json_string "${COUNT_ZFASTQ_NATIVE_VER}")"
         printf '  "z_fastq_bytes": %s,\n' "$(zebrac_json_number_or_null "${COUNT_ZFASTQ_BYTES}")"
-        printf '  "z_fastq_native_bytes": %s,\n' "$(zebrac_json_number_or_null "${COUNT_ZFASTQ_NATIVE_BYTES}")"
         printf '  "runs": %s,\n' "$(zebrac_json_number_or_null "$RUNS")"
         printf '  "warmup": %s,\n' "$(zebrac_json_number_or_null "$WARMUP")"
         printf '  "duration_ms": %s,\n' "$(zebrac_json_number_or_null "$ZEBRAC_DURATION_MS")"
@@ -574,7 +537,7 @@ write_manifest() {
 echo "z-fastq count bench  $TIMESTAMP"
 echo
 
-build_subjects
+bench_build_zfastq
 ensure_real_data
 
 VERIFY_PASS=""
@@ -600,9 +563,7 @@ COUNT_CHECK_EXTRA="$(IFS=,; printf '%s' "${EXTRA_ORDER[*]}")"
 COUNT_DATASETS_JSON="$(count_datasets_json "$DENSE_ID" "$VARIABLE_ID" "$LONG_ID" "$COUNT_CHECK_EXTRA")"
 COUNT_ZEBRAC_VER="$(bench_tool_version zebrac || true)"
 COUNT_ZFASTQ_VER="$(bench_tool_version z-fastq || true)"
-COUNT_ZFASTQ_NATIVE_VER="$(bench_tool_version z-fastq-native || true)"
 COUNT_ZFASTQ_BYTES="$(file_size_bytes "$ZFASTQ")"
-COUNT_ZFASTQ_NATIVE_BYTES="$(file_size_bytes "$ZFASTQ_NATIVE")"
 COUNT_SEQTK_VER="$(bench_tool_version seqtk || true)"
 COUNT_FQTOOLS_VER="$(bench_tool_version fqtools || true)"
 COUNT_NEEDLETAIL_VER="$(bench_tool_version needletail || true)"

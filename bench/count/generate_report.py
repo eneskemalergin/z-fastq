@@ -57,7 +57,7 @@ BASELINE = "z-fastq"
 REFERENCE_TOOLS = frozenset({"seqfu"})
 NO_RSS_RATIO = frozenset({"seqfu"})
 
-# z-fastq, native inflate, rust adapters, then C/Nim CLIs.
+# z-fastq, rust adapters, then C/Nim CLIs.
 PLAIN_TOOLS = [
     "z-fastq",
     "needletail",
@@ -68,7 +68,6 @@ PLAIN_TOOLS = [
 ]
 GZIP_TOOLS = [
     "z-fastq",
-    "z-fastq-native",
     "needletail",
     "helicase",
     "seqtk",
@@ -77,7 +76,6 @@ GZIP_TOOLS = [
 ]
 COLORS = {
     "z-fastq": "#F7A41D",
-    "z-fastq-native": "#FFB74D",
     "needletail": "#C45C26",
     "helicase": "#8B3A2A",
     "seqtk": "#6A1B9A",
@@ -86,8 +84,7 @@ COLORS = {
 }
 
 DISPLAY = {
-    "z-fastq": "z-fastq (ISA-L)",
-    "z-fastq-native": "z-fastq (native)",
+    "z-fastq": "z-fastq",
     "needletail": "Needletail",
     "helicase": "Helicase",
     "seqtk": "seqtk size",
@@ -752,7 +749,7 @@ def fig_occupancy_scatter(frame: pd.DataFrame, out: Path, title: str, *, alpha: 
     t_max = max(walls) * 1.32
     z_rsses = [float(v) for v in frame.loc[frame["tool"] == BASELINE, "rss"]]
     if not z_rsses:
-        raise SystemExit("error: occupancy scatter needs z-fastq ISA-L")
+        raise SystemExit("error: occupancy scatter needs z-fastq")
     y_max = max(max(rsses) * 1.16, max(z_rsses) * 4.05)
     label_stroke = [pe.withStroke(linewidth=3.2, foreground="white", alpha=0.92)]
 
@@ -808,7 +805,6 @@ def fig_occupancy_scatter(frame: pd.DataFrame, out: Path, title: str, *, alpha: 
     for tool in tools:
         color = COLORS.get(tool, "#888888")
         is_z = tool == BASELINE
-        is_native = tool == "z-fastq-native"
         for dataset in datasets:
             hit = frame[(frame["tool"] == tool) & (frame["dataset"] == dataset)]
             if hit.empty:
@@ -816,12 +812,12 @@ def fig_occupancy_scatter(frame: pd.DataFrame, out: Path, title: str, *, alpha: 
             ax.scatter(
                 float(hit["wall"].iloc[0]),
                 float(hit["rss"].iloc[0]),
-                s=118 if is_z else (92 if is_native else 86),
+                s=118 if is_z else 86,
                 marker=DATASET_MARKERS.get(dataset, "o"),
                 facecolor=color,
                 edgecolor="#111111" if is_z else "white",
                 linewidths=1.25 if is_z else 0.85,
-                zorder=5 if is_z else (4.4 if is_native else 4),
+                zorder=5 if is_z else 4,
                 label="_nolegend_",
             )
     ax.set_xscale("log")
@@ -949,7 +945,7 @@ def fig_efficiency_bars(frame: pd.DataFrame, out: Path, title: str) -> Path:
                 )
     ax.set_xticks(x)
     ax.set_xticklabels([display_tool(tool) for tool in tools], fontsize=9)
-    ax.set_ylabel("Efficiency vs z-fastq ISA-L (occupancy)", fontsize=10)
+    ax.set_ylabel("Efficiency vs z-fastq (occupancy)", fontsize=10)
     ax.set_title(title, fontsize=12, fontweight="bold")
     ax.grid(axis="y", alpha=0.28)
     ax.set_axisbelow(True)
@@ -973,7 +969,7 @@ def fig_efficiency_bars(frame: pd.DataFrame, out: Path, title: str) -> Path:
     fig.text(
         0.5,
         0.955,
-        "Higher is better. 1.00 = same wall x RSS as z-fastq ISA-L on that file. Color is the tool; hatch is the dataset.",
+        "Higher is better. 1.00 = same wall x RSS as z-fastq on that file. Color is the tool; hatch is the dataset.",
         ha="center",
         va="top",
         fontsize=9,
@@ -1015,7 +1011,7 @@ def md_occupancy_tables(frame: pd.DataFrame, tools: list[str], nums: ReportCount
             "",
             to_markdown_aligned(occ),
             "",
-            f"**Table {t_eff}:** Occupancy efficiency vs z-fastq ISA-L. Higher is better.",
+            f"**Table {t_eff}:** Occupancy efficiency vs z-fastq. Higher is better.",
             "",
             to_markdown_aligned(eff),
         ]
@@ -1150,7 +1146,7 @@ def md_overview(manifest: dict) -> str:
         verify_line = "The count-agreement check was skipped (`--skip-tests`). Do not treat this as a published run."
     elif verify:
         verify_line = (
-            "seqtk `size`, Needletail, Helicase, fqtools, and both z-fastq binaries agreed on the record count "
+            "seqtk `size`, Needletail, Helicase, fqtools, and z-fastq agreed on the record count "
             "for every timed file before any duration measurement. Details are in Count agreement below. "
             "I am not repeating those integers here."
         )
@@ -1168,7 +1164,7 @@ def md_overview(manifest: dict) -> str:
             "**What is timed**",
             "",
             "- One process, one file. Zebrac starts that argv; it does not start a shell.",
-            "- Plain files use the ISA-L product binary only. Gzip files also time the native inflate binary (`-Disa-l=false`).",
+            "- Plain and gzip files use the same z-fastq binary.",
             "- seqtk `size`, Needletail, Helicase, and fqtools are complete count peers. "
             "SeqFu may launch helper processes; its wall time is shown and its RSS is not used for ratios.",
             "",
@@ -1181,16 +1177,10 @@ def md_capability() -> str:
     matrix = pd.DataFrame(
         [
             {
-                "Tool": "z-fastq (ISA-L)",
+                "Tool": "z-fastq",
                 "Command": "`z-fastq count`",
                 "Same count job": "yes",
                 "Timed as": "product default",
-            },
-            {
-                "Tool": "z-fastq (native)",
-                "Command": "`z-fastq-native count`",
-                "Same count job": "yes, gzip only",
-                "Timed as": "second inflate backend",
             },
             {
                 "Tool": "Needletail",
@@ -1244,7 +1234,7 @@ def md_correctness(manifest: dict) -> str:
     else:
         body = (
             f"Status: **{status}**. The check required byte-identical count lines from z-fastq, "
-            "z-fastq native (gzip files), Needletail, Helicase, and the independent four-line counter, plus a matching "
+            "Needletail, Helicase, and the independent four-line counter, plus a matching "
             "seqtk reads field and fqtools integer. Timed files and the two-member concat-gzip fixture are in that "
             "check. The first mismatch would have stopped the run."
         )
@@ -1267,14 +1257,10 @@ def md_provenance(manifest: dict) -> str:
         for name in ("needletail", "helicase", "seqtk", "seqfu", "fqtools")
         if tools.get(name)
     ]
-    isa_bytes = int(manifest.get("z_fastq_bytes") or 0)
-    nat_bytes = int(manifest.get("z_fastq_native_bytes") or 0)
-    isa_line = f"- **z-fastq ISA-L:** {manifest.get('z_fastq', '')}"
-    nat_line = f"- **z-fastq native:** {manifest.get('z_fastq_native', '')}"
-    if isa_bytes:
-        isa_line += f" ({isa_bytes:,} bytes)"
-    if nat_bytes:
-        nat_line += f" ({nat_bytes:,} bytes)"
+    zfastq_bytes = int(manifest.get("z_fastq_bytes") or 0)
+    zfastq_line = f"- **z-fastq:** {manifest.get('z_fastq', '')}"
+    if zfastq_bytes:
+        zfastq_line += f" ({zfastq_bytes:,} bytes)"
     dense_line = md_real_files(manifest)
     verify = manifest.get("verify_pass")
     log = manifest.get("verify_log") or ""
@@ -1290,8 +1276,7 @@ def md_provenance(manifest: dict) -> str:
         f"- **Timestamp:** `{manifest.get('timestamp', '')}`",
         f"- **Runner:** zebrac, warm page cache, runs={manifest.get('runs')}, warmup={manifest.get('warmup')}, duration_ms={manifest.get('duration_ms')}",
         f"- **zebrac:** {manifest.get('zebrac', '')}",
-        isa_line,
-        nat_line,
+        zfastq_line,
         check_line,
         "",
         "**Peer versions**",
@@ -1330,7 +1315,7 @@ def md_perf_section(
             value_col="mean",
             fmt=fmt_wall,
             nums=nums,
-            ratio_summary="Time x = lane wall / z-fastq ISA-L. Same ratios as bar labels.",
+            ratio_summary="Time x = lane wall / z-fastq. Same ratios as bar labels.",
             zf_label="z-fastq",
             peer_label="Peer",
             ratio_label="Time x",
@@ -1371,7 +1356,7 @@ def md_perf_section(
                 value_col="peak_rss_mb",
                 fmt=fmt_rss,
                 nums=nums,
-                ratio_summary="RSS x = lane peak RSS / z-fastq ISA-L.",
+                ratio_summary="RSS x = lane peak RSS / z-fastq.",
                 zf_label="z-fastq",
                 peer_label="Peer",
                 ratio_label="RSS x",
@@ -1387,7 +1372,7 @@ def md_perf_section(
                 value_col="minor_faults",
                 fmt=fmt_faults,
                 nums=nums,
-                ratio_summary="Faults x = lane minor faults / z-fastq ISA-L.",
+                ratio_summary="Faults x = lane minor faults / z-fastq.",
                 zf_label="z-fastq",
                 peer_label="Peer",
                 ratio_label="Faults x",
@@ -1402,9 +1387,9 @@ def md_perf_section(
                     "Facets: wall time (log y) | peak RSS (linear) | minor page faults (log y).",
                     "X-axis: Dense, Variable, Long.",
                     (
-                        "Gold bars: z-fastq ISA-L (1x). Amber bars: native inflate."
+                        "Gold bars: z-fastq (1x)."
                         if include_throughput
-                        else "Gold bars: z-fastq ISA-L (1x). One z-fastq lane on plain FASTQ."
+                        else "Gold bars: z-fastq (1x). One z-fastq lane on plain FASTQ."
                     ),
                     "Hatched bars: SeqFu (descriptive; helper processes). They are not dominance comparisons.",
                     "Error bars show standard deviation.",
@@ -1431,25 +1416,25 @@ def md_perf_section(
             [
                 "## Occupancy (50/50 wall and RSS)",
                 "",
-                "Occupancy is mean wall times peak RSS. SeqFu is omitted because child RSS is not measured. The scatter is peak RSS against mean wall, not a ratio plot. Each dataset has its own 1x/2x/4x/8x family through that file's z-fastq ISA-L. Curve dash matches the scatter shape: Dense solid, Variable dashed, Long dash-dot. Color is the tool. Shape is the dataset. Efficiency vs z-fastq is the next figure, not this one.",
+                "Occupancy is mean wall times peak RSS. SeqFu is omitted because child RSS is not measured. The scatter is peak RSS against mean wall, not a ratio plot. Each dataset has its own 1x/2x/4x/8x family through that file's z-fastq. Curve dash matches the scatter shape: Dense solid, Variable dashed, Long dash-dot. Color is the tool. Shape is the dataset. Efficiency vs z-fastq is the next figure, not this one.",
                 "",
                 md_occupancy_tables(occ_frame, present, nums),
                 "",
                 md_figure_block(
                     nums,
                     f"results/figures/{occ_name}",
-                    "Peak RSS vs mean wall. Per-dataset occupancy isocosts through z-fastq ISA-L.",
+                    "Peak RSS vs mean wall. Per-dataset occupancy isocosts through z-fastq.",
                     [
                         "X: mean wall (s, log). Y: peak RSS (MB, linear).",
                         "Color = tool. Shape = dataset (Dense circle/solid, Variable square/dashed, Long triangle/dash-dot).",
-                        "Curves are 1x/2x/4x/8x memory-seconds of that dataset's z-fastq ISA-L. Dash matches the shape. Gold 1x, gray 2x/4x/8x.",
-                        "Lower-left is better. Native inflate appears on gzip only.",
+                        "Curves are 1x/2x/4x/8x memory-seconds of that dataset's z-fastq. Dash matches the shape. Gold 1x, gray 2x/4x/8x.",
+                        "Lower-left is better.",
                     ],
                 ),
                 md_figure_block(
                     nums,
                     f"results/figures/{eff_name}",
-                    "Occupancy efficiency vs z-fastq ISA-L. Higher is better. 1.00 matches z-fastq memory-seconds.",
+                    "Occupancy efficiency vs z-fastq. Higher is better. 1.00 matches z-fastq memory-seconds.",
                     [
                         "X-axis is the tool. Grouped bars are Dense / Variable / Long (hatch).",
                         "Bar color is the tool. Gold dashed line is 1x.",
@@ -1550,8 +1535,8 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
                 plain,
                 title="Performance: plain FASTQ",
                 intro=(
-                    "Uncompressed siblings of the same records. One z-fastq lane (the ISA-L product binary). "
-                    "Ratios use z-fastq ISA-L as 1x."
+                    "Uncompressed siblings of the same records. One z-fastq lane. "
+                    "Ratios use z-fastq as 1x."
                 ),
                 tools=PLAIN_TOOLS,
                 fig_name="perf_plain.png",
@@ -1568,14 +1553,13 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
                 gzip_df,
                 title="Performance: gzip FASTQ",
                 intro=(
-                    "The same records as gzip. Gold bars are z-fastq ISA-L (product default, 1x). "
-                    "Amber bars are native Zig inflate (`-Disa-l=false`). "
+                    "The same records as gzip. Gold bars are z-fastq (product default, 1x). "
                     "Decoded FASTQ MiB/s (uncompressed sibling size / wall) is the gzip unit that matches inflate work."
                 ),
                 tools=GZIP_TOOLS,
                 fig_name="perf_gzip.png",
                 fig_title="Gzip FASTQ count: wall, RSS, page faults",
-                fig_note=f"Error bars = zebrac stddev (n={sample_n}). Amber = native inflate. Hatched = SeqFu.",
+                fig_note=f"Error bars = zebrac stddev (n={sample_n}). Hatched = SeqFu.",
                 nums=nums,
                 figures_dir=figures_dir,
                 include_throughput=True,

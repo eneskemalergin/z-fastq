@@ -393,8 +393,10 @@ test "[cli] - [deinterleave]: failed input leaves command-created outputs" {
         "",
         expected,
     );
-    try expectEmptyFile(paths[0]);
-    try expectEmptyFile(paths[1]);
+    const output1 = try tmp.dir.readFileAlloc(io, "corrupt-r1.fastq", allocator, .limited(1024));
+    const output2 = try tmp.dir.readFileAlloc(io, "corrupt-r2.fastq", allocator, .limited(1024));
+    try cli.expectPrefix("@ok/1\nA\n+\n!\n", output1);
+    try cli.expectPrefix("@ok/2\nT\n+\n#\n", output2);
 }
 
 test "[cli] - [deinterleave]: late gzip failure retains the same complete prefix in both outputs" {

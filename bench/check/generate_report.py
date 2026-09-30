@@ -28,7 +28,7 @@ RESULTS_DIR = SCRIPT_DIR / "results"
 
 BASELINE = "z-fastq"
 PLAIN_TOOLS = ["z-fastq", "fq", "fastqvalidator", "seqfu", "fqtools"]
-GZIP_TOOLS = ["z-fastq", "z-fastq-native", "fq", "fastqvalidator", "seqfu", "fqtools"]
+GZIP_TOOLS = ["z-fastq", "fq", "fastqvalidator", "seqfu", "fqtools"]
 DESCRIPTIVE_TOOLS = frozenset({"fq", "fastqvalidator", "seqfu", "fqtools"})
 NO_OCCUPANCY = frozenset({"seqfu"})
 ROLE_MATRIX_ORDER = ["se", "paired", "casava", "slash", "interleaved", "gzip"]
@@ -69,15 +69,13 @@ FIXTURE_LABELS = {
 
 COLORS = {
     "z-fastq": "#F7A41D",
-    "z-fastq-native": "#FFB74D",
     "fq": "#1565C0",
     "fastqvalidator": "#6A1B9A",
     "seqfu": "#009485",
     "fqtools": "#555555",
 }
 DISPLAY = {
-    "z-fastq": "z-fastq (ISA-L)",
-    "z-fastq-native": "z-fastq (native)",
+    "z-fastq": "z-fastq",
     "fq": "fq lint",
     "fastqvalidator": "FastQValidator",
     "seqfu": "SeqFu check",
@@ -663,7 +661,7 @@ def fig_occupancy_scatter(
     t_max = max(walls) * 1.32
     z_rsses = [float(value) for value in frame.loc[frame["tool"] == BASELINE, "rss"]]
     if not z_rsses:
-        raise SystemExit("error: occupancy scatter needs z-fastq ISA-L")
+        raise SystemExit("error: occupancy scatter needs z-fastq")
     y_max = max(max(rsses) * 1.16, max(z_rsses) * 4.05)
     label_stroke = [pe.withStroke(linewidth=3.2, foreground="white", alpha=0.92)]
 
@@ -737,7 +735,6 @@ def fig_occupancy_scatter(
     for tool in tools:
         color = COLORS.get(tool, "#888888")
         is_z = tool == BASELINE
-        is_native = tool == "z-fastq-native"
         for workload in workloads:
             hit = frame[(frame["tool"] == tool) & (frame["workload"] == workload)]
             if hit.empty:
@@ -746,12 +743,12 @@ def fig_occupancy_scatter(
             ax.scatter(
                 float(hit["wall"].iloc[0]),
                 float(hit["rss"].iloc[0]),
-                s=118 if is_z else (92 if is_native else 86),
+                s=118 if is_z else 86,
                 marker=marker,
                 facecolor=color,
                 edgecolor="#111111" if is_z else "white",
                 linewidths=1.25 if is_z else 0.85,
-                zorder=5 if is_z else (4.4 if is_native else 4),
+                zorder=5 if is_z else 4,
                 label="_nolegend_",
             )
 
@@ -886,7 +883,7 @@ def fig_efficiency_bars(
                 )
     ax.set_xticks(x)
     ax.set_xticklabels([display_tool(tool) for tool in tools], fontsize=9)
-    ax.set_ylabel("Efficiency vs z-fastq ISA-L (occupancy)", fontsize=10)
+    ax.set_ylabel("Efficiency vs z-fastq (occupancy)", fontsize=10)
     ax.set_title(title, fontsize=12, fontweight="bold")
     ax.grid(axis="y", alpha=0.28)
     ax.set_axisbelow(True)
@@ -911,7 +908,7 @@ def fig_efficiency_bars(
     fig.text(
         0.5,
         0.955,
-        "Higher is better. 1.00 = the same wall × RSS as z-fastq ISA-L on that workload. Color is the tool; hatch is the workload.",
+        "Higher is better. 1.00 = the same wall × RSS as z-fastq on that workload. Color is the tool; hatch is the workload.",
         ha="center",
         va="top",
         fontsize=9,
@@ -962,7 +959,7 @@ def md_occupancy_tables(
             "",
             to_markdown_aligned(occupancy),
             "",
-            f"**Table {efficiency_number}:** Occupancy efficiency vs z-fastq ISA-L. Higher is better.",
+            f"**Table {efficiency_number}:** Occupancy efficiency vs z-fastq. Higher is better.",
             "",
             to_markdown_aligned(efficiency),
         ]
@@ -1013,7 +1010,7 @@ def md_metric_block(
         ratio_number = nums.next_table()
         blocks.extend(
             [
-                f"<details><summary><strong>Table {ratio_number}:</strong> Time relative to z-fastq ISA-L.</summary>",
+                f"<details><summary><strong>Table {ratio_number}:</strong> Time relative to z-fastq.</summary>",
                 "",
                 md_ratio_table(
                     frame,
@@ -1084,8 +1081,6 @@ def md_role_matrix(manifest: dict) -> str:
     def cell(tool: str, role: str) -> str:
         if tool == "z-fastq":
             return "timed" if role != "gzip" else "timed (gzip only)"
-        if tool == "z-fastq-native":
-            return "timed (gzip)"
         statuses = by_tool.get(tool, {}).get(role, set())
         if "timed" in statuses:
             return "timed"
@@ -1101,7 +1096,7 @@ def md_role_matrix(manifest: dict) -> str:
 
     columns = ["Tool"] + [ROLE_MATRIX_LABELS[role] for role in ROLE_MATRIX_ORDER]
     rows = []
-    for tool in ["z-fastq", "z-fastq-native", *PLAIN_TOOLS[1:]]:
+    for tool in ["z-fastq", *PLAIN_TOOLS[1:]]:
         row = {"Tool": display_tool(tool)}
         for role in ROLE_MATRIX_ORDER:
             row[ROLE_MATRIX_LABELS[role]] = cell(tool, role)
@@ -1146,16 +1141,10 @@ def md_capability(manifest: dict) -> str:
     peers = pd.DataFrame(
         [
             {
-                "Tool": "z-fastq (ISA-L)",
+                "Tool": "z-fastq",
                 "Command": "`z-fastq check`",
                 "Same check job": "yes; S001-S006 and P001/P002",
                 "Timed as": "contract reference",
-            },
-            {
-                "Tool": "z-fastq (native)",
-                "Command": "`z-fastq-native check`",
-                "Same check job": "yes, gzip only",
-                "Timed as": "second inflate backend",
             },
             {
                 "Tool": "fq",
@@ -1245,12 +1234,12 @@ def md_overview(manifest: dict) -> str:
             f"- **SE shapes:** {se_names}. Occupancy and efficiency live only here.",
             f"- **Pair layout:** {pair_names}. Same mate count; not mixed with SE file geometry.",
             f"- **Name policy:** {name_names}. Same MiniSeq sequences; only headers change.",
-            f"- **Concat gzip:** {concat_names}. z-fastq ISA-L vs native; member traversal is proven by record count.",
+            f"- **Concat gzip:** {concat_names}. Member traversal is proven by record count.",
             "",
             "**What is timed**",
             "",
             "- One process, one validation workload. Zebrac starts the argv directly; no shell or pipeline is measured.",
-            "- Plain and gzip inputs are separate sections. Gzip includes native z-fastq only as the second inflate backend.",
+            "- Plain and gzip inputs are separate sections.",
             "- External validators are descriptive peers. Their raw wall time, peak RSS, and minor faults are reported only for positive lanes they accept.",
             "- Concatenated gzip is probed with peers for the capability matrix and is not timed for them: a zero exit does not prove every gzip member was traversed.",
         ]
@@ -1264,7 +1253,7 @@ def md_correctness(manifest: dict) -> str:
         body = "The check contract preflight was skipped. This run is not publishable."
     else:
         body = (
-            f"Status: **{status}**. Both z-fastq binaries passed valid plain/gzip fixtures, exact S001-S006 "
+            f"Status: **{status}**. z-fastq passed valid plain/gzip fixtures, exact S001-S006 "
             "failure checks, alphabet policy, slash and Casava pair-name checks, pair-count checks, odd-interleaved "
             "checks, and ConcatGzip member traversal (record count). Positive real workloads were then probed with "
             "external validators; incompatible peer behavior was recorded rather than treated as a z-fastq failure."
@@ -1291,19 +1280,15 @@ def md_provenance(manifest: dict) -> str:
         for name in ("fq", "fastqvalidator", "seqfu", "fqtools")
         if tools.get(name)
     ]
-    isa = f"- **z-fastq ISA-L:** {manifest.get('z_fastq', '')}"
-    native = f"- **z-fastq native:** {manifest.get('z_fastq_native', '')}"
+    zfastq = f"- **z-fastq:** {manifest.get('z_fastq', '')}"
     if manifest.get("z_fastq_bytes"):
-        isa += f" ({int(manifest['z_fastq_bytes']):,} bytes)"
-    if manifest.get("z_fastq_native_bytes"):
-        native += f" ({int(manifest['z_fastq_native_bytes']):,} bytes)"
+        zfastq += f" ({int(manifest['z_fastq_bytes']):,} bytes)"
     return join(
         [
             f"- **Timestamp:** `{manifest.get('timestamp', '')}`",
             f"- **Runner:** zebrac, warm page cache, runs={manifest.get('runs')}, warmup={manifest.get('warmup')}, duration_ms={manifest.get('duration_ms')}",
             f"- **zebrac:** {manifest.get('zebrac', '')}",
-            isa,
-            native,
+            zfastq,
             "",
             "**Peer versions**",
             "",
@@ -1345,7 +1330,7 @@ def md_perf_section(
         bullets = figure_bullets or [
             "Facets: wall time (log y) | peak RSS (linear) | minor page faults (log y).",
             "X-axis: workload role and catalog ids; paired inputs are one workload.",
-            "Gold bars are z-fastq ISA-L. Amber bars are native inflate on gzip. Hatched bars are external validators with different edge-case contracts.",
+            "Gold bars are z-fastq. Hatched bars are external validators with different edge-case contracts.",
         ]
         blocks = [
             f"## {title}",
@@ -1356,7 +1341,7 @@ def md_perf_section(
                 work,
                 present,
                 heading="Wall time",
-                intro="Zebrac mean wall time for one validation process. Vertical annotations are time relative to the z-fastq ISA-L lane where a peer lane exists.",
+                intro="Zebrac mean wall time for one validation process. Vertical annotations are time relative to the z-fastq lane where a peer lane exists.",
                 value_col="mean",
                 formatter=fmt_wall,
                 nums=nums,
@@ -1423,18 +1408,18 @@ def md_perf_section(
                         md_figure_block(
                             nums,
                             f"results/figures/{occupancy_name}",
-                            "Peak RSS vs mean wall. Per-workload occupancy isocosts through z-fastq ISA-L.",
+                            "Peak RSS vs mean wall. Per-workload occupancy isocosts through z-fastq.",
                             [
                                 "X: mean wall (s, log). Y: peak RSS (MB, linear).",
                                 "Color = tool. Shape and line dash = workload; the legend names every SE shape.",
-                                "Curves are 1x/2x/4x/8x memory-seconds of that workload's z-fastq ISA-L lane. Gold 1x, gray 2x/4x/8x.",
+                                "Curves are 1x/2x/4x/8x memory-seconds of that workload's z-fastq lane. Gold 1x, gray 2x/4x/8x.",
                                 "Lower-left is better. Missing points are not treated as zero.",
                             ],
                         ),
                         md_figure_block(
                             nums,
                             f"results/figures/{efficiency_name}",
-                            "Occupancy efficiency vs z-fastq ISA-L. Higher is better. 1.00 matches z-fastq memory-seconds.",
+                            "Occupancy efficiency vs z-fastq. Higher is better. 1.00 matches z-fastq memory-seconds.",
                             [
                                 f"X-axis is the tool. Grouped bars are {' / '.join(display_workload(key) for key in workload_ids)}; hatches identify workloads.",
                                 "Bar color is the tool. Gold dashed line is 1x.",
@@ -1524,22 +1509,22 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
     se_bullets = [
         "Facets: wall time (log y) | peak RSS (linear) | minor page faults (log y).",
         "X-axis: SE catalog shapes only. Occupancy and efficiency follow this family.",
-        "Gold bars are z-fastq ISA-L. Amber bars are native inflate on gzip. Hatched bars are external validators with different edge-case contracts.",
+        "Gold bars are z-fastq. Hatched bars are external validators with different edge-case contracts.",
     ]
     pair_bullets = [
         "Facets: wall time (log y) | peak RSS (linear) | minor page faults (log y).",
         "X-axis: `--paired` then `--interleaved` on the matching mates. SE DenseSmall is not on this plot.",
-        "Gold bars are z-fastq ISA-L. Amber bars are native inflate on gzip. Hatched bars are external validators.",
+        "Gold bars are z-fastq. Hatched bars are external validators.",
     ]
     name_bullets = [
         "Facets: wall time (log y) | peak RSS (linear) | minor page faults (log y).",
         "X-axis: SRA-style paired names, Casava `1:N:0:`, then `@id/1` `/2`. Same sequences; only headers change.",
-        "Gold bars are z-fastq ISA-L. Amber bars are native inflate on gzip. Hatched bars are external validators.",
+        "Gold bars are z-fastq. Hatched bars are external validators.",
     ]
     concat_bullets = [
         "Facets: wall time (log y) | peak RSS (linear) | minor page faults (log y).",
-        "X-axis: ConcatGzip, two gzip members of DenseSmall. Timed z-fastq ISA-L vs native only.",
-        "Gold is ISA-L. Amber is native inflate. Peers were probed for the fixture matrix and are not timed here.",
+        "X-axis: ConcatGzip, two gzip members of DenseSmall. Timed z-fastq only.",
+        "Gold is z-fastq. Peers were probed for the fixture matrix and are not timed here.",
     ]
 
     if plain is not None and not plain.empty:
@@ -1547,7 +1532,7 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
             md_perf_section(
                 plain,
                 title="Performance: SE FASTQ",
-                intro="Single-end file geometry. Small set: DenseSmall, Variable, HiFi. Publication set: Dense, Variable, Long, HiFi. Occupancy and efficiency live only on these SE shapes. The z-fastq ISA-L lane is the 1x time reference; external validators are not treated as semantic equivalents.",
+                intro="Single-end file geometry. Small set: DenseSmall, Variable, HiFi. Publication set: Dense, Variable, Long, HiFi. Occupancy and efficiency live only on these SE shapes. The z-fastq lane is the 1x time reference; external validators are not treated as semantic equivalents.",
                 tools=PLAIN_TOOLS,
                 fig_name="perf_plain.png",
                 fig_title="Plain SE FASTQ check: wall, RSS, page faults",
@@ -1565,11 +1550,11 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
             md_perf_section(
                 gzip,
                 title="Performance: SE FASTQ (gzip)",
-                intro="The same SE shapes as gzip. Gold is z-fastq ISA-L; amber is native Zig inflate. Decoded FASTQ MiB/s uses the uncompressed sibling size divided by wall time.",
+                intro="The same SE shapes as gzip. Gold is z-fastq. Decoded FASTQ MiB/s uses the uncompressed sibling size divided by wall time.",
                 tools=GZIP_TOOLS,
                 fig_name="perf_gzip.png",
                 fig_title="Gzip SE FASTQ check: wall, RSS, page faults",
-                fig_note=f"Error bars = zebrac standard deviation (n={sample_count}). Amber = native inflate. Hatched = external validators.",
+                fig_note=f"Error bars = zebrac standard deviation (n={sample_count}). Hatched = external validators.",
                 roles=FAMILY_ROLES["se"],
                 include_throughput=True,
                 include_occupancy=True,
@@ -1601,11 +1586,11 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
             md_perf_section(
                 gzip,
                 title="Performance: pair layout (gzip)",
-                intro="The same paired vs interleaved mates as gzip. Gold is z-fastq ISA-L; amber is native Zig inflate.",
+                intro="The same paired vs interleaved mates as gzip. Gold is z-fastq.",
                 tools=GZIP_TOOLS,
                 fig_name="perf_gzip_pairs.png",
                 fig_title="Gzip pair layout check: wall, RSS, page faults",
-                fig_note=f"Error bars = zebrac standard deviation (n={sample_count}). Amber = native inflate. Hatched = external validators.",
+                fig_note=f"Error bars = zebrac standard deviation (n={sample_count}). Hatched = external validators.",
                 roles=FAMILY_ROLES["pairs"],
                 include_throughput=True,
                 figure_caption="Wall time, peak RSS, and minor page faults for gzip paired vs interleaved check.",
@@ -1636,11 +1621,11 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
             md_perf_section(
                 gzip,
                 title="Performance: name policy (gzip)",
-                intro="The same MiniSeq sequences as gzip, still only headers changing. Gold is z-fastq ISA-L; amber is native Zig inflate.",
+                intro="The same MiniSeq sequences as gzip, still only headers changing. Gold is z-fastq.",
                 tools=GZIP_TOOLS,
                 fig_name="perf_gzip_names.png",
                 fig_title="Gzip name-policy check: wall, RSS, page faults",
-                fig_note=f"Error bars = zebrac standard deviation (n={sample_count}). Amber = native inflate. Hatched = external validators.",
+                fig_note=f"Error bars = zebrac standard deviation (n={sample_count}). Hatched = external validators.",
                 roles=FAMILY_ROLES["names"],
                 include_throughput=True,
                 figure_caption="Wall time, peak RSS, and minor page faults for gzip pair-name policy check.",
@@ -1653,11 +1638,11 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
             md_perf_section(
                 gzip,
                 title="Performance: concat gzip",
-                intro="Two gzip members of DenseSmall. Timed only for z-fastq ISA-L vs native. Member traversal is proven by record count, not by `check` exit 0. Peers were probed for the fixture matrix and are not timed here.",
+                intro="Two gzip members of DenseSmall. Timed only for z-fastq. Member traversal is proven by record count, not by `check` exit 0. Peers were probed for the fixture matrix and are not timed here.",
                 tools=GZIP_TOOLS,
                 fig_name="perf_gzip_concat.png",
                 fig_title="Concat gzip check: wall, RSS, page faults",
-                fig_note=f"Error bars = zebrac standard deviation (n={sample_count}). Gold = ISA-L. Amber = native inflate.",
+                fig_note=f"Error bars = zebrac standard deviation (n={sample_count}). Gold = z-fastq.",
                 roles=FAMILY_ROLES["concat"],
                 include_throughput=True,
                 figure_caption="Wall time, peak RSS, and minor page faults for concatenated gzip.",

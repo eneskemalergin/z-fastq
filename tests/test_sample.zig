@@ -755,7 +755,7 @@ test "[cli] - [exact sample]: count boundaries preserve records in input order" 
     }
 }
 
-test "[cli] - [interleaved sample]: corrupt gzip refills preserve earlier output" {
+test "[cli] - [interleaved sample]: corrupt final gzip member keeps pairs from checked members" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -772,14 +772,17 @@ test "[cli] - [interleaved sample]: corrupt gzip refills preserve earlier output
         offset = end;
     }
     gzip.items[gzip.items.len - 8] ^= 1;
+    const final_member_start = (input.len - 1) / std.math.maxInt(u16) * std.math.maxInt(u16);
+    const checked_pairs_len = final_member_start / (2 * record.len) * (2 * record.len);
 
-    // The first 256 KiB read ends 12 bytes into the next pair.
-    try cli.expectResult(
-        try cli.runWithStdin(allocator, &.{ "sample", "--interleaved", "--fraction", "1", "-" }, gzip.items, gzip.items.len),
-        3,
-        input[0..262132],
-        "error: -: I/O error\n",
+    const result = try cli.runWithStdin(
+        allocator,
+        &.{ "sample", "--interleaved", "--fraction", "1", "-" },
+        gzip.items,
+        gzip.items.len,
     );
+    try cli.expectFailedPrefix(result, 3, input, "error: -: I/O error\n");
+    try std.testing.expect(result.stdout.len >= checked_pairs_len);
 }
 
 test "[integration] - [sample]: plain and gzip file and stdin select identical records" {

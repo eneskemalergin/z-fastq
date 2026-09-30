@@ -27,8 +27,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 RESULTS_DIR = SCRIPT_DIR / "results"
 
 BASELINE = "z-fastq"
-PLAIN_TOOLS = ["z-fastq", "seqtk", "seqfu", "fqkit", "irma", "bbtools"]
-GZIP_TOOLS = ["z-fastq", "z-fastq-native", "seqtk", "seqfu", "fqkit", "irma", "bbtools"]
+# BBTools is disabled in run.sh; its JVM uses several cores even with threads=1.
+# PLAIN_TOOLS = ["z-fastq", "seqtk", "seqfu", "fqkit", "irma", "bbtools"]
+PLAIN_TOOLS = ["z-fastq", "seqtk", "seqfu", "fqkit", "irma"]
+# GZIP_TOOLS = ["z-fastq", "seqtk", "seqfu", "fqkit", "irma", "bbtools"]
+GZIP_TOOLS = ["z-fastq", "seqtk", "seqfu", "fqkit", "irma"]
 DESCRIPTIVE_TOOLS = frozenset({"seqfu", "fqkit", "irma", "bbtools"})
 NO_OCCUPANCY = frozenset({"bbtools"})
 ROLE_MATRIX_ORDER = ["time"]
@@ -53,7 +56,6 @@ FIXTURE_LABELS = {
 
 COLORS = {
     "z-fastq": "#F7A41D",
-    "z-fastq-native": "#FFB74D",
     "seqtk": "#6A1B9A",
     "seqfu": "#009485",
     "fqkit": "#6D4C41",
@@ -61,8 +63,7 @@ COLORS = {
     "bbtools": "#C62828",
 }
 DISPLAY = {
-    "z-fastq": "z-fastq (ISA-L)",
-    "z-fastq-native": "z-fastq (native)",
+    "z-fastq": "z-fastq",
     "seqtk": "seqtk mergepe",
     "seqfu": "SeqFu interleave",
     "fqkit": "fqkit merge",
@@ -662,7 +663,7 @@ def fig_occupancy_scatter(
     t_max = max(walls) * 1.32
     z_rsses = [float(value) for value in frame.loc[frame["tool"] == BASELINE, "rss"]]
     if not z_rsses:
-        raise SystemExit("error: occupancy scatter needs z-fastq ISA-L")
+        raise SystemExit("error: occupancy scatter needs z-fastq")
     y_max = max(max(rsses) * 1.16, max(z_rsses) * 4.05)
     label_stroke = [pe.withStroke(linewidth=3.2, foreground="white", alpha=0.92)]
 
@@ -736,7 +737,6 @@ def fig_occupancy_scatter(
     for tool in tools:
         color = COLORS.get(tool, "#888888")
         is_z = tool == BASELINE
-        is_native = tool == "z-fastq-native"
         for workload in workloads:
             hit = frame[(frame["tool"] == tool) & (frame["workload"] == workload)]
             if hit.empty:
@@ -745,12 +745,12 @@ def fig_occupancy_scatter(
             ax.scatter(
                 float(hit["wall"].iloc[0]),
                 float(hit["rss"].iloc[0]),
-                s=118 if is_z else (92 if is_native else 86),
+                s=118 if is_z else 86,
                 marker=marker,
                 facecolor=color,
                 edgecolor="#111111" if is_z else "white",
                 linewidths=1.25 if is_z else 0.85,
-                zorder=5 if is_z else (4.4 if is_native else 4),
+                zorder=5 if is_z else 4,
                 label="_nolegend_",
             )
 
@@ -885,7 +885,7 @@ def fig_efficiency_bars(
                 )
     ax.set_xticks(x)
     ax.set_xticklabels([display_tool(tool) for tool in tools], fontsize=9)
-    ax.set_ylabel("Efficiency vs z-fastq ISA-L (occupancy)", fontsize=10)
+    ax.set_ylabel("Efficiency vs z-fastq (occupancy)", fontsize=10)
     ax.set_title(title, fontsize=12, fontweight="bold")
     ax.grid(axis="y", alpha=0.28)
     ax.set_axisbelow(True)
@@ -910,7 +910,7 @@ def fig_efficiency_bars(
     fig.text(
         0.5,
         0.955,
-        "Higher is better. 1.00 = the same wall × RSS as z-fastq ISA-L on that workload. Color is the tool; hatch is the workload.",
+        "Higher is better. 1.00 = the same wall × RSS as z-fastq on that workload. Color is the tool; hatch is the workload.",
         ha="center",
         va="top",
         fontsize=9,
@@ -961,7 +961,7 @@ def md_occupancy_tables(
             "",
             to_markdown_aligned(occupancy),
             "",
-            f"**Table {efficiency_number}:** Occupancy efficiency vs z-fastq ISA-L. Higher is better.",
+            f"**Table {efficiency_number}:** Occupancy efficiency vs z-fastq. Higher is better.",
             "",
             to_markdown_aligned(efficiency),
         ]
@@ -1012,7 +1012,7 @@ def md_metric_block(
         ratio_number = nums.next_table()
         blocks.extend(
             [
-                f"<details><summary><strong>Table {ratio_number}:</strong> Time relative to z-fastq ISA-L.</summary>",
+                f"<details><summary><strong>Table {ratio_number}:</strong> Time relative to z-fastq.</summary>",
                 "",
                 md_ratio_table(
                     frame,
@@ -1083,8 +1083,6 @@ def md_role_matrix(manifest: dict) -> str:
     def cell(tool: str, role: str) -> str:
         if tool == "z-fastq":
             return "timed"
-        if tool == "z-fastq-native":
-            return "timed (gzip)"
         statuses = by_tool.get(tool, {}).get(role, set())
         if "timed" in statuses:
             return "timed"
@@ -1098,7 +1096,7 @@ def md_role_matrix(manifest: dict) -> str:
 
     columns = ["Tool"] + [ROLE_MATRIX_LABELS[role] for role in ROLE_MATRIX_ORDER]
     rows = []
-    for tool in ["z-fastq", "z-fastq-native", *PLAIN_TOOLS[1:]]:
+    for tool in ["z-fastq", *PLAIN_TOOLS[1:]]:
         row = {"Tool": display_tool(tool)}
         for role in ROLE_MATRIX_ORDER:
             row[ROLE_MATRIX_LABELS[role]] = cell(tool, role)
@@ -1144,16 +1142,10 @@ def md_capability(manifest: dict) -> str:
     peers = pd.DataFrame(
         [
             {
-                "Tool": "z-fastq (ISA-L)",
+                "Tool": "z-fastq",
                 "Command": "`z-fastq interleave R1 R2`",
                 "Same interleave job": "yes; lockstep mates, name check, R1 then R2 stdout",
                 "Timed as": "contract reference",
-            },
-            {
-                "Tool": "z-fastq (native)",
-                "Command": "`z-fastq-native interleave R1 R2`",
-                "Same interleave job": "yes, gzip only",
-                "Timed as": "second inflate backend",
             },
             {
                 "Tool": "seqtk",
@@ -1179,12 +1171,13 @@ def md_capability(manifest: dict) -> str:
                 "Same interleave job": "no; layout zip; gzip layout matches plain",
                 "Timed as": "hatched; descriptive",
             },
-            {
-                "Tool": "BBTools",
-                "Command": "`reformat.sh in= in2= out=/dev/null`",
-                "Same interleave job": "no; JVM; `changequality=f` still rewrote R1 `!!`→`##` (Phred 0 to 2) on these fixtures",
-                "Timed as": "hatched; RSS not occupancy",
-            },
+            # BBTools is disabled in run.sh.
+            # {
+            #     "Tool": "BBTools",
+            #     "Command": "`reformat.sh in= in2= out=/dev/null`",
+            #     "Same interleave job": "no; JVM; `changequality=f` still rewrote R1 `!!`→`##` (Phred 0 to 2) on these fixtures",
+            #     "Timed as": "hatched; RSS not occupancy",
+            # },
         ]
     )
     omitted = pd.DataFrame(
@@ -1251,8 +1244,8 @@ def md_overview(manifest: dict) -> str:
             "",
             "**What is timed**",
             "",
-            "- One process, one interleave workload. Zebrac starts the argv directly; no shell or pipeline is measured. Stdout writers are discarded by zebrac. BBTools is timed with `out=/dev/null`.",
-            "- Plain and gzip inputs are separate sections. Gzip includes native z-fastq only as the second inflate backend.",
+            "- One process, one interleave workload. Zebrac starts the argv directly; no shell or pipeline is measured. Stdout writers are discarded by zebrac.",
+            "- Plain and gzip inputs are separate sections.",
             "- seqtk `mergepe` is timed as the screened exact layout reference. Other interleavers are descriptive peers and are hatched.",
             "- SeqFu is timed with `-c` so it compares first tokens; that is not z-fastq illumina (slash `/1` `/2` fixtures fail; Casava first tokens match). IRMA Core gzip is timed: layout zip, not a sampler RNG. Mixed gzip is contract-only.",
         ]
@@ -1266,14 +1259,14 @@ def md_correctness(manifest: dict) -> str:
         body = "The interleave contract preflight was skipped. This run is not publishable."
     else:
         body = (
-            f"Status: **{status}**. Both z-fastq binaries passed empty mates, slash and Casava names, "
+            f"Status: **{status}**. z-fastq passed empty mates, slash and Casava names, "
             "gzip and mixed gzip, CRLF→LF, `--pair-names exact` on identical tokens, stdin R1 and stdin R2, "
             "exact-on-slash exit 1 with empty stdout, arity, double stdin, `--json`, `--paired`, invalid `--pair-names` / `--alphabet`, "
             "P001 empty stdout, P002 keeping the complete earlier pair when R1 or R2 has leftovers, and P002 empty R1 with leftover R2. "
-            "Mixed gzip, stdin, CRLF, native gzip slash, and native plain slash were byte-compared to ISA-L LF slash. "
-            "ISA-L matched seqtk `mergepe` on slash, CRLF slash, gzip slash, empty mates, and the catalog pair "
+            "Mixed gzip, stdin, and CRLF were byte-compared to LF slash. "
+            "z-fastq matched seqtk `mergepe` on slash, CRLF slash, gzip slash, empty mates, and the catalog pair "
             "(this suite is bare plus). Catalog gzip output matched catalog plain. Real files were required to emit `2 × N` records. "
-            "ISA-L vs native gzip outputs were byte-compared when retained. Positive peer lanes "
+            "Positive peer lanes "
             "were probed next; incompatible peer behavior was recorded rather than treated as a z-fastq failure."
         )
     return join(
@@ -1284,7 +1277,7 @@ def md_correctness(manifest: dict) -> str:
             "",
             "**Peer fixture probes**",
             "",
-            "These rows are descriptive. A fail does not stop the run. `pass` is exit 0, and for stdout writers (and BBTools fixture files) an even pair-complete record count; `fail` is a nonzero exit or an odd count on a fixture z-fastq accepts; `unsupported` means that tool is not invoked. SeqFu `-c` failed slash `/1` `/2` (including CRLF) with a first-token mismatch on stdout, not FASTQ records, and passed Casava and empty; IRMA Core failed empty mates.",
+            "These rows are descriptive. A fail does not stop the run. `pass` is exit 0, and for stdout writers an even pair-complete record count; `fail` is a nonzero exit or an odd count on a fixture z-fastq accepts; `unsupported` means that tool is not invoked. SeqFu `-c` failed slash `/1` `/2` (including CRLF) with a first-token mismatch on stdout, not FASTQ records, and passed Casava and empty; IRMA Core failed empty mates.",
             "",
             md_fixture_table(manifest),
         ]
@@ -1298,20 +1291,16 @@ def md_provenance(manifest: dict) -> str:
         for name in ("seqtk", "seqfu", "fqkit", "irma", "bbtools")
         if tools.get(name)
     ]
-    isa = f"- **z-fastq ISA-L:** {manifest.get('z_fastq', '')}"
-    native = f"- **z-fastq native:** {manifest.get('z_fastq_native', '')}"
+    zfastq = f"- **z-fastq:** {manifest.get('z_fastq', '')}"
     if manifest.get("z_fastq_bytes"):
-        isa += f" ({int(manifest['z_fastq_bytes']):,} bytes)"
-    if manifest.get("z_fastq_native_bytes"):
-        native += f" ({int(manifest['z_fastq_native_bytes']):,} bytes)"
+        zfastq += f" ({int(manifest['z_fastq_bytes']):,} bytes)"
     return join(
         [
             f"- **Timestamp:** `{manifest.get('timestamp', '')}`",
             f"- **Runner:** zebrac, warm page cache, runs={manifest.get('runs')}, warmup={manifest.get('warmup')}, duration_ms={manifest.get('duration_ms')}",
             f"- **Catalog set:** {manifest.get('real_set')}",
             f"- **zebrac:** {manifest.get('zebrac', '')}",
-            isa,
-            native,
+            zfastq,
             "",
             "**Peer versions**",
             "",
@@ -1353,7 +1342,7 @@ def md_perf_section(
         bullets = figure_bullets or [
             "Facets: wall time (log y) | peak RSS (linear) | minor page faults (log y).",
             "X-axis: catalog mate pair. Two files are one workload.",
-            "Gold bars are z-fastq ISA-L. Hatched bars are descriptive interleavers with different validation or output contracts.",
+            "Gold bars are z-fastq. Hatched bars are descriptive interleavers with different validation or output contracts.",
         ]
         blocks = [
             f"## {title}",
@@ -1364,7 +1353,7 @@ def md_perf_section(
                 work,
                 present,
                 heading="Wall time",
-                intro="Zebrac mean wall time for one interleave process. Vertical annotations are wall time relative to z-fastq ISA-L, including hatched descriptive lanes. Hatched ratios are not a ranking.",
+                intro="Zebrac mean wall time for one interleave process. Vertical annotations are wall time relative to z-fastq, including hatched descriptive lanes. Hatched ratios are not a ranking.",
                 value_col="mean",
                 formatter=fmt_wall,
                 nums=nums,
@@ -1425,8 +1414,8 @@ def md_perf_section(
                     "Color = tool. One catalog mate pair."
                     if len(workload_ids) == 1
                     else "Color = tool. Shape and line dash = workload; the legend names the catalog mate pair.",
-                    "Curves are 1x/2x/4x/8x memory-seconds of that workload's z-fastq ISA-L lane. Gold 1x, gray 2x/4x/8x.",
-                    "Lower-left is better. Missing points are not treated as zero. BBTools is omitted (JVM RSS).",
+                    "Curves are 1x/2x/4x/8x memory-seconds of that workload's z-fastq lane. Gold 1x, gray 2x/4x/8x.",
+                    "Lower-left is better. Missing points are not treated as zero.",
                 ]
                 if len(workload_ids) == 1:
                     occupancy_eff_bullets = [
@@ -1444,20 +1433,20 @@ def md_perf_section(
                     [
                         "### Occupancy (50/50 wall and RSS)",
                         "",
-                        "Occupancy is mean wall time × peak RSS on the timed pair-interleave family. BBTools stays on the wall/RSS facets and is omitted here because its RSS is a JVM image. SeqFu interleave is a single process (threads share RSS) and is included. Occupancy is descriptive resource accounting, not a semantic-equivalence ranking.",
+                        "Occupancy is mean wall time × peak RSS on the timed pair-interleave family. SeqFu interleave is a single process (threads share RSS) and is included. Occupancy is descriptive resource accounting, not a semantic-equivalence ranking.",
                         "",
                         md_occupancy_tables(occupancy, scored, nums),
                         "",
                         md_figure_block(
                             nums,
                             f"results/figures/{occupancy_name}",
-                            "Peak RSS vs mean wall. Per-workload occupancy isocosts through z-fastq ISA-L.",
+                            "Peak RSS vs mean wall. Per-workload occupancy isocosts through z-fastq.",
                             occupancy_scatter_bullets,
                         ),
                         md_figure_block(
                             nums,
                             f"results/figures/{efficiency_name}",
-                            "Occupancy efficiency vs z-fastq ISA-L. Higher is better. 1.00 matches z-fastq memory-seconds.",
+                            "Occupancy efficiency vs z-fastq. Higher is better. 1.00 matches z-fastq memory-seconds.",
                             occupancy_eff_bullets,
                         ),
                     ]
@@ -1543,12 +1532,12 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
     pair_bullets_plain = [
         "Facets: wall time (log y) | peak RSS (linear) | minor page faults (log y).",
         "X-axis: catalog mate pair. Two files are one workload. Occupancy follows this family.",
-        "Gold bars are z-fastq ISA-L. Hatched bars are descriptive interleavers. seqtk `mergepe` is the screened exact layout reference and is not hatched. BBTools JVM RSS dominates the memory facet; occupancy omits it.",
+        "Gold bars are z-fastq. Hatched bars are descriptive interleavers. seqtk `mergepe` is the screened exact layout reference and is not hatched.",
     ]
     pair_bullets_gzip = [
         "Facets: wall time (log y) | peak RSS (linear) | minor page faults (log y).",
         "X-axis: catalog mate pair. Two files are one workload. Occupancy follows this family.",
-        "Gold bars are z-fastq ISA-L. Amber bars are native inflate. Hatched bars are descriptive interleavers. seqtk `mergepe` is the screened exact layout reference and is not hatched. BBTools JVM RSS dominates the memory facet; occupancy omits it.",
+        "Gold bars are z-fastq. Hatched bars are descriptive interleavers. seqtk `mergepe` is the screened exact layout reference and is not hatched.",
     ]
 
     if plain is not None and not plain.empty:
@@ -1579,14 +1568,14 @@ def generate(results_dir: Path, allow_incomplete: bool) -> None:
                 gzip,
                 title="Performance: pair interleave (gzip)",
                 intro=(
-                    "The same catalog mate pair as the plain section. Gold is z-fastq ISA-L; amber is native Zig inflate. "
+                    "The same catalog mate pair as the plain section. Gold is z-fastq. "
                     "Decoded FASTQ MiB/s uses the sum of uncompressed sibling sizes divided by wall time. "
                     "IRMA Core gzip is timed: layout zip, not a sampler RNG."
                 ),
                 tools=GZIP_TOOLS,
                 fig_name="perf_gzip_pairs.png",
                 fig_title="Gzip pair interleave: wall, RSS, page faults",
-                fig_note=f"Error bars = zebrac standard deviation (n={run_count}). Amber = native inflate. Hatched = descriptive interleavers.",
+                fig_note=f"Error bars = zebrac standard deviation (n={run_count}). Hatched = descriptive interleavers.",
                 roles=FAMILY_ROLES["pairs"],
                 include_throughput=True,
                 include_occupancy=True,
