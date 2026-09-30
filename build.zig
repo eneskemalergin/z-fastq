@@ -74,6 +74,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .single_threaded = true,
             .strip = strip,
+            // Stripped builds print no stack traces, so their unwind tables would go unused.
+            .unwind_tables = if (strip) .none else null,
         }),
     });
     exe.root_module.addOptions("build_options", build_options);
