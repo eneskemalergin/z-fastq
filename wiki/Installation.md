@@ -8,7 +8,7 @@ The supported build is:
 - Zig `0.16.0`.
 - Network access for the first build, which downloads the pinned Zipir package.
 
-Release builds are static. gzip input is decoded by [Zipir](https://github.com/eneskemalergin/zipir), a Zig package that `build.zig.zon` pins to its `v0.2.0` release archive and package hash. The build needs no NASM, C compiler, or system zlib.
+Release builds are static. gzip input is decoded by [Zipir](https://github.com/eneskemalergin/zipir), a Zig package that `build.zig.zon` pins to its `v0.2.1` release archive and package hash. The build needs no NASM, C compiler, or system zlib.
 
 ## Build a release binary
 

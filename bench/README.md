@@ -65,11 +65,11 @@ Timed argv is the tool. Do not wrap in `bash -c` or a pipeline; that measures th
 
 ## Binaries
 
-Stripped Linux x86-64 sizes on 2026-09-15; the z-fastq row is from 2026-09-29, after gzip moved to Zipir and the release dropped unused networking code and unwind tables. Adapters are my wrappers, not upstream CLIs. BBTools is the retained class tree, not one ELF.
+Stripped Linux x86-64 sizes on 2026-09-15; the z-fastq row is from 2026-09-30, using Zipir 0.2.1 with unused networking code and unwind tables disabled. Adapters are my wrappers, not upstream CLIs. BBTools is the retained class tree, not one ELF.
 
 | Binary | Version | Bytes | This host |
 | ------ | ------- | ----: | --------- |
-| z-fastq | 0.0.18 | 544,256 | static |
+| z-fastq | 0.0.18 | 544,928 | static |
 | seqtk | 1.5-r133 | 77,600 | `libz`, `libm`, `libc` |
 | FastQValidator | 0.1.1a | 169,120 | `libz`, `libstdc++`, `libgcc_s`, `libm`, `libc` |
 | Needletail adapter | 0.7.3 | 425,896 | `libgcc_s`, `libc` |
@@ -117,7 +117,7 @@ Runtime shared libraries on this install, then what the build actually pulls in.
 
 | Binary | Runtime libs | Stack |
 | ------ | ------------ | ----- |
-| z-fastq | none | Zig std + Zipir 0.2.0 gzip (Zig package pinned by hash) |
+| z-fastq | none | Zig std + Zipir 0.2.1 gzip (Zig package pinned by hash) |
 | seqtk | `libz` | one C file |
 | FastQValidator | `libz`, libstdc++ | libStatGen |
 | Needletail adapter | libc, libgcc | 11 crates (`flate2`) |

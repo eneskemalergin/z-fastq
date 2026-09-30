@@ -75,17 +75,21 @@ test "[unit] - [root]: library version matches the manifest and retains its sent
 test "[property] - [gzip source]: optional member chains decode at every input chunk size" {
     const gzip_xx = GZIP_OPTIONAL_X ++ GZIP_OPTIONAL_X;
 
-    for (1..gzip_xx.len + 1) |chunk_len| {
-        var input_buffer: [10]u8 = undefined;
-        var input = FragmentReader.init(&gzip_xx, chunk_len, &input_buffer);
-        try std.testing.expectEqualSlices(u8, gzip_xx[0..2], try input.interface.peek(2));
-        var gzip = zfastq.io.gzip.ReaderSource.init(&input.interface);
-        const source = gzip.byteSource();
-        var output: [2]u8 = undefined;
+    for ([_]usize{ 0, 1, 2, 10, 16 }) |buffer_len| {
+        for (1..gzip_xx.len + 1) |chunk_len| {
+            var input_buffer: [16]u8 = undefined;
+            var input = FragmentReader.init(&gzip_xx, chunk_len, input_buffer[0..buffer_len]);
+            if (buffer_len >= 2) {
+                try std.testing.expectEqualSlices(u8, gzip_xx[0..2], try input.interface.peek(2));
+            }
+            var gzip = zfastq.io.gzip.ReaderSource.init(&input.interface);
+            const source = gzip.byteSource();
+            var output: [2]u8 = undefined;
 
-        try std.testing.expectEqual(@as(usize, 2), try source.read(&output));
-        try std.testing.expectEqualStrings("xx", &output);
-        try std.testing.expectEqual(@as(usize, 0), try source.read(&output));
+            try std.testing.expectEqual(@as(usize, 2), try source.read(&output));
+            try std.testing.expectEqualStrings("xx", &output);
+            try std.testing.expectEqual(@as(usize, 0), try source.read(&output));
+        }
     }
 }
 

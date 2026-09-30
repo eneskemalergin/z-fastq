@@ -39,7 +39,7 @@ The current CLI is single-threaded by design. That keeps one invocation easy to 
 
 The supported target is currently **Linux x86-64**. Native Windows and other targets are not supported yet.
 
-gzip input is decoded by [Zipir](https://github.com/eneskemalergin/zipir) 0.2.0, a Zig package pinned by hash in `build.zig.zon`. Building needs only Zig: no NASM, C compiler, or system zlib. The first build downloads the pinned Zipir release; later builds reuse the downloaded package.
+gzip input is decoded by [Zipir](https://github.com/eneskemalergin/zipir) 0.2.1, a Zig package pinned by hash in `build.zig.zon`. Building needs only Zig: no NASM, C compiler, or system zlib. The first build downloads the pinned Zipir release; later builds reuse the downloaded package.
 
 The release path is intended to be static. More detailed format guarantees, limits, error codes, machine-readable output, and compatibility notes belong in the project documentation rather than this overview.
 
@@ -95,7 +95,7 @@ See the [project Wiki](https://github.com/eneskemalergin/z-fastq/wiki) for the e
 
 ## License
 
-The project license is still being selected. gzip decoding uses Zipir 0.2.0 under the [MIT license](https://github.com/eneskemalergin/zipir/blob/v0.2.0/LICENSE); include that notice with binary distributions.
+The project license is still being selected. gzip decoding uses Zipir 0.2.1 under the [MIT license](https://github.com/eneskemalergin/zipir/blob/v0.2.1/LICENSE); include that notice with binary distributions.
 
 ---
 

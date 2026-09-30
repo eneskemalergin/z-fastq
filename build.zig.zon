@@ -3,8 +3,8 @@
     .version = "0.0.18",
     .dependencies = .{
         .zipir = .{
-            .url = "https://github.com/eneskemalergin/zipir/releases/download/v0.2.0/zipir-0.2.0-source.tar.gz",
-            .hash = "zipir-0.2.0-_67xOUSfJQDZyLhBhFL0mmugOPwgjpeKrEpv5JS334aj",
+            .url = "https://github.com/eneskemalergin/zipir/releases/download/v0.2.1/zipir-0.2.1-source.tar.gz",
+            .hash = "zipir-0.2.1-_67xOQ3vJQDjpQJwgWVKo3sZr5JZrLKw17p3oBUUFGKm",
         },
     },
     .fingerprint = 0x87a2d3e31f4c5c5d,

@@ -13,7 +13,6 @@ pub const DEFAULT_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_READER_BUFFER_BYTES: usize = 256 * 1024;
 pub const COUNT_READ_BUFFER_BYTES: usize = DEFAULT_READER_BUFFER_BYTES;
 const GZIP_OPTIONAL_HEADER_BYTES_MAX: usize = 64 * 1024;
-const GZIP_MIN_INPUT_BUFFER_BYTES = 16;
 
 /// Copied pull interface whose adapter must remain at a stable address and outlive it.
 /// A read initializes the returned prefix and rejects a count beyond the destination.
@@ -204,10 +203,9 @@ fn fileSourceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
 // --- gzip input ---
 
 /// Streams and validates complete RFC 1952 member sequences from a borrowed reader.
-/// The reader needs at least ten buffer bytes and must share this adapter's stable lifetime.
+/// The reader accepts any buffer size and must share this adapter's stable lifetime.
 pub const GzipSource = struct {
     input: *std.Io.Reader,
-    small_input: SmallInput = undefined,
     decoder: zipir.gzip.Decompressor = undefined,
     started: bool = false,
 
@@ -224,39 +222,10 @@ pub const GzipSource = struct {
 
     fn decoded(self: *GzipSource) *std.Io.Reader {
         if (!self.started) {
-            const input = if (self.input.buffer.len < GZIP_MIN_INPUT_BUFFER_BYTES) input: {
-                self.small_input.init(self.input);
-                break :input &self.small_input.interface;
-            } else self.input;
-            self.decoder.init(input, .{ .max_header_bytes = GZIP_OPTIONAL_HEADER_BYTES_MAX });
+            self.decoder.init(self.input, .{ .max_header_bytes = GZIP_OPTIONAL_HEADER_BYTES_MAX });
             self.started = true;
         }
         return &self.decoder.reader;
-    }
-};
-
-const SmallInput = struct {
-    interface: std.Io.Reader,
-    inner: *std.Io.Reader,
-    buffer: [GZIP_MIN_INPUT_BUFFER_BYTES]u8,
-
-    fn init(self: *SmallInput, inner: *std.Io.Reader) void {
-        self.inner = inner;
-        self.interface = .{
-            .vtable = &.{ .stream = stream },
-            .buffer = &self.buffer,
-            .seek = 0,
-            .end = 0,
-        };
-    }
-
-    fn stream(
-        r: *std.Io.Reader,
-        w: *std.Io.Writer,
-        limit: std.Io.Limit,
-    ) std.Io.Reader.StreamError!usize {
-        const self: *SmallInput = @alignCast(@fieldParentPtr("interface", r));
-        return self.inner.stream(w, limit);
     }
 };
 
