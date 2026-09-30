@@ -2477,8 +2477,10 @@ fn sampleExactFile(
 ) error{WriteFailed}!?CommandFailure {
     var selector = sampling.ExactSelector.init(count, options.seed);
     defer selector.deinit(allocator);
+    // Both passes reuse this storage, so their read buffers touch the same stack pages.
+    var input: RecordInput = undefined;
 
-    const first = sampleExactFirstPass(io, allocator, path, &selector, options);
+    const first = sampleExactFirstPass(io, allocator, &input, path, &selector, options);
     const completed = switch (first) {
         .failure => |failure| return failure,
         .success => |success| success,
@@ -2489,6 +2491,7 @@ fn sampleExactFile(
             true,
             io,
             allocator,
+            &input,
             path,
             writer,
             .empty,
@@ -2500,6 +2503,7 @@ fn sampleExactFile(
             false,
             io,
             allocator,
+            &input,
             path,
             writer,
             indexes,
@@ -2513,12 +2517,12 @@ fn sampleExactFile(
 fn sampleExactFirstPass(
     io: std.Io,
     allocator: std.mem.Allocator,
+    input: *RecordInput,
     path: []const u8,
     selector: *sampling.ExactSelector,
     options: SampleOptions,
 ) ExactFirstPass {
-    var input: RecordInput = undefined;
-    const initial = switch (initExactInput(&input, io, path, null, options.output_identity)) {
+    const initial = switch (initExactInput(input, io, path, null, options.output_identity)) {
         .failure => |failure| return .{ .failure = failure },
         .success => |snapshot| snapshot,
     };
@@ -2552,7 +2556,7 @@ fn sampleExactFirstPass(
         }
     }
 
-    if (exactInputSnapshotFailure(&input, io, initial)) |snapshot_failure| {
+    if (exactInputSnapshotFailure(input, io, initial)) |snapshot_failure| {
         return .{ .failure = snapshot_failure };
     }
     if (failure) |details| return .{ .failure = details };
@@ -2575,6 +2579,7 @@ fn sampleExactSecondPass(
     comptime select_all: bool,
     io: std.Io,
     allocator: std.mem.Allocator,
+    input: *RecordInput,
     path: []const u8,
     writer: *zfastq.Writer,
     selected: sampling.ExactIndexes,
@@ -2582,8 +2587,7 @@ fn sampleExactSecondPass(
     expected_count: u64,
     options: SampleOptions,
 ) error{WriteFailed}!?CommandFailure {
-    var input: RecordInput = undefined;
-    switch (initExactInput(&input, io, path, expected_snapshot, options.output_identity)) {
+    switch (initExactInput(input, io, path, expected_snapshot, options.output_identity)) {
         .failure => |failure| return failure,
         .success => {},
     }
@@ -2635,7 +2639,7 @@ fn sampleExactSecondPass(
         }
     }
 
-    if (exactInputSnapshotFailure(&input, io, expected_snapshot)) |snapshot_failure| {
+    if (exactInputSnapshotFailure(input, io, expected_snapshot)) |snapshot_failure| {
         return snapshot_failure;
     }
     if (failure) |details| return details;
@@ -2700,8 +2704,17 @@ fn sampleExactPairs(
 ) error{WriteFailed}!?PairCommandFailure {
     var selector = sampling.ExactSelector.init(count, options.seed);
     defer selector.deinit(allocator);
+    // Both passes reuse this storage, so their read buffers touch the same stack pages.
+    var record_inputs: [2]RecordInput = undefined;
 
-    const first = sampleExactPairFirstPass(io, allocator, inputs, &selector, options);
+    const first = sampleExactPairFirstPass(
+        io,
+        allocator,
+        &record_inputs,
+        inputs,
+        &selector,
+        options,
+    );
     const completed = switch (first) {
         .failure => |failure| return failure,
         .success => |success| success,
@@ -2712,6 +2725,7 @@ fn sampleExactPairs(
             true,
             io,
             allocator,
+            &record_inputs,
             inputs,
             writer,
             .empty,
@@ -2724,6 +2738,7 @@ fn sampleExactPairs(
             false,
             io,
             allocator,
+            &record_inputs,
             inputs,
             writer,
             indexes,
@@ -2738,6 +2753,7 @@ fn sampleExactPairs(
 fn sampleExactPairFirstPass(
     io: std.Io,
     allocator: std.mem.Allocator,
+    record_inputs: *[2]RecordInput,
     inputs: []const []const u8,
     selector: *sampling.ExactSelector,
     options: SampleOptions,
@@ -2753,6 +2769,7 @@ fn sampleExactPairFirstPass(
         .paired => sampleExactPairedFirstPass(
             io,
             allocator,
+            record_inputs,
             inputs,
             selector,
             pair_options,
@@ -2761,6 +2778,7 @@ fn sampleExactPairFirstPass(
         .interleaved => sampleExactInterleavedFirstPass(
             io,
             allocator,
+            &record_inputs[0],
             inputs[0],
             selector,
             pair_options,
@@ -2772,14 +2790,22 @@ fn sampleExactPairFirstPass(
 fn sampleExactPairedFirstPass(
     io: std.Io,
     allocator: std.mem.Allocator,
+    record_inputs: *[2]RecordInput,
     inputs: []const []const u8,
     selector: *sampling.ExactSelector,
     options: PairedCheckOptions,
     output_identity: ?FileIdentity,
 ) ExactPairFirstPass {
-    var input1: RecordInput = undefined;
-    var input2: RecordInput = undefined;
-    const snapshots = switch (initExactPairedInputs(&input1, &input2, io, inputs, null, output_identity)) {
+    const input1 = &record_inputs[0];
+    const input2 = &record_inputs[1];
+    const snapshots = switch (initExactPairedInputs(
+        input1,
+        input2,
+        io,
+        inputs,
+        null,
+        output_identity,
+    )) {
         .failure => |failure| return .{ .failure = failure },
         .success => |snapshots| snapshots,
     };
@@ -2793,10 +2819,10 @@ fn sampleExactPairedFirstPass(
         options,
         selector,
     );
-    if (exactPairSnapshotFailure(&input1, io, snapshots[0], 0)) |changed| {
+    if (exactPairSnapshotFailure(input1, io, snapshots[0], 0)) |changed| {
         return .{ .failure = changed };
     }
-    if (exactPairSnapshotFailure(&input2, io, snapshots[1], 1)) |changed| {
+    if (exactPairSnapshotFailure(input2, io, snapshots[1], 1)) |changed| {
         return .{ .failure = changed };
     }
     if (failure) |details| return .{ .failure = details };
@@ -2808,13 +2834,13 @@ fn sampleExactPairedFirstPass(
 fn sampleExactInterleavedFirstPass(
     io: std.Io,
     allocator: std.mem.Allocator,
+    input: *RecordInput,
     path: []const u8,
     selector: *sampling.ExactSelector,
     options: PairedCheckOptions,
     output_identity: ?FileIdentity,
 ) ExactPairFirstPass {
-    var input: RecordInput = undefined;
-    const snapshot = switch (initExactInput(&input, io, path, null, output_identity)) {
+    const snapshot = switch (initExactInput(input, io, path, null, output_identity)) {
         .failure => |failure| return .{ .failure = pairCommandFailure(0, failure) },
         .success => |captured| captured,
     };
@@ -2826,7 +2852,7 @@ fn sampleExactInterleavedFirstPass(
         options,
         selector,
     );
-    if (exactPairSnapshotFailure(&input, io, snapshot, 0)) |changed| {
+    if (exactPairSnapshotFailure(input, io, snapshot, 0)) |changed| {
         return .{ .failure = changed };
     }
     if (failure) |details| return .{ .failure = details };
@@ -2839,6 +2865,7 @@ fn sampleExactPairSecondPass(
     select_all: bool,
     io: std.Io,
     allocator: std.mem.Allocator,
+    record_inputs: *[2]RecordInput,
     inputs: []const []const u8,
     writer: *zfastq.Writer,
     indexes: sampling.ExactIndexes,
@@ -2852,6 +2879,7 @@ fn sampleExactPairSecondPass(
             select_all,
             io,
             allocator,
+            record_inputs,
             inputs,
             writer,
             indexes,
@@ -2863,6 +2891,7 @@ fn sampleExactPairSecondPass(
             select_all,
             io,
             allocator,
+            &record_inputs[0],
             inputs[0],
             writer,
             indexes,
@@ -2878,6 +2907,7 @@ fn sampleExactPairedSecondPass(
     select_all: bool,
     io: std.Io,
     allocator: std.mem.Allocator,
+    record_inputs: *[2]RecordInput,
     inputs: []const []const u8,
     writer: *zfastq.Writer,
     indexes: sampling.ExactIndexes,
@@ -2885,9 +2915,9 @@ fn sampleExactPairedSecondPass(
     expected_count: u64,
     options: SampleOptions,
 ) error{WriteFailed}!?PairCommandFailure {
-    var input1: RecordInput = undefined;
-    var input2: RecordInput = undefined;
-    switch (initExactPairedInputs(&input1, &input2, io, inputs, snapshots, options.output_identity)) {
+    const input1 = &record_inputs[0];
+    const input2 = &record_inputs[1];
+    switch (initExactPairedInputs(input1, input2, io, inputs, snapshots, options.output_identity)) {
         .failure => |failure| return failure,
         .success => {},
     }
@@ -3005,8 +3035,8 @@ fn sampleExactPairedSecondPass(
             }
         }
     }
-    if (exactPairSnapshotFailure(&input1, io, snapshots[0], 0)) |changed| return changed;
-    if (exactPairSnapshotFailure(&input2, io, snapshots[1], 1)) |changed| return changed;
+    if (exactPairSnapshotFailure(input1, io, snapshots[0], 0)) |changed| return changed;
+    if (exactPairSnapshotFailure(input2, io, snapshots[1], 1)) |changed| return changed;
     if (failure) |details| return details;
     if (cursor.unit_count != expected_count or !cursor.selectionComplete()) {
         return inputChangedPairFailure(0);
@@ -3018,6 +3048,7 @@ fn sampleExactInterleavedSecondPass(
     select_all: bool,
     io: std.Io,
     allocator: std.mem.Allocator,
+    input: *RecordInput,
     path: []const u8,
     writer: *zfastq.Writer,
     indexes: sampling.ExactIndexes,
@@ -3026,8 +3057,7 @@ fn sampleExactInterleavedSecondPass(
     staging_limit: usize,
     options: SampleOptions,
 ) error{WriteFailed}!?PairCommandFailure {
-    var input: RecordInput = undefined;
-    switch (initExactInput(&input, io, path, snapshot, options.output_identity)) {
+    switch (initExactInput(input, io, path, snapshot, options.output_identity)) {
         .failure => |failure| return pairCommandFailure(0, failure),
         .success => {},
     }
@@ -3158,7 +3188,7 @@ fn sampleExactInterleavedSecondPass(
             if (failure == null) failure = inputChangedPairFailure(0);
         }
     }
-    if (exactPairSnapshotFailure(&input, io, snapshot, 0)) |changed| return changed;
+    if (exactPairSnapshotFailure(input, io, snapshot, 0)) |changed| return changed;
     if (failure) |details| return details;
     if (cursor.unit_count != expected_count or !cursor.selectionComplete()) {
         return inputChangedPairFailure(0);
@@ -4457,6 +4487,7 @@ test "[unit] - [exact sample]: every retained file-change signal is compared" {
 }
 
 test "[failure] - [exact sample]: selection allocation failure precedes later block format error" {
+    var record_inputs: [2]RecordInput = undefined;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4478,13 +4509,20 @@ test "[failure] - [exact sample]: selection allocation failure precedes later bl
         .fail_index = 0,
     });
 
-    const result = sampleExactFirstPass(io, failing.allocator(), path, &selector, .{
-        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-        .alphabet = .iupac,
-        .fraction = null,
-        .count = 1,
-        .seed = 11,
-    });
+    const result = sampleExactFirstPass(
+        io,
+        failing.allocator(),
+        &record_inputs[0],
+        path,
+        &selector,
+        .{
+            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+            .alphabet = .iupac,
+            .fraction = null,
+            .count = 1,
+            .seed = 11,
+        },
+    );
     const failure = switch (result) {
         .success => return error.ExpectedFailure,
         .failure => |failure| failure,
@@ -4496,6 +4534,7 @@ test "[failure] - [exact sample]: selection allocation failure precedes later bl
 }
 
 test "[failure] - [exact sample]: final record-count change keeps a valid prefix" {
+    var record_inputs: [2]RecordInput = undefined;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4520,6 +4559,7 @@ test "[failure] - [exact sample]: final record-count change keeps a valid prefix
         false,
         io,
         std.testing.allocator,
+        &record_inputs[0],
         path,
         &writer,
         .{ .low_words = &.{1}, .middle_bytes = &.{0} },
@@ -4540,6 +4580,7 @@ test "[failure] - [exact sample]: final record-count change keeps a valid prefix
 }
 
 test "[failure] - [exact sample]: changed metadata stops the second pass before output" {
+    var record_inputs: [2]RecordInput = undefined;
     const io = std.testing.io;
     const path = "tests/data/synthetic/basic_valid.fastq";
     var snapshot = try snapshotTestFile(io, path);
@@ -4552,6 +4593,7 @@ test "[failure] - [exact sample]: changed metadata stops the second pass before 
         false,
         io,
         std.testing.allocator,
+        &record_inputs[0],
         path,
         &writer,
         .{ .low_words = &.{1}, .middle_bytes = &.{0} },
@@ -4649,6 +4691,7 @@ fn writeExactTestInput(
 }
 
 test "[integration] - [exact sample]: selected records are revalidated after metadata-preserving changes" {
+    var record_inputs: [2]RecordInput = undefined;
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4690,7 +4733,14 @@ test "[integration] - [exact sample]: selected records are revalidated after met
                 };
                 var selector = sampling.ExactSelector.init(options.count.?, options.seed);
                 defer selector.deinit(allocator);
-                const first = sampleExactFirstPass(io, allocator, path, &selector, options);
+                const first = sampleExactFirstPass(
+                    io,
+                    allocator,
+                    &record_inputs[0],
+                    path,
+                    &selector,
+                    options,
+                );
                 try std.testing.expect(first == .success);
                 try std.testing.expectEqual(@as(u64, 2), selector.record_count);
                 const snapshot = first.success.snapshot;
@@ -4704,6 +4754,7 @@ test "[integration] - [exact sample]: selected records are revalidated after met
                     selection == .all,
                     io,
                     allocator,
+                    &record_inputs[0],
                     path,
                     &writer,
                     if (selection == .all) .empty else .{
@@ -4733,6 +4784,7 @@ test "[integration] - [exact sample]: selected records are revalidated after met
 }
 
 test "[integration] - [paired exact sample]: selected pairs are revalidated after metadata-preserving changes" {
+    var record_inputs: [2]RecordInput = undefined;
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4820,7 +4872,14 @@ test "[integration] - [paired exact sample]: selected pairs are revalidated afte
                     }
                     var selector = sampling.ExactSelector.init(options.count.?, options.seed);
                     defer selector.deinit(allocator);
-                    const first = sampleExactPairFirstPass(io, allocator, inputs, &selector, options);
+                    const first = sampleExactPairFirstPass(
+                        io,
+                        allocator,
+                        &record_inputs,
+                        inputs,
+                        &selector,
+                        options,
+                    );
                     try std.testing.expect(first == .success);
                     try std.testing.expectEqual(@as(u64, 2), selector.record_count);
                     const snapshots = first.success.snapshots;
@@ -4844,6 +4903,7 @@ test "[integration] - [paired exact sample]: selected pairs are revalidated afte
                         selection == .all,
                         io,
                         allocator,
+                        &record_inputs,
                         inputs,
                         &writer,
                         if (selection == .all) .empty else .{
@@ -4881,6 +4941,7 @@ test "[integration] - [paired exact sample]: selected pairs are revalidated afte
 }
 
 test "[integration] - [interleaved exact sample]: revalidation survives mate storage changes and output failures" {
+    var record_inputs: [2]RecordInput = undefined;
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4966,7 +5027,14 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
         try writeExactTestInput(io, path, input.items, false, null);
         var selector = sampling.ExactSelector.init(2, options.seed);
         defer selector.deinit(allocator);
-        const first = sampleExactPairFirstPass(io, allocator, &.{path}, &selector, options);
+        const first = sampleExactPairFirstPass(
+            io,
+            allocator,
+            &record_inputs,
+            &.{path},
+            &selector,
+            options,
+        );
         try std.testing.expect(first == .success);
         try std.testing.expectEqual(@as(u64, 2), selector.record_count);
         const snapshot = first.success.snapshots.interleaved;
@@ -5001,6 +5069,7 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
                     select_all,
                     io,
                     allocator,
+                    &record_inputs[0],
                     path,
                     &writer,
                     if (select_all) .empty else .{ .low_words = &.{2}, .middle_bytes = &.{0} },
@@ -5035,6 +5104,7 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
 }
 
 test "[integration] - [interleaved exact sample]: preserves the first mate parse failure" {
+    var record_inputs: [2]RecordInput = undefined;
     const SnapshotChangingSink = struct {
         inner: io_layer.SliceSink,
         path: []const u8,
@@ -5094,6 +5164,7 @@ test "[integration] - [interleaved exact sample]: preserves the first mate parse
                 select_all,
                 io,
                 allocator,
+                &record_inputs[0],
                 path,
                 &writer,
                 if (select_all) .empty else .{ .low_words = &.{2}, .middle_bytes = &.{0} },
@@ -5126,6 +5197,7 @@ test "[integration] - [interleaved exact sample]: preserves the first mate parse
 }
 
 test "[failure] - [paired exact sample]: each input snapshot is checked independently" {
+    var record_inputs: [2]RecordInput = undefined;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5178,6 +5250,7 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
             true,
             io,
             std.testing.allocator,
+            &record_inputs,
             &inputs,
             &writer,
             .empty,
@@ -5203,6 +5276,7 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
         true,
         io,
         std.testing.allocator,
+        &record_inputs[0],
         pairs_path,
         &writer,
         .empty,
@@ -5227,6 +5301,7 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
 }
 
 test "[integration] - [paired exact sample]: the output pass checks structure and count" {
+    var record_inputs: [2]RecordInput = undefined;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5271,6 +5346,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         true,
         io,
         std.testing.allocator,
+        &record_inputs,
         &inputs,
         &paired_writer,
         .empty,
@@ -5297,6 +5373,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         true,
         io,
         std.testing.allocator,
+        &record_inputs[0],
         pairs_path,
         &interleaved_writer,
         .empty,
@@ -5332,6 +5409,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         true,
         io,
         std.testing.allocator,
+        &record_inputs,
         &inputs,
         &structural_writer,
         .empty,
@@ -5527,6 +5605,7 @@ test "[integration] - [paired inputs]: identity follows open descriptors after p
 }
 
 test "[integration] - [output aliases]: rejection closes inputs on both exact passes" {
+    var record_inputs: [2]RecordInput = undefined;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5569,10 +5648,33 @@ test "[integration] - [output aliases]: rejection closes inputs on both exact pa
             .seed = 11,
             .output_identity = identities[0],
         };
-        const single_failure = (try sampleExactSecondPass(true, io, allocator, paths[0], &writer, .empty, snapshots[0], 1, options)).?;
+        const single_failure = (try sampleExactSecondPass(
+            true,
+            io,
+            allocator,
+            &record_inputs[0],
+            paths[0],
+            &writer,
+            .empty,
+            snapshots[0],
+            1,
+            options,
+        )).?;
         try std.testing.expectEqualStrings("input_changed", single_failure.code);
         try std.testing.expectEqual(@as(u8, 3), single_failure.exit_code);
-        const interleaved_failure = (try sampleExactInterleavedSecondPass(true, io, allocator, paths[0], &writer, .empty, snapshots[0], 1, try recordStagingLimit(options.max_line_bytes), options)).?;
+        const interleaved_failure = (try sampleExactInterleavedSecondPass(
+            true,
+            io,
+            allocator,
+            &record_inputs[0],
+            paths[0],
+            &writer,
+            .empty,
+            snapshots[0],
+            1,
+            try recordStagingLimit(options.max_line_bytes),
+            options,
+        )).?;
         try std.testing.expectEqualStrings("input_changed", interleaved_failure.command.details.code);
         try std.testing.expectEqual(@as(u8, 3), interleaved_failure.exitCode());
         try std.testing.expectEqual(descriptors, try openDescriptorCount());
@@ -5582,7 +5684,18 @@ test "[integration] - [output aliases]: rejection closes inputs on both exact pa
             try std.testing.expectEqualStrings("same_output", paired_stream.command.details.code);
             try std.testing.expectEqual(@as(u1, @intCast(side)), paired_stream.command.input_index);
             try std.testing.expectEqual(descriptors, try openDescriptorCount());
-            const paired_failure = (try sampleExactPairedSecondPass(true, io, allocator, &paths, &writer, .empty, snapshots, 1, options)).?;
+            const paired_failure = (try sampleExactPairedSecondPass(
+                true,
+                io,
+                allocator,
+                &record_inputs,
+                &paths,
+                &writer,
+                .empty,
+                snapshots,
+                1,
+                options,
+            )).?;
             try std.testing.expectEqualStrings("input_changed", paired_failure.command.details.code);
             try std.testing.expectEqual(@as(u8, 3), paired_failure.exitCode());
             try std.testing.expectEqual(@as(u1, @intCast(side)), paired_failure.command.input_index);
