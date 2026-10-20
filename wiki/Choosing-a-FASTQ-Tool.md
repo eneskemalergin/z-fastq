@@ -1,6 +1,6 @@
 # Choosing a FASTQ tool
 
-No single FASTQ program is the right fit for every job. I think about the choice in terms of the work a pipeline needs, not a general claim that one tool is always faster.
+No single FASTQ program is the right fit for every job. I think about the choice in terms of the work a workflow needs, not a general claim that one tool is always faster.
 
 ## Use z-fastq when
 
@@ -19,7 +19,7 @@ z-fastq is intentionally narrower than a general sequence manipulation suite. It
 
 ## Use SeqKit when
 
-[SeqKit](https://github.com/shenwei356/seqkit) is a better fit for a broad FASTA/Q toolbox with many subcommands, more compression formats, configurable threading, sequence searches, conversions, and larger workflow coverage. Its documentation is correspondingly broader. z-fastq does not try to reproduce that surface.
+[SeqKit](https://github.com/shenwei356/seqkit) is a better fit for a broad FASTA/Q toolbox with many subcommands, more compression formats, configurable threading, sequence searches, conversions, and larger workflow coverage. Its documentation is correspondingly broader. z-fastq does not try to reproduce that command set.
 
 ## Use fastp when
 

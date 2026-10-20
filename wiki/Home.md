@@ -23,7 +23,7 @@ Follow [Getting started](Getting-Started) for a small end-to-end run. It creates
 - [Convert between two-file and interleaved pairs](Interleaving).
 - [Use gzip, pipes, and output streams correctly](Input-and-Output).
 - [Integrate results into a script](Automation).
-- [Compare z-fastq's scope with other FASTQ tools](Choosing-a-FASTQ-Tool).
+- [Compare what z-fastq does with other FASTQ tools](Choosing-a-FASTQ-Tool).
 - [Recover from a failure](Troubleshooting).
 - [Use the Zig API](Zig-Library).
 

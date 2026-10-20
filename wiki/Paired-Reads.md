@@ -29,6 +29,7 @@ The policy:
 3. Checks a leading `1:` or `2:` marker in the next token when present.
 4. Checks a terminal `/1` or `/2` marker in that next token when present.
 5. Requires the normalized identifiers to match.
+6. When both headers carry markers, requires R1 to be mate 1 and R2 to be mate 2. Reversed markers are rejected.
 
 These headers match under the default policy:
 

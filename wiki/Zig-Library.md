@@ -16,8 +16,8 @@ The repository's `build.zig` registers the module from `src/root.zig`.
 
 The root module exports:
 
-- `Record` and `OwnedRecord`.
-- `Reader`, `RecordOffsets`, `Writer`, and their error types.
+- `Record`, `OwnedRecord`, and `toOwned`.
+- `Reader`, `RecordOffsets`, `Writer`, and their error types, including `ParseError`.
 - `LintCode`, `codeTag`, `Alphabet`, and `ValidationOptions`.
 - `SemanticField`, `SemanticError`, and `validateRecord`.
 - `Stats`, `StatsResult`, `StatsError`, `QualityError`, and `decodePhred33`.
@@ -25,6 +25,8 @@ The root module exports:
 - Plain slice, reader, file, writer, and sink adapters.
 - A gzip reader-source adapter.
 - The allocation-free `count_scan` module.
+- `limits` (also reachable as `io.limits`) with the default line limit and buffer sizes.
+- `VERSION`, the package version string.
 
 The CLI's option parsing, pair-name orchestration, sampling selectors, JSON serialization, and deinterleave file policy remain executable code. They are not all part of the root library API.
 
@@ -46,7 +48,7 @@ This distinction is central to the module. Borrowed records keep streaming work 
 
 ## Reader and I/O behavior
 
-The reader consumes a `ByteSource`, exposes record offsets, and enforces the configured line limit. The I/O adapters keep path and stream ownership outside the FASTQ record types. The gzip adapter validates gzip framing while reading through its backing source.
+The reader consumes a `ByteSource`, exposes record offsets, and enforces the configured line limit. The caller opens and closes paths and streams; the I/O adapters only borrow them, so the FASTQ record types never handle files. The gzip adapter validates gzip framing while reading through its backing source.
 
 ## Compatibility
 

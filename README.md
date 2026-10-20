@@ -10,7 +10,7 @@
   <a href="https://github.com/eneskemalergin/z-fastq/releases"><img src="https://img.shields.io/badge/version-v0.0.18-2563eb?style=flat-square" alt="Version v0.0.18"></a>
   <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
   <img src="https://img.shields.io/badge/platform-Linux%20x86--64-64748b?style=flat-square" alt="Supported platform: Linux x86-64">
-  <img src="https://img.shields.io/badge/license-not%20selected-94a3b8?style=flat-square" alt="License not selected yet">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT License"></a>
 </p>
 
 ---
@@ -41,7 +41,7 @@ The supported target is currently **Linux x86-64**. Native Windows and other tar
 
 gzip input is decoded by [Zipir](https://github.com/eneskemalergin/zipir) 0.2.1, a Zig package pinned by hash in `build.zig.zon`. Building needs only Zig: no NASM, C compiler, or system zlib. The first build downloads the pinned Zipir release; later builds reuse the downloaded package.
 
-The release path is intended to be static. More detailed format guarantees, limits, error codes, machine-readable output, and compatibility notes belong in the project documentation rather than this overview.
+ReleaseSafe and ReleaseFast builds are static. More detailed format guarantees, limits, error codes, machine-readable output, and compatibility notes belong in the project documentation rather than this overview.
 
 ## Start
 
@@ -68,14 +68,12 @@ Use `z-fastq --help` for the complete command and option reference.
 
 ## Commands
 
-| Command        | Purpose                                                    |
-| -------------- | ---------------------------------------------------------- |
-| `count`        | Count successfully parsed records.                         |
-| `stats`        | Report lengths, composition, GC, and quality metrics.      |
-| `check`        | Validate FASTQ structure, symbols, qualities, and pairing. |
-| `sample`       | Select records or read pairs by fraction or exact count.   |
-| `interleave`   | Combine R1 and R2 into a validated interleaved stream.     |
-| `deinterleave` | Split validated interleaved reads into two output files.   |
+- `count`: count successfully parsed records.
+- `stats`: report lengths, composition, GC, and quality metrics.
+- `check`: validate FASTQ structure, symbols, qualities, and pairing.
+- `sample`: select records or read pairs by fraction or exact count.
+- `interleave`: combine R1 and R2 into a validated interleaved stream.
+- `deinterleave`: split validated interleaved reads into two output files.
 
 All commands report errors with non-zero exit status. Validation and parsing failures identify the affected record and source location where available.
 
@@ -95,7 +93,7 @@ See the [project Wiki](https://github.com/eneskemalergin/z-fastq/wiki) for the e
 
 ## License
 
-The project license is still being selected. gzip decoding uses Zipir 0.2.1 under the [MIT license](https://github.com/eneskemalergin/zipir/blob/v0.2.1/LICENSE); include that notice with binary distributions.
+z-fastq is released under the [MIT license](LICENSE). gzip decoding uses Zipir 0.2.1 under the [MIT license](https://github.com/eneskemalergin/zipir/blob/v0.2.1/LICENSE); include that notice with binary distributions.
 
 ---
 

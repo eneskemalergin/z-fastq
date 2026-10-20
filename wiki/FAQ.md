@@ -22,7 +22,7 @@ Phred+33 only. Quality bytes must be ASCII 33 through 126. Phred+64 is not suppo
 
 ## Why does `check` print nothing on success?
 
-It is designed to act as a validation gate. A zero exit status is the success result; diagnostics appear only when something fails.
+It is designed as a pass or fail step for scripts. A zero exit status is the success result; diagnostics appear only when something fails.
 
 ## Can I use stdin for exact-count sampling?
 

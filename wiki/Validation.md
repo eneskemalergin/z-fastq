@@ -6,13 +6,13 @@
 z-fastq check reads.fastq.gz
 ```
 
-A valid input produces no standard output and exits with status `0`. This is deliberate. It makes `check` useful as a gate in a shell workflow.
+A valid input produces no standard output and exits with status `0`. This is deliberate. It makes `check` useful as a pass or fail step in a shell workflow.
 
 ## Record rules
 
 Each record has four logical lines:
 
-1. A header beginning with `@`.
+1. A header beginning with `@`, followed immediately by an identifier: the byte after `@` must exist and must not be a space or tab.
 2. A sequence line.
 3. A plus line beginning with `+`.
 4. A quality line with the same byte length as the sequence.
@@ -37,11 +37,11 @@ The policy validates the input. It does not rewrite the sequence or change its c
 
 ## First failure and error codes
 
-z-fastq reports the first structural or semantic failure it encounters. The codes are stable labels for the current validation contract:
+z-fastq reports the first structural or semantic failure it encounters. The codes are stable labels for the current validation rules:
 
 - `S001`: The plus line does not begin with `+`.
 - `S002`: A sequence byte is outside the selected alphabet.
-- `S003`: The header does not begin with `@`.
+- `S003`: The header does not begin with `@` followed immediately by an identifier.
 - `S004`: The record ends before all four lines are present.
 - `S005`: Sequence and quality lengths differ.
 - `S006`: A quality byte is outside the Phred+33 range.
@@ -66,4 +66,4 @@ Read [Paired reads](Paired-Reads) before choosing a pair-name policy. Structural
 
 ## Validation is not repair
 
-`check` does not skip bad records, rewrite invalid quality bytes, repair names, or create a cleaned output. If you need a transformed file, first decide what the correction means for your data, then use a tool that owns that transformation explicitly.
+`check` does not skip bad records, rewrite invalid quality bytes, repair names, or create a cleaned output. If you need a transformed file, first decide what the correction means for your data, then use a tool built for that transformation.

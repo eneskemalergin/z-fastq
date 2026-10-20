@@ -8,16 +8,16 @@ Zebrac is Linux-only. Peers, adapters, zebrac, and report Python are under [`too
 
 ## Suites
 
-| Suite | Report | Compared fact |
-| ----- | ------ | ------------- |
-| [`count`](count/) | [REPORT.md](count/REPORT.md) | record count integer |
-| [`stats`](stats/) | [REPORT.md](stats/REPORT.md) | human stats block (lengths, ACGTN, GC, arithmetic Phred, Q20/Q30) |
-| [`check`](check/) | [REPORT.md](check/REPORT.md) | FASTQ structure, symbols, quality, and pair semantics |
-| [`sample`](sample/) | [REPORT.md](sample/REPORT.md) | source-ordered subset; exact `min(K,N)` or pair-complete fraction |
-| [`interleave`](interleave/) | [REPORT.md](interleave/REPORT.md) | validated pair-complete interleaved stdout in source order |
-| [`deinterleave`](deinterleave/) | [REPORT.md](deinterleave/REPORT.md) | validated pair-complete split into two files in source order |
+Each suite compares one fact across the timed commands:
 
-Each suite builds one ReleaseFast z-fastq binary at `zig-out/bin/z-fastq`.
+- [`count`](count/): the record count integer.
+- [`stats`](stats/): the human stats block (lengths, ACGTN, GC, arithmetic Phred, Q20/Q30).
+- [`check`](check/): FASTQ structure, symbols, quality, and pair rules.
+- [`sample`](sample/): a source-ordered subset, either exactly `min(K,N)` records or a pair-complete fraction.
+- [`interleave`](interleave/): validated pair-complete interleaved stdout in source order.
+- [`deinterleave`](deinterleave/): a validated pair-complete split into two files in source order.
+
+Each suite builds one ReleaseFast z-fastq binary at `zig-out/bin/z-fastq`. Its report step writes `REPORT.md` and `results/figures/` in the suite's folder.
 
 ## Run
 
@@ -57,54 +57,54 @@ Check `--small-real` uses the small SE, paired, Casava, slash-name, interleaved,
 
 Sample `--small-real` uses the small SE, paired, and interleaved rows, each timed as `--fraction 0.1` and `--count 1000` with seed 11. The showcase is four families so they are not one race: SE fraction, SE exact-count (occupancy on each, separately), pair-layout fraction, and pair-layout count. seqtk `sample` / `sample -2` is the screened SE exact reference (LF, nonempty, bare plus; not Dense named-plus). Descriptive timed peers are SeqKit, Rasusa, `fq subsample`, fqkit (exact SE only), and IRMA Core (plain SE and paired only). BBTools `reformat.sh` is disabled: its JVM used two to four cores even with `threads=1`. SeqKit RSS is the Go image and is omitted from occupancy. Fasten is not timed (stdin-only, no seed). IRMA gzip is probed and not timed: gzip and plain select different records. IRMA interleaved is not timed: one file is SE records, not pair units. File-writing peers sink to `/dev/null`.
 
-Interleave `--small-real` uses DenseSmall + PairSmallR2; publication uses PairR1 + PairR2. One family: two mate files → validated interleaved stdout. Casava names, slash names, and mixed gzip are fixtures, not a second race. seqtk `mergepe` is the screened exact layout reference (LF, nonempty, bare plus). Descriptive timed peers are SeqFu `interleave -c` (first-token check, not z-fastq illumina), fqkit `merge`, and IRMA Core `xleave` (gzip timed: layout zip, not a sampler RNG). BBTools `reformat.sh` is disabled: its JVM used two to four cores even with `threads=1`. SeqKit `pair` is not timed: two output files, not interleaved stdout. SeqFu interleave is one process and is included in occupancy.
+Interleave `--small-real` uses DenseSmall + PairSmallR2; publication uses PairR1 + PairR2. One family: two mate files to validated interleaved stdout. Casava names, slash names, and mixed gzip are fixtures, not a second race. seqtk `mergepe` is the screened exact layout reference (LF, nonempty, bare plus). Descriptive timed peers are SeqFu `interleave -c` (first-token check, not z-fastq illumina), fqkit `merge`, and IRMA Core `xleave` (gzip timed: layout zip, not a sampler RNG). BBTools `reformat.sh` is disabled: its JVM used two to four cores even with `threads=1`. SeqKit `pair` is not timed: two output files, not interleaved stdout. SeqFu interleave is one process and is included in occupancy.
 
-Deinterleave `--small-real` uses InterleavedSmall; publication uses Interleaved. One family: one interleaved file → two mate files. Casava names and slash names are fixtures, not a second race. seqtk `seq -l 0 -1`/`-2` is the screened positional layout reference (LF, nonempty, bare plus) and is not timed: two processes, odd/even records, no pair-name check. Descriptive timed peers are SeqFu `deinterleave -c` (`-c` did not reject slash or P001 here; unlike SeqFu interleave `-c` on slash), fqkit `split` (positional; odd extra R1 is unequal counts), and IRMA Core `xleave` (gzip timed: layout split; rejects P001 stem mismatch and odd count). BBTools `reformat.sh` and its fixture check are disabled: its JVM used two to four cores even with `threads=1`. SeqKit `split2` is not timed: size/parts, not R1/R2. z-fastq exclusive-create cannot reuse `/dev/null`; timed runs write two files to tmpfs and a companion reaper unlinks the known output names so zebrac can repeat the same argv. SeqFu deinterleave is one process and is included in occupancy.
+Deinterleave `--small-real` uses InterleavedSmall; publication uses Interleaved. One family: one interleaved file to two mate files. Casava names and slash names are fixtures, not a second race. seqtk `seq -l 0 -1`/`-2` is the screened positional layout reference (LF, nonempty, bare plus) and is not timed: two processes, odd/even records, no pair-name check. Descriptive timed peers are SeqFu `deinterleave -c` (`-c` did not reject slash or P001 here; unlike SeqFu interleave `-c` on slash), fqkit `split` (positional; odd extra R1 is unequal counts), and IRMA Core `xleave` (gzip timed: layout split; rejects P001 stem mismatch and odd count). BBTools `reformat.sh` and its fixture check are disabled: its JVM used two to four cores even with `threads=1`. SeqKit `split2` is not timed: size/parts, not R1/R2. z-fastq exclusive-create cannot reuse `/dev/null`; timed runs write two files to tmpfs and a companion reaper unlinks the known output names so zebrac can repeat the same argv. SeqFu deinterleave is one process and is included in occupancy.
 
 Timed argv is the tool. Do not wrap in `bash -c` or a pipeline; that measures the shell. Plain vs gzip are separate sections. Gzip throughput is decoded FASTQ MiB/s.
 
 ## Binaries
 
-Stripped Linux x86-64 sizes on 2026-09-15; the z-fastq row is from 2026-09-30, using Zipir 0.2.1 with unused networking code and unwind tables disabled. Adapters are my wrappers, not upstream CLIs. BBTools is the retained class tree, not one ELF.
+Stripped Linux x86-64 sizes of each listed version. The z-fastq build includes the Zipir 0.2.1 gzip decoder, omits the standard library's networking code, and has no unwind tables. Adapters are my wrappers, not upstream CLIs. BBTools is the retained class tree, not one ELF. Runtime libraries are listed under [Dependencies](#dependencies).
 
-| Binary | Version | Bytes | This host |
-| ------ | ------- | ----: | --------- |
+| Binary | Version | Bytes | Linkage |
+| ------ | ------- | ----: | ------- |
 | z-fastq | 0.0.18 | 544,928 | static |
-| seqtk | 1.5-r133 | 77,600 | `libz`, `libm`, `libc` |
-| FastQValidator | 0.1.1a | 169,120 | `libz`, `libstdc++`, `libgcc_s`, `libm`, `libc` |
-| Needletail adapter | 0.7.3 | 425,896 | `libgcc_s`, `libc` |
-| Helicase adapter | 0.2.0 | 428,944 | `libgcc_s`, `libc` |
-| Fasten `fasten_sample` | 0.9.0 | 470,336 | `libgcc_s`, `libc` |
-| fqtools | 2.3 + HTSlib 1.24 | 905,088 | `libz`, `libm`, `libc` (HTSlib in the binary) |
-| SeqFu | 1.27.1 | 1,673,280 | `libz`, `libm`, `libc` |
-| IRMA Core | 0.10.1 | 2,485,768 | `libgcc_s`, `libpthread`, `libm`, `libdl`, `libc` |
-| fq | 0.12.0 | 2,740,832 | `libgcc_s`, `libpthread`, `libm`, `libc` |
+| seqtk | 1.5-r133 | 77,600 | dynamic |
+| FastQValidator | 0.1.1a | 169,120 | dynamic |
+| Needletail adapter | 0.7.3 | 425,896 | dynamic |
+| Helicase adapter | 0.2.0 | 428,944 | dynamic |
+| Fasten `fasten_sample` | 0.9.0 | 470,336 | dynamic |
+| fqtools | 2.3 + HTSlib 1.24 | 905,088 | dynamic |
+| SeqFu | 1.27.1 | 1,673,280 | dynamic |
+| IRMA Core | 0.10.1 | 2,485,768 | dynamic |
+| fq | 0.12.0 | 2,740,832 | dynamic |
 | fastp | 1.3.7 | 3,007,424 | static |
-| Rasusa | 5.1.0 | 5,640,352 | `libgcc_s`, `librt`, `libpthread`, `libdl`, `libc` |
-| fqkit | 0.4.14 | 6,007,128 | `liblzma`, `libz`, `libbz2`, `libgcc_s`, plus fontconfig/freetype/harfbuzz/png/xml/glib |
+| Rasusa | 5.1.0 | 5,640,352 | dynamic |
+| fqkit | 0.4.14 | 6,007,128 | dynamic |
 | SeqKit | 2.13.0 | 20,076,696 | static |
-| BBTools | 40.02 | 19,359,140 | Java class tree; needs a JVM |
+| BBTools | 40.02 | 19,359,140 | JVM |
 
-seqtk is the smallest file (`libz` at runtime). z-fastq is larger because it is static, with the Zipir gzip decoder compiled in. The ISA-L build it replaced was 783,168 bytes.
+seqtk is the smallest file (`libz` at runtime). z-fastq is larger because it is static, with the Zipir gzip decoder compiled in.
 
 ## Targets
 
-`yes` = author ships or documents that OS/arch. `pkg` = Bioconda/conda only. `cargo` = `cargo install` / compile. `—` = not stated. `no` = author or this project says no. I have only run the Linux x86-64 column.
+`yes` = author ships or documents that OS/arch. `pkg` = Bioconda/conda only. `cargo` = `cargo install` / compile. `-` = not stated. `no` = author or this project says no. I have only run the Linux x86-64 column.
 
 | Binary | linux amd64 | linux arm64 | macOS amd64 | macOS arm64 | Windows |
 | ------ | ----------- | ----------- | ----------- | ----------- | ------- |
 | z-fastq | yes | no | no | no | no |
-| seqtk | yes | pkg | — | pkg | — |
-| FastQValidator | yes | — | — | — | — |
-| Needletail | yes | — | CI wheels | CI wheels | — |
-| Helicase | yes (AVX2/SSE3) | NEON | — | NEON | — |
+| seqtk | yes | pkg | - | pkg | - |
+| FastQValidator | yes | - | - | - | - |
+| Needletail | yes | - | CI wheels | CI wheels | - |
+| Helicase | yes (AVX2/SSE3) | NEON | - | NEON | - |
 | Fasten | yes | cargo | cargo | cargo | cargo |
-| fqtools | yes | pkg | pkg | pkg | — |
-| SeqFu | yes | — | yes | Darwin zip | no |
-| IRMA Core | yes | — | — | — | — |
-| fq | yes | — | yes | — | yes |
-| fastp | yes | — | compile | compile | — |
-| Rasusa | yes | yes | yes | yes | — |
+| fqtools | yes | pkg | pkg | pkg | - |
+| SeqFu | yes | - | yes | Darwin zip | no |
+| IRMA Core | yes | - | - | - | - |
+| fq | yes | - | yes | - | yes |
+| fastp | yes | - | compile | compile | - |
+| Rasusa | yes | yes | yes | yes | - |
 | fqkit | cargo | cargo | cargo | cargo | cargo |
 | SeqKit | yes | yes | yes | yes | yes |
 | BBTools | JVM | JVM | JVM | JVM | JVM |
@@ -113,23 +113,23 @@ Needletail and Helicase are libraries; I time Linux x86-64 adapters. Helicase wa
 
 ## Dependencies
 
-Runtime shared libraries on this install, then what the build actually pulls in.
+Direct shared-library dependencies (ELF `NEEDED` entries) of the installed binaries, then what each build pulls in.
 
 | Binary | Runtime libs | Stack |
 | ------ | ------------ | ----- |
 | z-fastq | none | Zig std + Zipir 0.2.1 gzip (Zig package pinned by hash) |
-| seqtk | `libz` | one C file |
-| FastQValidator | `libz`, libstdc++ | libStatGen |
-| Needletail adapter | libc, libgcc | 11 crates (`flate2`) |
-| Helicase adapter | libc, libgcc | 12 crates (`deko`, `memmap2`, `flate2`) |
-| Fasten | libc, libgcc | Rust crate graph |
-| fqtools | `libz` | HTSlib 1.24 (bz2/lzma/curl off in my recipe) |
-| SeqFu | `libz` | Nim 2.2.12 + 16 Nimble packages |
-| IRMA Core | libc, libgcc, libpthread, libdl | upstream Rust release |
-| fq | libc, libgcc, libpthread | upstream Rust release |
+| seqtk | `libz`, `libm`, `libc` | one C file |
+| FastQValidator | `libz`, `libstdc++`, `libm`, `libgcc_s`, `libc` | libStatGen |
+| Needletail adapter | `libgcc_s`, `libc` | 11 crates (`flate2`) |
+| Helicase adapter | `libgcc_s`, `libc` | 12 crates (`deko`, `memmap2`, `flate2`) |
+| Fasten | `libgcc_s`, `libc` | Rust crate graph |
+| fqtools | `libz`, `libm`, `libc` | HTSlib 1.24 (bz2/lzma/curl off in my recipe) |
+| SeqFu | `libz`, `libm`, `libc` | Nim 2.2.12 + 16 Nimble packages |
+| IRMA Core | `libgcc_s`, `libpthread`, `libm`, `libdl`, `libc` | upstream Rust release |
+| fq | `libgcc_s`, `libpthread`, `libm`, `libc` | upstream Rust release |
 | fastp | none (static) | ISA-L + libdeflate + Highway when built from source |
-| Rasusa | libc, libgcc, libpthread, libdl | upstream Rust release |
-| fqkit | zlib, lzma, bz2, font stack | Rust + plotters/GUI libs |
+| Rasusa | `libgcc_s`, `librt`, `libpthread`, `libdl`, `libc` | upstream Rust release |
+| fqkit | `liblzma`, `libfontconfig`, `libfreetype`, `libgcc_s`, `libm`, `libc` | Rust + plotters/GUI libs |
 | SeqKit | none (static) | Go, many codecs in-binary |
 | BBTools | JVM | Java runtime + class tree |
 
@@ -145,18 +145,20 @@ The shared catalog is for every comparison, not only `count`. `features.tsv` ass
 
 | Id | Accession | What it is | Count | Stats | Check | Sample | Interleave | Deinterleave |
 | -- | --------- | ---------- | ----- | ----- | ----- | ------ | ---------- | ------------ |
-| Dense | SRR1810900 | HiSeq 2500 ChIP-seq, 24.5M x 50 bp, named plus, Q=`?`. Plain ~6.1 GiB. | publication volume | no (constant Q) | SE | SE | no | no |
-| DenseSmall | SRR10325788 R1 | MiniSeq, 60,910 x 153 bp, bare plus. Pair-small left. | `--small-real` dense | real Illumina Q | SE / pair left | SE / pair | pair-small | no |
-| PairSmallR2 | SRR10325788 R2 | MiniSeq mate | ConcatGzip dep | with R1 | `--paired` | `--paired` | pair-small | no |
-| Variable | ERR164407 | 454 GS FLX Titanium, 40-631 bp (mean 345). | mixed-length | min/max/mean | SE | SE | no | no |
-| Long | DRR217704 | MinION Klebsiella WGS, 21,247 reads, 17-92,337 bp (mean 7,435). | publication long | length and Q | SE | SE | no | no |
-| HiFi | DRR054114 | PacBio CCS, 1,114 reads, 863-7274 bp. | `--small-real` long | CCS Q | SE | `--small-real` SE | no | no |
-| PairR1 / PairR2 | ERR5404925 | MiSeq, 349,760 pairs, trimmed 30-151 bp. | no | PairR1 lengths | `--paired` | `--paired` | publication pair | no |
-| ConcatGzip | derived | DenseSmall as two gzip members. | agreement check | no | gzip members | no | no | no |
-| InterleavedSmall | derived | MiniSeq R1/R2 interleaved. | no | no | `--interleaved` | `--interleaved` | no | small |
-| Interleaved | derived | ERR5404925 interleaved. | no | no | `--interleaved` | `--interleaved` | no | publication |
-| CasavaR1 / CasavaR2 | derived | MiniSeq bases, Casava `1:N:0:` / `2:N:0:` names. | no | no | `--pair-names illumina` | no | no | no |
-| SlashR1 / SlashR2 | derived | MiniSeq bases, `@id/1` / `@id/2`. | no | no | illumina vs exact | no | no | no |
+| Dense | SRR1810900 | HiSeq 2500 ChIP-seq SE | publication volume | no (constant Q) | SE | SE | no | no |
+| DenseSmall | SRR10325788 R1 | MiniSeq RNA-seq R1 | `--small-real` dense | real Illumina Q | SE / pair left | SE / pair | pair-small | no |
+| PairSmallR2 | SRR10325788 R2 | MiniSeq RNA-seq R2 | ConcatGzip dep | with R1 | `--paired` | `--paired` | pair-small | no |
+| Variable | ERR164407 | 454 GS FLX Titanium SE | mixed-length | min/max/mean | SE | SE | no | no |
+| Long | DRR217704 | MinION Klebsiella WGS | publication long | length and Q | SE | SE | no | no |
+| HiFi | DRR054114 | PacBio RS II CCS | `--small-real` long | CCS Q | SE | `--small-real` SE | no | no |
+| PairR1 / PairR2 | ERR5404925 | MiSeq PE, trimmed | no | PairR1 lengths | `--paired` | `--paired` | publication pair | no |
+| ConcatGzip | derived | DenseSmall, two gzip members | agreement check | no | gzip members | no | no | no |
+| InterleavedSmall | derived | MiniSeq R1/R2 interleaved | no | no | `--interleaved` | `--interleaved` | no | small |
+| Interleaved | derived | ERR5404925 interleaved | no | no | `--interleaved` | `--interleaved` | no | publication |
+| CasavaR1 / CasavaR2 | derived | MiniSeq, Casava names | no | no | `--pair-names illumina` | no | no | no |
+| SlashR1 / SlashR2 | derived | MiniSeq, slash names | no | no | illumina vs exact | no | no | no |
+
+Read counts, lengths, name forms, and quality notes for each id are in `bench/shared/datasets.manifest`. Dense has a constant `?` quality byte, which is why stats does not time it. Casava names use `1:N:0:` and `2:N:0:`; slash names use `@id/1` and `@id/2`.
 
 ```bash
 bash bench/shared/download_data.sh                     # count publication (+ ConcatGzip)

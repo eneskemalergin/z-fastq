@@ -4634,7 +4634,7 @@ test "[failure] - [exact sample]: a FIFO replacement reports input changed on re
         std.os.linux.S.IFIFO | 0o600,
         0,
     )));
-    // A connected FIFO keeps a blocking-open regression from hanging this in-process test.
+    // A connected FIFO keeps a blocking open of the path from hanging this in-process test.
     const keeper: std.Io.File = .{
         .handle = try std.posix.openat(tmp.dir.handle, name, .{
             .ACCMODE = .RDWR,

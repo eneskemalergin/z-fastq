@@ -61,8 +61,13 @@ deinterleave --out1 R1 --out2 R2 interleaved.fastq
 
 ```text
 -h, --help
--V, --version
 --max-line-bytes N
+```
+
+`-h` and `--help` work before or after a command. `-V` and `--version` work only before a command:
+
+```bash
+z-fastq --version
 ```
 
 The default maximum logical line length is 16 MiB. Use `--` before a path that begins with a hyphen:

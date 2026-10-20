@@ -24,19 +24,17 @@ z-fastq stats reads.fastq.gz
 
 The human-readable report contains these fields:
 
-| Field | Meaning |
-| --- | --- |
-| `reads` | Number of FASTQ records. |
-| `bases` | Total sequence bases. |
-| `min_length`, `max_length` | Shortest and longest sequence lengths. |
-| `mean_length` | `bases / reads` when reads exist. |
-| `a`, `c`, `g`, `t`, `n` | Case-insensitive counts for those symbols. |
-| `other_bases` | Symbols outside A, C, G, T, and N. |
-| `gc_fraction` | `(g + c) / (a + c + g + t)`. |
-| `quality_sum` | Sum of decoded Phred scores. |
-| `mean_quality` | `quality_sum / bases` when bases exist. |
-| `q20_bases`, `q20_fraction` | Bases with Phred score at least 20. |
-| `q30_bases`, `q30_fraction` | Bases with Phred score at least 30. |
+- `reads`: number of FASTQ records.
+- `bases`: total sequence bases.
+- `min_length`, `max_length`: shortest and longest sequence lengths.
+- `mean_length`: `bases / reads` when reads exist.
+- `a`, `c`, `g`, `t`, `n`: case-insensitive counts for those symbols.
+- `other_bases`: symbols outside A, C, G, T, and N.
+- `gc_fraction`: `(g + c) / (a + c + g + t)`.
+- `quality_sum`: sum of decoded Phred scores.
+- `mean_quality`: `quality_sum / bases` when bases exist.
+- `q20_bases`, `q20_fraction`: bases with Phred score at least 20, as a count and as a fraction of `bases`.
+- `q30_bases`, `q30_fraction`: the same for a Phred score of at least 30.
 
 The quality encoding is Phred+33. Quality bytes must be ASCII 33 through 126.
 
@@ -52,4 +50,4 @@ Undefined values print as `-` in human-readable output. This includes ratios wit
 
 ## What this report does not provide
 
-The current report is an aggregate summary. It does not include quality histograms, per-cycle summaries, N50, adapter content, duplicate estimates, or platform classification. Those belong to a broader QC workflow rather than this command's current contract.
+The current report is an aggregate summary. It does not include quality histograms, per-cycle summaries, N50, adapter content, duplicate estimates, or platform classification. Those belong to a broader QC workflow rather than this command's current output.

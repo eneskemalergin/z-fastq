@@ -1,6 +1,6 @@
 # Recipes
 
-These are short workflow patterns. Each command still owns its documented exit status and output behavior.
+These are short workflow patterns. Each command keeps its documented exit status and output behavior.
 
 ## Count several lanes
 
@@ -10,7 +10,7 @@ z-fastq count lane1.fastq.gz lane2.fastq.gz lane3.fastq.gz
 
 The output has one count per successful input, in argument order.
 
-## Gate a workflow on validation
+## Stop a workflow when validation fails
 
 ```bash
 if z-fastq check --paired R1.fastq.gz R2.fastq.gz; then
@@ -29,7 +29,7 @@ Use `--pair-names exact` when the default Illumina-style normalization is too pe
 z-fastq interleave R1.fastq.gz R2.fastq.gz | gzip > reads.interleaved.fastq.gz
 ```
 
-The external `gzip` process owns output compression. z-fastq validates each pair before writing it.
+The external `gzip` process compresses the output. z-fastq validates each pair before writing it.
 
 ## Sample a pair without breaking synchronization
 

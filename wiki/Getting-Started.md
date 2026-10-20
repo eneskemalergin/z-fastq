@@ -1,6 +1,6 @@
 # Getting started
 
-This is the short path I recommend when you first try z-fastq. It starts with a tiny file so you can see what each command owns.
+This is the short path I recommend when you first try z-fastq. It starts with a tiny file so you can see what each command does.
 
 ## 1. Create a FASTQ file
 
