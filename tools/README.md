@@ -20,20 +20,20 @@ The table lists the pinned comparison tools and the retained Linux x86-64 size o
 
 | Tool                 |              Version | Size (bytes) |
 | -------------------- | -------------------: | -----------: |
-| `seqtk`              |             1.5-r133 |       77,600 |
-| `FastQValidator`     |               0.1.1a |      169,120 |
-| `Fasten`             |                0.9.0 |      470,336 |
-| `Needletail adapter` |                0.7.3 |      425,896 |
+| `seqtk`              |             1.5-r133 |       77,552 |
+| `FastQValidator`     |               0.1.1a |      169,072 |
+| `Fasten`             |                0.9.0 |      470,288 |
+| `Needletail adapter` |                0.7.3 |      425,912 |
 | `Helicase adapter`   |                0.2.0 |      428,944 |
-| `fqtools`            | 2.3 with HTSlib 1.24 |      905,088 |
-| `SeqFu`              |               1.27.1 |    1,673,280 |
-| `IRMA Core`          |               0.10.1 |    2,485,768 |
+| `fqtools`            | 2.3 with HTSlib 1.24 |      905,048 |
+| `SeqFu`              |               1.29.0 |    2,227,064 |
+| `IRMA Core`          |               0.11.0 |    2,601,752 |
 | `fq`                 |               0.12.0 |    2,740,832 |
-| `fastp`              |                1.3.7 |    3,007,424 |
+| `fastp`              |                1.4.0 |    3,007,424 |
 | `Rasusa`             |                5.1.0 |    5,640,352 |
-| `fqkit`              |               0.4.14 |    6,007,128 |
-| `SeqKit`             |               2.13.0 |   20,076,696 |
-| `BBTools`            |                40.02 |   19,359,140 |
+| `fqkit`              |               0.4.14 |    6,007,912 |
+| `SeqKit`             |               2.14.0 |   20,473,816 |
+| `BBTools`            |                40.05 |   27,434,020 |
 
 What each tool is used for here:
 
@@ -55,7 +55,7 @@ This list describes local comparison inputs; it does not rank the tools.
 
 ## Report Python and zebrac
 
-`tools/venv` is also the report environment. `tools/install.sh` (or `tools/install.sh venv`) installs pinned matplotlib 3.10.6, pandas 3.0.1, and tabulate 0.10.0 into that venv. Bench scripts call `tools/venv/bin/python` and do not use a second virtualenv.
+`tools/venv` is also the report environment. `tools/install.sh` (or `tools/install.sh venv`) installs pinned matplotlib 3.11.2, pandas 3.0.6, and tabulate 0.10.0 into that venv. Bench scripts call `tools/venv/bin/python` and do not use a second virtualenv.
 
 The benchmark runner is [zebrac](https://github.com/eneskemalergin/zebrac). Keep the Linux binary at `tools/zebrac`. `tools/install.sh --check zebrac` and `tools/install.sh --check all` verify that path; they do not download or build zebrac.
 

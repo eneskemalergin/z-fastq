@@ -55,7 +55,7 @@ tools/zebrac; this script does not download it.
 
 The installer uses commands already on PATH. It does not use the repository
 root .venv, install system packages, edit PATH, or activate an environment.
-Downloads, package caches, source, and build files stay under /tmp. Only the
+Downloads, package caches, source, and build files stay under /var/tmp. Only the
 checked runtime is published below tools/.local and linked from tools/bin.
 EOF
 }
@@ -94,7 +94,7 @@ cleanup() {
 
     if [[ -n "$ACTIVE_WORK" && -d "$ACTIVE_WORK" ]]; then
         case "$ACTIVE_WORK" in
-            /tmp/z-fastq-tools.*)
+            /var/tmp/z-fastq-tools.*)
                 if [[ "$KEEP_TOOL_WORK" == 1 ]]; then
                     echo "keep: $ACTIVE_WORK"
                 else
@@ -115,7 +115,7 @@ finish_work() {
     [[ -n "$work" && -d "$work" ]] || return
 
     case "$work" in
-        /tmp/z-fastq-tools.*)
+        /var/tmp/z-fastq-tools.*)
             if [[ "$KEEP_TOOL_WORK" == 1 ]]; then
                 echo "keep: $work"
             else
@@ -392,7 +392,7 @@ check_wrapper_smoke() {
     local helicase="$2"
     local fixture="$ROOT_DIR/tests/data/synthetic/basic_valid.fastq"
     local smoke_dir
-    smoke_dir="$(mktemp -d /tmp/z-fastq-wrapper-smoke.XXXXXX)"
+    smoke_dir="$(mktemp -d /var/tmp/z-fastq-wrapper-smoke.XXXXXX)"
 
     (
         trap 'rm -rf -- "$smoke_dir"' EXIT
@@ -524,7 +524,7 @@ install_wrappers() {
 
     mkdir -p "$LOCAL_DIR/stage" "$WRAPPER_INSTALLS_DIR" "$BIN_DIR"
     remove_stale_stages wrappers
-    ACTIVE_WORK="$(mktemp -d /tmp/z-fastq-tools.XXXXXX)"
+    ACTIVE_WORK="$(mktemp -d /var/tmp/z-fastq-tools.XXXXXX)"
     ACTIVE_STAGE="$(mktemp -d "$LOCAL_DIR/stage/wrappers.XXXXXX")"
     printf 'wrappers\n' >"$ACTIVE_STAGE/.z-fastq-tool"
     mkdir -p "$ACTIVE_STAGE/bin"
@@ -790,7 +790,7 @@ check_peer_smoke() {
     local fixture="$ROOT_DIR/tests/data/synthetic/basic_valid.fastq"
     local short_fixture="$ROOT_DIR/tests/data/synthetic/acgtn_valid.fastq"
     local smoke_dir
-    smoke_dir="$(mktemp -d /tmp/z-fastq-peer-smoke.XXXXXX)"
+    smoke_dir="$(mktemp -d /var/tmp/z-fastq-peer-smoke.XXXXXX)"
 
     (
         trap 'rm -rf -- "$smoke_dir"' EXIT
@@ -1278,7 +1278,7 @@ build_bbtools() {
     cp -a "$source/current" "$stage/runtime/current"
     find "$stage/runtime/current" -type f -name '*.java' -delete
     mkdir -p "$stage/runtime/resources"
-    install -m 644 "$source/resources/bbmerge.bbnet" "$stage/runtime/resources/bbmerge.bbnet"
+    install -m 644 "$source/networks/bbmerge.bbnet.gz" "$stage/runtime/resources/bbmerge.bbnet.gz"
     for script in bbversion.sh reformat.sh repair.sh javasetup.sh memdetect.sh; do
         install -m 755 "$source/$script" "$stage/runtime/$script"
     done
@@ -1374,7 +1374,7 @@ install_peer() {
     local installs="$INSTALLS_DIR/$name"
     mkdir -p "$LOCAL_DIR/stage" "$installs" "$BIN_DIR"
     remove_stale_stages "$name"
-    ACTIVE_WORK="$(mktemp -d /tmp/z-fastq-tools.XXXXXX)"
+    ACTIVE_WORK="$(mktemp -d /var/tmp/z-fastq-tools.XXXXXX)"
     ACTIVE_STAGE="$(mktemp -d "$LOCAL_DIR/stage/$name.XXXXXX")"
     printf '%s\n' "$name" >"$ACTIVE_STAGE/.z-fastq-tool"
     mkdir -p "$ACTIVE_STAGE/bin"
