@@ -20,7 +20,7 @@ z-fastq sample --fraction 0.01 --seed 2025 reads.fastq > sample-b.fastq
 cmp sample-a.fastq sample-b.fastq
 ```
 
-The same seed and input record stream repeat the current selection. The project may change its generator before the `0.1.0` interface settles.
+The same seed, input record stream, and sampling options repeat the selection in `0.1.0`. Pin the package version when exact selected records must remain reproducible across upgrades.
 
 ## Select an exact count
 

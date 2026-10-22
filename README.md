@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/eneskemalergin/z-fastq/releases"><img src="https://img.shields.io/badge/version-v0.0.18-2563eb?style=flat-square" alt="Version v0.0.18"></a>
+  <a href="https://github.com/eneskemalergin/z-fastq/releases"><img src="https://img.shields.io/badge/version-v0.1.0-2563eb?style=flat-square" alt="Version v0.1.0"></a>
   <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
   <img src="https://img.shields.io/badge/platform-Linux%20x86--64-64748b?style=flat-square" alt="Supported platform: Linux x86-64">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT License"></a>

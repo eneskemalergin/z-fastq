@@ -1,6 +1,6 @@
 .{
     .name = .z_fastq,
-    .version = "0.0.18",
+    .version = "0.1.0",
     .dependencies = .{
         .zipir = .{
             .url = "https://github.com/eneskemalergin/zipir/releases/download/v0.2.1/zipir-0.2.1-source.tar.gz",

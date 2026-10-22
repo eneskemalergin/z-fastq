@@ -22,7 +22,7 @@ zig build -Dstatic=true -Doptimize=ReleaseFast
 The current version prints:
 
 ```text
-z-fastq 0.0.18
+z-fastq 0.1.0
 ```
 
 For a safety-checked static build, use `ReleaseSafe`:

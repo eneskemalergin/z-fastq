@@ -40,7 +40,7 @@ The quality encoding is Phred+33. Quality bytes must be ASCII 33 through 126.
 
 ## Interpret empty and ambiguous data
 
-Undefined values print as `-` in human-readable output. This includes ratios with an empty denominator. A zero-length record still counts as one read, so `reads` and `bases` answer different questions. The current machine-readable representation is provisional; see [Automation](Automation) before building an integration around it.
+Undefined values print as `-` in human-readable output and `null` in JSON. This includes ratios with an empty denominator. A zero-length record still counts as one read, so `reads` and `bases` answer different questions. Version `0.1.0` freezes the `z-fastq/stats-v1` document shape; see [Automation](Automation) before building an integration around it.
 
 `gc_fraction` excludes N and other symbols from its denominator. z-fastq does not guess whether an ambiguous symbol should count as A, C, G, or T.
 

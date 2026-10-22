@@ -9,7 +9,7 @@ No single FASTQ program is the right fit for every job. I think about the choice
 - You want explicit behavior for paired names, validation codes, exit classes, and output creation.
 - You want a streaming command that keeps normal process state bounded.
 - You want to embed the reader, writer, statistics, or I/O adapters in a Zig program.
-- You are comfortable with the current Linux x86-64 boundary and pre-`0.1.0` interface.
+- Your workflow runs on Linux x86-64 and uses the documented `0.1.0` commands or Zig API.
 
 z-fastq is intentionally narrower than a general sequence manipulation suite. Its value is the consistency of these core operations and the fact that their failure behavior is part of the documented interface.
 

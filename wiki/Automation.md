@@ -37,4 +37,4 @@ z-fastq stats --json reads.fastq.gz > stats.json
 z-fastq check --json reads.fastq.gz > check.json
 ```
 
-The document shape remains provisional. If you automate against it, pin the z-fastq version and validate upgrades deliberately. This page documents output streams and exit statuses; it does not freeze the JSON format.
+Version `0.1.0` freezes the `z-fastq/stats-v1` and `z-fastq/check-v1` document shapes. Check the `schema` field before reading results; `tool.name` and `tool.version` identify the producer. Results follow input argument order, and a handled input failure appears in its result entry. Always check the process exit status as well: a document can contain failed inputs, and an output failure can leave incomplete JSON.

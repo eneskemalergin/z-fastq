@@ -52,5 +52,5 @@ The reader consumes a `ByteSource`, exposes record offsets, and enforces the con
 
 ## Compatibility
 
-The current module targets Zig `0.16.0` and Linux x86-64. The API is pre-`0.1.0`. Pin the project revision when an application depends on the exact exported names or error shapes.
+The `0.1.0` module targets Zig `0.16.0` and Linux x86-64. Pin the package version when an application depends on the exact exported names or error shapes, and check release notes before upgrading.
 

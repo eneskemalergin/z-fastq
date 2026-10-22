@@ -4,6 +4,8 @@
 
 All notable changes to z-fastq will be documented in this file.
 
+## Unreleased
+
 ## [0.1.0]
 
 The first public release. z-fastq is a single-threaded command-line toolkit for plain and gzip-compressed FASTQ on Linux x86-64, built around bounded streaming memory, strict validation, reproducible selection, and a small Zig module for applications that need the reader, writer, validation, and statistics building blocks. FASTQ-producing commands write plain four-line records with LF endings; the CLI does not write gzip output.
