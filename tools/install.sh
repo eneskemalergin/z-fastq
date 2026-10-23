@@ -30,6 +30,8 @@ PEER_NAMES=(
     fastqvalidator
     fastp
     bbtools
+    fastqc
+    fastqc-rust
 )
 
 # shellcheck source=tools/versions.sh
@@ -47,7 +49,8 @@ Usage:
   tools/install.sh --help              show this help
 
 Names: venv, zebrac, wrappers, seqtk, fqtools, fq, fqkit, seqkit, rasusa,
-       fasten, seqfu, irma-core, fastqvalidator, fastp, bbtools, peers, all
+       fasten, seqfu, irma-core, fastqvalidator, fastp, bbtools, fastqc,
+       fastqc-rust, peers, all
 
 venv also installs the pinned matplotlib, pandas, and tabulate packages used
 by bench report generation. zebrac is a check-only name: place the binary at
@@ -591,6 +594,8 @@ peer_version() {
         fastqvalidator) printf '%s\n' "$FASTQ_VALIDATOR_VERSION" ;;
         fastp) printf '%s\n' "$FASTP_VERSION" ;;
         bbtools) printf '%s\n' "$BBTOOLS_VERSION" ;;
+        fastqc) printf '%s\n' "$FASTQC_VERSION" ;;
+        fastqc-rust) printf '%s\n' "$FASTQC_RUST_VERSION" ;;
         *) return 1 ;;
     esac
 }
@@ -609,6 +614,8 @@ peer_recipe() {
         fastqvalidator) printf '%s\n' "$FASTQ_VALIDATOR_RECIPE" ;;
         fastp) printf '%s\n' "$FASTP_RECIPE" ;;
         bbtools) printf '%s\n' "$BBTOOLS_RECIPE" ;;
+        fastqc) printf '%s\n' "$FASTQC_RECIPE" ;;
+        fastqc-rust) printf '%s\n' "$FASTQC_RUST_RECIPE" ;;
         *) return 1 ;;
     esac
 }
@@ -627,6 +634,8 @@ peer_binaries() {
         fastqvalidator) printf 'fastQValidator\n' ;;
         fastp) printf 'fastp\n' ;;
         bbtools) printf 'bbversion.sh reformat.sh repair.sh\n' ;;
+        fastqc) printf 'fastqc\n' ;;
+        fastqc-rust) printf 'fastqc-rust\n' ;;
         *) return 1 ;;
     esac
 }
@@ -649,6 +658,8 @@ peer_source() {
             ;;
         fastp) printf 'release v%s\n' "$FASTP_VERSION" ;;
         bbtools) printf 'tag v%s\n' "$BBTOOLS_VERSION" ;;
+        fastqc) printf 'zip v%s\n' "$FASTQC_VERSION" ;;
+        fastqc-rust) printf 'release v%s\n' "$FASTQC_RUST_VERSION" ;;
         *) return 1 ;;
     esac
 }
@@ -681,6 +692,13 @@ peer_build_environment() {
         bbtools)
             require_command java >/dev/null
             java -version 2>&1 | sed -n '1p'
+            ;;
+        fastqc)
+            require_command java >/dev/null
+            require_command python3 >/dev/null
+            printf '%s; %s\n' \
+                "$(java -version 2>&1 | sed -n '1p')" \
+                "$(python3 --version 2>&1)"
             ;;
         *)
             printf 'upstream release binary\n'
@@ -777,6 +795,14 @@ check_peer_version() {
         bbtools)
             output="$("$root/bin/bbversion.sh" 2>&1)"
             [[ "$output" == *"$BBTOOLS_VERSION"* ]]
+            ;;
+        fastqc)
+            output="$("$root/bin/fastqc" --version 2>&1)"
+            [[ "$output" == *"FastQC v$FASTQC_VERSION"* ]]
+            ;;
+        fastqc-rust)
+            output="$("$root/bin/fastqc-rust" --version 2>&1)"
+            [[ "$output" == *"v$FASTQC_RUST_VERSION"* ]]
             ;;
     esac || {
         echo "error: $name did not report version $(peer_version "$name")" >&2
@@ -914,6 +940,23 @@ check_peer_smoke() {
                 cmp "$smoke_dir/source-r1.fastq" "$smoke_dir/repaired-r1.fastq" || return
                 cmp "$smoke_dir/source-r2.fastq" "$smoke_dir/repaired-r2.fastq" || return
                 ;;
+            fastqc|fastqc-rust)
+                local fastqc_bin="$root/bin/fastqc"
+                if [[ "$name" == fastqc-rust ]]; then
+                    fastqc_bin="$root/bin/fastqc-rust"
+                fi
+                mkdir -p "$smoke_dir/fastqc-out"
+                "$fastqc_bin" \
+                    --outdir "$smoke_dir/fastqc-out" \
+                    --extract \
+                    -t 1 \
+                    -q \
+                    "$fixture" >/dev/null 2>&1 || return
+                [[ -s "$smoke_dir/fastqc-out/basic_valid_fastqc.html" ]] || return
+                [[ -s "$smoke_dir/fastqc-out/basic_valid_fastqc.zip" ]] || return
+                grep -Fqx 'Total Sequences	5' \
+                    "$smoke_dir/fastqc-out/basic_valid_fastqc/fastqc_data.txt" || return
+                ;;
         esac
     ) || {
         echo "error: $name smoke check failed" >&2
@@ -924,8 +967,11 @@ check_peer_smoke() {
 check_peer_at() {
     local name="$1"
     local root="$2"
-    if [[ "$name" == bbtools ]]; then
+    if [[ "$name" == bbtools || "$name" == fastqc ]]; then
         require_command java
+        if [[ "$name" == fastqc ]]; then
+            require_command python3
+        fi
     else
         check_stripped_binary "$root/bin/$(peer_binaries "$name")"
     fi
@@ -1288,6 +1334,37 @@ build_bbtools() {
     BUILD_DESCRIPTION='upstream compiled Java classes; source removed'
 }
 
+build_fastqc() {
+    local stage="$1"
+    local archive="$ACTIVE_WORK/fastqc.zip"
+    download \
+        "https://github.com/s-andrews/FastQC/releases/download/v$FASTQC_VERSION/fastqc_v$FASTQC_VERSION.zip" \
+        "$archive"
+    mkdir -p "$ACTIVE_WORK/extract"
+    unzip -q "$archive" 'FastQC/*' -d "$ACTIVE_WORK/extract"
+    mkdir -p "$stage/runtime"
+    cp -a "$ACTIVE_WORK/extract/FastQC/." "$stage/runtime/"
+    chmod +x "$stage/runtime/fastqc"
+    ln -s '../runtime/fastqc' "$stage/bin/fastqc"
+    BUILD_DESCRIPTION='upstream zip distribution; no build'
+}
+
+build_fastqc_rust() {
+    local stage="$1"
+    local asset="fastqc-linux-x86_64.tar.gz"
+    local archive="$ACTIVE_WORK/$asset"
+    download \
+        "https://github.com/ewels/FastQC-Rust/releases/download/v$FASTQC_RUST_VERSION/$asset" \
+        "$archive"
+    printf '%s  %s\n' "$FASTQC_RUST_LINUX_X64_SHA256" "$archive" | sha256sum -c - >/dev/null
+    mkdir -p "$ACTIVE_WORK/extract"
+    tar -xzf "$archive" -C "$ACTIVE_WORK/extract"
+    local source
+    source="$(find_binary "$ACTIVE_WORK/extract" fastqc)"
+    install -m 755 "$source" "$stage/bin/fastqc-rust"
+    BUILD_DESCRIPTION='upstream Linux x86-64 release binary'
+}
+
 build_peer() {
     local name="$1"
     local stage="$2"
@@ -1304,6 +1381,8 @@ build_peer() {
         fastqvalidator) build_fastqvalidator "$stage" ;;
         fastp) build_fastp "$stage" ;;
         bbtools) build_bbtools "$stage" ;;
+        fastqc) build_fastqc "$stage" ;;
+        fastqc-rust) build_fastqc_rust "$stage" ;;
         *) return 1 ;;
     esac
 }
@@ -1311,7 +1390,7 @@ build_peer() {
 strip_peer() {
     local name="$1"
     local stage="$2"
-    [[ "$name" != bbtools ]] || return 0
+    [[ "$name" != bbtools && "$name" != fastqc ]] || return 0
 
     strip --strip-all "$stage/bin/$(peer_binaries "$name")"
     BUILD_DESCRIPTION="$BUILD_DESCRIPTION; stripped"
@@ -1321,10 +1400,10 @@ require_peer_commands() {
     local name="$1"
     require_command curl
     require_command install
-    if [[ "$name" != bbtools ]]; then
+    if [[ "$name" != bbtools && "$name" != fastqc ]]; then
         require_command strip
     fi
-    if [[ "$name" != fastp ]]; then
+    if [[ "$name" != fastp && "$name" != fastqc ]]; then
         require_command tar
     fi
     case "$name" in
@@ -1354,6 +1433,12 @@ require_peer_commands() {
             ;;
         bbtools)
             require_command java
+            ;;
+        fastqc)
+            require_command unzip
+            ;;
+        fastqc-rust)
+            require_command sha256sum
             ;;
     esac
 }
@@ -1485,7 +1570,7 @@ run_install_target() {
             install_wrappers
             install_peers
             ;;
-        seqtk|fqtools|fq|fqkit|seqkit|rasusa|fasten|seqfu|irma-core|fastqvalidator|fastp|bbtools)
+        seqtk|fqtools|fq|fqkit|seqkit|rasusa|fasten|seqfu|irma-core|fastqvalidator|fastp|bbtools|fastqc|fastqc-rust)
             install_peer "$1"
             ;;
         *) return 1 ;;
@@ -1504,7 +1589,7 @@ run_check_target() {
             check_wrappers
             check_peers
             ;;
-        seqtk|fqtools|fq|fqkit|seqkit|rasusa|fasten|seqfu|irma-core|fastqvalidator|fastp|bbtools)
+        seqtk|fqtools|fq|fqkit|seqkit|rasusa|fasten|seqfu|irma-core|fastqvalidator|fastp|bbtools|fastqc|fastqc-rust)
             check_peer "$1"
             ;;
         *) return 1 ;;

@@ -16,7 +16,7 @@ The scripts prepare the tools needed by local comparison workflows. They do not 
 
 ## Current tools
 
-The table lists the pinned comparison tools and the retained Linux x86-64 size of each pinned version. Compiled-tool values are exact byte lengths of the stripped executable linked from `tools/bin/`. The BBTools value is the sum of regular files in its retained runtime tree because BBTools is a Java class tree rather than one executable. Versions are defined by `tools/versions.sh`.
+The table lists the pinned comparison tools and the retained Linux x86-64 size of each pinned version. Compiled-tool values are exact byte lengths of the stripped executable linked from `tools/bin/`. The BBTools value is the sum of regular files in its retained runtime tree because BBTools is a Java class tree rather than one executable. The FastQC value is the same kind of sum because FastQC is a Java distribution with a Python launcher rather than one executable. Versions are defined by `tools/versions.sh`.
 
 | Tool                 |              Version | Size (bytes) |
 | -------------------- | -------------------: | -----------: |
@@ -32,6 +32,8 @@ The table lists the pinned comparison tools and the retained Linux x86-64 size o
 | `fastp`              |                1.4.0 |    3,007,424 |
 | `Rasusa`             |                5.1.0 |    5,640,352 |
 | `fqkit`              |               0.4.14 |    6,007,912 |
+| `fastqc-rust`        |                1.1.0 |    6,278,600 |
+| `FastQC`             |               0.13.0 |   14,418,443 |
 | `SeqKit`             |               2.14.0 |   20,473,816 |
 | `BBTools`            |                40.05 |   27,434,020 |
 
@@ -50,6 +52,8 @@ What each tool is used for here:
 - `fqkit`: interleave, deinterleave, stats, sampling, and sharding.
 - `SeqKit`: broad stats, sampling, pairing, and conversion peer.
 - `BBTools`: sampling, pair validation, interleave, and deinterleave.
+- `FastQC`: descriptive Java QC report peer.
+- `fastqc-rust`: descriptive Rust QC report peer with Java matching text output.
 
 This list describes local comparison inputs; it does not rank the tools.
 
