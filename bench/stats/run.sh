@@ -5,11 +5,6 @@ source "$(dirname -- "$0")/../lib/bench.sh"
 job "aggregate statistics of a FASTQ file"
 truth "the read count the corpus cutter wrote into each manifest; every other field from Needletail, an independent parser that must agree with z-fastq exactly"
 agree needletail reads
-headline medium
-# Three runs at 1 GiB while the suite is in development; a publication run uses the default.
-runs medium 3
-scaling "$SHAPE_SOURCES"
-pick auto
 
 word title "Aggregate statistics"
 word subject "z-fastq stats"
@@ -21,7 +16,7 @@ word missed "got a value wrong"
 word unseen "the values are wrong"
 word legend "wrong value, exit 0"
 word verb "summarizes"
-word done "summarized"
+word past "summarized"
 word payer "a tool"
 word same "statistics"
 word many "Summarizing"
@@ -38,14 +33,11 @@ lane seqfu partial "{bin} stats --threads 1 {in}" note="lengths only: no base or
 
 family file "one file by path"
 lanes all
-input real "$MEDIUM_SOURCES" medium interleaved
-input shape "$SHAPE_SOURCES" medium
-input shape "$SHAPE_SOURCES" tiny,xsmall,small
+corpus_inputs
 
 family stdin "the same file on stdin"
 lanes all stdin
-input real illumina-drr1001190,illumina-drr147610,ont-err14758576 medium interleaved
-input shape endings medium
+stdin_inputs
 
 family many-files "every xsmall corpus file in one call"
 lanes z-fastq,seqkit,seqfu

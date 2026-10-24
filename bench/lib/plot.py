@@ -35,7 +35,6 @@ THEMES = {
 }
 MARKERS = {"circle": "o", "square": "s", "diamond": "D", "triangle": "^", "triangle-down": "v", "plus": "P", "star": "*", "cross": "X"}
 SUBJECT = "z-fastq"
-TIER_SIZE = {"tiny": "1 MiB", "xsmall": "10 MiB", "small": "100 MiB", "medium": "1 GiB"}
 # Reserved status colors (dataviz reference palette); every cell also carries its text.
 # Strength: how much of the color a cell shows, per theme; stronger for worse verdicts.
 VERDICTS = [("right", "#0ca30c", "right", (0.30, 0.42)), ("refused", "#fab219", "refused a valid input", (0.50, 0.45)),
@@ -325,7 +324,7 @@ class Figures:
             ax.set_ylabel(f"{spec['axis']}, log scale", fontsize=9, color=THEMES[theme]["ink2"])
         lower = "Lower is better. " if metric != "faults" else ""
         self.finish(fig, f"{family}-{metric}", theme, f"{spec['title']} by kind of input",
-                    f"{lower}{self.headline.capitalize()} tier, about {TIER_SIZE[self.headline]} of FASTQ per input. Bars: geometric "
+                    f"{lower}{self.headline.capitalize()} tier, about {self.words['size']} of FASTQ per input. Bars: geometric "
                     "mean over the inputs of a group (dots, each the median of its timed repeats; markers name the synthetic "
                     "shapes), whiskers their range. Boxes: multiple of "
                     f"z-fastq (dashed line). {CLASS_NOTE}", handles=self.bar_handles(shown, theme), keys=self.dot_keys(theme))
@@ -576,7 +575,7 @@ class Figures:
                     fontweight="bold" if r["verdict"] in ("wrong", "crash") else "normal")
         prev = None
         for y, (label, expected) in sorted(labels.items()):
-            group = "reject" if expected == "reject" else "policy" if expected == "tool policy" else "value"
+            group = "reject" if expected.startswith("reject") else "policy" if expected == "tool policy" else "value"
             if prev and group != prev:
                 ax.axhline(y + 0.03, xmin=0, xmax=1, color=t["grid"], linewidth=0.8)
             prev = group

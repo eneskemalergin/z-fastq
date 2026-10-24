@@ -4,11 +4,6 @@ source "$(dirname -- "$0")/../lib/bench.sh"
 
 job "records in a FASTQ file"
 truth "the record count the corpus cutter wrote into each manifest (and each shape's state.json), derived without z-fastq"
-headline medium
-# Three runs at 1 GiB while the suite is in development; a publication run uses the default.
-runs medium 3
-scaling "$SHAPE_SOURCES"
-pick auto
 remark scaling "Every tool is held to one CPU, so a tool that starts threads (SeqFu starts 8 by default) gains nothing from them here; its CPU time equals its wall time. Lines rise with size because each tool's fixed start cost spreads over more data; SeqFu has the largest start cost, so its line rises the most."
 
 lane z-fastq subject "{zfastq} count {in}"
@@ -20,14 +15,11 @@ lane seqtk partial "{bin} size {in}" note="no structure check"
 
 family file "one file by path"
 lanes all
-input real "$MEDIUM_SOURCES" medium interleaved
-input shape "$SHAPE_SOURCES" medium
-input shape "$SHAPE_SOURCES" tiny,xsmall,small
+corpus_inputs
 
 family stdin "the same file on stdin"
 lanes z-fastq,needletail,helicase-checked,seqfu,seqtk stdin
-input real illumina-drr1001190,illumina-drr147610,ont-err14758576 medium interleaved
-input shape endings medium
+stdin_inputs
 
 family many-files "every xsmall corpus file in one call"
 lanes z-fastq,seqfu

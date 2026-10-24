@@ -21,6 +21,9 @@ describe endings "100 bp, CRLF and LF lines"
 describe variable "50 to 150 bp, annotated plus line"
 describe long "300 kb sequence lines"
 describe longread "nanopore headers, rare 300 kb reads"
+describe paired "100 bp mate pairs"
+# The real sources with R1 and R2 files at medium.
+PAIRED_SOURCES=illumina-drr1001190,illumina-err4686103,mgi-err10448913,illumina-srr19571648
 describe all "every xsmall corpus file"
 
 # Bar groups: real runs pooled by the kind of reads they hold, then the
@@ -29,3 +32,16 @@ group "Short, fixed length" illumina-drr018447,illumina-drr1001190,illumina-err4
 group "Short, variable length" illumina-drr018439,illumina-srr19571648
 group "Long reads" ont-err10496769,ont-err14758576,pacbio-err10472470,pacbio-srr29396856
 group Synthetic "$SHAPE_SOURCES"
+
+# The inputs the headline file family of every feature declares: the real
+# sources and shapes at 1 GiB, and the shapes at the smaller scaling tiers.
+corpus_inputs() {
+    input real "$MEDIUM_SOURCES" medium interleaved
+    input shape "$SHAPE_SOURCES" medium
+    input shape "$SHAPE_SOURCES" tiny,xsmall,small
+}
+# The stdin family's inputs: short, very short, and long reads, and CRLF lines.
+stdin_inputs() {
+    input real illumina-drr1001190,illumina-drr147610,ont-err14758576 medium interleaved
+    input shape endings medium
+}
