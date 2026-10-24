@@ -160,11 +160,17 @@ fn collect_stats<P: HelicaseParser + Iterator>(mut parser: P, path: &Path) -> st
         let quality = parser
             .get_quality()
             .unwrap_or_else(|| fail_path(path, "record has no quality"));
+        // Helicase keeps the CR of a CRLF line in both fields; it is a line
+        // ending, not a base or a quality byte.
         aggregate
-            .add_record(parser.get_dna_string(), quality)
+            .add_record(strip_cr(parser.get_dna_string()), strip_cr(quality))
             .unwrap_or_else(|error| fail_path(path, error));
     }
     aggregate
+}
+
+fn strip_cr(field: &[u8]) -> &[u8] {
+    field.strip_suffix(b"\r").unwrap_or(field)
 }
 
 fn fail_path(path: &Path, error: impl std::fmt::Display) -> ! {
