@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const fastq = @import("fastq.zig");
+const simd = @import("simd.zig");
 
 pub const Options = fastq.ReaderOptions;
 
@@ -54,10 +55,10 @@ const DenseLayout = struct {
         const quality_len = fastq.lineContentLen(quality);
         return header_len >= 2 and fastq.headerPrefixIsValid(record[0], record[1]) and
             record[layout.sequence_start - 1] == '\n' and
-            !@call(.always_inline, containsNewline, .{ 1, .{header} }) and
+            !simd.containsNewline(header, null) and
             header_len <= max_line_bytes and
             record[layout.sequence_end] == '\n' and
-            !@call(.always_inline, containsNewline, .{ 2, .{ sequence, quality } }) and
+            !simd.containsNewline(sequence, quality) and
             sequence_len <= max_line_bytes and
             record[layout.plus_start] == '+' and
             record[layout.plus_start + 1] == '\n' and
@@ -224,7 +225,7 @@ pub const Scanner = struct {
         }
 
         var line_ends: [4]usize = undefined;
-        if (!findRecordNewlines(data, &line_ends)) return 0;
+        if (!simd.findNewlines(data, &line_ends)) return 0;
 
         const header_end = line_ends[0];
         const sequence_start = header_end + 1;
@@ -289,7 +290,7 @@ pub const Scanner = struct {
         var pos: usize = 0;
 
         while (pos < data.len) {
-            const rel = std.mem.findScalar(u8, data[pos..], '\n');
+            const rel = simd.findNewline(data[pos..]);
             if (rel == null) {
                 try self.consumeLineBytes(data[pos..]);
                 self.byte_offset = try fastq.progressAfter(self.byte_offset, data.len - pos);
@@ -436,77 +437,6 @@ pub const Scanner = struct {
     }
 };
 
-fn containsNewline(comptime slice_count: usize, slices: [slice_count][]const u8) bool {
-    const len = slices[0].len;
-    inline for (slices[1..]) |slice| std.debug.assert(slice.len == len);
-
-    const vector_len = std.simd.suggestVectorLength(u8) orelse @sizeOf(usize);
-    const Vector = @Vector(vector_len, u8);
-    const newline: Vector = @splat('\n');
-
-    if (len >= vector_len) {
-        const full_end = len - len % vector_len;
-        var pos: usize = 0;
-        while (pos < full_end) : (pos += vector_len) {
-            var found = false;
-            inline for (slices) |slice| {
-                const chunk: Vector = slice[pos..][0..vector_len].*;
-                found = @reduce(.Or, chunk == newline) or found;
-            }
-            if (found) return true;
-        }
-        if (pos < len) {
-            var found = false;
-            inline for (slices) |slice| {
-                const chunk: Vector = slice[len - vector_len ..][0..vector_len].*;
-                found = @reduce(.Or, chunk == newline) or found;
-            }
-            if (found) return true;
-        }
-        return false;
-    }
-
-    for (0..len) |pos| {
-        inline for (slices) |slice| {
-            if (slice[pos] == '\n') return true;
-        }
-    }
-    return false;
-}
-
-fn findRecordNewlines(bytes: []const u8, line_ends: *[4]usize) bool {
-    var found: usize = 0;
-    var pos: usize = 0;
-    while (bytes.len - pos >= 32) : (pos += 32) {
-        const first_mask = fastq.newlineMask(16, bytes[pos..][0..16]);
-        const second_mask = fastq.newlineMask(16, bytes[pos + 16 ..][0..16]);
-        var mask = @as(u32, first_mask) | @as(u32, second_mask) << 16;
-        while (mask != 0) {
-            line_ends[found] = pos + @as(usize, @intCast(@ctz(mask)));
-            found += 1;
-            if (found == line_ends.len) return true;
-            mask &= mask - 1;
-        }
-    }
-    if (bytes.len - pos >= 16) {
-        var mask = fastq.newlineMask(16, bytes[pos..][0..16]);
-        while (mask != 0) {
-            line_ends[found] = pos + @as(usize, @intCast(@ctz(mask)));
-            found += 1;
-            if (found == line_ends.len) return true;
-            mask &= mask - 1;
-        }
-        pos += 16;
-    }
-    for (bytes[pos..], pos..) |byte, index| {
-        if (byte != '\n') continue;
-        line_ends[found] = index;
-        found += 1;
-        if (found == line_ends.len) return true;
-    }
-    return false;
-}
-
 /// Counts all records in one slice and replaces `scanner` with the final state.
 ///
 /// Structural failures leave details in `scanner` for `takeLastError`.
@@ -614,59 +544,6 @@ test "[property] - [count scanner]: dense validation checks every field region" 
             try std.testing.expectEqual(case.line, details.line_in_record);
             try std.testing.expectEqual(prefix.len + case.offset, details.byte_offset);
         }
-    }
-}
-
-test "[property] - [dense newline scan]: matches scalar searches across vector tails" {
-    const lanes = std.simd.suggestVectorLength(u8) orelse @sizeOf(usize);
-    var first_storage: [3 * lanes + 2]u8 = undefined;
-    var second_storage: [3 * lanes + 2]u8 = undefined;
-    for ([_]usize{ 0, 1, lanes - 1 }) |alignment| {
-        for (0..2 * lanes + 3) |len| {
-            @memset(&first_storage, '\n');
-            @memset(&second_storage, '\n');
-            const first = first_storage[alignment..][0..len];
-            const second = second_storage[alignment..][0..len];
-            @memset(first, 0xff);
-            @memset(second, '\r');
-            try std.testing.expect(!containsNewline(1, .{first}));
-            try std.testing.expect(!containsNewline(2, .{ first, second }));
-
-            for (0..len) |pos| {
-                inline for (.{ first, second }, .{ 0xff, '\r' }) |slice, original| {
-                    slice[pos] = '\n';
-                    const first_has_lf = std.mem.findScalar(u8, first, '\n') != null;
-                    const second_has_lf = std.mem.findScalar(u8, second, '\n') != null;
-                    try std.testing.expectEqual(first_has_lf, containsNewline(1, .{first}));
-                    try std.testing.expectEqual(
-                        first_has_lf or second_has_lf,
-                        containsNewline(2, .{ first, second }),
-                    );
-                    slice[pos] = original;
-                }
-            }
-        }
-    }
-}
-
-test "[edge] - [record newline scan]: vector boundaries and incomplete input are exact" {
-    const cases = [_][4]usize{
-        .{ 14, 15, 30, 31 },
-        .{ 15, 16, 31, 32 },
-        .{ 30, 31, 62, 63 },
-        .{ 31, 32, 63, 64 },
-        .{ 126, 127, 128, 129 },
-    };
-
-    for (cases) |expected| {
-        var data: [131]u8 = @splat('x');
-        for (expected) |index| data[index] = '\n';
-        data[130] = '\n';
-        var actual: [4]usize = undefined;
-
-        try std.testing.expect(findRecordNewlines(&data, &actual));
-        try std.testing.expectEqual(expected, actual);
-        try std.testing.expect(!findRecordNewlines(data[0..expected[3]], &actual));
     }
 }
 
