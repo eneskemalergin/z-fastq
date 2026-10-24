@@ -4,6 +4,9 @@
 # The real sources with a medium (1 GiB) tier; the others are too small to cut one.
 MEDIUM_SOURCES=illumina-drr1001190,illumina-err4686103,mgi-err10448913,illumina-drr147610,illumina-srr19571648,ont-err14758576,pacbio-srr29396856
 SHAPE_SOURCES=dense,endings,variable,longread,long
+# The long-read sources and shapes; every other source holds short reads. A
+# family parameter written short:A,long:B takes its value from this class.
+LONG_SOURCES=ont-err10496769,ont-err14758576,pacbio-err10472470,pacbio-srr29396856,longread,long
 
 describe illumina-drr018447 "MiSeq, 151 bp"
 describe illumina-drr1001190 "NovaSeq, 150 bp"

@@ -116,23 +116,16 @@ sweep_one() { # "kind index"
     rm -f -- "$file" "$file.err"
 }
 
-feature_check() {
-    local key name kind i
-    key="$(for name in "${LANES[@]}"; do printf '%s %s\n' "$name" "$(lane_id "$name")"; done; printf '%s %s %s\n' "$SWEEP_KINDS" "$SWEEP_PER_KIND" "$SWEEP_SOURCES"
-        for i in $SWEEP_SOURCES; do fileid "$REAL/$i"; done; declare -f inject reported_line sweep_one | cksum)"
-    STAGE=sweep
-    if [[ -f "$SWEEP" && "$(cat "$RESULTS/sweep.key" 2>/dev/null)" == "$key" ]]; then
-        log sweep CACHE "$(wc -l <"$SWEEP") results, every lane unchanged"
-        return 0
-    fi
-    local t0=$SECONDS files=$(($(wc -w <<<"$SWEEP_KINDS") * SWEEP_PER_KIND))
-    log sweep RUN "$files defect files, $BENCH_JOBS at a time"
+sweep_jobs() {
+    local kind i
     for kind in $SWEEP_KINDS; do
         for ((i = 0; i < SWEEP_PER_KIND; i++)); do printf '%s %s\n' "$kind" "$i"; done
-    done | pool sweep_one >"$SWEEP.part"
-    mv -- "$SWEEP.part" "$SWEEP"
-    printf '%s\n' "$key" >"$RESULTS/sweep.key"
-    log sweep DONE "$files files, $(wc -l <"$SWEEP") results  $(duration $((SECONDS - t0)))"
+    done
+}
+feature_check() {
+    local i
+    cached_step sweep "$(lane_keys; printf '%s %s %s\n' "$SWEEP_KINDS" "$SWEEP_PER_KIND" "$SWEEP_SOURCES"
+        for i in $SWEEP_SOURCES; do fileid "$REAL/$i"; done; declare -f inject reported_line sweep_one | cksum)" sweep_jobs sweep_one "$SWEEP"
 }
 
 # --- report sections ---

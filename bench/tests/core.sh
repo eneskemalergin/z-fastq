@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Check the benchmark core without timing anything: syntax, help, declaration
-# validation, the batch-reuse rule, the lane identity, and the per-CPU timing lock.
+# validation, the batch-reuse rule, the lane identity, case parameters, and the
+# per-CPU timing lock.
 # Runs in seconds on the corpus already cut under bench/data.
 set -euo pipefail
 export LC_ALL=C
@@ -103,6 +104,36 @@ feature ''
     [[ "$(lane_id_now seqtk)" != "$a" ]] || fail 'changing a command kept the lane identity'
     exit 0
 ) || fail 'batch-reuse checks'
+
+# Case parameters: a short:A,long:B value follows the source's read class, a
+# varied parameter names its value in the case id, every placeholder expands,
+# and two parameter sets never share a check key.
+feature 'family k "by count"
+lanes all
+param k short:100,long:7
+param seed 11
+input real illumina-drr1001190,ont-err14758576 small interleaved
+family kv "by K"
+lanes all
+vary k 5,50
+input real illumina-drr1001190 small interleaved'
+# shellcheck disable=SC2034,SC2154  # read by the sourced core's functions
+(
+    BASH_ARGV0="$work/feat/run.sh"
+    source "$work/feat/run.sh" __probe
+    list="$(cases)"
+    [[ "$(awk -F'\t' '$1 == "k" && $7 == "illumina-drr1001190" { print $10; exit }' <<<"$list")" == "k=100;seed=11" ]] || fail 'a short-read source did not get the short value'
+    [[ "$(awk -F'\t' '$1 == "k" && $7 == "ont-err14758576" { print $10; exit }' <<<"$list")" == "k=7;seed=11" ]] || fail 'a long-read source did not get the long value'
+    [[ "$(awk -F'\t' '$1 == "kv" { print $2 }' <<<"$list" | head -2 | tr '\n' ' ')" == "illumina-drr1001190:small:k=5:plain illumina-drr1001190:small:k=50:plain " ]] ||
+        fail "a varied parameter is not in the case id: $(awk -F'\t' '$1 == "kv" { print $2 }' <<<"$list" | head -2)"
+    [[ "$(expand '{bin} -n {k} -s {seed} {in} {out1}' seqtk IN 'k=3;seed=9')" == "${REG_PATH[seqtk]} -n 3 -s 9 IN /dev/null" ]] || fail 'expand left a placeholder or used the wrong value'
+    [[ "$(OUT1=/x expand '{out1}' seqtk IN -)" == /x ]] || fail 'expand ignored OUT1'
+    LANE_IDS=(["seqtk|k"]=B)
+    [[ "$(status_key seqtk k file F -)" == "seqtk|B|file|F" ]] || fail 'a case without parameters changed its check key'
+    [[ "$(status_key seqtk k file F "k=5")" != "$(status_key seqtk k file F "k=50")" ]] || fail 'two parameter sets share a check key'
+    exit 0
+) || fail 'case-parameter checks'
+expect_invalid 'command seqtk "{bin} size -n {nope} {in}"' 'uses {nope}, which no param line declares'
 
 # Only one timing run at a time on a CPU.
 cpu="${BENCH_CPU:-3}"

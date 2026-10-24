@@ -1,12 +1,14 @@
 """Benchmark figures, light and dark SVG, from the flat files bench.sh writes.
 
-    plot.py REPORT_DIR FIGURE_DIR HEADLINE_TIER SCALING_SOURCES MAIN_FAMILY
+    plot.py REPORT_DIR FIGURE_DIR HEADLINE_TIER SCALING_SOURCES MAIN_FAMILIES [FAMILY:PARAM,...]
 
 REPORT_DIR holds summary.tsv, style.tsv, cases.tsv, and edges.tsv. Figures:
-the edge-case matrix, then for the main family: an isocost-style overview
-against z-fastq; wall time, peak RSS, and minor page faults by kind of input
-(one row per format, one bar group per declared shape group); and throughput
-and peak RSS against input size for the scaling sources.
+the edge-case matrix, then for each main family (comma-separated): an
+isocost-style overview against z-fastq; wall time, peak RSS, and minor page
+faults by kind of input (one row per format, one bar group per declared shape
+group); and throughput and peak RSS against input size for the scaling
+sources. Each FAMILY:PARAM adds wall time and peak RSS against the value of
+the case parameter PARAM.
 """
 
 import csv
@@ -92,13 +94,14 @@ def count_axis(axis, unit="", dense=False):
 
 
 class Figures:
-    def __init__(self, report, out, headline, scaling, main):
+    def __init__(self, report, out, headline, scaling, mains, lines=""):
         self.report = Path(report)
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
         self.headline = headline
         self.scaling = scaling.split()
-        self.main = main
+        self.mains = mains.split(",")
+        self.lines = [tuple(x.split(":", 1)) for x in lines.split(",") if x]
         # The feature's phrases: the wrong-answer legend and the past tense of its job.
         self.words = dict(line.split("\t", 1) for line in (self.report / "words.tsv").read_text().splitlines())
         self.style = {r["lane"]: r for r in read(self.report / "style.tsv")}
@@ -545,6 +548,59 @@ class Figures:
                     handles=self.mark_handles([n for n in self.order if n in shown], theme), ncol=len(shown))
         return True
 
+    # ---- a case parameter --------------------------------------------------
+
+    def param_figure(self, family, param, theme):
+        """Columns: wall time and peak RSS; rows: formats; x: the case parameter; one line per lane."""
+        grid = {}
+        for (fam, case), lanes in self.rows.items():
+            info = self.cases.get((fam, case))
+            if fam != family or not info:
+                continue
+            values = dict(kv.split("=", 1) for kv in info.get("params", "-").split(";") if "=" in kv)
+            if param not in values:
+                continue
+            x = float(values[param])
+            for lane in lanes:
+                t, m = self.value(family, case, lane, "speed"), self.value(family, case, lane, "memory")
+                if t and m:
+                    grid.setdefault(info["format"], {}).setdefault(lane, []).append((x, t / 1e3, m))
+        fmts = [f for f in ("plain", "gzip") if f in grid]
+        if not fmts:
+            return False
+        t = THEMES[theme]
+        fig, axes = self.frame(theme, len(fmts), 2, width=9.0, height=3.4 * len(fmts) + 0.4, sharex=True)
+        shown = []
+        for r, fmt in enumerate(fmts):
+            for c, (col, unit) in enumerate(((1, "wall time (s)"), (2, "peak RSS (MiB)"))):
+                ax = axes[r, c]
+                ax.set_xscale("log")
+                ax.set_yscale("log")
+                for lane in self.order:
+                    pts = sorted(grid[fmt].get(lane, []))
+                    if len(pts) < 2:
+                        continue
+                    st = self.style[lane]
+                    ls = (0, (4, 2)) if st["class"] == "partial" else "-"
+                    ax.plot([p[0] for p in pts], [p[col] for p in pts], color=st[theme], linestyle=ls,
+                            linewidth=2.2 if st["class"] == "subject" else 1.2, zorder=3 if lane == SUBJECT else 2)
+                    for p in pts:
+                        self.mark(ax, lane, p[0], p[col], theme, size=4.5, label=False)
+                    if lane not in shown:
+                        shown.append(lane)
+                count_axis(ax.xaxis)
+                count_axis(ax.yaxis)
+                ax.margins(y=0.12)
+                if r == len(fmts) - 1:
+                    ax.set_xlabel(f"{param.upper()}, log scale", fontsize=8.5, color=t["ink2"])
+                ax.set_ylabel(f"{fmt} input\n{unit}, log scale" if c == 0 else f"{unit}, log scale", fontsize=9, color=t["ink2"])
+        label = next(i["label"] for i in self.cases.values() if i["family"] == family)
+        self.finish(fig, f"{family}-lines", theme, f"Time and peak memory against {param.upper()}",
+                    f"Lower is better. {label}, one input; each point is the median of its runs. A line that rises with "
+                    f"{param.upper()} holds what it keeps in memory. Dashed: partial structure check.",
+                    handles=self.mark_handles([n for n in self.order if n in shown], theme), ncol=len(shown))
+        return True
+
     # ---- edge cases ---------------------------------------------------------
 
     def edges(self, path, theme):
@@ -598,14 +654,16 @@ class Figures:
         edges = self.report / "edges.tsv"
         if edges.exists():
             self.edges(edges, theme)
-        family = self.main
-        if any(f == family for f, _ in self.rows):
-            self.overview(family, theme)
-            for metric in METRICS:
-                self.metric_bars(family, metric, theme)
-            for metric in ("speed", "memory"):
-                self.scaling_figure(family, metric, theme)
+        for family in self.mains:
+            if any(f == family for f, _ in self.rows):
+                self.overview(family, theme)
+                for metric in METRICS:
+                    self.metric_bars(family, metric, theme)
+                for metric in ("speed", "memory"):
+                    self.scaling_figure(family, metric, theme)
+        for family, param in self.lines:
+            self.param_figure(family, param, theme)
 
 
 if __name__ == "__main__":
-    Figures(*sys.argv[1:6]).run()
+    Figures(*sys.argv[1:7]).run()
