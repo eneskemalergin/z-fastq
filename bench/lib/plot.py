@@ -2,7 +2,9 @@
 
     plot.py REPORT_DIR FIGURE_DIR HEADLINE_TIER SCALING_SOURCES MAIN_FAMILIES [FAMILY:PARAM,...]
 
-REPORT_DIR holds summary.tsv, style.tsv, cases.tsv, and edges.tsv. Figures:
+REPORT_DIR holds summary.tsv, style.tsv, cases.tsv, and edges.tsv. Every figure
+is written twice per theme: an SVG for development and the PNG the README
+shows (200 dpi on the theme's page color, 256 colors, no dithering). Figures:
 the edge-case matrix, then for each main family (comma-separated): an
 isocost-style overview against z-fastq; wall time, peak RSS, and minor page
 faults by kind of input (one row per format, one bar group per declared shape
@@ -12,6 +14,7 @@ the case parameter PARAM.
 """
 
 import csv
+import io
 import math
 import multiprocessing
 import sys
@@ -27,6 +30,7 @@ from matplotlib.colors import to_rgb  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch, Rectangle  # noqa: E402
 from matplotlib.ticker import FixedFormatter, FixedLocator, FuncFormatter, LogLocator, NullFormatter, NullLocator  # noqa: E402
+from PIL import Image  # noqa: E402
 
 plt.rcParams.update({"font.family": "DejaVu Sans", "hatch.linewidth": 0.7, "svg.hashsalt": "z-fastq"})
 
@@ -159,6 +163,14 @@ class Figures:
         part = path.with_suffix(".svg.part")
         fig.savefig(part, format="svg", facecolor=t["bg"], bbox_inches="tight", pad_inches=0.2)
         part.replace(path)
+        # The README's copy: a flat chart needs few colors, so a 256-color
+        # palette without dithering keeps every edge and halves the file.
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=200, facecolor=t["bg"], bbox_inches="tight", pad_inches=0.2)
+        png = path.with_suffix(".png")
+        image = Image.open(buf).convert("RGB").quantize(256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+        image.save(png.with_suffix(".png.part"), format="png", optimize=True)
+        png.with_suffix(".png.part").replace(png)
         plt.close(fig)
 
     def bar_style(self, lane, theme):

@@ -1122,12 +1122,12 @@ mdtable() {
         function pad(s, k, al,   g) { g = k - length(s); while (g-- > 0) s = (al == "r") ? " " s : s " "; return s }'
 }
 picture() { # stem alt; nothing when the figure was not drawn
-    [[ -e "$RESULTS/figures/$1-light.svg" ]] || return 0
+    [[ -e "$RESULTS/figures/$1-light.png" ]] || return 0
     cat <<EOF
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/$1-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/$1-light.svg">
-  <img src="results/figures/$1-light.svg" alt="$2" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/$1-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/$1-light.png">
+  <img src="results/figures/$1-light.png" alt="$2" width="100%">
 </picture>
 EOF
 }
@@ -1636,7 +1636,7 @@ readme_speed() { # family [title]
     printf '\n'
     picture "$fam-speed" "Wall time by kind of input" && printf '\n'
     picture "$fam-memory" "Peak memory by kind of input" && printf '\n'
-    if [[ -e "$RESULTS/figures/$fam-faults-light.svg" ]]; then
+    if [[ -e "$RESULTS/figures/$fam-faults-light.png" ]]; then
         details "Minor page faults by kind of input"
         picture "$fam-faults" "Minor page faults by kind of input"
         printf '\n</details>\n\n'
@@ -1766,18 +1766,18 @@ report() {
     mains="$(full_families)" mains="${mains% }" mains="${mains// /,}"
     for fam in "${FAMILIES[@]}"; do [[ "${FAM_LOOK[$fam]}" != lines ]] || lines+="$fam:${FAM_VARY[$fam]%% *},"; done
     key="$(cat "$REPORT_DIR"/{summary,style,cases,edges,words}.tsv "$BENCH/lib/plot.py" | cksum) $HEADLINE $SCALING $mains${lines:+ ${lines%,}}"
-    if [[ "$(cat "$REPORT_DIR/figures.key" 2>/dev/null)" != "$key" ]] || ! ls "$figures"/*.svg >/dev/null 2>&1; then
+    if [[ "$(cat "$REPORT_DIR/figures.key" 2>/dev/null)" != "$key" ]] || ! ls "$figures"/*.png >/dev/null 2>&1; then
         stamp="$REPORT_DIR/stamp"
         : >"$stamp"
         "$REPO/tools/venv/bin/python" -I "$BENCH/lib/plot.py" "$REPORT_DIR" "$figures" "$HEADLINE" "$SCALING" "$mains" ${lines:+"${lines%,}"}
         # A figure the plot step did not just write belongs to nothing declared now.
-        for f in "$figures"/*.svg; do [[ "$f" -nt "$stamp" || ! -e "$f" ]] || rm -- "$f"; done
+        for f in "$figures"/*.svg "$figures"/*.png; do [[ "$f" -nt "$stamp" || ! -e "$f" ]] || rm -- "$f"; done
         printf '%s\n' "$key" >"$REPORT_DIR/figures.key"
     fi
     write_picks
     readme >"$FEATURE_DIR/README.md.part"
     mv -- "$FEATURE_DIR/README.md.part" "$FEATURE_DIR/README.md"
-    log report DONE "${FEATURE_DIR#"$REPO"/}/README.md, $(ls "$figures" | wc -l) figures"
+    log report DONE "${FEATURE_DIR#"$REPO"/}/README.md, $(ls "$figures"/*.png | wc -l) figures"
 }
 
 # --- quick checks: picks, peer, ab ------------------------------------------

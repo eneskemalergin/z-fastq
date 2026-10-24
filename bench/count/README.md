@@ -48,9 +48,9 @@ z-fastq returned the right count on all 218 inputs: every corpus file and synthe
 > Helicase, SeqFu, seqtk and fqtools print a wrong count and exit 0 on some malformed inputs, so a script cannot tell the count is wrong. Helicase crashes on some malformed gzip input.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/edges-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/edges-light.svg">
-  <img src="results/figures/edges-light.svg" alt="What each tool does on small edge-case inputs" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/edges-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/edges-light.png">
+  <img src="results/figures/edges-light.png" alt="What each tool does on small edge-case inputs" width="100%">
 </picture>
 
 > [!NOTE]
@@ -69,9 +69,9 @@ z-fastq returned the right count on all 218 inputs: every corpus file and synthe
 > <sub>The real runs and synthetic shapes at the medium tier, about 1 GiB of FASTQ each, pooled into kinds of input. Every tool runs on one CPU with the file in the page cache.</sub>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-overview-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/file-overview-light.svg">
-  <img src="results/figures/file-overview-light.svg" alt="Time and peak RSS relative to z-fastq" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-overview-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/file-overview-light.png">
+  <img src="results/figures/file-overview-light.png" alt="Time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
 z-fastq itself takes 141.0 ms and 0.75 MiB per plain input, 1397.2 ms and 0.75 MiB per gzip input (geometric means over 12 inputs each); the table gives every tool as a multiple of that.
@@ -86,23 +86,23 @@ z-fastq itself takes 141.0 ms and 0.75 MiB per plain input, 1397.2 ms and 0.75 M
 | fqtools    |     23.90x |        4.34x |     3.33x |       4.98x |
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-speed-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/file-speed-light.svg">
-  <img src="results/figures/file-speed-light.svg" alt="Wall time by kind of input" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-speed-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/file-speed-light.png">
+  <img src="results/figures/file-speed-light.png" alt="Wall time by kind of input" width="100%">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-memory-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/file-memory-light.svg">
-  <img src="results/figures/file-memory-light.svg" alt="Peak memory by kind of input" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-memory-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/file-memory-light.png">
+  <img src="results/figures/file-memory-light.png" alt="Peak memory by kind of input" width="100%">
 </picture>
 
 <details><summary>Minor page faults by kind of input</summary>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-faults-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/file-faults-light.svg">
-  <img src="results/figures/file-faults-light.svg" alt="Minor page faults by kind of input" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-faults-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/file-faults-light.png">
+  <img src="results/figures/file-faults-light.png" alt="Minor page faults by kind of input" width="100%">
 </picture>
 
 </details>
@@ -111,15 +111,15 @@ z-fastq itself takes 141.0 ms and 0.75 MiB per plain input, 1397.2 ms and 0.75 M
 > <sub>Each synthetic shape from 1 MiB to 1 GiB of FASTQ: throughput and peak memory against input size. A shape changes one thing a counter pays for, so its line shows what that one thing costs each tool.</sub>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-scaling-speed-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/file-scaling-speed-light.svg">
-  <img src="results/figures/file-scaling-speed-light.svg" alt="Throughput by input size" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-scaling-speed-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/file-scaling-speed-light.png">
+  <img src="results/figures/file-scaling-speed-light.png" alt="Throughput by input size" width="100%">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-scaling-memory-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/file-scaling-memory-light.svg">
-  <img src="results/figures/file-scaling-memory-light.svg" alt="Peak memory by input size" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-scaling-memory-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/file-scaling-memory-light.png">
+  <img src="results/figures/file-scaling-memory-light.png" alt="Peak memory by input size" width="100%">
 </picture>
 
 At 1 GiB, z-fastq counts 5.7 to 10.7 GiB/s on plain input and 0.4 to 0.8 GiB/s on gzip input. Faster there: Helicase on gzip dense (1.01x), throughput as a multiple of z-fastq.

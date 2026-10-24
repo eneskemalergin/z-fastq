@@ -46,9 +46,9 @@ z-fastq returned the right verdict on all 228 inputs: every corpus file and synt
 > fqtools and fastQValidator print a wrong verdict and exit 0 on some malformed inputs, so a script cannot tell the file is broken.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/edges-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/edges-light.svg">
-  <img src="results/figures/edges-light.svg" alt="What each tool does on small edge-case inputs" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/edges-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/edges-light.png">
+  <img src="results/figures/edges-light.png" alt="What each tool does on small edge-case inputs" width="100%">
 </picture>
 
 > [!NOTE]
@@ -135,9 +135,9 @@ There were a total of 1 errors.
 > <sub>The real runs and synthetic shapes at the medium tier, about 1 GiB of FASTQ each, pooled into kinds of input. Every tool runs on one CPU with the file in the page cache.</sub>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-overview-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/single-overview-light.svg">
-  <img src="results/figures/single-overview-light.svg" alt="Time and peak RSS relative to z-fastq" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-overview-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/single-overview-light.png">
+  <img src="results/figures/single-overview-light.png" alt="Time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
 z-fastq itself takes 254.3 ms and 0.75 MiB per plain input, 1457.9 ms and 0.75 MiB per gzip input (geometric means over 12 inputs each); the table gives every tool as a multiple of that.
@@ -150,23 +150,23 @@ z-fastq itself takes 254.3 ms and 0.75 MiB per plain input, 1457.9 ms and 0.75 M
 | fastQValidator |     25.83x |        8.66x |     5.34x |       9.06x |
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-speed-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/single-speed-light.svg">
-  <img src="results/figures/single-speed-light.svg" alt="Wall time by kind of input" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-speed-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/single-speed-light.png">
+  <img src="results/figures/single-speed-light.png" alt="Wall time by kind of input" width="100%">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-memory-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/single-memory-light.svg">
-  <img src="results/figures/single-memory-light.svg" alt="Peak memory by kind of input" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-memory-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/single-memory-light.png">
+  <img src="results/figures/single-memory-light.png" alt="Peak memory by kind of input" width="100%">
 </picture>
 
 <details><summary>Minor page faults by kind of input</summary>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-faults-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/single-faults-light.svg">
-  <img src="results/figures/single-faults-light.svg" alt="Minor page faults by kind of input" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-faults-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/single-faults-light.png">
+  <img src="results/figures/single-faults-light.png" alt="Minor page faults by kind of input" width="100%">
 </picture>
 
 </details>
@@ -175,15 +175,15 @@ z-fastq itself takes 254.3 ms and 0.75 MiB per plain input, 1457.9 ms and 0.75 M
 > <sub>Each synthetic shape from 1 MiB to 1 GiB of FASTQ: throughput and peak memory against input size. A shape changes one thing a validator pays for, so its line shows what that one thing costs each tool.</sub>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-scaling-speed-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/single-scaling-speed-light.svg">
-  <img src="results/figures/single-scaling-speed-light.svg" alt="Throughput by input size" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-scaling-speed-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/single-scaling-speed-light.png">
+  <img src="results/figures/single-scaling-speed-light.png" alt="Throughput by input size" width="100%">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-scaling-memory-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/single-scaling-memory-light.svg">
-  <img src="results/figures/single-scaling-memory-light.svg" alt="Peak memory by input size" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-scaling-memory-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/single-scaling-memory-light.png">
+  <img src="results/figures/single-scaling-memory-light.png" alt="Peak memory by input size" width="100%">
 </picture>
 
 At 1 GiB, z-fastq validates 3.0 to 6.2 GiB/s on plain input and 0.4 to 0.9 GiB/s on gzip input; no other tool is faster there.

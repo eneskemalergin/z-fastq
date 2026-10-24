@@ -87,9 +87,9 @@ z-fastq returned the right sample on all 84 inputs it was given. Every other too
 > Rasusa, seqtk, fq, fqkit, SeqKit and Fasten print a wrong sample and exit 0 on some malformed inputs, so a script cannot tell the sample is wrong.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/edges-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/edges-light.svg">
-  <img src="results/figures/edges-light.svg" alt="What each tool does on small edge-case inputs" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/edges-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/edges-light.png">
+  <img src="results/figures/edges-light.png" alt="What each tool does on small edge-case inputs" width="100%">
 </picture>
 
 > [!NOTE]
@@ -140,9 +140,9 @@ A tool fails at a count bias beyond 4.9, a spread outside 0.5 to 1.5, a tenth be
 > <sub>The real runs and synthetic shapes at the medium tier, about 1 GiB of FASTQ each, pooled into kinds of input. Every tool runs on one CPU with the file in the page cache.</sub>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-overview-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-overview-light.svg">
-  <img src="results/figures/fraction-overview-light.svg" alt="Time and peak RSS relative to z-fastq" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-overview-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-overview-light.png">
+  <img src="results/figures/fraction-overview-light.png" alt="Time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
 z-fastq itself takes 415.4 ms and 0.89 MiB per plain input, 1762.8 ms and 0.89 MiB per gzip input (geometric means over 12 inputs each); the table gives every tool as a multiple of that.
@@ -157,23 +157,23 @@ z-fastq itself takes 415.4 ms and 0.89 MiB per plain input, 1762.8 ms and 0.89 M
 | IRMA Core |      3.28x |        5.25x |     2.94x |       5.16x | none             |
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-speed-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-speed-light.svg">
-  <img src="results/figures/fraction-speed-light.svg" alt="Wall time by kind of input" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-speed-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-speed-light.png">
+  <img src="results/figures/fraction-speed-light.png" alt="Wall time by kind of input" width="100%">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-memory-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-memory-light.svg">
-  <img src="results/figures/fraction-memory-light.svg" alt="Peak memory by kind of input" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-memory-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-memory-light.png">
+  <img src="results/figures/fraction-memory-light.png" alt="Peak memory by kind of input" width="100%">
 </picture>
 
 <details><summary>Minor page faults by kind of input</summary>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-faults-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-faults-light.svg">
-  <img src="results/figures/fraction-faults-light.svg" alt="Minor page faults by kind of input" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-faults-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-faults-light.png">
+  <img src="results/figures/fraction-faults-light.png" alt="Minor page faults by kind of input" width="100%">
 </picture>
 
 </details>
@@ -182,15 +182,15 @@ z-fastq itself takes 415.4 ms and 0.89 MiB per plain input, 1762.8 ms and 0.89 M
 > <sub>Each synthetic shape from 1 MiB to 1 GiB of FASTQ: throughput and peak memory against input size. A shape changes one thing a sampler pays for, so its line shows what that one thing costs each tool.</sub>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-scaling-speed-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-scaling-speed-light.svg">
-  <img src="results/figures/fraction-scaling-speed-light.svg" alt="Throughput by input size" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-scaling-speed-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-scaling-speed-light.png">
+  <img src="results/figures/fraction-scaling-speed-light.png" alt="Throughput by input size" width="100%">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-scaling-memory-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-scaling-memory-light.svg">
-  <img src="results/figures/fraction-scaling-memory-light.svg" alt="Peak memory by input size" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-scaling-memory-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-scaling-memory-light.png">
+  <img src="results/figures/fraction-scaling-memory-light.png" alt="Peak memory by input size" width="100%">
 </picture>
 
 At 1 GiB, z-fastq samples 1.5 to 5.3 GiB/s on plain input and 0.4 to 0.7 GiB/s on gzip input. Faster there: Rasusa on plain long (1.74x); Rasusa on plain variable (1.52x); Rasusa on plain longread (1.45x); Rasusa on gzip dense (1.01x); Rasusa on plain endings (1.49x); Rasusa on plain dense (1.66x); seqtk on plain long (1.45x); seqtk on plain longread (1.25x); seqtk on plain endings (1.16x); seqtk on plain dense (1.08x), throughput as a multiple of z-fastq.
@@ -200,9 +200,9 @@ z-fastq peaks at 0.76 to 1.77 MiB across sizes and shapes. Memory that grows wit
 > <sub>The real runs and synthetic shapes at the medium tier, about 1 GiB of FASTQ each, pooled into kinds of input. Every tool runs on one CPU with the file in the page cache.</sub>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/exact-overview-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/exact-overview-light.svg">
-  <img src="results/figures/exact-overview-light.svg" alt="Time and peak RSS relative to z-fastq" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/exact-overview-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/exact-overview-light.png">
+  <img src="results/figures/exact-overview-light.png" alt="Time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
 z-fastq itself takes 518.0 ms and 1.28 MiB per plain input (geometric mean over 12 inputs); the table gives every tool as a multiple of that.
@@ -218,23 +218,23 @@ z-fastq itself takes 518.0 ms and 1.28 MiB per plain input (geometric mean over 
 | IRMA Core |      2.36x |        3.67x | none             |
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/exact-speed-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/exact-speed-light.svg">
-  <img src="results/figures/exact-speed-light.svg" alt="Wall time by kind of input" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/exact-speed-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/exact-speed-light.png">
+  <img src="results/figures/exact-speed-light.png" alt="Wall time by kind of input" width="100%">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/exact-memory-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/exact-memory-light.svg">
-  <img src="results/figures/exact-memory-light.svg" alt="Peak memory by kind of input" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/exact-memory-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/exact-memory-light.png">
+  <img src="results/figures/exact-memory-light.png" alt="Peak memory by kind of input" width="100%">
 </picture>
 
 <details><summary>Minor page faults by kind of input</summary>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/exact-faults-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/exact-faults-light.svg">
-  <img src="results/figures/exact-faults-light.svg" alt="Minor page faults by kind of input" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/exact-faults-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/exact-faults-light.png">
+  <img src="results/figures/exact-faults-light.png" alt="Minor page faults by kind of input" width="100%">
 </picture>
 
 </details>
@@ -244,9 +244,9 @@ Plain input only: with gzip, most exact-count tools decompress the file twice, s
 ### Time and memory against K
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/figures/exact-k-lines-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="results/figures/exact-k-lines-light.svg">
-  <img src="results/figures/exact-k-lines-light.svg" alt="Time and peak memory against K" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/exact-k-lines-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="results/figures/exact-k-lines-light.png">
+  <img src="results/figures/exact-k-lines-light.png" alt="Time and peak memory against K" width="100%">
 </picture>
 
 |         K | z-fastq peak | Lowest other     | Highest other  |

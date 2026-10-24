@@ -18,9 +18,11 @@ __pycache__/
 /tools/venv/
 /tools/.local/
 
-# Benchmarks: each feature's run.sh, generated README.md, and results/figures/
-# are tracked; corpus data, shared builds, and raw results are local
+# Benchmarks: each feature's run.sh, generated README.md, and the PNG figures
+# it shows are tracked; corpus data, shared builds, raw results, and the
+# development SVG figures are local
 /bench/data/
 /bench/cache/
 /bench/*/results/*
 !/bench/*/results/figures/
+/bench/*/results/figures/*.svg
