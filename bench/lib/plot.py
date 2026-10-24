@@ -35,6 +35,7 @@ THEMES = {
 }
 MARKERS = {"circle": "o", "square": "s", "diamond": "D", "triangle": "^", "triangle-down": "v", "plus": "P", "star": "*", "cross": "X"}
 SUBJECT = "z-fastq"
+TIER_SIZE = {"tiny": "1 MiB", "xsmall": "10 MiB", "small": "100 MiB", "medium": "1 GiB"}
 # Reserved status colors (dataviz reference palette); every cell also carries its text.
 # Strength: how much of the color a cell shows, per theme; stronger for worse verdicts.
 VERDICTS = [("right", "#0ca30c", "right", (0.30, 0.42)), ("refused", "#fab219", "refused a valid input", (0.50, 0.45)),
@@ -99,6 +100,8 @@ class Figures:
         self.headline = headline
         self.scaling = scaling.split()
         self.main = main
+        # The feature's phrases: the wrong-answer legend and the past tense of its job.
+        self.words = dict(line.split("\t", 1) for line in (self.report / "words.tsv").read_text().splitlines())
         self.style = {r["lane"]: r for r in read(self.report / "style.tsv")}
         self.order = sorted(self.style, key=lambda n: int(self.style[n]["order"]))
         self.cases = {(r["family"], r["case"]): r for r in read(self.report / "cases.tsv")}
@@ -322,7 +325,7 @@ class Figures:
             ax.set_ylabel(f"{spec['axis']}, log scale", fontsize=9, color=THEMES[theme]["ink2"])
         lower = "Lower is better. " if metric != "faults" else ""
         self.finish(fig, f"{family}-{metric}", theme, f"{spec['title']} by kind of input",
-                    f"{lower}{self.headline.capitalize()} tier, about 100 MiB of FASTQ per input. Bars: geometric "
+                    f"{lower}{self.headline.capitalize()} tier, about {TIER_SIZE[self.headline]} of FASTQ per input. Bars: geometric "
                     "mean over the inputs of a group (dots, each the median of its timed repeats; markers name the synthetic "
                     "shapes), whiskers their range. Boxes: multiple of "
                     f"z-fastq (dashed line). {CLASS_NOTE}", handles=self.bar_handles(shown, theme), keys=self.dot_keys(theme))
@@ -532,7 +535,7 @@ class Figures:
                     unit = "MiB/s" if metric == "speed" else "peak RSS (MiB)"
                     ax.set_ylabel(f"{fmt} input\n{unit}, log scale", fontsize=9, color=t["ink2"])
         if metric == "speed":
-            title, note = ("Throughput by input size", "Higher is better. MiB of FASTQ counted per second of wall time; "
+            title, note = ("Throughput by input size", f"Higher is better. MiB of FASTQ {self.words['done']} per second of wall time; "
                            "at 1 MiB, starting the process dominates")
         else:
             title, note = ("Peak memory by input size", "Lower is better. A flat line means memory does not grow with the input; "
@@ -573,7 +576,7 @@ class Figures:
                     fontweight="bold" if r["verdict"] in ("wrong", "crash") else "normal")
         prev = None
         for y, (label, expected) in sorted(labels.items()):
-            group = "reject" if expected == "reject" else "policy" if not expected[:1].isdigit() else "count"
+            group = "reject" if expected == "reject" else "policy" if expected == "tool policy" else "value"
             if prev and group != prev:
                 ax.axhline(y + 0.03, xmin=0, xmax=1, color=t["grid"], linewidth=0.8)
             prev = group
@@ -583,7 +586,7 @@ class Figures:
         for x, tool in enumerate(tools):
             ax.text(x + 0.5, -0.55, tool, ha="center", va="center", fontsize=9, color=t["ink"], fontweight="bold" if tool == SUBJECT else "normal")
         handles = [Patch(facecolor=mix(c, t["bg"], s[0 if theme == "light" else 1]) if c else t["bg"], edgecolor=t["grid"] if not c else "none",
-                         label=w) for _, c, w, s in VERDICTS]
+                         label=self.words["wrong"] if v == "wrong" else w) for v, c, w, s in VERDICTS]
         self.finish(fig, "edges", theme, "What each tool does on edge cases",
                     "Each cell is what the tool printed; color shows whether that was right.", handles=handles)
 
