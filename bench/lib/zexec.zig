@@ -1,7 +1,7 @@
 //! Benchmark exec helper: give the measured program a fresh stdin, a stdout
 //! file, and per-run paths, then replace this process with it.
 //!
-//!     zexec [-i FILE] [-o FILE] [-r FILE] -- PROGRAM [ARG...]
+//!     zexec [-i FILE] [-o FILE] [-r FILE] [-u FILE]... -- PROGRAM [ARG...]
 //!
 //! `-i` opens FILE as stdin and `-o` creates or truncates FILE as stdout, for
 //! each run. "@RUN@" in FILE paths and in ARGs becomes zexec's process id, so
@@ -14,7 +14,9 @@
 //! footprint at fork is hidden: the high-water mark it inherits survives exec.
 //!
 //! With `-r`, zexec runs PROGRAM as its child, waits, appends one line to FILE,
-//! and ends the way PROGRAM ended (same exit status, same signal). The line is
+//! and ends the way PROGRAM ended (same exit status, same signal). Each `-u`
+//! FILE is removed once PROGRAM has ended and its line is written, so a run's
+//! output files never pile up across runs. The line is
 //! `maxrss_kib user_us system_us minor_faults status wall_us`, tab-separated:
 //! the child's own `wait4` usage, then the monotonic time from fork to wait. zexec is static with no libc, so the child starts
 //! with a few KiB of inherited pages instead of the runner's, and its peak RSS
@@ -30,6 +32,8 @@ var pool: [1 << 18]u8 = undefined;
 var pool_used: usize = 0;
 var pid_buf: [20]u8 = undefined;
 var pid: []const u8 = undefined;
+var unlink_paths: [8][*:0]const u8 = undefined;
+var unlink_count: usize = 0;
 
 pub fn main(init: std.process.Init.Minimal) noreturn {
     const argv = init.args.vector;
@@ -50,6 +54,10 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
             stdout_path = expand(argv[i + 1]);
         } else if (std.mem.eql(u8, arg, "-r")) {
             report_path = expand(argv[i + 1]);
+        } else if (std.mem.eql(u8, arg, "-u")) {
+            if (unlink_count == unlink_paths.len) die("too many", "-u files", null);
+            unlink_paths[unlink_count] = expand(argv[i + 1]);
+            unlink_count += 1;
         } else die("unknown option", arg, null);
     }
     i += 1;
@@ -100,6 +108,8 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         wall_us,
     }) catch unreachable;
     if (linux.write(@intCast(fd), text.ptr, text.len) != text.len) die("write", std.mem.span(report), null);
+    // A file the program did not write is not an error here.
+    for (unlink_paths[0..unlink_count]) |path| _ = linux.unlinkat(linux.AT.FDCWD, path, 0);
 
     if (linux.W.IFSIGNALED(status)) {
         const sig = linux.W.TERMSIG(status);

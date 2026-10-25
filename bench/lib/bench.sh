@@ -70,8 +70,8 @@ declare -A WARM=([tiny]=1 [xsmall]=1 [small]=1 [medium]=1 [many]=1)
 
 # --- declarations ---------------------------------------------------------
 JOB="" TRUTH="" HEADLINE=medium SCALING="" FAMILIES=() LANES=() CUR_FAMILY=""
-declare -A LANE_CLASS LANE_TMPL LANE_NOTE LANE_HEADLINE DESCRIBE
-declare -A FAM_DESC FAM_LANES FAM_STDIN FAM_INPUTS FAM_KIND FAM_PARAMS FAM_VARY FAM_FORMATS FAM_LOOK
+declare -A LANE_CLASS LANE_TMPL LANE_NOTE LANE_HEADLINE LANE_OUTS DESCRIBE
+declare -A FAM_DESC FAM_LANES FAM_STDIN FAM_INPUTS FAM_KIND FAM_PARAMS FAM_VARY FAM_FORMATS FAM_LOOK FAM_MEM
 job() { JOB="$1"; }
 # order LANES: this feature's table and legend order, ahead of the registry's.
 order() { local n i=0; for n in ${1//,/ }; do REG_ORDER[$n]=$((i++ - 1000)); done; }
@@ -119,6 +119,7 @@ lane() {
         case "$arg" in
             note=*) LANE_NOTE[$name]="${arg#note=}" ;;
             headline-only) LANE_HEADLINE[$name]=1 ;;
+            outputs=*) LANE_OUTS[$name]="${arg#outputs=}" ;;
             *) die "lane $name: unknown option $arg" ;;
         esac
     done
@@ -146,6 +147,12 @@ vary() { FAM_VARY[$CUR_FAMILY]="$1 ${2//,/ }"; }
 formats() { FAM_FORMATS[$CUR_FAMILY]="${*//,/ }"; }
 # look full|table|lines: how a feature's own README order shows the family.
 look() { FAM_LOOK[$CUR_FAMILY]="$1"; }
+# memory SIZE: the current family's memory cap per run, in place of BENCH_MEM.
+memory() { FAM_MEM[$CUR_FAMILY]="$1"; }
+# rival any: the quick-check rival is the fastest other tool of any class,
+# not only the fastest complete one.
+RIVAL_ANY=0
+rival() { [[ "$1" == any ]] || die "rival: unknown value $1"; RIVAL_ANY=1; }
 # facts piped: each lane's stdout streams into fact while the lane runs,
 # instead of through a file; for outputs too large to keep.
 FACT_PIPE=0
@@ -274,11 +281,16 @@ cache_lane_ids() {
 
 # Expands a command template: {zfastq}, {bin}, {in} (space-separated paths
 # for many-files), each case parameter in PARAMS (NAME=VALUE;...; - for none),
-# and {out1} and {out2}, the paths in OUT1 and OUT2 (/dev/null when unset).
+# {out1} and {out2}, the paths in OUT1 and OUT2 (/dev/null when unset), and
+# for a lane that names its outputs from a stem, {stem}, {dir}, and {name}:
+# STEM, its directory, and its last part. {in1} and {in2} are the first and
+# last input path.
 expand() { # template lane input params
     local t="$1" kv
+    if [[ -n "${STEM:-}" ]]; then t="${t//\{stem\}/$STEM}" t="${t//\{dir\}/${STEM%/*}}" t="${t//\{name\}/${STEM##*/}}"; fi
     t="${t//\{zfastq\}/$ZFASTQ}"
     t="${t//\{bin\}/$(lane_bin "$2")}"
+    t="${t//\{in1\}/${3%% *}}" t="${t//\{in2\}/${3##* }}"
     t="${t//\{in\}/$3}"
     if [[ "$4" != - ]]; then for kv in ${4//;/ }; do t="${t//\{${kv%%=*}\}/${kv#*=}}"; done; fi
     t="${t//\{out1\}/${OUT1:-/dev/null}}"
@@ -539,13 +551,37 @@ ensure_builds() {
 # ERR. With piped facts the lane's stdout streams into fact, and each named
 # output ({out1}, {out2}) is a FIFO that fact reads; this shell holds the
 # FIFOs' write ends open while the lane runs, so fact always sees them end.
+# A failed run's verdict for a fact: reject, with the rule (S001 to S006,
+# P001, P002) the tool named in ERR, if any.
+reject_code() {
+    local code
+    code="$(sed 's/\x1b\[[0-9;]*m//g' "$ERR" | grep -o -m1 -E ': \[?[SP]00[1-6]\]?:?' | grep -o -E '[SP]00[1-6]' | head -1)" || code=""
+    printf 'reject%s\n' "${code:+ $code}"
+}
 # fact with the case's variables, read from the calling check_one's locals.
 fact_of() { LANE="$name" FAMILY="$fam" IN="$paths" TRUTH="$truth" PARAMS="$params" fact; }
 check_one() { # lane form fam id fmt paths want bytes params truth
     local name="$1" form="$2" fam="$3" paths="$6" want="$7" params="${9:--}" truth="${10:-$7}" out rc=0 value cmd input=- status=fail diff=""
     out="$(mktemp "/var/tmp/bench-$FEATURE.XXXXXX")"
     [[ "$form" == stdin ]] || input="$paths"
-    if ((FACT_PIPE)); then
+    if ((FACT_PIPE)) && uses_stem "$name" "$fam"; then
+        # A lane that names its outputs from a stem writes new regular files
+        # (it may refuse an existing path), read by fact once it has ended.
+        local -a sfx
+        read -r -a sfx <<<"${LANE_OUTS[$name]//,/ }"
+        local stem="$out.o" o1="" o2=""
+        o1="$stem${sfx[0]}"
+        ((${#sfx[@]} < 2)) || o2="$stem${sfx[1]}"
+        cmd="$(STEM="$stem" lane_cmd "$name" "$input" "$fam" "$params")"
+        if [[ "$form" == stdin ]]; then $cmd <"$paths" >/dev/null 2>"$out.err" || rc=$?; else $cmd >/dev/null 2>"$out.err" || rc=$?; fi
+        if ((rc == 0)); then
+            value="$(OUT1="$o1" OUT2="$o2" fact_of </dev/null | paste -sd';' -)"
+        else
+            value="$(RC="$rc" ERR="$out.err" fact_of </dev/null | paste -sd';' -)"
+        fi
+        # Every file under the stem, also one a tool named its own way.
+        rm -f -- "$o1" "$o2" "${stem:?}"*
+    elif ((FACT_PIPE)); then
         local tmpl o1="" o2="" w1 w2 fpid
         tmpl="$(lane_tmpl "$name" "$fam")"
         [[ "$tmpl" != *"{out1}"* ]] || { o1="$out.1"; mkfifo -- "$o1"; }
@@ -779,12 +815,19 @@ gzzeros	policy	policy	policy	policy	-	zero bytes after the last gzip member
 dup	-	-	-	accept	-	the same record twice
 EOF
 }
-edge_col() { case "$EDGE_SET" in count) echo 2 ;; stats) echo 3 ;; check) echo 4 ;; sample) echo 5 ;; *) die "unknown edge set $EDGE_SET" ;; esac; }
-# name<TAB>expected<TAB>row label, for the declared edge set
-edge_list() { edge_table | awk -F'\t' -v c="$(edge_col)" -v OFS='\t' '$c != "-" { print $1, $c, $7 }'; }
+edge_col() { case "$EDGE_SET" in count) echo 2 ;; stats) echo 3 ;; check) echo 4 ;; sample) echo 5 ;; *) declare -F feature_edge_list >/dev/null || die "unknown edge set $EDGE_SET" ;; esac; }
+# name<TAB>expected<TAB>row label, for the declared edge set. A feature with
+# its own rows defines feature_edge_list, make_feature_edges (its inputs),
+# edge_input EDGE (the paths a row runs on), and edge_family EDGE (the family
+# whose commands run the row; a lane outside it shows "-").
+edge_list() {
+    if declare -F feature_edge_list >/dev/null; then feature_edge_list; return; fi
+    edge_table | awk -F'\t' -v c="$(edge_col)" -v OFS='\t' '$c != "-" { print $1, $c, $7 }'
+}
 probe_rows() { edge_table | awk -F'\t' -v c="$(edge_col)" '$c != "-" && $6 == "probe" { print $1 }'; }
 make_edges() {
     mkdir -p -- "$EDGES"
+    if declare -F make_feature_edges >/dev/null; then make_feature_edges; fi
     local r='@r1\nACGT\n+\nIIII\n@r2\nAC\n+\nII\n' e="$EDGES"
     [[ -f "$e/qhigh.fq" && -f "$e/gzzeros.fq.gz" && -f "$e/dup.fq" ]] && return 0
     printf '@r1\nACGT\n+\n!5?~\n' >"$e/qrange.fq"
@@ -813,7 +856,10 @@ make_edges() {
     { printf "$r" | gzip -n; head -c 8 /dev/zero; } >"$e/gzzeros.fq.gz"
     printf '@r1\nACGT\n+\nIIII\n@r1\nACGT\n+\nIIII\n' >"$e/dup.fq"
 }
-edge_path() { if [[ -f "$EDGES/$1.fq" ]]; then printf '%s\n' "$EDGES/$1.fq"; else printf '%s\n' "$EDGES/$1.fq.gz"; fi; }
+edge_path() {
+    if declare -F edge_input >/dev/null; then edge_input "$1"; return; fi
+    if [[ -f "$EDGES/$1.fq" ]]; then printf '%s\n' "$EDGES/$1.fq"; else printf '%s\n' "$EDGES/$1.fq.gz"; fi
+}
 # Cell text: the count when right, "reject" when refused, "wrong: V" when a
 # count differs, "refused" when a valid input was rejected, "crash" when the
 # lane died by a signal.
@@ -835,7 +881,8 @@ run_edges() {
     # Cached while every lane's command and every edge file is unchanged.
     key="$(for name in "${LANES[@]}"; do printf '%s %s\n' "$name" "$(lane_id "$name" "${edge_fam[$name]}")"; done
         [[ "$EDGE_PARAMS" == - ]] || printf 'params %s\n' "$EDGE_PARAMS"
-        edge_list | while IFS=$'\t' read -r edge _; do fileid "$(edge_path "$edge")"; done)"
+        if declare -F edge_family >/dev/null; then lane_keys; declare -f edge_family edge_input | cksum; fi
+        edge_list | while IFS=$'\t' read -r edge _; do fileid $(edge_path "$edge"); done)"
     STAGE=edges
     if [[ -f "$out" && "$(cat "$RESULTS/edges.key" 2>/dev/null)" == "$key" ]]; then
         log edges CACHE "$(edge_list | wc -l) rows, every lane unchanged"
@@ -844,20 +891,33 @@ run_edges() {
     local t0=$SECONDS
     : >"$out"
     local o="$RESULTS/edges.out" tmpl cmd params="$EDGE_PARAMS" paths truth=""
+    local stem=""
     for name in "${LANES[@]}"; do
-        fam="${edge_fam[$name]}" tmpl="$(lane_tmpl "$name" "$fam")"
-        local o1="" o2=""
-        [[ "$tmpl" != *"{out1}"* ]] || o1="$o.1"
-        [[ "$tmpl" != *"{out2}"* ]] || o2="$o.2"
         while IFS=$'\t' read -r edge expected label; do
+            fam="${edge_fam[$name]}"
+            if declare -F edge_family >/dev/null; then
+                fam="$(edge_family "$edge")"
+                if [[ " ${FAM_LANES[$fam]} " != *" $name "* ]]; then printf '%s\t%s\t-\n' "$name" "$edge" >>"$out"; continue; fi
+            fi
+            tmpl="$(lane_tmpl "$name" "$fam")"
+            local o1="" o2="" stem=""
+            [[ "$tmpl" != *"{out1}"* ]] || o1="$o.1"
+            [[ "$tmpl" != *"{out2}"* ]] || o2="$o.2"
+            if [[ -n "$fam" ]] && uses_stem "$name" "$fam"; then
+                local -a sfx
+                read -r -a sfx <<<"${LANE_OUTS[$name]//,/ }"
+                stem="$o.s" o1="$stem${sfx[0]}" o2=""
+                ((${#sfx[@]} < 2)) || o2="$stem${sfx[1]}"
+                rm -f -- "$o1" "$o2"
+            fi
             path="$(edge_path "$edge")" paths="$path"
             rc=0
-            # A lane whose command names no input reads it on stdin.
-            if [[ (-n "$fam" && "${FAM_STDIN[$fam]}" == 1) || "$tmpl" != *"{in}"* ]]; then
-                cmd="$(OUT1="$o1" OUT2="$o2" lane_cmd "$name" - "$fam" "$params")"
+            # A lane whose command names no input ({in}, {in1}, {in2}) reads it on stdin.
+            if [[ (-n "$fam" && "${FAM_STDIN[$fam]}" == 1) || "$tmpl" != *"{in"* ]]; then
+                cmd="$(STEM="$stem" OUT1="$o1" OUT2="$o2" lane_cmd "$name" - "$fam" "$params")"
                 $cmd <"$path" >"$o" 2>"$o.err" || rc=$?
             else
-                cmd="$(OUT1="$o1" OUT2="$o2" lane_cmd "$name" "$path" "$fam" "$params")"
+                cmd="$(STEM="$stem" OUT1="$o1" OUT2="$o2" lane_cmd "$name" "$path" "$fam" "$params")"
                 $cmd >"$o" 2>"$o.err" || rc=$?
             fi
             value="$(RC="$rc" ERR="$o.err" OUT1="$o1" OUT2="$o2" EDGE=1 fact_of <"$o" | paste -sd';' -)"
@@ -894,6 +954,7 @@ run_edges() {
                 cell="wrong: ${value:-empty}"
             fi
             printf '%s\t%s\t%s\n' "$name" "$edge" "$cell" >>"$out"
+            [[ -z "$stem" ]] || rm -f -- "$o1" "$o2"
         done < <(edge_list)
     done
     rm -f -- "$o" "$o.err" "$o.1" "$o.2"
@@ -941,6 +1002,28 @@ find_batch() { # glob-prefix; reads META, sets BATCH
     done
     [[ -n "$BATCH" ]]
 }
+# Whether LANE's command in FAMILY names its output files from a stem.
+uses_stem() { local t; t="$(lane_tmpl "$1" "$2")"; [[ -n "${LANE_OUTS[$1]:-}" && ("$t" == *"{stem}"* || "$t" == *"{name}"*) ]]; }
+# Timed runs of a lane that writes named files write them under OUT_DIR with
+# zexec's @RUN@ token in the stem, so every run writes new files, and zexec
+# removes them when the run ends.
+OUT_DIR="/var/tmp/bench-outputs"
+declare -A UNLINKS=()
+# Appends one timed command (NAME=command) to SPECS, with the lane's output
+# files set up and their -u options in UNLINKS[NAME]; NAME is the batch's name
+# for the run (the lane, or a1, a2, b for ab's builds), BIN a z-fastq build.
+SPECS=()
+timed_spec() { # name lane input family params [bin]
+    local name="$1" lane="$2" stem="" s cmd
+    UNLINKS[$name]=""
+    if uses_stem "$lane" "$4"; then
+        mkdir -p -- "$OUT_DIR"
+        stem="$OUT_DIR/$FEATURE-$name-@RUN@"
+        for s in ${LANE_OUTS[$lane]//,/ }; do UNLINKS[$name]+=" -u $stem$s"; done
+    fi
+    if [[ -n "${6:-}" ]]; then cmd="$(STEM="$stem" build_cmd "$6" "$3" "$4" "$5")"; else cmd="$(STEM="$stem" lane_cmd "$lane" "$3" "$4" "$5")"; fi
+    SPECS+=("$name=$cmd")
+}
 # Times every passing lane of one case in one zebrac batch, unless a cached
 # batch can stand for it.
 run_batch() { # fam id fmt paths truth bytes src tier kind params
@@ -973,9 +1056,9 @@ run_batch() { # fam id fmt paths truth bytes src tier kind params
     bkey="$(printf '%s' "$META" | cksum | cut -d' ' -f1)"
     dir="$prefix$bkey"
     printf '%s\t%s\t%s\n' "$fam" "$id" "$dir" >>"$RESULTS/current.tsv.part"
-    local specs=()
-    for name in "${timed[@]}"; do specs+=("$name=$(lane_cmd "$name" "$([[ "$form" == stdin ]] && echo - || echo "$paths")" "$fam" "$params")"); done
-    time_lanes "$dir" "$form" "$paths" "$runs" "$warm" "$fam" "$id" "${specs[@]}"
+    SPECS=()
+    for name in "${timed[@]}"; do timed_spec "$name" "$name" "$([[ "$form" == stdin ]] && echo - || echo "$paths")" "$fam" "$params"; done
+    time_lanes "$dir" "$form" "$paths" "$runs" "$warm" "$fam" "$id" "${SPECS[@]}"
     N_TIMED=$((N_TIMED + 1))
 }
 # Times one zebrac batch into DIR, every NAME=COMMAND through zexec -r (stdin
@@ -991,19 +1074,21 @@ time_lanes() { # dir form paths runs warm fam id name=command...
         name="${spec%%=*}"
         names+=("$name")
         if [[ "$form" == stdin ]]; then
-            cmds+=("$ZEXEC -r $dir/$name.tsv -i $paths -- ${spec#*=}")
+            cmds+=("$ZEXEC -r $dir/$name.tsv -i $paths${UNLINKS[$name]:-} -- ${spec#*=}")
         else
-            cmds+=("$ZEXEC -r $dir/$name.tsv -- ${spec#*=}")
+            cmds+=("$ZEXEC -r $dir/$name.tsv${UNLINKS[$name]:-} -- ${spec#*=}")
         fi
     done
     for p in $paths; do cat -- "$p" >/dev/null; done
     read -r load0 _ </proc/loadavg
     log time RUN "${PROGRESS:-} $fam $id: ${#names[@]} lanes, $runs runs + $warm warmup${ETA_TEXT:+, $ETA_TEXT}"
     local t0=$SECONDS
-    systemd-run --user --scope -q -p CPUQuota=100% -p "MemoryMax=$BENCH_MEM" \
+    systemd-run --user --scope -q -p CPUQuota=100% -p "MemoryMax=${FAM_MEM[$fam]:-$BENCH_MEM}" \
         taskset -c "$BENCH_CPU" zebrac -q -w "$warm" -i "$runs" -a "$runs" -d 1 --json="$dir/zebrac.json" "${cmds[@]}" 2>"$dir/zebrac.err" ||
         die "zebrac failed for $fam $id: $(head -c 400 "$dir/zebrac.err")"
     read -r load1 _ </proc/loadavg
+    # Output files a run left behind (zexec removes each run's own).
+    rm -f -- "${OUT_DIR:?}/$FEATURE"-*
     # Each lane's zexec file must hold warmups + runs lines, every status 0.
     for name in "${names[@]}"; do
         lines="$(wc -l <"$dir/$name.tsv")"
@@ -1142,6 +1227,8 @@ cases_tsv() {
     printf 'family\tcase\tformat\tsource\ttier\tkind\tbytes\tlabel\torder\tgroup\tgroup_order\tparams\n'
     local fam id fmt paths truth bytes src tier kind params n=0
     while IFS=$'\t' read -r fam id fmt paths truth bytes src tier kind params; do
+        # A pair cut from a synthetic shape is a shape in the figures.
+        [[ "$kind" != pair || ! -d "$SHAPES/$src" ]] || kind=shape
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$fam" "$id" "$fmt" "$src" "$tier" "$kind" "$bytes" \
             "$(label_of "$src")" $((n++)) "${GROUP_OF[$src]:-Other}" "${GROUP_RANK[$src]:-99}" "$params"
     done < <(cases)
@@ -1170,7 +1257,7 @@ summary_table() { # family | family:mode...
     fams="$(printf '%s|' "$@")"
     awk -F'\t' -v fams="${fams%|}" -v tier="$HEADLINE" -v through="${THROUGH:-0}" '
         BEGIN { nf = split(fams, fl, "|"); for (i = 1; i <= nf; i++) { split(fl[i], q, ":"); fam[i] = q[1]; mode[i] = q[2]; at[q[1]] = i } }
-        FILENAME ~ /through.tsv$/ { lets[$1] = $3; next }
+        FILENAME ~ /through.tsv$/ { lets[$2, $1] = $4; next }
         FILENAME ~ /cases.tsv$/ { if (FNR > 1 && ($1 in at) && $5 == tier && $6 != "many") { fmt[$1, $2] = $3; if ($3 == "gzip") hasgz = 1 } next }
         FILENAME ~ /style.tsv$/ { if (FNR > 1) { label[$1] = $2; ord[$1] = $7 } next }
         FNR == 1 || !(($1, $2) in fmt) { next }
@@ -1193,7 +1280,7 @@ summary_table() { # family | family:mode...
                                 k++; sw += log(w[F, c2, l] / w[F, c2, "z-fastq"]); sm += log(m[F, c2, l] / m[F, c2, "z-fastq"]) } }
                         line = line "\t" (k ? sprintf("%.2fx", exp(sw / k)) : "-") "\t" (k ? sprintf("%.2fx", exp(sm / k)) : "-")
                     }
-                    print line (through ? "\t" (l in lets ? lets[l] : "-") : "")
+                    print line (through ? "\t" (((F, l) in lets) ? lets[F, l] : (("", l) in lets) ? lets["", l] : "-") : "")
                 }
             }
         }' "$REPORT_DIR/through.tsv" "$REPORT_DIR/cases.tsv" "$REPORT_DIR/style.tsv" "$REPORT_DIR/summary.tsv" | mdtable
@@ -1287,18 +1374,18 @@ findings() { # family [parts] [label]
             lo = hi = 0
             for (i = 1; i <= n; i++) for (f = 1; f <= 2; f++) { r = ratio(list[i], fs[f], m); if (r) { if (!lo || r < lo) lo = r; if (r > hi) hi = r } }
             for (c in fmt) if ((c, "z-fastq") in m) { zm += log(m[c, "z-fastq"]); zk++; if (fmt[c] == "gzip") zg = 1 }
-            if (index(parts, " memory ")) printf "- **Memory:** every other tool peaks at %.1fx to %.0fx z-fastq%ss %.2f MiB.\n", lo, hi, "\047", exp(zm / zk) / 1024
+            if (index(parts, " memory ")) printf "- **Memory%s:** every other tool peaks at %.1fx to %.0fx z-fastq%ss %.2f MiB.\n", (lbl == "" ? "" : ", " tolower(lbl)), lo, hi, "\047", exp(zm / zk) / 1024
             # Kinds of input where some tool is faster than z-fastq.
             out = ""
             for (c in fmt) gs[grp[c]] = 1
             for (g in gs) for (f = 1; f <= 2; f++) for (i = 1; i <= n; i++) {
                 k = s = 0
                 for (c in fmt) if (grp[c] == g && fmt[c] == fs[f] && (c, list[i]) in w && (c, "z-fastq") in w) { k++; s += log(w[c, list[i]] / w[c, "z-fastq"]) }
-                if (k && exp(s / k) < 0.995) out = out sprintf("%s%s on %s %s (%.2fx)", (out == "" ? "" : "; "), label[list[i]], fs[f], tolower(g), exp(s / k))
+                if (k && exp(s / k) < 0.99) out = out sprintf("%s%s on %s %s (%.2fx)", (out == "" ? "" : "; "), label[list[i]], fs[f], tolower(g), exp(s / k))
             }
             where = "- **Where z-fastq is not fastest" (lbl == "" ? "" : ", " tolower(lbl)) ":** "
             if (!index(parts, " where ")) { }
-            else if (out == "") print where "nowhere; it is the fastest tool on every kind of input" (zg ? ", plain and gzip." : ".")
+            else if (out == "") print where "on no kind of input; it is the fastest tool on every kind of input (geometric mean over the group), " (zg ? "plain and gzip." : "plain.")
             else print where out "."
         }
         function ratio(l, f, a,   c, k, s) { for (c in fmt) if (fmt[c] == f && (c, l) in a && (c, "z-fastq") in a) { k++; s += log(a[c, l] / a[c, "z-fastq"]) } return k ? exp(s / k) : 0 }
@@ -1329,9 +1416,9 @@ scaling_sentences() { # family
             }
             out = ""
             for (i = 1; i <= n; i++) for (k in big) { c = big[k]; split(k, p, SUBSEP); l = list[i]
-                if (v[c, l] > v[c, "z-fastq"] * 1.005)
+                if (v[c, l] > v[c, "z-fastq"] * 1.01)
                     out = out (out == "" ? "" : "; ") sprintf("%s on %s %s (%.2fx)", label[l], p[2], p[1], v[c, l] / v[c, "z-fastq"]) }
-            print line (out == "" ? "; no other tool is faster there." : ". Faster there: " out ", throughput as a multiple of z-fastq.") 
+            print line (out == "" ? "; no other tool is faster there." : ". Faster on a single shape there, as throughput over z-fastq'"'"'s: " out ".")
             zlo = zhi = 0; grow = ""
             for (c in fmt) if ((c, "z-fastq") in r) { x = r[c, "z-fastq"]; if (!zlo || x < zlo) zlo = x; if (x > zhi) zhi = x }
             for (i = 1; i <= n; i++) { l = list[i]; g = 0
@@ -1408,20 +1495,98 @@ many_sentence() { # family
             printf "\n"
         }' "$REPORT_DIR/style.tsv" "$REPORT_DIR/summary.tsv"
 }
-# Per lane, the malformed edge inputs it lets through with exit 0, as short
+# Per lane (and per family, for a feature whose edge rows each run in one
+# family), the malformed edge inputs it lets through with exit 0, as short
 # names ("nothing" when it rejects them all), and their count: "N of M" or
-# "none". One line per lane: lane, names, count.
+# "none". One line per lane: lane, family (empty for all), names, count.
 lets_through() {
-    local name
+    local name fam fams=""
+    declare -F edge_family >/dev/null && fams="${FAMILIES[*]}"
     for name in "${LANES[@]}"; do
-        awk -F'\t' -v l="$name" 'BEGIN {
-                short["blank"] = "blank line"; short["lenmis"] = "length mismatch"; short["trunc"] = "truncated record"
-                short["dash"] = "bad plus line"; short["qlow"] = "quality range"; short["qhigh"] = "quality range"
-                short["noat"] = "bad header"; short["gztrunc"] = "broken gzip"; short["gzgarbage"] = "broken gzip" }
-            FNR == NR { if ($2 ~ /^reject/) want[$1] = 1; next }
-            $1 == l && ($2 in want) { total++; if ($3 ~ /^wrong/) { passed++; n = ($2 in short) ? short[$2] : $2; if (!(n in seen)) { seen[n] = 1; out = out (out == "" ? "" : ", ") n } } }
-            END { printf "%s\t%s\t%s\n", l, (out == "" ? "nothing" : out), (passed ? passed " of " total : "none") }' <(edge_list) "$RESULTS/edges.tsv"
+        for fam in "" $fams; do
+            awk -F'\t' -v l="$name" -v f="$fam" -v rowfam="$(edge_list | while IFS=$'\t' read -r e _; do printf '%s=%s ' "$e" "$(declare -F edge_family >/dev/null && edge_family "$e")"; done)" 'BEGIN {
+                    short["blank"] = "blank line"; short["lenmis"] = "length mismatch"; short["trunc"] = "truncated record"
+                    short["dash"] = "bad plus line"; short["qlow"] = "quality range"; short["qhigh"] = "quality range"
+                    short["noat"] = "bad header"; short["gztrunc"] = "broken gzip"; short["gzgarbage"] = "broken gzip"
+                    n = split(rowfam, rf, " "); for (i = 1; i <= n; i++) { split(rf[i], kv, "="); of[kv[1]] = kv[2] } }
+                FNR == NR { if ($2 ~ /^reject/) { want[$1] = 1; label[$1] = $3 } next }
+                $1 == l && ($2 in want) && $3 != "-" && (f == "" || of[$2] == f) { total++
+                    if ($3 ~ /^wrong/) { passed++; k = ($2 in short) ? short[$2] : label[$2]; if (!(k in seen)) { seen[k] = 1; out = out (out == "" ? "" : ", ") k } } }
+                END { if (f == "" || total) printf "%s\t%s\t%s\t%s\n", l, f, (out == "" ? "nothing" : out), (passed ? passed " of " total : "none") }' <(edge_list) "$RESULTS/edges.tsv"
+        done
     done
+}
+# One findings bullet: each valid edge input on which some tool exits 0 but
+# writes the wrong output, with those tools (in table order) and how; nothing
+# when none does.
+valid_wrong_bullet() {
+    awk -F'\t' 'FILENAME ~ /style.tsv$/ { if (FNR > 1) { label[$1] = $2; ord[$1] = $7 + 0 } next }
+        FNR == NR { if ($2 !~ /^reject/ && $2 != "policy") { ok[$1] = 1; what[$1] = $3; row[$1] = ++rows; name[rows] = $1 } next }
+        ($2 in ok) && $3 ~ /^wrong/ { s = $3; sub(/^wrong: /, "", s); if (s ~ /^[0-9]+$/) s = "printed " s; else if (s ~ /^[a-z_]+$/) s = s " wrong"
+            n = ++cnt[$2]; tool[$2, n] = $1; how[$2, n] = s }
+        END {
+            for (r = 1; r <= rows; r++) { e = name[r]; if (!(e in cnt)) continue
+                m = cnt[e]
+                for (a = 1; a <= m; a++) for (b = a + 1; b <= m; b++) if (ord[tool[e, b]] < ord[tool[e, a]]) {
+                    t = tool[e, a]; tool[e, a] = tool[e, b]; tool[e, b] = t; t = how[e, a]; how[e, a] = how[e, b]; how[e, b] = t }
+                part = what[e] ": "
+                for (a = 1; a <= m; a++) part = part (a > 1 ? ", " : "") label[tool[e, a]] ((a == m || how[e, a] != how[e, a + 1]) ? " (" how[e, a] ")" : "")
+                out = out (out == "" ? "" : "; ") part }
+            if (out != "") { gsub(/`/, "", out); print "- **Wrong on valid input, exit 0:** " out "." } }' \
+        <(edge_list) "$REPORT_DIR/style.tsv" "$RESULTS/edges.tsv"
+}
+# Per lane, "N of M": the malformed edge inputs it rejects, over every one it ran.
+rejects_all() { # lane
+    awk -F'\t' -v l="$1" 'FNR == NR { if ($2 ~ /^reject/) want[$1] = 1; next } $1 == l && ($2 in want) && $3 != "-" { n++; if ($3 ~ /^reject/) r++ } END { printf "%d of %d", r, n }' <(edge_list) "$RESULTS/edges.tsv"
+}
+# yes when every check of LANE in FAMILY passed, partly when some did, no when none.
+mode_cell() { # lane family
+    awk -F'\t' -v l="$1" -v f="$2" '$1 == f && $2 == l { n++; if ($3 == "pass") p++ } END { print (n == 0) ? "-" : (p == n) ? "yes" : (p > 0) ? "partly" : "no" }' "$FAMILY_CHECKS"
+}
+# Every current check of every family into FAMILY_CHECKS: family, lane,
+# status, value, case id. Written once per report.
+FAMILY_CHECKS=""
+family_checks() {
+    local fam id fmt paths truth bytes src tier kind params inid name form key
+    FAMILY_CHECKS="$REPORT_DIR/family-checks.tsv"
+    load_checks
+    cache_lane_ids
+    while IFS=$'\t' read -r fam id fmt paths truth bytes src tier kind params inid; do
+        form=file
+        [[ "${FAM_STDIN[$fam]}" == 0 ]] || form=stdin
+        for name in ${FAM_LANES[$fam]}; do
+            key="$(status_key "$name" "$fam" "$form" "$inid" "$params")"
+            [[ ! -v "CHECK_STATUS[$key]" ]] || printf '%s\t%s\t%s\t%s\t%s\n' "$fam" "$name" "${CHECK_STATUS[$key]}" "${CHECK_VALUE[$key]}" "$id"
+        done
+    done < <(cases | with_input_ids) >"$FAMILY_CHECKS"
+}
+# One row per lane: each kind of malformed edge input (SPEC is
+# Label=edge,edge|...) as rejects, or **passes** when the lane exits 0 on any
+# of its edge inputs; then the columns EXTRA (tab-separated headers) that
+# FUNCTION prints for the lane, or none.
+kinds_table() { # spec [extra-headers function]
+    local name spec="$1" extra="${2:-}" fn="${3:-}" head="" align="" tail
+    head="$(tr '|' '\n' <<<"$spec" | cut -d= -f1 | paste -sd$'\t' -)"
+    align="$(tr '|' '\n' <<<"$spec" | sed 's/.*/l/' | paste -sd$'\t' -)"
+    {
+        printf 'Tool\t%s%s\n' "$head" "${extra:+$'\t'$extra}"
+        printf 'l\t%s%s\n' "$align" "${extra:+$'\t'$(tr '\t' '\n' <<<"$extra" | sed 's/.*/l/' | paste -sd$'\t' -)}"
+        for name in "${LANES[@]}"; do
+            tail=""
+            [[ -z "$fn" ]] || tail="$("$fn" "$name")"
+            awk -F'\t' -v l="$name" -v label="${REG_LABEL[$name]}" -v spec="$spec" -v tail="$tail" '
+                BEGIN { nk = split(spec, kinds, "|"); for (i = 1; i <= nk; i++) sub(/^[^=]*=/, "", kinds[i]) }
+                FNR == NR { if ($2 ~ /^reject/) want[$1] = 1; next }
+                $1 == l && ($2 in want) { cell[$2] = $3 }
+                END {
+                    line = label
+                    for (i = 1; i <= nk; i++) { n = split(kinds[i], e, ","); passed = 0; seen = 0
+                        for (j = 1; j <= n; j++) { if (e[j] in cell) seen = 1; if (cell[e[j]] ~ /^wrong/) passed = 1 }
+                        line = line "\t" (!seen || cell[e[1]] == "-" ? "-" : passed ? "**passes**" : "rejects") }
+                    print line (tail == "" ? "" : "\t" tail)
+                }' <(edge_list) "$RESULTS/edges.tsv"
+        done
+    } | mdtable
 }
 # Per lane, "N of M": the malformed edge inputs it rejects, over every one in the set.
 rejects_all() { # lane
@@ -1460,9 +1625,10 @@ current_checks() {
         ($1 in want) && !($1 in done) { done[$1] = 1; split(want[$1], w, "\t")
             printf "%s\t%s\t%s\t%s\t%s\t%s\n", w[1], w[2], $2, $3, substr($4, 1, 40), w[3] }' - "$CHECKS"
 }
-# One sentence: who was right on what, and which inputs a tool missed.
+# One sentence on z-fastq, then the other tools wrong on inputs they were
+# given, as a table (tool, wrong, of, inputs), or a sentence when none was.
 correctness_sentence() {
-    local name pass fail out="" zf="" where
+    local name pass fail rows="" zf="" where
     for name in "${LANES[@]}"; do
         read -r pass fail < <(awk -F'\t' -v l="$name" '$1 == l { if ($3 == "pass") a++; else b++ } END { print a + 0, b + 0 }' "$REPORT_DIR/checks.tsv")
         if [[ "$name" == z-fastq ]]; then
@@ -1475,14 +1641,15 @@ correctness_sentence() {
         fi
         ((fail > 0)) || continue
         where="$(awk -F'\t' -v l="$name" '$1 == l && $3 == "fail" { print $2 }' "$REPORT_DIR/checks.tsv" | sort -u |
-            while read -r src; do printf '%s; ' "$(label_of "$src")"; done)"
-        out+="${REG_LABEL[$name]} ${WORD[missed]} on $fail of its $((pass + fail)) inputs (${where%; }) and is not timed on them; "
+            while read -r src; do if [[ -d "$SHAPES/$src" ]]; then printf '%s, ' "$src"; else printf '%s, ' "${DESCRIBE[$src]:-$src}"; fi; done)"
+        rows+="${REG_LABEL[$name]}"$'\t'"$fail"$'\t'"$((pass + fail))"$'\t'"${where%, }"$'\n'
     done
     printf '%s ' "$zf"
-    if [[ -z "$out" ]]; then
+    if [[ -z "$rows" ]]; then
         printf 'Every other tool was right on every input it was given.\n'
     else
-        printf 'Every other tool was right on every input it was given, except: %s\n' "${out%; }."
+        printf 'Every other tool was right on every input it was given except these, which are not timed where they %s:\n\n' "${WORD[missed]}"
+        { printf 'Tool\tWrong\tOf\tInputs\n'; printf 'l\tr\tr\tl\n'; printf '%s' "$rows"; } | mdtable
     fi
 }
 # The edge-case matrix for plot.py: row, label, expected, tool, cell, verdict.
@@ -1496,6 +1663,7 @@ edges_tsv() {
                 wrong*) verdict=wrong ;;
                 crash*) verdict=crash ;;
                 refused) verdict=refused ;;
+                -) verdict=policy ;;
                 *) verdict=right ;;
             esac
             [[ "$expected" != policy ]] || verdict=policy
@@ -1540,7 +1708,7 @@ data_list() {
     done
     printf -- '- `data`:\n'
     printf -- '  - **Real**: *%d public sequencing runs, %s each, pooled in the bars by the kind of reads they hold*\n%s' "$reals" "${TIER_SIZE[$HEADLINE]}" "$lines"
-    printf -- '  - **Synthetic**: *%d shapes generated from real reads, each changing one thing; one group in the bars at %s, and the scaling lines from %s*\n%s' "$shapes" "${TIER_SIZE[$HEADLINE]}" "$(scaling_range)" "$synth"
+    printf -- '  - **Synthetic**: *%d %s generated from real reads, each changing one thing; one group in the bars at %s, and the scaling lines from %s*\n%s' "$shapes" "$( ((shapes == 1)) && echo shape || echo shapes)" "${TIER_SIZE[$HEADLINE]}" "$(scaling_range)" "$synth"
 }
 # The source revisions of the z-fastq binaries the current batches timed, as
 # recorded when each was built, with batch counts when there are several.
@@ -1566,15 +1734,19 @@ readme_head() {
     for name in "${LANES[@]}"; do
         case "${LANE_CLASS[$name]}" in complete | partial) counters=$((counters + 1)) ;; esac
     done
-    reals="$(cases | awk -F'\t' -v f="$first" -v t="$HEADLINE" '$1 == f && $8 == t && $9 == "real" { print $7 }' | sort -u | wc -l)"
-    shapes="$(cases | awk -F'\t' -v f="$first" -v t="$HEADLINE" '$1 == f && $8 == t && $9 == "shape" { print $7 }' | sort -u | wc -l)"
+    # Sources of the first family at the headline tier: a shape has a synthetic directory.
+    local used src fmts
+    used="$(cases | awk -F'\t' -v f="$first" -v t="$HEADLINE" '$1 == f && $8 == t && $9 != "many" { print $7 }' | sort -u)"
+    reals=0 shapes=0
+    for src in $used; do if [[ -d "$SHAPES/$src" ]]; then shapes=$((shapes + 1)); else reals=$((reals + 1)); fi; done
+    fmts="$(cases | awk -F'\t' '$3 == "gzip" { g = 1 } END { print g ? "plain and gzip" : "plain" }')"
     local cpu
     cpu="$(awk -F': ' '/model name/ { print $2; exit }' /proc/cpuinfo | sed 's/^AMD //; s/^Intel(R) Core(TM) //; s/ [0-9]*-Core Processor$//')"
     cat <<EOF
 <!-- markdownlint-disable MD013 MD033 MD041 -->
 
 # ${WORD[title]}
-> <sub>\`${WORD[subject]}\` against $counters other ${WORD[others]}, on $reals real sequencing runs and $shapes synthetic shapes, plain and gzip. A tool is timed only where ${WORD[timed]}; time and memory come from the same run, on one CPU.</sub>
+> <sub>\`${WORD[subject]}\` against $counters other ${WORD[others]}, on $reals real sequencing run$( ((reals == 1)) || echo s) and $shapes synthetic shape$( ((shapes == 1)) || echo s), $fmts. A tool is timed only where ${WORD[timed]}; time and memory come from the same run, on one CPU.</sub>
 
 - \`z-fastq\`: *$("$ZFASTQ" --version | awk '{ print $2 }') $rev*
 - \`machine\`: *$cpu, Linux $(uname -r | cut -d- -f1); one CPU per run*
@@ -1645,7 +1817,12 @@ readme_speed() { # family [title]
 readme_scaling() { # family [heading level]
     local fam="$1" slow
     slow="$(headline_only)"
-    printf '%s Scaling\n> <sub>Each synthetic shape from %s of FASTQ: throughput and peak memory against input size. A shape changes one thing %s pays for, so its line shows what that one thing costs each tool.</sub>\n\n' "${2:-##}" "$(scaling_range)" "${WORD[payer]}"
+    if [[ "$SCALING" == *" "* ]]; then
+        printf '%s Scaling\n> <sub>Each synthetic shape from %s of FASTQ: throughput and peak memory against input size. A shape changes one thing %s pays for, so its line shows what that one thing costs each tool.</sub>\n\n' "${2:-##}" "$(scaling_range)" "${WORD[payer]}"
+    else
+        printf '%s Scaling\n> <sub>The `%s` shape (%s) from %s of FASTQ: throughput and peak memory against input size.</sub>\n\n' "${2:-##}" "$SCALING" "${DESCRIBE[$SCALING]}" "$(scaling_range)"
+    fi
+    picture "$fam-scaling" "Throughput and peak memory by input size" && printf '\n'
     picture "$fam-scaling-speed" "Throughput by input size" && printf '\n'
     picture "$fam-scaling-memory" "Peak memory by input size" && printf '\n'
     scaling_sentences "$fam"
@@ -1674,6 +1851,8 @@ readme_forms() {
         fi
     done
 }
+# The families with their own memory cap, as ", 8G for deinterleave".
+mem_caps() { local fam out=""; for fam in "${FAMILIES[@]}"; do [[ -z "${FAM_MEM[$fam]:-}" ]] || out+=", ${FAM_MEM[$fam]} for $fam"; done; printf '%s' "$out"; }
 readme_repro() {
     local name fam date rev
     date="$(date -u +%Y-%m-%d)"
@@ -1681,7 +1860,7 @@ readme_repro() {
     printf '## Reproducibility\n\n'
     details "How it was measured"
     cat <<EOF
-Every tool runs through \`zexec -r\` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a $BENCH_MEM memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. The kernel reports peak memory in 256 KiB steps, so values closer than that are equal. Runs per tier, each after one warmup: tiny ${RUNS[tiny]}, xsmall ${RUNS[xsmall]}, small ${RUNS[small]}, medium ${RUNS[medium]}; sizes 1 MiB to 1 GiB. Generated by \`bench/$FEATURE/run.sh release\` on $date.
+Every tool runs through \`zexec -r\` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a $BENCH_MEM memory cap$(mem_caps), after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. The kernel reports peak memory in 256 KiB steps, so values closer than that are equal. Runs per tier, each after one warmup: tiny ${RUNS[tiny]}, xsmall ${RUNS[xsmall]}, small ${RUNS[small]}, medium ${RUNS[medium]}; sizes 1 MiB to 1 GiB. Generated by \`bench/$FEATURE/run.sh release\` on $date.
 
 </details>
 
@@ -1720,7 +1899,11 @@ EOF
     printf '\n</details>\n\n'
     if [[ -f "$RESULTS/picks.tsv" ]]; then
         details "Quick-check cases for peer and ab"
-        printf 'Picked from these results: per group and format, the case where z-fastq leads its fastest full-check rival by the least. `run.sh peer` times z-fastq against a cached reference of the rival on each; `run.sh ab REV` times two z-fastq builds on each.\n\n'
+        if ((RIVAL_ANY)); then
+            printf 'Picked from these results: per family, group, and format, the case where z-fastq is closest to, or furthest behind, its fastest rival of any class. `run.sh peer` times z-fastq against a cached reference of the rival on each; `run.sh ab REV` times two z-fastq builds on each.\n\n'
+        else
+            printf 'Picked from these results: per group and format, the case where z-fastq leads its fastest full-check rival by the least. `run.sh peer` times z-fastq against a cached reference of the rival on each; `run.sh ab REV` times two z-fastq builds on each.\n\n'
+        fi
         awk -F'\t' -v many="$(($(wc -w <<<"$(full_families)") > 1))" 'FILENAME ~ /style.tsv$/ { if (FNR > 1) label[$1] = $2; next }
             FILENAME ~ /cases.tsv$/ { if (FNR > 1) name[$1 "\t" $2] = $8; next }
             FNR > 1 { k = $1 "\t" $2
@@ -1738,7 +1921,9 @@ EOF
 readme() {
     if declare -F feature_readme >/dev/null; then feature_readme; return; fi
     readme_head
-    printf '## Findings\n\n%s\n\n' "$(findings "${FAMILIES[0]}")"
+    printf '## Findings\n\n%s\n' "$(findings "${FAMILIES[0]}")"
+    valid_wrong_bullet
+    printf '\n'
     readme_tools
     readme_right
     if declare -F feature_report >/dev/null; then feature_report; fi
@@ -1804,7 +1989,7 @@ write_picks() {
         printf 'family\tcase\tgroup\tformat\trival\tmemory_rival\tlead\treason\n'
         if [[ "$PICK_MODE" != only ]]; then
             for pf in $(full_families); do
-            awk -F'\t' -v fam="$pf" -v tier="$HEADLINE" '
+            awk -F'\t' -v fam="$pf" -v tier="$HEADLINE" -v any="$RIVAL_ANY" '
                 FILENAME ~ /cases.tsv$/ { if (FNR > 1 && $1 == fam && $5 == tier && $6 != "many") { fmt[$2] = $3; grp[$2] = $10; ord[$2] = $9 + 0 } next }
                 FILENAME ~ /style.tsv$/ { if (FNR > 1) cls[$1] = $3; next }
                 FNR == 1 || $1 != fam || !($2 in fmt) { next }
@@ -1817,7 +2002,8 @@ write_picks() {
                             if (r == "" || w[c, l] < w[c, r]) r = l
                             if (m[c, l] < m[c, "z-fastq"] && (mr == "" || m[c, l] < m[c, mr])) mr = l
                         }
-                        # With no complete lane in the family, the rival is the fastest other lane.
+                        # With no complete lane in the family, or with rival any, the rival is the fastest other lane.
+                        if (any) r = mr = ""
                         if (r == "") for (l in lanes) if (l != "z-fastq" && (c, l) in w) {
                             if (r == "" || w[c, l] < w[c, r]) r = l
                             if (m[c, l] < m[c, "z-fastq"] && (mr == "" || m[c, l] < m[c, mr])) mr = l
@@ -1887,10 +2073,11 @@ run_peer() {
         [[ "$params" == - ]] || META+="params $params"$'\n'
         META+="host $host"$'\n'
         if ! find_batch "$RESULTS/peer/ref/$fam-${id//:/-}-"; then
-            local specs=() l
-            for l in $lanes; do specs+=("$l=$(lane_cmd "$l" "$([[ "$form" == stdin ]] && echo - || echo "$paths")" "$fam" "$params")"); done
+            local l
+            SPECS=()
+            for l in $lanes; do timed_spec "$l" "$l" "$([[ "$form" == stdin ]] && echo - || echo "$paths")" "$fam" "$params"; done
             BATCH="$RESULTS/peer/ref/$fam-${id//:/-}-$(printf '%s' "$META" | cksum | cut -d' ' -f1)"
-            time_lanes "$BATCH" "$form" "$paths" "$PEER_RUNS" "$PEER_WARM" "$fam" "$id" "${specs[@]}"
+            time_lanes "$BATCH" "$form" "$paths" "$PEER_RUNS" "$PEER_WARM" "$fam" "$id" "${SPECS[@]}"
         fi
         local ref="$BATCH/summary.tsv"
         # z-fastq now: headline settings, kept while its binary is unchanged.
@@ -1900,7 +2087,9 @@ run_peer() {
         META+="host $host"$'\n'
         if ! find_batch "$RESULTS/peer/now/$fam-${id//:/-}-"; then
             BATCH="$RESULTS/peer/now/$fam-${id//:/-}-$(printf '%s' "$META" | cksum | cut -d' ' -f1)"
-            time_lanes "$BATCH" "$form" "$paths" "$runs" "$warm" "$fam" "$id" "z-fastq=$(lane_cmd z-fastq "$([[ "$form" == stdin ]] && echo - || echo "$paths")" "$fam" "$params")"
+            SPECS=()
+            timed_spec z-fastq z-fastq "$([[ "$form" == stdin ]] && echo - || echo "$paths")" "$fam" "$params"
+            time_lanes "$BATCH" "$form" "$paths" "$runs" "$warm" "$fam" "$id" "${SPECS[@]}"
         fi
         META=""
         awk -F'\t' -v id="$id" -v rival="$rival" -v mem="$mem" '
@@ -1946,7 +2135,11 @@ run_ab() {
         read -r runs warm <<<"$(batch_settings "$tier" "$kind")"
         dir="$RESULTS/ab/$fam-${id//:/-}"
         META=""
-        time_lanes "$dir" file "$paths" "$runs" "$warm" "$fam" "$id" "a1=$(build_cmd "$a" "$paths" "$fam" "$params")" "a2=$(build_cmd "$a" "$paths" "$fam" "$params")" "b=$(build_cmd "$b" "$paths" "$fam" "$params")"
+        SPECS=()
+        timed_spec a1 z-fastq "$paths" "$fam" "$params" "$a"
+        timed_spec a2 z-fastq "$paths" "$fam" "$params" "$a"
+        timed_spec b z-fastq "$paths" "$fam" "$params" "$b"
+        time_lanes "$dir" file "$paths" "$runs" "$warm" "$fam" "$id" "${SPECS[@]}"
         awk -F'\t' -v id="$id" '
             { w[$3] = $5; r[$3] = $8 }
             END {
@@ -1978,7 +2171,7 @@ validate() {
         [[ "${FAM_LOOK[$fam]}" =~ ^(|full|table|lines)$ ]] || errs+=("family $fam: unknown look ${FAM_LOOK[$fam]}")
         [[ "${FAM_LOOK[$fam]}" != lines || -n "${FAM_VARY[$fam]}" ]] || errs+=("family $fam: look lines needs a vary line")
         # Every placeholder in a family's commands is a core one or a family parameter.
-        local known=" zfastq bin in out1 out2 ${FAM_VARY[$fam]%% *} " kv ph tmpl
+        local known=" zfastq bin in in1 in2 out1 out2 stem dir name ${FAM_VARY[$fam]%% *} " kv ph tmpl
         for kv in ${FAM_PARAMS[$fam]}; do known+="${kv%%=*} "; done
         for name in ${FAM_LANES[$fam]:-}; do
             [[ -v "LANE_TMPL[$name]" ]] || continue
@@ -2003,7 +2196,7 @@ validate() {
     for t in $PICK_CASES; do grep -q $'\t'"$t"$'\t' <<<"$list" || errs+=("pick: no case $t"); done
     for t in "${!REMARK[@]}"; do [[ "$t" == scaling ]] || errs+=("remark: unknown section $t"); done
     [[ -z "$AGREE_LANE" || -v "LANE_TMPL[$AGREE_LANE]" ]] || errs+=("agree: lane $AGREE_LANE is not declared")
-    [[ -z "$EDGE_SET" || "$EDGE_SET" =~ ^(count|stats|check|sample)$ ]] || errs+=("edges: unknown set $EDGE_SET")
+    [[ -z "$EDGE_SET" || "$EDGE_SET" =~ ^(count|stats|check|sample)$ ]] || declare -F feature_edge_list >/dev/null || errs+=("edges: unknown set $EDGE_SET")
     for fam in $EDGE_FAMS; do [[ -v "FAM_LANES[$fam]" ]] || errs+=("edges: no family $fam"); done
     ((${#errs[@]} == 0)) && return 0
     printf 'run.sh: %s\n' "${errs[@]}" >&2

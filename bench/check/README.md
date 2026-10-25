@@ -17,14 +17,14 @@
     - `variable`: *50 to 150 bp, annotated plus line*
     - `longread`: *nanopore headers, rare 300 kb reads*
     - `long`: *300 kb sequence lines*
-- `date`: *2026-10-24*
+- `date`: *2026-10-25*
 
 ## Findings
 
 - **Right answers:** z-fastq returned the right verdict on all 228 checked inputs and rejected every malformed edge case. 2 of the 3 other tools print a wrong verdict or crash on at least one.
 - **Speed:** fq, the fastest other full-check tool, takes 3.49x z-fastq's time on plain input and 2.28x on gzip.
 - **Memory:** every other tool peaks at 4.4x to 9x z-fastq's 0.75 MiB.
-- **Where z-fastq is not fastest:** nowhere; it is the fastest tool on every kind of input, plain and gzip.
+- **Where z-fastq is not fastest:** on no kind of input; it is the fastest tool on every kind of input (geometric mean over the group), plain and gzip.
 
 ## Compared tools
 > <sub>*complete* tools check as much as z-fastq; *partial* tools check less, so they do less work. The bold count is how many of four malformed inputs the tool rejects: a sequence and quality length mismatch, a truncated last record, `-` instead of `+`, and a quality byte below 33.</sub>
@@ -40,7 +40,13 @@
 ## Right answers
 > <sub>Every corpus file is valid, so the right verdict on each is to accept it. The edge cases are small inputs where tools differ: each cell shows what the tool printed, and its color whether that was right.</sub>
 
-z-fastq returned the right verdict on all 228 inputs: every corpus file and synthetic shape on disk, 1 MiB to 1 GiB, plain and gzip. Every other tool was right on every input it was given, except: fq gave a wrong verdict on 2 of its 64 inputs (paired: 100 bp mate pairs) and is not timed on them; fqtools gave a wrong verdict on 16 of its 64 inputs (endings: 100 bp, CRLF and LF lines; variable: 50 to 150 bp, annotated plus line) and is not timed on them; fastQValidator gave a wrong verdict on 8 of its 54 inputs (endings: 100 bp, CRLF and LF lines) and is not timed on them.
+z-fastq returned the right verdict on all 228 inputs: every corpus file and synthetic shape on disk, 1 MiB to 1 GiB, plain and gzip. Every other tool was right on every input it was given except these, which are not timed where they gave a wrong verdict:
+
+| Tool           | Wrong |  Of | Inputs            |
+| -------------- | ----: | --: | ----------------- |
+| fq             |     2 |  64 | paired            |
+| fqtools        |    16 |  64 | endings, variable |
+| fastQValidator |     8 |  54 | endings           |
 
 > [!CAUTION]
 > fqtools and fastQValidator print a wrong verdict and exit 0 on some malformed inputs, so a script cannot tell the file is broken.
@@ -88,14 +94,25 @@ z-fastq returned the right verdict on all 228 inputs: every corpus file and synt
 </details>
 
 ## Defect sweep
-> <sub>Real reads with one injected defect each, 40 files per kind, at random records of three 1 MiB files (short fixed, short variable, and long reads). Each cell is the share the tool rejected; in brackets, the share where the line it reported is in the broken record, left out for a tool that reports no line.</sub>
+> <sub>Real reads with one injected defect each, 40 files per kind, at random records of three 1 MiB files (short fixed, short variable, and long reads).</sub>
 
-| Tool           |   plus line | sequence byte |      header |   truncated | lengths differ | quality below 33 | quality above 126 |
-| -------------- | ----------: | ------------: | ----------: | ----------: | -------------: | ---------------: | ----------------: |
-| z-fastq        | 100% (100%) |   100% (100%) | 100% (100%) | 100% (100%) |    100% (100%) |      100% (100%) |       100% (100%) |
-| fq             | 100% (100%) |   100% (100%) | 100% (100%) | 100% (100%) |    100% (100%) |      100% (100%) |       100% (100%) |
-| fqtools        | 100% (100%) |   100% (100%) | 100% (100%) | 100% (100%) |      100% (0%) |      100% (100%) |       100% (100%) |
-| fastQValidator | 100% (100%) |   100% (100%) | 100% (100%) | 100% (100%) |      100% (2%) |      100% (100%) |                0% |
+The share of files each tool rejected:
+
+| Tool           | plus line | sequence byte | header | truncated | lengths differ | quality below 33 | quality above 126 |
+| -------------- | --------: | ------------: | -----: | --------: | -------------: | ---------------: | ----------------: |
+| z-fastq        |      100% |          100% |   100% |      100% |           100% |             100% |              100% |
+| fq             |      100% |          100% |   100% |      100% |           100% |             100% |              100% |
+| fqtools        |      100% |          100% |   100% |      100% |           100% |             100% |              100% |
+| fastQValidator |      100% |          100% |   100% |      100% |           100% |             100% |                0% |
+
+The share where the line the tool reported is in the broken record (`-`: the tool reports no line):
+
+| Tool           | plus line | sequence byte | header | truncated | lengths differ | quality below 33 | quality above 126 |
+| -------------- | --------: | ------------: | -----: | --------: | -------------: | ---------------: | ----------------: |
+| z-fastq        |      100% |          100% |   100% |      100% |           100% |             100% |              100% |
+| fq             |      100% |          100% |   100% |      100% |           100% |             100% |              100% |
+| fqtools        |      100% |          100% |   100% |      100% |             0% |             100% |              100% |
+| fastQValidator |      100% |          100% |   100% |      100% |             2% |             100% |                 - |
 
 ## How each tool reports a problem
 
@@ -112,19 +129,19 @@ error: reads.fastq: S006: quality byte must be ASCII 33 through 126 (record 1097
 - `fq` exited 1:
 
 ```text
-reads.fastq:4392:119: [S006] QualityStringValidator: invalid quality score character: ''
+reads.fastq:4392:119: [S006] QualityStringValidator: invalid quality score character: '\x1f'
 ```
 
 - `fqtools` exited 1:
 
 ```text
-ERROR [line 4392]: invalid quality character ()
+ERROR [line 4392]: invalid quality character (\x1f)
 ```
 
 - `fastQValidator` exited 1:
 
 ```text
-ERROR on Line 4392: Invalid character ('') in quality string.
+ERROR on Line 4392: Invalid character ('\x1f') in quality string.
 Finished processing reads.fastq with 11584 lines containing 2896 sequences.
 There were a total of 1 errors.
 ```
@@ -174,6 +191,7 @@ z-fastq itself takes 254.3 ms and 0.75 MiB per plain input, 1457.9 ms and 0.75 M
 ## Scaling
 > <sub>Each synthetic shape from 1 MiB to 1 GiB of FASTQ: throughput and peak memory against input size. A shape changes one thing a validator pays for, so its line shows what that one thing costs each tool.</sub>
 
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-scaling-speed-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="results/figures/single-scaling-speed-light.png">
@@ -218,7 +236,7 @@ z-fastq itself takes 570.1 ms and 0.75 MiB per plain input, 1644.7 ms and 0.75 M
 
 <details><summary>How it was measured</summary>
 
-Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. The kernel reports peak memory in 256 KiB steps, so values closer than that are equal. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Generated by `bench/check/run.sh release` on 2026-10-24.
+Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. The kernel reports peak memory in 256 KiB steps, so values closer than that are equal. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Generated by `bench/check/run.sh release` on 2026-10-25.
 
 </details>
 
@@ -226,7 +244,7 @@ Every tool runs through `zexec -r` inside one zebrac batch per case, held to one
 
 - `z-fastq`: *0.1.0 at 90e46b4*
 - `zebrac`: *0.6.2*
-- `zexec`: *12448 bytes, static, no libc*
+- `zexec`: *12616 bytes, static, no libc*
 - `kernel`: *7.2.11-200.fc44.x86_64*
 - `cpu`: *AMD Ryzen 9 3950X 16-Core Processor*
 - `load at batch start`: *2.62 to 11.67*

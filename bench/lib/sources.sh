@@ -34,7 +34,7 @@ describe all "every xsmall corpus file"
 group "Short, fixed length" illumina-drr018447,illumina-drr1001190,illumina-err4686103,mgi-err10448913,illumina-drr147610
 group "Short, variable length" illumina-drr018439,illumina-srr19571648
 group "Long reads" ont-err10496769,ont-err14758576,pacbio-err10472470,pacbio-srr29396856
-group Synthetic "$SHAPE_SOURCES"
+group Synthetic "$SHAPE_SOURCES,paired"
 
 # The inputs the headline file family of every feature declares: the real
 # sources and shapes at 1 GiB, and the shapes at the smaller scaling tiers.

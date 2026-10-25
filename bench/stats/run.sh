@@ -26,10 +26,10 @@ word probes "The bold count is how many of four malformed inputs the tool reject
 
 lane z-fastq subject "{zfastq} stats {in}"
 lane needletail complete "{bin} stats {in}" note="built for this CPU"
-lane helicase-checked partial "{bin} stats {in}" note="accepts a bad plus line"
+lane helicase-checked partial "{bin} stats {in}" note="accepts a truncated last record and a bad plus line"
 lane seqtk partial "{bin} fqchk {in}" note="no structure check; per-position table"
 lane seqkit partial "{bin} stats -a -T -j 1 {in}" note="no structure check; keeps every read length"
-lane seqfu partial "{bin} stats --threads 1 {in}" note="lengths only: no base or quality counts; accepts a bad plus line and quality bytes"
+lane seqfu partial "{bin} stats --threads 1 {in}" note="lengths only: no base or quality counts; accepts a truncated last record, a blank line, and out-of-range quality bytes"
 
 family file "one file by path"
 lanes all

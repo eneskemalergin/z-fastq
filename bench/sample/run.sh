@@ -12,6 +12,8 @@ SUBSET_CHECKER=1
 # Speed tables name what each tool lets through, since the work is not equal.
 THROUGH=1
 order z-fastq,rasusa,seqtk,fq,fqkit,seqkit,irma-core,fasten
+# z-fastq's competition here is partial tools, so the quick-check rival is the fastest of any class.
+rival any
 
 word title "Sampling records"
 word subject "z-fastq sample"
@@ -61,7 +63,6 @@ exact_commands() {
 family exact "an exact number of records: K = 100,000, or 1,000 for long reads"
 lanes z-fastq,seqtk,seqkit,rasusa,fq,fqkit,irma-core
 look full
-formats plain
 param k short:100000,long:1000
 param seed 11
 exact_commands
@@ -80,7 +81,6 @@ input real illumina-drr1001190 medium interleaved
 family paired-fraction "mates in two files, p = 0.1"
 lanes z-fastq,rasusa,fq,irma-core
 look table
-formats plain
 param p 0.1
 param pct 10
 param seed 11
@@ -92,7 +92,6 @@ input pair "$PAIRED_SOURCES,paired" medium
 family paired-exact "mates in two files, K = 100,000 pairs"
 lanes z-fastq,rasusa,fq,irma-core
 look table
-formats plain
 param k 100000
 param seed 11
 command z-fastq "{zfastq} sample --paired --count {k} --seed {seed} {in}"
@@ -116,12 +115,6 @@ input shape paired medium interleaved
 # record count, or p = 1 for a tool with no exact count (Fasten, single-end).
 edges sample exact fraction "k=1000;p=1;pct=100;seed=11"
 
-# The rule a failing tool named, as in check.
-reject_code() {
-    local code
-    code="$(sed 's/\x1b\[[0-9;]*m//g' "$ERR" | grep -o -m1 -E ': \[?[SP]00[1-6]\]?:?' | grep -o -E '[SP]00[1-6]' | head -1)" || code=""
-    printf 'reject%s\n' "${code:+ $code}"
-}
 # A plain path for an input: the plain copy beside a gzip file, or the
 # decompressed stream when there is none.
 plain_of() { if [[ "$1" != *.gz ]]; then printf '%s\n' "$1"; elif [[ -f "${1%.gz}" ]]; then printf '%s\n' "${1%.gz}"; else printf '%s\n' "<(gzip -dc '$1')"; fi; }
@@ -400,50 +393,16 @@ tools_table() {
     } | mdtable
 }
 # Per lane: what it rejects, by kind of malformed input, and what it changes
-# in kept records. A kind is passed when the tool exits 0 on any of its edge
-# inputs.
+# in kept records.
+sample_changes() { # lane -> plus line, line endings, unfair modes
+    local plus ends unfair
+    plus="$(record_cell "$1" variable plus)" ends="$(record_cell "$1" endings cr)"
+    unfair="$(fair_verdicts | awk -v l="$1" '$1 == l && $3 == "no" { print $2 }' | while read -r f; do mode_name "$f"; done | paste -sd, - | sed 's/,/, /g')"
+    printf '%s\t%s\t%s\n' "$plus" "$ends" "${unfair:--}"
+}
 checks_table() {
-    local name plus ends unfair
-    {
-        printf 'Tool\tLength mismatch\tTruncated record\tBad plus line\tBad header\tQuality range\tBlank line\tBroken gzip\tPlus line written\tLine endings written\tUnfair in\n'
-        printf 'l\tl\tl\tl\tl\tl\tl\tl\tl\tl\tl\n'
-        for name in "${LANES[@]}"; do
-            plus="$(record_cell "$name" variable plus)" ends="$(record_cell "$name" endings cr)"
-            unfair="$(fair_verdicts | awk -v l="$name" '$1 == l && $3 == "no" { print $2 }' | while read -r f; do mode_name "$f"; done | paste -sd, - | sed 's/,/, /g')"
-            awk -F'\t' -v l="$name" -v label="${REG_LABEL[$name]}" -v tail="$plus"$'\t'"$ends"$'\t'"${unfair:--}" '
-                BEGIN { split("lenmis trunc dash noat qlow,qhigh blank gztrunc,gzgarbage", kinds, " ") }
-                FNR == NR { if ($2 ~ /^reject/) want[$1] = 1; next }
-                $1 == l && ($2 in want) { cell[$2] = $3 }
-                END {
-                    line = label
-                    for (i = 1; i <= 7; i++) { n = split(kinds[i], e, ","); passed = 0
-                        for (j = 1; j <= n; j++) if (cell[e[j]] ~ /^wrong/) passed = 1
-                        line = line "\t" (passed ? "**passes**" : "rejects") }
-                    print line "\t" tail
-                }' <(edge_list) "$RESULTS/edges.tsv"
-        done
-    } | mdtable
-}
-# yes when every check of LANE in FAMILY passed, partly when some did, no when none.
-mode_cell() { # lane family
-    awk -F'\t' -v l="$1" -v f="$2" '$1 == f && $2 == l { n++; if ($3 == "pass") p++ } END { print (n == 0) ? "-" : (p == n) ? "yes" : (p > 0) ? "partly" : "no" }' "$FAMILY_CHECKS"
-}
-# Every current check of every family into FAMILY_CHECKS: family, lane,
-# status, value, case id. Written once per report.
-FAMILY_CHECKS=""
-family_checks() {
-    local fam id fmt paths truth bytes src tier kind params inid name form key
-    FAMILY_CHECKS="$REPORT_DIR/family-checks.tsv"
-    load_checks
-    cache_lane_ids
-    while IFS=$'\t' read -r fam id fmt paths truth bytes src tier kind params inid; do
-        form=file
-        [[ "${FAM_STDIN[$fam]}" == 0 ]] || form=stdin
-        for name in ${FAM_LANES[$fam]}; do
-            key="$(status_key "$name" "$fam" "$form" "$inid" "$params")"
-            [[ ! -v "CHECK_STATUS[$key]" ]] || printf '%s\t%s\t%s\t%s\t%s\n' "$fam" "$name" "${CHECK_STATUS[$key]}" "${CHECK_VALUE[$key]}" "$id"
-        done
-    done < <(cases | with_input_ids) >"$FAMILY_CHECKS"
+    kinds_table "Length mismatch=lenmis|Truncated record=trunc|Bad plus line=dash|Bad header=noat|Quality range=qlow,qhigh|Blank line=blank|Broken gzip=gztrunc,gzgarbage" \
+        $'Plus line written\tLine endings written\tUnfair in' sample_changes
 }
 # What LANE's kept records on SHAPE's headline-tier plain case carry: the
 # plus line (kept, bare +, changed) or the line endings (as input, LF, CRLF,
@@ -502,6 +461,7 @@ sample_findings() {
     else
         printf -- '- **Fair samples:** every tool passes the fairness tests in every mode.\n'
     fi
+    valid_wrong_bullet
     seqtk_match | awk -F'\t' '{ t += $3; m += $2; d = d sprintf("%s%s %d of %d", (NR > 1 ? ", " : ""), ($1 == "exact" ? "exact count" : $1), $2, $3) } END {
         printf "- **Matches seqtk:** z-fastq kept the same records as seqtk on %d of %d screened inputs (%s).\n", m, t, d }'
     ANY=1 findings fraction speed Fraction
@@ -535,13 +495,13 @@ feature_readme() {
     readme_speed fraction "Fraction sampling, p = 0.1"
     readme_scaling fraction "###"
     readme_speed exact "Exact count, K = 100,000 (1,000 for long reads)"
-    printf 'Plain input only: with gzip, most exact-count tools decompress the file twice, so the time is mostly zlib; fraction sampling shows the gzip cost. K is 100,000 reads for short-read inputs and 1,000 for long-read inputs (the Long reads group, `longread`, and `long`); the `long` shape holds 1,789 records, so its 1,000 is close to a copy.\n\n'
+    printf 'K is 100,000 reads for short-read inputs and 1,000 for long-read inputs (the Long reads group, `longread`, and `long`); the `long` shape holds 1,789 records, so its 1,000 is close to a copy.\n\n'
     printf '### Time and memory against K\n\n'
     picture exact-k-lines "Time and peak memory against K" && printf '\n'
     k_memory | awk -F'\t' 'BEGIN { print "K\tz-fastq peak\tLowest other\tHighest other"; print "r\tr\tl\tl" }
         function commas(n,   s) { s = n ""; while (s ~ /[0-9]{4}/) sub(/[0-9]{3}($|,)/, ",&", s); sub(/,,/, ",", s); return s }
         { printf "%s\t%.2f MiB\t%.1fx (%s)\t%.1fx (%s)\n", commas($1), $2, $3, $4, $5, $6 }' | mdtable
-    printf '\n## Pairs\n> <sub>Each tool'"'"'s time and peak memory as a multiple of z-fastq'"'"'s, geometric mean over the 4 paired runs and the `paired` shape at 1 GiB. Plain input: paired fraction and paired exact count read two mate files, interleaved fraction one interleaved file on stdin.</sub>\n\n'
+    printf '\n## Pairs\n> <sub>Each tool'"'"'s time and peak memory as a multiple of z-fastq'"'"'s, geometric mean over the 4 paired runs and the `paired` shape at 1 GiB. Paired fraction and paired exact count read two mate files; interleaved fraction reads one interleaved file on stdin, plain only, since Fasten cannot read gzip.</sub>\n\n'
     summary_table "paired-fraction:Paired fraction" "paired-exact:Paired exact count" "interleaved-fraction:Interleaved fraction"
     printf '\n'
     readme_repro

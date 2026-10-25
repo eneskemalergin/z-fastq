@@ -129,10 +129,13 @@ feature_check() {
 }
 
 # --- report sections ---
-sweep_table() {
+# One table per measure: the share each tool rejected (rejected), or the
+# share where the line it reported is in the broken record (located; "-" for
+# a tool that reports no line).
+sweep_table() { # rejected | located
     local labels="" kind
     for kind in $SWEEP_KINDS; do labels+="${KIND_LABEL[$kind]// /_} "; done
-    awk -F'\t' -v kinds="$SWEEP_KINDS" -v labels="$labels" '
+    awk -F'\t' -v kinds="$SWEEP_KINDS" -v labels="$labels" -v measure="$1" '
         FILENAME ~ /style.tsv$/ { if (FNR > 1) { label[$1] = $2; ord[$1] = $7 } next }
         { n[$1, $2]++; if ($4 > 0 && $4 < 128) caught[$1, $2]++; if ($5 != "-") told[$1, $2]++; if ($5 == 1) at[$1, $2]++; lanes[$1] = 1 }
         END {
@@ -145,7 +148,7 @@ sweep_table() {
                 l = list[i]; line = label[l]
                 for (j = 1; j <= k; j++) {
                     c = caught[l, ks[j]] + 0; a = at[l, ks[j]] + 0; t = n[l, ks[j]]
-                    line = line "\t" sprintf("%d%%", 100 * c / t) (told[l, ks[j]] ? sprintf(" (%d%%)", 100 * a / t) : "")
+                    line = line "\t" (measure == "rejected" ? sprintf("%d%%", 100 * c / t) : told[l, ks[j]] ? sprintf("%d%%", 100 * a / t) : "-")
                 }
                 print line
             }
@@ -161,7 +164,7 @@ report_samples() {
         rc=0
         $(lane_cmd "$name" "$file") >"$file.err" 2>&1 || rc=$?
         text="$(sed 's/\x1b\[[0-9;]*m//g' "$file.err" | grep -v -E ' INFO |^WARNING: Using incubator|^java |^Executing|^Version|^Picked up' |
-            grep -v -E '^\s*$' | head -3 | sed "s#$file#reads.fastq#g")"
+            grep -v -E '^\s*$' | head -3 | sed "s#$file#reads.fastq#g; s/\x1f/\\\\x1f/g")"
         printf -- '- `%s` exited %d:\n\n```text\n%s\n```\n\n' "${REG_LABEL[$name]}" "$rc" "${text:-(nothing printed)}"
     done
     rm -f -- "$file" "$file.err"
@@ -169,8 +172,11 @@ report_samples() {
 
 feature_report() {
     [[ -f "$SWEEP" ]] || return 0
-    printf '## Defect sweep\n> <sub>Real reads with one injected defect each, %d files per kind, at random records of three 1 MiB files (short fixed, short variable, and long reads). Each cell is the share the tool rejected; in brackets, the share where the line it reported is in the broken record, left out for a tool that reports no line.</sub>\n\n' "$SWEEP_PER_KIND"
-    sweep_table
+    printf '## Defect sweep\n> <sub>Real reads with one injected defect each, %d files per kind, at random records of three 1 MiB files (short fixed, short variable, and long reads).</sub>\n\n' "$SWEEP_PER_KIND"
+    printf 'The share of files each tool rejected:\n\n'
+    sweep_table rejected
+    printf '\nThe share where the line the tool reported is in the broken record (`-`: the tool reports no line):\n\n'
+    sweep_table located
     printf '\n## How each tool reports a problem\n\n'
     details "Messages for one broken record"
     report_samples

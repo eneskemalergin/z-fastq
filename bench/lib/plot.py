@@ -80,7 +80,7 @@ def times(r):
     if r >= 100:
         return f"{r:.0f}x"
     if r >= 0.995:
-        return f"{r:.1f}x".replace(".0x", "x")
+        return f"{r:.1f}x"
     return f"{r:.2g}x"
 
 
@@ -180,9 +180,11 @@ class Figures:
             return dict(facecolor=mix(color, bg, 0.30), edgecolor=color, hatch="////")
         return dict(facecolor=color, edgecolor=color, hatch=None)
 
-    def dot_keys(self, theme):
+    def dot_keys(self, theme, family=None):
+        """Marker keys for the inputs a figure of FAMILY shows: real runs, then its shapes."""
         t = THEMES[theme]
-        keys = [("o", "real run")] + [(m, src) for src, m in self.dot.items()]
+        present = {i["source"] for i in self.cases.values() if family is None or i["family"] == family}
+        keys = [("o", "real run")] + [(m, src) for src, m in self.dot.items() if src in present]
         return [Line2D([], [], marker=m, linestyle="none", markersize=5 if m == "o" else 5.5, markerfacecolor=t["bg"],
                        markeredgecolor=t["ink"], markeredgewidth=0.8, label=text) for m, text in keys]
 
@@ -293,7 +295,7 @@ class Figures:
         ax.set_xlim(-0.5, len(groups) - 0.5)
         ax.set_xticks(range(len(groups)))
         synthetic = [all(c["kind"] == "shape" for c in cases) for _, cases in groups]
-        ax.set_xticklabels([f"{label}\n{len(cases)} {'shapes' if syn else 'real runs'}"
+        ax.set_xticklabels([f"{label}\n{len(cases)} {('shape' if syn else 'real run') + ('' if len(cases) == 1 else 's')}"
                             for (label, cases), syn in zip(groups, synthetic)], fontsize=8.5, color=t["ink"], linespacing=1.3)
         ax.tick_params(axis="x", length=0)
         for gi in range(1, len(groups)):
@@ -342,7 +344,7 @@ class Figures:
                     f"{lower}{self.headline.capitalize()} tier, about {self.words['size']} of FASTQ per input. Bars: geometric "
                     "mean over the inputs of a group (dots, each the median of its timed repeats; markers name the synthetic "
                     "shapes), whiskers their range. Boxes: multiple of "
-                    f"z-fastq (dashed line). {CLASS_NOTE}", handles=self.bar_handles(shown, theme), keys=self.dot_keys(theme))
+                    f"z-fastq (dashed line). {CLASS_NOTE}", handles=self.bar_handles(shown, theme), keys=self.dot_keys(theme, family))
         return True
 
     # ---- overview -----------------------------------------------------------
@@ -354,6 +356,7 @@ class Figures:
         t = THEMES[theme]
         fig, axes = self.frame(theme, 1, len(fmts), width=5.2 * len(fmts) + 0.6, height=5.4)
         shown, nshapes = [], {}
+        self.front_drawn = False
         for ax, fmt in zip(axes[0], fmts):
             data = {}
             cases = self.tier_cases(family, fmt)
@@ -366,18 +369,18 @@ class Figures:
                     if lt and lm and ref_t and ref_m:
                         data.setdefault(lane, []).append((lt / ref_t, lm / ref_m))
             self.isocost(ax, data, theme)
-            ax.set_title(f"{fmt} input, {len(cases)} shapes", loc="left", fontsize=10, color=t["ink"], fontweight="bold", pad=8)
+            ax.set_title(f"{fmt} input, {len(cases)} inputs", loc="left", fontsize=10, color=t["ink"], fontweight="bold", pad=8)
             shown += [n for n in data if n not in shown]
         self.finish(fig, f"{family}-overview", theme, "Time and memory relative to z-fastq",
-                    f"Large marks: geometric mean over the {self.headline}-tier shapes; faint marks: single shapes; "
-                    "whiskers: 95% interval of the mean; ellipse: where about half the shapes fall. Dashed curves: "
-                    "equal cost C = (time + memory) / 2. Solid line: tools nothing beats on both.",
+                    f"Large marks: geometric mean over the {self.headline}-tier inputs; faint marks: single inputs; "
+                    "whiskers: 95% interval of the mean; ellipse: where about half the inputs fall. Dashed curves: "
+                    "equal cost C = (time + memory) / 2." + (" Solid line: tools nothing beats on both." if self.front_drawn else ""),
                     handles=self.mark_handles([n for n in self.order if n in shown], theme), ncol=len(shown))
         return True
 
     def isocost(self, ax, data, theme):
         """Per lane: faint marks for the shapes, the geometric mean as a large mark, whiskers for
-        the 95% interval of that mean on each axis, and an ellipse holding about half the shapes.
+        the 95% interval of that mean on each axis, and an ellipse holding about half the inputs.
         Equal-cost curves are linear cost (time ratio + RSS ratio) / 2, curved on log axes."""
         t = THEMES[theme]
         fig = ax.figure
@@ -458,6 +461,7 @@ class Figures:
         front = sorted(p for p in points.values() if not any(q[0] <= p[0] and q[1] <= p[1] and q != p for q in points.values()))
         if len(front) > 1:
             ax.plot([p[0] for p in front], [p[1] for p in front], color=t["ink2"], linewidth=1.0, zorder=2.5)
+            self.front_drawn = True
         # Direct labels: the first of eight spots around the marker that overlaps no mark or label.
         scale = 72 / fig.dpi
         centers = {n: ax.transData.transform(p) * scale for n, p in points.items()}
@@ -489,8 +493,10 @@ class Figures:
 
     # ---- scaling ------------------------------------------------------------
 
-    def scaling_figure(self, family, metric, theme):
-        """Rows: formats; columns: scaling sources; x: input size; one line per lane."""
+    def scaling_figure(self, family, metrics, theme):
+        """Rows: formats; columns: each scaling source, once per metric (throughput,
+        peak RSS); x: input size; one line per lane. With one source, both
+        metrics share one figure side by side."""
         grid = {}
         for (fam, case), lanes in self.rows.items():
             info = self.cases.get((fam, case))
@@ -498,27 +504,30 @@ class Figures:
                 continue
             mib = int(info["bytes"]) / 2**20
             for lane in lanes:
-                v = self.value(family, case, lane, "speed" if metric == "speed" else "memory")
-                if v:
-                    y = mib / (v / 1e3) if metric == "speed" else v
-                    grid.setdefault((info["format"], info["source"]), {}).setdefault(lane, []).append((mib, y))
-        fmts = [f for f in ("plain", "gzip") if any(len(s.get(SUBJECT, [])) > 1 for (ff, _), s in grid.items() if ff == f)]
-        sources = [s for s in self.scaling if any((f, s) in grid for f in fmts)]
+                t, m = self.value(family, case, lane, "speed"), self.value(family, case, lane, "memory")
+                if t:
+                    grid.setdefault((info["format"], info["source"], "speed"), {}).setdefault(lane, []).append((mib, mib / (t / 1e3)))
+                if m:
+                    grid.setdefault((info["format"], info["source"], "memory"), {}).setdefault(lane, []).append((mib, m))
+        fmts = [f for f in ("plain", "gzip") if any(len(s.get(SUBJECT, [])) > 1 for (ff, _, _), s in grid.items() if ff == f)]
+        sources = [s for s in self.scaling if any((f, s, metrics[0]) in grid for f in fmts)]
         if not fmts or not sources:
             return False
+        cols = [(src, metric) for src in sources for metric in metrics]
         t = THEMES[theme]
-        fig, axes = self.frame(theme, len(fmts), len(sources), width=2.5 * len(sources) + 0.8, height=2.8 * len(fmts) + 0.4,
-                               sharex=True, sharey=True)
+        both = len(metrics) > 1
+        fig, axes = self.frame(theme, len(fmts), len(cols), width=(3.6 if both else 2.5) * len(cols) + 0.8,
+                               height=2.8 * len(fmts) + 0.4, sharex=True, sharey=False if both else True)
         sizes = [(1, "1 MiB"), (10, "10 MiB"), (100, "100 MiB"), (1024, "1 GiB"), (10240, "10 GiB")]
-        top = max(p[0] for ser in grid.values() for pts in ser.values() for p in pts)
-        sizes = [s for s in sizes if s[0] <= top * 1.5]
+        xs = [p[0] for ser in grid.values() for pts in ser.values() for p in pts]
+        sizes = [s for s in sizes if s[0] <= max(xs) * 1.5]
         shown = []
         for r, fmt in enumerate(fmts):
-            for c, src in enumerate(sources):
+            for c, (src, metric) in enumerate(cols):
                 ax = axes[r, c]
                 ax.set_xscale("log")
                 ax.set_yscale("log")
-                series = grid.get((fmt, src), {})
+                series = grid.get((fmt, src, metric), {})
                 for lane in self.order:
                     # A lane timed at one size only (headline-only) has no line to draw.
                     if len(series.get(lane, [])) < 2:
@@ -535,28 +544,36 @@ class Figures:
                 ax.xaxis.set_major_locator(FixedLocator([v for v, _ in sizes]))
                 ax.xaxis.set_major_formatter(FixedFormatter([n for _, n in sizes]))
                 ax.xaxis.set_minor_locator(NullLocator())
-                ax.set_xlim(min(0.65, min(p[0] for ser in grid.values() for pts in ser.values() for p in pts) / 1.25),
-                            max(p[0] for ser in grid.values() for pts in ser.values() for p in pts) * 1.4)
+                ax.set_xlim(min(0.65, min(xs) / 1.25), max(xs) * 1.4)
                 ax.tick_params(axis="x", labelsize=7.5)
                 count_axis(ax.yaxis)
                 ax.margins(y=0.12)
+                unit = "MiB/s" if metric == "speed" else "peak RSS (MiB)"
                 if r == 0:
                     label = next(i["label"] for i in self.cases.values() if i["source"] == src)
-                    ax.set_title(textwrap.fill(label, 26), fontsize=9, color=t["ink"], pad=6, linespacing=1.2)
+                    head = ("Throughput" if metric == "speed" else "Peak memory") if both else textwrap.fill(label, 26)
+                    ax.set_title(head, fontsize=9.5 if both else 9, color=t["ink"], pad=6, linespacing=1.2,
+                                 fontweight="bold" if both else "normal")
                 if r == len(fmts) - 1:
                     ax.set_xlabel("FASTQ size, log scale", fontsize=8.5, color=t["ink2"])
-                if c == 0:
-                    unit = "MiB/s" if metric == "speed" else "peak RSS (MiB)"
-                    ax.set_ylabel(f"{fmt} input\n{unit}, log scale", fontsize=9, color=t["ink2"])
-        if metric == "speed":
-            title, note = ("Throughput by input size", f"Higher is better. MiB of FASTQ {self.words['done']} per second of wall time; "
-                           "at 1 MiB, starting the process dominates")
+                if c == 0 or both:
+                    ax.set_ylabel(f"{fmt} input\n{unit}, log scale" if c == 0 else f"{unit}, log scale", fontsize=9, color=t["ink2"])
+        gz = " (gzip rows: the same reads compressed)" if "gzip" in fmts else ""
+        what = (f"Each synthetic shape, 1 MiB to 1 GiB of FASTQ{gz}" if len(sources) > 1
+                else "The {} shape ({}), 1 MiB to 1 GiB of FASTQ{}".format(sources[0], next(i['label'] for i in self.cases.values() if i['source'] == sources[0]).split(": ", 1)[-1], gz))
+        if both:
+            stem, title = f"{family}-scaling", "Throughput and peak memory by input size"
+            note = (f"Throughput: higher is better, MiB of FASTQ {self.words['done']} per second of wall time; at 1 MiB, starting "
+                    "the process dominates. Peak memory: lower is better; a flat line means memory does not grow with the input")
+        elif metrics[0] == "speed":
+            stem, title = f"{family}-scaling-speed", "Throughput by input size"
+            note = (f"Higher is better. MiB of FASTQ {self.words['done']} per second of wall time; at 1 MiB, starting the process "
+                    "dominates")
         else:
-            title, note = ("Peak memory by input size", "Lower is better. A flat line means memory does not grow with the input; "
-                           "the kernel reports peak RSS in 256 KiB steps, so small wiggles are rounding")
-        self.finish(fig, f"{family}-scaling-{metric}", theme, title,
-                    f"{note}. Each synthetic shape, 1 MiB to 1 GiB of FASTQ (gzip rows: the same reads compressed). Each "
-                    "point is the median of its runs. Dashed: partial structure check.",
+            stem, title = f"{family}-scaling-memory", "Peak memory by input size"
+            note = ("Lower is better. A flat line means memory does not grow with the input; the kernel reports peak RSS in "
+                    "256 KiB steps, so small wiggles are rounding")
+        self.finish(fig, stem, theme, title, f"{note}. {what}. Each point is the median of its runs. Dashed: partial structure check.",
                     handles=self.mark_handles([n for n in self.order if n in shown], theme), ncol=len(shown))
         return True
 
@@ -639,7 +656,11 @@ class Figures:
             color, strength = style[r["verdict"]]
             if color:
                 ax.add_patch(Rectangle((x + 0.04, y + 0.06), 0.92, 0.88, facecolor=mix(color, t["bg"], strength), edgecolor="none"))
-            ax.text(x + 0.5, y + 0.5, r["cell"], ha="center", va="center", fontsize=8, color=t["ink"],
+            # A long verdict wraps onto two lines in a smaller size, so it stays inside its cell.
+            text, size = r["cell"], 8
+            if len(text) > 16:
+                text, size = textwrap.fill(text, 16), 6.8
+            ax.text(x + 0.5, y + 0.5, text, ha="center", va="center", fontsize=size, color=t["ink"], linespacing=1.05,
                     fontweight="bold" if r["verdict"] in ("wrong", "crash") else "normal")
         prev = None
         for y, (label, expected) in sorted(labels.items()):
@@ -671,8 +692,12 @@ class Figures:
                 self.overview(family, theme)
                 for metric in METRICS:
                     self.metric_bars(family, metric, theme)
-                for metric in ("speed", "memory"):
-                    self.scaling_figure(family, metric, theme)
+                # One scaling source: throughput and memory side by side in one figure.
+                if len([src for src in self.scaling if any(i["source"] == src and i["family"] == family for i in self.cases.values())]) == 1:
+                    self.scaling_figure(family, ["speed", "memory"], theme)
+                else:
+                    for metric in ("speed", "memory"):
+                        self.scaling_figure(family, [metric], theme)
         for family, param in self.lines:
             self.param_figure(family, param, theme)
 

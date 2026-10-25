@@ -17,15 +17,16 @@
     - `variable`: *50 to 150 bp, annotated plus line*
     - `longread`: *nanopore headers, rare 300 kb reads*
     - `long`: *300 kb sequence lines*
-- `date`: *2026-10-24*
+- `date`: *2026-10-25*
 
 ## Findings
 
-- **Right answers:** z-fastq returned the right sample on all 84 checked inputs and rejected every malformed edge case. 6 of the 7 other tools print a wrong sample or crash on at least one edge case.
+- **Right answers:** z-fastq returned the right sample on all 106 checked inputs and rejected every malformed edge case. 6 of the 7 other tools print a wrong sample or crash on at least one edge case.
 - **Fair samples:** every tool passes the fairness tests except IRMA Core (fraction).
-- **Matches seqtk:** z-fastq kept the same records as seqtk on 45 of 45 screened inputs (fraction 36 of 36, exact count 9 of 9).
+- **Wrong on valid input, exit 0:** no final newline: fqkit (1 kept); tab inside the header: seqtk (not a subset).
+- **Matches seqtk:** z-fastq kept the same records as seqtk on 54 of 54 screened inputs (fraction 36 of 36, exact count 18 of 18).
 - **Fraction speed:** the fastest other tool takes 0.69x z-fastq's time on plain input (Rasusa) and 1.01x on gzip (Rasusa); IRMA Core, the fastest other full-check tool, takes 3.28x z-fastq's time on plain input and 2.94x on gzip.
-- **Exact-count speed:** the fastest other tool takes 0.90x z-fastq's time on plain input (Rasusa); IRMA Core, the fastest other full-check tool, takes 2.36x z-fastq's time on plain input.
+- **Exact-count speed:** the fastest other tool takes 0.90x z-fastq's time on plain input (Rasusa) and 1.09x on gzip (Rasusa); IRMA Core, the fastest other full-check tool, takes 2.36x z-fastq's time on plain input.
 - **Memory against K:** at K = 100,000, z-fastq peaks at 1.27 MiB and the other tools at 3.4x to 15.3x that; at K = 1,000,000, z-fastq peaks at 3.77 MiB and the other tools at 1.2x to 9.5x that.
 - **Where z-fastq is not fastest, fraction:** Rasusa on plain synthetic (0.64x); seqtk on plain synthetic (0.90x); Rasusa on plain short, variable length (0.68x); Rasusa on gzip short, variable length (0.89x); Rasusa on plain long reads (0.76x); seqtk on plain long reads (0.89x); Rasusa on plain short, fixed length (0.73x); Rasusa on gzip short, fixed length (0.98x).
 - **Where z-fastq is not fastest, exact count:** Rasusa on plain synthetic (0.86x); Rasusa on plain long reads (0.76x); seqtk on plain long reads (0.95x).
@@ -41,7 +42,7 @@
 | fq        | partial  | yes      | yes         | yes              | -                  | no    | yes  | yes  |
 | fqkit     | partial  | -        | yes         | -                | -                  | no    | yes  | yes  |
 | SeqKit    | partial  | yes      | yes         | -                | -                  | yes   | yes  | yes  |
-| IRMA Core | complete | yes      | yes         | partly           | -                  | no    | yes  | yes  |
+| IRMA Core | complete | yes      | partly      | partly           | -                  | no    | yes  | yes  |
 | Fasten    | partial  | -        | -           | -                | yes                | yes   | no   | no   |
 
 ### What each tool checks and changes
@@ -73,7 +74,7 @@
 > <sub>z-fastq promises seqtk's selection on inputs with LF endings, nonempty reads, bare plus lines, printable headers, a seed that fits signed 64-bit, and a value seqtk reads as a fraction. Equivalent commands: `z-fastq sample --fraction P --seed S IN` and `seqtk sample -s S IN P`; `z-fastq sample --count K --seed S IN` and `seqtk sample -2 -s S IN K`.</sub>
 
 - `fraction`: *the same records on 36 of 36 inputs*
-- `exact count`: *the same records on 9 of 9 inputs*
+- `exact count`: *the same records on 18 of 18 inputs*
 
 > [!NOTE]
 > seqtk without `-2` keeps the same records but writes them in reservoir order, reads `1.0` as a count of 1, and reads `0` as a fraction.
@@ -81,7 +82,12 @@
 ## Right answers
 > <sub>A sample is right when every kept record is an input record, unchanged in header, sequence, and quality, in input order, with mates kept together, and the count is the one asked for (exact count) or passes a two-sided binomial test at 1e-6 (fraction); the subset checker, which shares no code with z-fastq, decides. The edge cases are small inputs where tools differ: each cell shows what the tool printed, and its color whether that was right.</sub>
 
-z-fastq returned the right sample on all 84 inputs it was given. Every other tool was right on every input it was given, except: seqtk gave a wrong sample on 3 of its 69 inputs (PromethION, 30 to 153 kb) and is not timed on them; IRMA Core gave a wrong sample on 2 of its 79 inputs (paired: 100 bp mate pairs) and is not timed on them.
+z-fastq returned the right sample on all 106 inputs it was given. Every other tool was right on every input it was given except these, which are not timed where they gave a wrong sample:
+
+| Tool      | Wrong |  Of | Inputs                                                                                                                                                                                               |
+| --------- | ----: | --: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| seqtk     |     4 |  81 | PromethION, 30 to 153 kb                                                                                                                                                                             |
+| IRMA Core |    20 | 101 | dense, endings, NovaSeq, 150 bp, miRNA, 36 bp, NovaSeq, Casava headers, 10x mates, 28 and 150 bp, long, longread, BGISEQ, 100 bp, PromethION, 30 to 153 kb, Revio HiFi, 4 to 21 kb, paired, variable |
 
 > [!CAUTION]
 > Rasusa, seqtk, fq, fqkit, SeqKit and Fasten print a wrong sample and exit 0 on some malformed inputs, so a script cannot tell the sample is wrong.
@@ -97,11 +103,28 @@ z-fastq returned the right sample on all 84 inputs it was given. Every other too
 
 <details><summary>Inputs where a tool gave a wrong sample</summary>
 
-| Tool      | Input                                           | Exit | Printed             |
-| --------- | ----------------------------------------------- | ---: | ------------------- |
-| IRMA Core | bench/data/synthetic/paired/medium_R1.fastq     |    1 | reject              |
-| seqtk     | bench/data/real/ont-err14758576/medium.fastq    |    0 | wrong: not a subset |
-| seqtk     | bench/data/real/ont-err14758576/medium.fastq.gz |    0 | wrong: not a subset |
+| Tool      | Input                                                            | Exit | Printed             |
+| --------- | ---------------------------------------------------------------- | ---: | ------------------- |
+| IRMA Core | bench/data/real/illumina-drr1001190/medium_R1.fastq.gz           |    0 | wrong: not a subset |
+| IRMA Core | bench/data/real/illumina-drr1001190/medium_interleaved.fastq.gz  |    0 | wrong: not a subset |
+| IRMA Core | bench/data/real/illumina-drr147610/medium.fastq.gz               |    0 | wrong: not a subset |
+| IRMA Core | bench/data/real/illumina-err4686103/medium_R1.fastq.gz           |    0 | wrong: not a subset |
+| IRMA Core | bench/data/real/illumina-err4686103/medium_interleaved.fastq.gz  |    0 | wrong: not a subset |
+| IRMA Core | bench/data/real/illumina-srr19571648/medium_R1.fastq.gz          |    0 | wrong: not a subset |
+| IRMA Core | bench/data/real/illumina-srr19571648/medium_interleaved.fastq.gz |    0 | wrong: not a subset |
+| IRMA Core | bench/data/real/mgi-err10448913/medium_R1.fastq.gz               |    0 | wrong: not a subset |
+| IRMA Core | bench/data/real/mgi-err10448913/medium_interleaved.fastq.gz      |    0 | wrong: not a subset |
+| IRMA Core | bench/data/real/ont-err14758576/medium.fastq.gz                  |    0 | wrong: not a subset |
+| IRMA Core | bench/data/real/pacbio-srr29396856/medium.fastq.gz               |    0 | wrong: not a subset |
+| IRMA Core | bench/data/synthetic/dense/medium.fastq.gz                       |    0 | wrong: not a subset |
+| IRMA Core | bench/data/synthetic/endings/medium.fastq.gz                     |    0 | wrong: not a subset |
+| IRMA Core | bench/data/synthetic/long/medium.fastq.gz                        |    0 | wrong: not a subset |
+| IRMA Core | bench/data/synthetic/longread/medium.fastq.gz                    |    0 | wrong: not a subset |
+| IRMA Core | bench/data/synthetic/paired/medium_R1.fastq                      |    1 | reject              |
+| IRMA Core | bench/data/synthetic/paired/medium_R1.fastq.gz                   |    1 | reject              |
+| IRMA Core | bench/data/synthetic/variable/medium.fastq.gz                    |    0 | wrong: not a subset |
+| seqtk     | bench/data/real/ont-err14758576/medium.fastq                     |    0 | wrong: not a subset |
+| seqtk     | bench/data/real/ont-err14758576/medium.fastq.gz                  |    0 | wrong: not a subset |
 
 </details>
 
@@ -132,7 +155,7 @@ z-fastq returned the right sample on all 84 inputs it was given. Every other too
 | Paired exact count   | fq        |          exact |      - |             2.6 |          - |         - | yes        | yes          | yes   | yes  |
 | Paired exact count   | IRMA Core |          exact |      - |             1.5 |          - |         - | yes        | yes          | yes   | yes  |
 | Interleaved fraction | z-fastq   |           -2.1 |   0.96 |             3.1 |          - |         - | yes        | yes          | yes   | yes  |
-| Interleaved fraction | Fasten    |           +0.7 |   0.98 |             2.5 |          - |         - | no         | yes          | yes   | yes  |
+| Interleaved fraction | Fasten    |           +0.1 |   0.99 |             2.6 |          - |         - | no         | yes          | yes   | yes  |
 
 A tool fails at a count bias beyond 4.9, a spread outside 0.5 to 1.5, a tenth beyond 5.3 (each two-sided 1e-6), the first or last record kept outside 3 to 43 times of 200, or the same kept set from seeds 11 and 12. At these sizes a tenth's share is tested to about 0.7% (fraction) and 2% (exact) of its value. Same twice is reproducibility, not fairness.
 
@@ -181,6 +204,7 @@ z-fastq itself takes 415.4 ms and 0.89 MiB per plain input, 1762.8 ms and 0.89 M
 ### Scaling
 > <sub>Each synthetic shape from 1 MiB to 1 GiB of FASTQ: throughput and peak memory against input size. A shape changes one thing a sampler pays for, so its line shows what that one thing costs each tool.</sub>
 
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/fraction-scaling-speed-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="results/figures/fraction-scaling-speed-light.png">
@@ -193,7 +217,7 @@ z-fastq itself takes 415.4 ms and 0.89 MiB per plain input, 1762.8 ms and 0.89 M
   <img src="results/figures/fraction-scaling-memory-light.png" alt="Peak memory by input size" width="100%">
 </picture>
 
-At 1 GiB, z-fastq samples 1.5 to 5.3 GiB/s on plain input and 0.4 to 0.7 GiB/s on gzip input. Faster there: Rasusa on plain long (1.74x); Rasusa on plain variable (1.52x); Rasusa on plain longread (1.45x); Rasusa on gzip dense (1.01x); Rasusa on plain endings (1.49x); Rasusa on plain dense (1.66x); seqtk on plain long (1.45x); seqtk on plain longread (1.25x); seqtk on plain endings (1.16x); seqtk on plain dense (1.08x), throughput as a multiple of z-fastq.
+At 1 GiB, z-fastq samples 1.5 to 5.3 GiB/s on plain input and 0.4 to 0.7 GiB/s on gzip input. Faster on a single shape there, as throughput over z-fastq's: Rasusa on plain long (1.74x); Rasusa on plain variable (1.52x); Rasusa on plain longread (1.45x); Rasusa on gzip dense (1.01x); Rasusa on plain endings (1.49x); Rasusa on plain dense (1.66x); seqtk on plain long (1.45x); seqtk on plain longread (1.25x); seqtk on plain endings (1.16x); seqtk on plain dense (1.08x).
 z-fastq peaks at 0.76 to 1.77 MiB across sizes and shapes. Memory that grows with the input: seqtk by 1.4x on plain longread; fq by 1.3x on gzip longread; SeqKit by 1.5x on plain dense; IRMA Core by 1.4x on plain longread.
 
 ## Exact count, K = 100,000 (1,000 for long reads)
@@ -205,17 +229,17 @@ z-fastq peaks at 0.76 to 1.77 MiB across sizes and shapes. Memory that grows wit
   <img src="results/figures/exact-overview-light.png" alt="Time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
-z-fastq itself takes 518.0 ms and 1.28 MiB per plain input (geometric mean over 12 inputs); the table gives every tool as a multiple of that.
+z-fastq itself takes 518.0 ms and 1.28 MiB per plain input, 3008.3 ms and 1.19 MiB per gzip input (geometric means over 12 inputs each); the table gives every tool as a multiple of that.
 
-| Tool      | Plain time | Plain memory | Passes malformed |
-| --------- | ---------: | -----------: | ---------------- |
-| z-fastq   |      1.00x |        1.00x | none             |
-| Rasusa    |      0.90x |        8.18x | 2 of 9           |
-| seqtk     |      1.43x |        3.08x | 9 of 9           |
-| fq        |      1.17x |        3.51x | 5 of 9           |
-| fqkit     |      1.38x |       27.96x | 7 of 9           |
-| SeqKit    |      2.24x |       18.78x | 3 of 9           |
-| IRMA Core |      2.36x |        3.67x | none             |
+| Tool      | Plain time | Plain memory | Gzip time | Gzip memory | Passes malformed |
+| --------- | ---------: | -----------: | --------: | ----------: | ---------------- |
+| z-fastq   |      1.00x |        1.00x |     1.00x |       1.00x | none             |
+| Rasusa    |      0.90x |        8.18x |     1.09x |       8.87x | 2 of 9           |
+| seqtk     |      1.43x |        3.08x |     1.20x |       3.40x | 9 of 9           |
+| fq        |      1.17x |        3.51x |     1.84x |       3.81x | 5 of 9           |
+| fqkit     |      1.38x |       27.96x |     1.82x |      27.75x | 7 of 9           |
+| SeqKit    |      2.24x |       18.78x |     2.91x |      23.20x | 3 of 9           |
+| IRMA Core |      2.36x |        3.67x |         - |           - | none             |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/exact-speed-dark.png">
@@ -239,7 +263,7 @@ z-fastq itself takes 518.0 ms and 1.28 MiB per plain input (geometric mean over 
 
 </details>
 
-Plain input only: with gzip, most exact-count tools decompress the file twice, so the time is mostly zlib; fraction sampling shows the gzip cost. K is 100,000 reads for short-read inputs and 1,000 for long-read inputs (the Long reads group, `longread`, and `long`); the `long` shape holds 1,789 records, so its 1,000 is close to a copy.
+K is 100,000 reads for short-read inputs and 1,000 for long-read inputs (the Long reads group, `longread`, and `long`); the `long` shape holds 1,789 records, so its 1,000 is close to a copy.
 
 ### Time and memory against K
 
@@ -257,26 +281,26 @@ Plain input only: with gzip, most exact-count tools decompress the file twice, s
 | 1,000,000 |     3.77 MiB | 1.2x (IRMA Core) | 9.5x (SeqKit)  |
 
 ## Pairs
-> <sub>Each tool's time and peak memory as a multiple of z-fastq's, geometric mean over the 4 paired runs and the `paired` shape at 1 GiB. Plain input: paired fraction and paired exact count read two mate files, interleaved fraction one interleaved file on stdin.</sub>
+> <sub>Each tool's time and peak memory as a multiple of z-fastq's, geometric mean over the 4 paired runs and the `paired` shape at 1 GiB. Paired fraction and paired exact count read two mate files; interleaved fraction reads one interleaved file on stdin, plain only, since Fasten cannot read gzip.</sub>
 
-| Mode                 | Tool      | Plain time | Plain memory | Passes malformed |
-| -------------------- | --------- | ---------: | -----------: | ---------------- |
-| Paired fraction      | z-fastq   |      1.00x |        1.00x | none             |
-| Paired fraction      | Rasusa    |      0.57x |        4.50x | 2 of 9           |
-| Paired fraction      | fq        |      0.90x |        3.97x | 5 of 9           |
-| Paired fraction      | IRMA Core |      2.54x |        4.32x | none             |
-| Paired exact count   | z-fastq   |      1.00x |        1.00x | none             |
-| Paired exact count   | Rasusa    |      0.74x |        9.65x | 2 of 9           |
-| Paired exact count   | fq        |      0.73x |        2.86x | 5 of 9           |
-| Paired exact count   | IRMA Core |      1.78x |        2.93x | none             |
-| Interleaved fraction | z-fastq   |      1.00x |        1.00x | none             |
-| Interleaved fraction | Fasten    |      2.59x |        3.12x | 7 of 9           |
+| Mode                 | Tool      | Plain time | Plain memory | Gzip time | Gzip memory | Passes malformed |
+| -------------------- | --------- | ---------: | -----------: | --------: | ----------: | ---------------- |
+| Paired fraction      | z-fastq   |      1.00x |        1.00x |     1.00x |       1.00x | none             |
+| Paired fraction      | Rasusa    |      0.57x |        4.50x |     0.98x |       4.63x | 2 of 9           |
+| Paired fraction      | fq        |      0.90x |        3.97x |     1.70x |       4.26x | 5 of 9           |
+| Paired fraction      | IRMA Core |      2.54x |        4.32x |     2.46x |       4.57x | none             |
+| Paired exact count   | z-fastq   |      1.00x |        1.00x |     1.00x |       1.00x | none             |
+| Paired exact count   | Rasusa    |      0.74x |        9.65x |     0.94x |      11.66x | 2 of 9           |
+| Paired exact count   | fq        |      0.73x |        2.86x |     1.24x |       3.53x | 5 of 9           |
+| Paired exact count   | IRMA Core |      1.78x |        2.93x |         - |           - | none             |
+| Interleaved fraction | z-fastq   |      1.00x |        1.00x |         - |           - | none             |
+| Interleaved fraction | Fasten    |      2.59x |        3.12x |         - |           - | 7 of 9           |
 
 ## Reproducibility
 
 <details><summary>How it was measured</summary>
 
-Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. The kernel reports peak memory in 256 KiB steps, so values closer than that are equal. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Generated by `bench/sample/run.sh release` on 2026-10-24.
+Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. The kernel reports peak memory in 256 KiB steps, so values closer than that are equal. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Generated by `bench/sample/run.sh release` on 2026-10-25.
 
 </details>
 
@@ -284,10 +308,10 @@ Every tool runs through `zexec -r` inside one zebrac batch per case, held to one
 
 - `z-fastq`: *0.1.0 at 90e46b4*
 - `zebrac`: *0.6.2*
-- `zexec`: *12448 bytes, static, no libc*
+- `zexec`: *12616 bytes, static, no libc*
 - `kernel`: *7.2.11-200.fc44.x86_64*
 - `cpu`: *AMD Ryzen 9 3950X 16-Core Processor*
-- `load at batch start`: *2.00 to 13.41*
+- `load at batch start`: *2.00 to 15.16*
 
 </details>
 
@@ -328,20 +352,24 @@ Every tool runs through `zexec -r` inside one zebrac batch per case, held to one
 
 <details><summary>Quick-check cases for peer and ab</summary>
 
-Picked from these results: per group and format, the case where z-fastq leads its fastest full-check rival by the least. `run.sh peer` times z-fastq against a cached reference of the rival on each; `run.sh ab REV` times two z-fastq builds on each.
+Picked from these results: per family, group, and format, the case where z-fastq is closest to, or furthest behind, its fastest rival of any class. `run.sh peer` times z-fastq against a cached reference of the rival on each; `run.sh ab REV` times two z-fastq builds on each.
 
-- `fraction: Long reads, plain`: *PromethION, 30 to 153 kb*; rival IRMA Core at 2.76x z-fastq's time
-- `fraction: Short, fixed length, plain`: *BGISEQ, 100 bp*; rival IRMA Core at 3.27x z-fastq's time
-- `fraction: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival IRMA Core at 3.52x z-fastq's time
-- `fraction: Synthetic, plain`: *long: 300 kb sequence lines*; rival IRMA Core at 2.35x z-fastq's time
-- `fraction: Long reads, gzip`: *PromethION, 30 to 153 kb*; rival IRMA Core at 2.83x z-fastq's time
-- `fraction: Short, fixed length, gzip`: *miRNA, 36 bp*; rival IRMA Core at 2.27x z-fastq's time
-- `fraction: Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival IRMA Core at 2.78x z-fastq's time
-- `fraction: Synthetic, gzip`: *endings: 100 bp, CRLF and LF lines*; rival IRMA Core at 2.80x z-fastq's time
-- `exact: Long reads, plain`: *PromethION, 30 to 153 kb*; rival IRMA Core at 1.72x z-fastq's time
-- `exact: Short, fixed length, plain`: *NovaSeq, Casava headers*; rival IRMA Core at 2.40x z-fastq's time
-- `exact: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival IRMA Core at 2.90x z-fastq's time
-- `exact: Synthetic, plain`: *long: 300 kb sequence lines*; rival IRMA Core at 1.51x z-fastq's time
+- `fraction: Long reads, plain`: *PromethION, 30 to 153 kb*; rival Rasusa at 0.67x z-fastq's time
+- `fraction: Short, fixed length, plain`: *miRNA, 36 bp*; rival Rasusa at 0.62x z-fastq's time
+- `fraction: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival Rasusa at 0.68x z-fastq's time
+- `fraction: Synthetic, plain`: *long: 300 kb sequence lines*; rival Rasusa at 0.58x z-fastq's time
+- `fraction: Long reads, gzip`: *PromethION, 30 to 153 kb*; rival Rasusa at 0.99x z-fastq's time
+- `fraction: Short, fixed length, gzip`: *miRNA, 36 bp*; rival Rasusa at 0.88x z-fastq's time
+- `fraction: Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival Rasusa at 0.89x z-fastq's time
+- `fraction: Synthetic, gzip`: *dense: uniform 150 bp, bare plus line*; rival Rasusa at 0.99x z-fastq's time
+- `exact: Long reads, plain`: *PromethION, 30 to 153 kb*; rival Rasusa at 0.71x z-fastq's time
+- `exact: Short, fixed length, plain`: *NovaSeq, Casava headers*; rival Rasusa at 0.94x z-fastq's time
+- `exact: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival Rasusa at 1.01x z-fastq's time
+- `exact: Synthetic, plain`: *longread: nanopore headers, rare 300 kb reads*; rival Rasusa at 0.72x z-fastq's time
+- `exact: Long reads, gzip`: *PromethION, 30 to 153 kb*; rival Rasusa at 1.03x z-fastq's time
+- `exact: Short, fixed length, gzip`: *NovaSeq, 150 bp*; rival Rasusa at 1.07x z-fastq's time
+- `exact: Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival Rasusa at 1.10x z-fastq's time
+- `exact: Synthetic, gzip`: *longread: nanopore headers, rare 300 kb reads*; rival Rasusa at 1.02x z-fastq's time
 
 </details>
 
