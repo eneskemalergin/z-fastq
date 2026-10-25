@@ -1446,6 +1446,23 @@ pub const Reader = struct {
         }
     }
 
+    /// Reads one record line by line without retaining any field; `hook`
+    /// receives its sequence and quality bytes.
+    fn readStreamedRecord(self: *Reader, comptime Hook: type, hook: *Hook) ReaderError!bool {
+        self.beginFallbackRecord();
+        while (true) {
+            const line = try self.readLine(false, Hook, hook, null);
+            switch (try self.ingestLine(line)) {
+                .eof => return false,
+                .continue_ => {},
+                .record_ready => {
+                    self.current_record_offsets = self.record_offsets;
+                    return true;
+                },
+            }
+        }
+    }
+
     fn readFallbackRecord(self: *Reader, comptime retained_fields: u4) ReaderError!bool {
         self.beginFallbackRecord();
         while (true) {
@@ -1834,7 +1851,7 @@ pub const Reader = struct {
         const record_offsets = self.record_offsets;
         var record: RefillRecord = .{ .start = self.cursor, .len = prefix_len };
         while (true) {
-            const line = try self.readLine(false, null, &record);
+            const line = try self.readLine(false, FallbackValidation, null, &record);
             if (record.stopped) break;
             if (try self.ingestLine(line) == .record_ready) break;
         }
@@ -1958,10 +1975,10 @@ pub const Reader = struct {
 
     fn readFallbackLine(self: *Reader, comptime retained_fields: u4) ReaderError!?Line {
         return switch (self.machine.expected) {
-            .header => self.readLine(retained_fields & 0b0001 != 0, null, null),
-            .sequence => self.readLine(retained_fields & 0b0010 != 0, null, null),
-            .plus => self.readLine(retained_fields & 0b0100 != 0, null, null),
-            .quality => self.readLine(retained_fields & 0b1000 != 0, null, null),
+            .header => self.readLine(retained_fields & 0b0001 != 0, FallbackValidation, null, null),
+            .sequence => self.readLine(retained_fields & 0b0010 != 0, FallbackValidation, null, null),
+            .plus => self.readLine(retained_fields & 0b0100 != 0, FallbackValidation, null, null),
+            .quality => self.readLine(retained_fields & 0b1000 != 0, FallbackValidation, null, null),
         };
     }
 
@@ -1970,15 +1987,18 @@ pub const Reader = struct {
         validation: *FallbackValidation,
     ) ReaderError!?Line {
         return switch (self.machine.expected) {
-            .header => self.readLine(true, validation, null),
-            .sequence, .plus, .quality => self.readLine(false, validation, null),
+            .header => self.readLine(true, FallbackValidation, validation, null),
+            .sequence, .plus, .quality => self.readLine(false, FallbackValidation, validation, null),
         };
     }
 
+    /// `hook` (validation or streamed totals) sees every byte of a line that
+    /// is not retained, with its offset in the line, then the line's end.
     fn readLine(
         self: *Reader,
         comptime retain: bool,
-        validation: ?*FallbackValidation,
+        comptime Hook: type,
+        hook: ?*Hook,
         refill_record: ?*RefillRecord,
     ) ReaderError!?Line {
         const field_index = @intFromEnum(self.machine.expected);
@@ -2005,7 +2025,7 @@ pub const Reader = struct {
                             &last_byte,
                             haystack[0..rel],
                         );
-                        if (validation) |state| {
+                        if (hook) |state| {
                             try state.consume(self.machine.expected, haystack[0..rel], chunk_start);
                         }
                     }
@@ -2022,7 +2042,7 @@ pub const Reader = struct {
                             .start_offset = line_start_offset,
                         };
                     }
-                    if (validation) |state| {
+                    if (hook) |state| {
                         state.finishLine(self.machine.expected, true, discarded_len);
                     }
                     if (last_byte == '\r') discarded_len -= 1;
@@ -2045,7 +2065,7 @@ pub const Reader = struct {
                         &last_byte,
                         haystack,
                     );
-                    if (validation) |state| {
+                    if (hook) |state| {
                         try state.consume(self.machine.expected, haystack, chunk_start);
                     }
                 }
@@ -2073,7 +2093,7 @@ pub const Reader = struct {
                     if (content_len > self.options.max_line_bytes) {
                         return error.LineTooLong;
                     }
-                    if (validation) |state| {
+                    if (hook) |state| {
                         state.finishLine(self.machine.expected, false, content_len);
                     }
                     if (!retain) return .{
@@ -2286,6 +2306,33 @@ pub fn nextPayload(reader: *Reader) ReaderError!?RecordPayload {
 /// On rejection, reread from the checkpoint to recover structural errors first.
 pub fn nextPredictedPayload(reader: *Reader) ReaderError!?PredictedPayload {
     return reader.readPredictedPayload();
+}
+
+pub const PayloadOrStreamed = union(enum) {
+    payload: PredictedPayload,
+    /// The record was larger than what is buffered: its sequence and quality
+    /// went to the hook instead of being copied.
+    streamed,
+};
+
+/// Like `nextPredictedPayload`, but a record that is not complete in the
+/// buffer streams through `hook` (see `readLine`) instead of being copied.
+pub fn nextPayloadOrStreamed(reader: *Reader, comptime Hook: type, hook: *Hook) ReaderError!?PayloadOrStreamed {
+    reader.beginRecord();
+    switch (try reader.readBufferedRecord(.predicted_payload, false, null, false)) {
+        .incomplete => return if (try reader.readStreamedRecord(Hook, hook)) .streamed else null,
+        .eof => return null,
+        .record => |buffered| {
+            reader.current_record_offsets = reader.record_offsets;
+            return .{ .payload = .{
+                .payload = .{
+                    .sequence = buffered.payload.sequence.slice(reader.buf),
+                    .quality = buffered.payload.quality.slice(reader.buf),
+                },
+                .checkpoint = buffered.checkpoint,
+            } };
+        },
+    }
 }
 
 pub fn nextValidatedHeader(

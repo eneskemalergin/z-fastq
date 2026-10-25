@@ -63,7 +63,22 @@ pub const Stats = struct {
             self.last_quality_error = quality_error;
             return err;
         };
+        try self.applyTotals(delta);
+    }
 
+    /// Applies one record accumulated by `StreamedTotals`, with the same
+    /// validation and all-or-nothing update as `addRecord`.
+    pub fn addStreamed(self: *Stats, streamed: *const StreamedTotals) StatsError!void {
+        self.last_quality_error = null;
+        if (streamed.quality_error) |quality_error| {
+            self.last_quality_error = quality_error;
+            return error.S006InvalidQuality;
+        }
+        if (streamed.overflow) return error.Overflow;
+        try self.applyTotals(try totalsFromPayload(streamed.totals, streamed.sequence_len));
+    }
+
+    inline fn applyTotals(self: *Stats, delta: RecordTotals) StatsError!void {
         var updated = self.*;
         updated.reads = try add(self.reads, 1);
         updated.bases = try add(self.bases, delta.length);
@@ -134,10 +149,10 @@ const RecordTotals = struct {
 
 // Extern layout: the AVX2 copy of `payloadTotals` returns it across the object boundary.
 const PayloadTotals = extern struct {
-    base_counts: [6]usize,
-    quality_sum: u64,
-    q20_bases: usize,
-    q30_bases: usize,
+    base_counts: [6]usize = .{0} ** 6,
+    quality_sum: u64 = 0,
+    q20_bases: usize = 0,
+    q30_bases: usize = 0,
 };
 
 fn recordTotals(
@@ -150,9 +165,12 @@ fn recordTotals(
         try payloadTotals(u64, record.sequence, record.quality, quality_error)
     else
         try payloadTotals(u128, record.sequence, record.quality, quality_error);
+    return totalsFromPayload(payload_totals, record.sequence.len);
+}
 
+fn totalsFromPayload(payload_totals: PayloadTotals, length: usize) StatsError!RecordTotals {
     return .{
-        .length = std.math.cast(u64, record.sequence.len) orelse return error.Overflow,
+        .length = std.math.cast(u64, length) orelse return error.Overflow,
         .a = std.math.cast(u64, payload_totals.base_counts[0]) orelse return error.Overflow,
         .c = std.math.cast(u64, payload_totals.base_counts[1]) orelse return error.Overflow,
         .g = std.math.cast(u64, payload_totals.base_counts[2]) orelse return error.Overflow,
@@ -166,6 +184,83 @@ fn recordTotals(
     };
 }
 
+/// Totals of one record whose sequence and quality arrive as chunks, for a
+/// record larger than what the reader has buffered; nothing is copied. A CR
+/// at the end of a chunk waits for the next one: before LF it ends the line,
+/// anywhere else it is a sequence or quality byte.
+pub const StreamedTotals = struct {
+    totals: PayloadTotals = .{},
+    sequence_len: usize = 0,
+    quality_error: ?QualityError = null,
+    overflow: bool = false,
+    pending_cr: bool = false,
+
+    pub fn consume(
+        self: *StreamedTotals,
+        line_kind: fastq.ExpectedLine,
+        bytes: []const u8,
+        start_index: usize,
+    ) fastq.ReaderError!void {
+        switch (line_kind) {
+            .sequence => self.consumeField(.sequence, bytes, start_index),
+            .quality => self.consumeField(.quality, bytes, start_index),
+            .header, .plus => {},
+        }
+    }
+
+    pub fn finishLine(self: *StreamedTotals, line_kind: fastq.ExpectedLine, terminated: bool, content_len: usize) void {
+        switch (line_kind) {
+            .sequence, .quality => {
+                if (self.pending_cr and !terminated) {
+                    self.add(line_kind == .quality, "\r", content_len - 1);
+                }
+                self.pending_cr = false;
+            },
+            .header, .plus => {},
+        }
+    }
+
+    fn consumeField(self: *StreamedTotals, comptime field: fastq.SemanticField, bytes: []const u8, start_index: usize) void {
+        if (bytes.len == 0) return;
+        if (self.pending_cr) {
+            self.add(field == .quality, "\r", start_index - 1);
+            self.pending_cr = false;
+        }
+        const end = if (bytes[bytes.len - 1] == '\r') bytes.len - 1 else bytes.len;
+        self.pending_cr = end != bytes.len;
+        self.add(field == .quality, bytes[0..end], start_index);
+    }
+
+    fn add(self: *StreamedTotals, is_quality: bool, bytes: []const u8, start_index: usize) void {
+        if (bytes.len == 0) return;
+        if (!is_quality) {
+            self.sequence_len += bytes.len;
+            var no_quality_error: ?QualityError = null;
+            const chunk = chunkTotals(.sequence, bytes, &no_quality_error) catch unreachable;
+            for (&self.totals.base_counts, chunk.base_counts) |*total, count| total.* += count;
+            return;
+        }
+        if (self.quality_error != null or self.overflow) return;
+        var chunk_error: ?QualityError = null;
+        const chunk = chunkTotals(.quality, bytes, &chunk_error) catch |err| switch (err) {
+            error.S006InvalidQuality => {
+                self.quality_error = .{ .byte_index = start_index + chunk_error.?.byte_index, .byte = chunk_error.?.byte };
+                return;
+            },
+            else => {
+                self.overflow = true;
+                return;
+            },
+        };
+        self.totals.quality_sum = std.math.add(u64, self.totals.quality_sum, chunk.quality_sum) catch {
+            self.overflow = true;
+            return;
+        };
+        self.totals.q20_bases += chunk.q20_bases;
+        self.totals.q30_bases += chunk.q30_bases;
+    }
+};
+
 fn maxQualitySum(length: usize) ?u64 {
     const length_u64 = std.math.cast(u64, length) orelse return null;
     return std.math.mul(u64, length_u64, 93) catch null;
@@ -178,26 +273,39 @@ fn payloadTotals(
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
     // Long payloads take the AVX2 copy when the running CPU has it.
-    if (sum_type == u64 and simd.useAvx2(quality.len)) {
-        var totals: PayloadTotals = undefined;
-        var error_index: usize = undefined;
-        var error_byte: u8 = undefined;
-        switch (zfq_avx2_payload_totals(sequence.ptr, quality.ptr, quality.len, &totals, &error_index, &error_byte)) {
-            0 => return totals,
-            1 => {
-                quality_error.* = .{ .byte_index = error_index, .byte = error_byte };
-                return error.S006InvalidQuality;
-            },
-            else => return error.Overflow,
-        }
+    if (sum_type == u64 and simd.useAvx2(quality.len)) return avx2Totals(.both, sequence, quality, quality_error);
+    return payloadTotalsInline(sum_type, .both, sequence, quality, quality_error);
+}
+
+/// Totals of one chunk of a streamed record: `bytes` is sequence or quality,
+/// per `parts`. Long chunks take the AVX2 copy when the CPU has it.
+fn chunkTotals(comptime parts: Parts, bytes: []const u8, quality_error: *?QualityError) StatsError!PayloadTotals {
+    const sequence = if (parts == .sequence) bytes else "";
+    const quality = if (parts == .quality) bytes else "";
+    if (simd.useAvx2(bytes.len)) return avx2Totals(parts, sequence, quality, quality_error);
+    return payloadTotalsInline(u64, parts, sequence, quality, quality_error);
+}
+
+fn avx2Totals(parts: Parts, sequence: []const u8, quality: []const u8, quality_error: *?QualityError) StatsError!PayloadTotals {
+    var totals: PayloadTotals = undefined;
+    var error_index: usize = undefined;
+    var error_byte: u8 = undefined;
+    switch (zfq_avx2_payload_totals(@intFromEnum(parts), sequence.ptr, sequence.len, quality.ptr, quality.len, &totals, &error_index, &error_byte)) {
+        0 => return totals,
+        1 => {
+            quality_error.* = .{ .byte_index = error_index, .byte = error_byte };
+            return error.S006InvalidQuality;
+        },
+        else => return error.Overflow,
     }
-    return payloadTotalsInline(sum_type, sequence, quality, quality_error);
 }
 
 extern fn zfq_avx2_payload_totals(
+    parts: u8,
     sequence: [*]const u8,
+    sequence_len: usize,
     quality: [*]const u8,
-    len: usize,
+    quality_len: usize,
     totals: *PayloadTotals,
     error_index: *usize,
     error_byte: *u8,
@@ -210,15 +318,19 @@ comptime {
 /// 0 on success, 1 for an invalid quality byte (reported through the out
 /// parameters), 2 for counter overflow.
 fn avx2PayloadTotals(
+    parts: u8,
     sequence: [*]const u8,
+    sequence_len: usize,
     quality: [*]const u8,
-    len: usize,
+    quality_len: usize,
     totals: *PayloadTotals,
     error_index: *usize,
     error_byte: *u8,
 ) callconv(.c) u8 {
     var quality_error: ?QualityError = null;
-    totals.* = payloadTotalsInline(u64, sequence[0..len], quality[0..len], &quality_error) catch |err| switch (err) {
+    totals.* = switch (@as(Parts, @enumFromInt(parts))) {
+        inline else => |known| payloadTotalsInline(u64, known, sequence[0..sequence_len], quality[0..quality_len], &quality_error),
+    } catch |err| switch (err) {
         error.S006InvalidQuality => {
             error_index.* = quality_error.?.byte_index;
             error_byte.* = quality_error.?.byte;
@@ -229,28 +341,35 @@ fn avx2PayloadTotals(
     return 0;
 }
 
+/// Which fields a call covers: whole records pass both (equal lengths);
+/// streamed chunks pass one field and leave the other empty.
+const Parts = enum { both, sequence, quality };
+
 fn payloadTotalsInline(
     comptime sum_type: type,
+    comptime parts: Parts,
     sequence: []const u8,
     quality: []const u8,
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
+    const len = if (parts == .sequence) sequence.len else quality.len;
     if (sum_type == u64) {
         if (std.simd.suggestVectorLength(u8)) |vector_len| {
             if (vector_len >= 2 and
                 vector_len % 2 == 0 and
                 vector_len <= std.math.maxInt(u16) / std.math.maxInt(u8) and
-                quality.len >= vector_len)
+                len >= vector_len)
             {
-                return payloadTotalsVector(vector_len, sequence, quality, quality_error);
+                return payloadTotalsVector(vector_len, parts, sequence, quality, quality_error);
             }
         }
     }
-    return payloadTotalsScalar(sum_type, sequence, quality, quality_error);
+    return payloadTotalsScalar(sum_type, parts, sequence, quality, quality_error);
 }
 
 fn payloadTotalsScalar(
     comptime sum_type: type,
+    comptime parts: Parts,
     sequence: []const u8,
     quality: []const u8,
     quality_error: *?QualityError,
@@ -259,24 +378,29 @@ fn payloadTotalsScalar(
     var quality_sum: sum_type = 0;
     var q20_bases: usize = 0;
     var q30_bases: usize = 0;
-    for (sequence, quality, 0..) |base, quality_byte, byte_index| {
-        const score = fastq.decodePhred33(quality_byte) catch {
-            quality_error.* = .{ .byte_index = byte_index, .byte = quality_byte };
-            return error.S006InvalidQuality;
-        };
-        quality_sum += score;
-        if (score >= 20) q20_bases += 1;
-        if (score >= 30) q30_bases += 1;
-
-        const index: usize = switch (base) {
-            'A', 'a' => 0,
-            'C', 'c' => 1,
-            'G', 'g' => 2,
-            'T', 't' => 3,
-            'N', 'n' => 4,
-            else => 5,
-        };
-        base_counts[index] += 1;
+    if (parts != .sequence) {
+        for (quality, 0..) |quality_byte, byte_index| {
+            const score = fastq.decodePhred33(quality_byte) catch {
+                quality_error.* = .{ .byte_index = byte_index, .byte = quality_byte };
+                return error.S006InvalidQuality;
+            };
+            quality_sum += score;
+            if (score >= 20) q20_bases += 1;
+            if (score >= 30) q30_bases += 1;
+        }
+    }
+    if (parts != .quality) {
+        for (sequence) |base| {
+            const index: usize = switch (base) {
+                'A', 'a' => 0,
+                'C', 'c' => 1,
+                'G', 'g' => 2,
+                'T', 't' => 3,
+                'N', 'n' => 4,
+                else => 5,
+            };
+            base_counts[index] += 1;
+        }
     }
     return .{
         .base_counts = base_counts,
@@ -288,6 +412,7 @@ fn payloadTotalsScalar(
 
 fn payloadTotalsVector(
     comptime vector_len: comptime_int,
+    comptime parts: Parts,
     sequence: []const u8,
     quality: []const u8,
     quality_error: *?QualityError,
@@ -312,7 +437,7 @@ fn payloadTotalsVector(
     const ones: Bytes = @splat(1);
     const zeros: Bytes = @splat(0);
     const lane_indices = std.simd.iota(u8, vector_len);
-    const tail_len = quality.len % vector_len;
+    const tail_len = (if (parts == .sequence) sequence.len else quality.len) % vector_len;
 
     var quality_sum: u64 = 0;
     var q20_bases: usize = 0;
@@ -569,6 +694,7 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
         var vector_error: ?QualityError = null;
         const scalar = try payloadTotalsScalar(
             u64,
+            .both,
             sequence[0..length],
             quality[0..length],
             &scalar_error,
@@ -588,6 +714,7 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
         var vector_error: ?QualityError = null;
         const scalar = try payloadTotalsScalar(
             u64,
+            .both,
             sequence[0..length],
             quality[0..length],
             &scalar_error,
@@ -614,6 +741,7 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
                 error.S006InvalidQuality,
                 payloadTotalsScalar(
                     u64,
+                    .both,
                     sequence[0..length],
                     quality[0..length],
                     &scalar_error,
@@ -638,6 +766,7 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
     var maximum_vector_error: ?QualityError = null;
     const maximum_scalar = try payloadTotalsScalar(
         u64,
+        .both,
         sequence[0..quality_block_len],
         quality[0..quality_block_len],
         &maximum_scalar_error,
@@ -665,6 +794,7 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
         error.S006InvalidQuality,
         payloadTotalsScalar(
             u64,
+            .both,
             sequence[0..bound_len],
             quality[0..bound_len],
             &bound_scalar_error,
@@ -703,6 +833,7 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
             error.S006InvalidQuality,
             payloadTotalsScalar(
                 u64,
+                .both,
                 sequence[0..invalid_len],
                 quality[0..invalid_len],
                 &scalar_error,
@@ -726,6 +857,7 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
         error.S006InvalidQuality,
         payloadTotalsScalar(
             u64,
+            .both,
             sequence[0..invalid_len],
             quality[0..invalid_len],
             &scalar_error,

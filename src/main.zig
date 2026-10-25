@@ -6,6 +6,7 @@ const fastq = @import("fastq.zig");
 const io_layer = @import("io.zig");
 const pairing = @import("pair.zig");
 const sampling = @import("sample.zig");
+const statistics = @import("stats.zig");
 
 // z-fastq never opens a network connection; this drops std.Io's DNS and socket code.
 pub const std_options: std.Options = .{ .networking = false };
@@ -1474,67 +1475,84 @@ fn collectStats(
     defer reader.deinit();
 
     var stats: zfastq.Stats = .{};
-    while (fastq.nextPredictedPayload(&reader) catch |err| {
-        return .{ .failure = mapReaderFailure(&reader, err) };
-    }) |predicted| {
-        var payload = predicted.payload;
-        var checkpoint = predicted.checkpoint;
-        while (true) {
-            stats.addRecord(.{
-                .header = "",
-                .id = "",
-                .sequence = payload.sequence,
-                .plus = "",
-                .quality = payload.quality,
-            }) catch |err| {
-                if (err == error.S006InvalidQuality) {
-                    if (checkpoint) |saved| {
-                        payload = saved.reread(&reader) catch |reader_error| {
-                            return .{ .failure = mapReaderFailure(&reader, reader_error) };
-                        };
-                        checkpoint = null;
-                        continue;
-                    }
+    // A record larger than what is buffered streams its totals here.
+    var streamed: statistics.StreamedTotals = .{};
+    while (true) {
+        const next = fastq.nextPayloadOrStreamed(&reader, statistics.StreamedTotals, &streamed) catch |err| {
+            return .{ .failure = mapReaderFailure(&reader, err) };
+        } orelse break;
+        switch (next) {
+            .streamed => {
+                stats.addStreamed(&streamed) catch |err| {
+                    return .{ .failure = statsFailure(&stats, &reader, err) };
+                };
+                streamed = .{};
+            },
+            .payload => |predicted| {
+                var payload = predicted.payload;
+                var checkpoint = predicted.checkpoint;
+                while (true) {
+                    stats.addRecord(.{
+                        .header = "",
+                        .id = "",
+                        .sequence = payload.sequence,
+                        .plus = "",
+                        .quality = payload.quality,
+                    }) catch |err| {
+                        if (err == error.S006InvalidQuality) {
+                            if (checkpoint) |saved| {
+                                payload = saved.reread(&reader) catch |reader_error| {
+                                    return .{ .failure = mapReaderFailure(&reader, reader_error) };
+                                };
+                                checkpoint = null;
+                                continue;
+                            }
+                        }
+                        return .{ .failure = statsFailure(&stats, &reader, err) };
+                    };
+                    break;
                 }
-                switch (err) {
-                    error.S006InvalidQuality => {
-                        const quality_error = stats.takeLastQualityError() orelse {
-                            return .{ .failure = CommandFailure.plain(
-                                "io_error",
-                                "quality validation failed without details",
-                                3,
-                            ) };
-                        };
-                        const offsets = reader.currentRecordOffsets() orelse {
-                            return .{ .failure = CommandFailure.plain(
-                                "io_error",
-                                "record location is unavailable",
-                                3,
-                            ) };
-                        };
-                        const details = fastq.semanticParseError(
-                            fastq.semanticQualityError(quality_error.byte_index),
-                            reader.recordIndex() - 1,
-                            offsets.quality,
-                        ) catch return .{ .failure = CommandFailure.plain(
-                            "arithmetic_limit",
-                            "statistics arithmetic limit exceeded",
-                            4,
-                        ) };
-                        return .{ .failure = CommandFailure.lint(details) };
-                    },
-                    error.S005LengthMismatch => @panic("Reader returned unequal sequence and quality lengths"),
-                    error.Overflow => return .{ .failure = CommandFailure.plain(
-                        "arithmetic_limit",
-                        "statistics arithmetic limit exceeded",
-                        4,
-                    ) },
-                }
-            };
-            break;
+            },
         }
     }
     return .{ .success = stats };
+}
+
+fn statsFailure(stats: *zfastq.Stats, reader: *zfastq.Reader, err: statistics.StatsError) CommandFailure {
+    switch (err) {
+        error.S006InvalidQuality => {
+            const quality_error = stats.takeLastQualityError() orelse {
+                return CommandFailure.plain(
+                    "io_error",
+                    "quality validation failed without details",
+                    3,
+                );
+            };
+            const offsets = reader.currentRecordOffsets() orelse {
+                return CommandFailure.plain(
+                    "io_error",
+                    "record location is unavailable",
+                    3,
+                );
+            };
+            const details = fastq.semanticParseError(
+                fastq.semanticQualityError(quality_error.byte_index),
+                reader.recordIndex() - 1,
+                offsets.quality,
+            ) catch return CommandFailure.plain(
+                "arithmetic_limit",
+                "statistics arithmetic limit exceeded",
+                4,
+            );
+            return CommandFailure.lint(details);
+        },
+        error.S005LengthMismatch => @panic("Reader returned unequal sequence and quality lengths"),
+        error.Overflow => return CommandFailure.plain(
+            "arithmetic_limit",
+            "statistics arithmetic limit exceeded",
+            4,
+        ),
+    }
 }
 
 // --- Check command ---
@@ -4428,8 +4446,9 @@ test "[edge] - [stats-json]: preserves the maximum u64 counter" {
     try std.testing.expectEqualStrings("18446744073709551615", result.number_string);
 }
 
-test "[failure] - [stats command]: reader allocation failure becomes a handled result" {
-    var source = zfastq.io.plain.SliceSource.init("@r\nA\n+\n!\n");
+test "[property] - [stats command]: records larger than the read buffer need no allocation" {
+    // A 4-byte stream buffer makes every record cross it.
+    var source = zfastq.io.plain.SliceSource.init("@r\nAc\n+\n!5\n@s\nNG\n+\nI?\n");
     var buffer: [4]u8 = undefined;
     var stream = io_layer.ByteSourceReader.init(source.byteSource(), &buffer);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
@@ -4437,17 +4456,90 @@ test "[failure] - [stats command]: reader allocation failure becomes a handled r
     });
 
     const outcome = collectStats(failing.allocator(), &stream.interface, .{});
-    const failure = switch (outcome) {
-        .success => return error.ExpectedFailure,
-        .failure => |failure| failure,
+    const result = switch (outcome) {
+        .success => |stats| stats.result(),
+        .failure => return error.UnexpectedFailure,
     };
-    try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqualStrings("out_of_memory", failure.code);
-    try std.testing.expectEqualStrings("out of memory", failure.message);
-    try std.testing.expectEqual(@as(u8, 3), failure.exit_code);
-    try std.testing.expect(failure.record_index == null);
-    try std.testing.expect(failure.byte_offset == null);
-    try std.testing.expect(failure.line_in_record == null);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u64, 2), result.reads);
+    try std.testing.expectEqual(@as(u64, 4), result.bases);
+    try std.testing.expectEqual(@as(u64, 1), result.a);
+    try std.testing.expectEqual(@as(u64, 1), result.c);
+    try std.testing.expectEqual(@as(u64, 1), result.g);
+    try std.testing.expectEqual(@as(u64, 1), result.n);
+    try std.testing.expectEqual(@as(u64, 0 + 20 + 40 + 30), result.quality_sum);
+    try std.testing.expectEqual(@as(u64, 3), result.q20_bases);
+    try std.testing.expectEqual(@as(u64, 2), result.q30_bases);
+}
+
+test "[property] - [stats command]: streamed records match buffered totals and failures" {
+    const allocator = std.testing.allocator;
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(allocator);
+    var prng = std.Random.DefaultPrng.init(17);
+    const random = prng.random();
+    var long_quality_start: usize = 0;
+    for (0..40) |index| {
+        const len: usize = switch (index % 5) {
+            0 => 0,
+            1 => 3,
+            2 => 70,
+            3 => 300,
+            else => 1000 + random.uintLessThan(usize, 2000),
+        };
+        const eol: []const u8 = if (index % 3 == 0) "\r\n" else "\n";
+        try data.appendSlice(allocator, "@r");
+        try data.appendSlice(allocator, eol);
+        for (0..len) |_| try data.append(allocator, "ACGTNacgtnRY"[random.uintLessThan(usize, 12)]);
+        try data.appendSlice(allocator, eol);
+        try data.append(allocator, '+');
+        try data.appendSlice(allocator, eol);
+        if (len > 1000) long_quality_start = data.items.len;
+        for (0..len) |_| try data.append(allocator, 33 + random.uintLessThan(u8, 94));
+        try data.appendSlice(allocator, eol);
+    }
+
+    // The whole input in one buffer takes the buffered path for every record.
+    var whole = std.Io.Reader.fixed(data.items);
+    const reference = switch (collectStats(allocator, &whole, .{})) {
+        .success => |stats| stats.result(),
+        .failure => return error.UnexpectedFailure,
+    };
+    for ([_]usize{ 1, 7, 64, 333, 4096 }) |buffer_len| {
+        const buffer = try allocator.alloc(u8, buffer_len);
+        defer allocator.free(buffer);
+        var source = zfastq.io.plain.SliceSource.init(data.items);
+        var stream = io_layer.ByteSourceReader.init(source.byteSource(), buffer);
+        const streamed = switch (collectStats(allocator, &stream.interface, .{})) {
+            .success => |stats| stats.result(),
+            .failure => return error.UnexpectedFailure,
+        };
+        try std.testing.expectEqualDeep(reference, streamed);
+    }
+
+    // An invalid quality byte reports the same failure on either path.
+    for ([_]usize{ 0, 17, 700 }) |offset| {
+        const original = data.items[long_quality_start + offset];
+        data.items[long_quality_start + offset] = ' ';
+        defer data.items[long_quality_start + offset] = original;
+        var whole_bad = std.Io.Reader.fixed(data.items);
+        const expected = switch (collectStats(allocator, &whole_bad, .{})) {
+            .success => return error.ExpectedFailure,
+            .failure => |failure| failure,
+        };
+        var buffer: [64]u8 = undefined;
+        var source = zfastq.io.plain.SliceSource.init(data.items);
+        var stream = io_layer.ByteSourceReader.init(source.byteSource(), &buffer);
+        const actual = switch (collectStats(allocator, &stream.interface, .{})) {
+            .success => return error.ExpectedFailure,
+            .failure => |failure| failure,
+        };
+        try std.testing.expectEqualStrings(expected.code, actual.code);
+        try std.testing.expectEqualStrings(expected.message, actual.message);
+        try std.testing.expectEqual(expected.record_index, actual.record_index);
+        try std.testing.expectEqual(expected.byte_offset, actual.byte_offset);
+        try std.testing.expectEqual(expected.line_in_record, actual.line_in_record);
+    }
 }
 
 test "[integration] - [stats command]: handled failures preserve input order and exit precedence" {
@@ -4503,22 +4595,11 @@ test "[integration] - [stats command]: handled failures preserve input order and
     const long_line = try std.testing.allocator.alloc(u8, window + 2);
     defer std.testing.allocator.free(long_line);
     try tmp.dir.writeFile(io, .{ .sub_path = "small.fastq", .data = "@r\nA\n+\n!\n" });
-    {
-        const file = try tmp.dir.createFile(io, "large.fastq", .{});
-        defer file.close(io);
-        try file.writeStreamingAll(io, "@r\nA\n+\n!\n@long\n");
-        @memset(long_line, 'A');
-        try file.writeStreamingAll(io, long_line[0 .. window + 1]);
-        try file.writeStreamingAll(io, "\n+\n");
-        @memset(long_line, '!');
-        try file.writeStreamingAll(io, long_line[0 .. window + 1]);
-        try file.writeStreamingAll(io, "\n");
-    }
     @memset(long_line, 'x');
     long_line[0] = '@';
     try tmp.dir.writeFile(io, .{ .sub_path = "limit.fastq", .data = long_line });
 
-    // Both Reader buffers fit; growing a retained field fails without exhausting the host.
+    // Stats allocates nothing; the bounded allocator proves it stays untouched.
     const storage = try std.testing.allocator.alloc(u8, 2 * window);
     defer std.testing.allocator.free(storage);
     const block = "input: small.fastq\n" ++
@@ -4536,26 +4617,26 @@ test "[integration] - [stats command]: handled failures preserve input order and
         stdout_capacity: usize = 1024,
     }{
         .{
-            .inputs = &.{ "large.fastq", "small.fastq" },
+            .inputs = &.{ "missing.fastq", "small.fastq" },
             .stdout = block,
-            .stderr = "error: large.fastq: out of memory\n",
+            .stderr = "error: missing.fastq: file not found\n",
             .status = 3,
+            .opened = 1,
+        },
+        .{
+            .inputs = &.{ "limit.fastq", "missing.fastq", "small.fastq" },
+            .stdout = block,
+            .stderr = "error: limit.fastq: line length limit exceeded\n" ++
+                "error: missing.fastq: file not found\n",
+            .status = 4,
             .opened = 2,
         },
         .{
-            .inputs = &.{ "limit.fastq", "large.fastq", "small.fastq" },
-            .stdout = block,
-            .stderr = "error: limit.fastq: line length limit exceeded\n" ++
-                "error: large.fastq: out of memory\n",
-            .status = 4,
-            .opened = 3,
-        },
-        .{
-            .inputs = &.{ "small.fastq", "large.fastq", "small.fastq" },
+            .inputs = &.{ "small.fastq", "missing.fastq", "small.fastq" },
             .stdout = block ++ "\n" ++ block,
-            .stderr = "error: large.fastq: out of memory\n",
+            .stderr = "error: missing.fastq: file not found\n",
             .status = 3,
-            .opened = 3,
+            .opened = 2,
         },
         .{
             .inputs = &.{ "small.fastq", "limit.fastq", "small.fastq", "small.fastq" },
