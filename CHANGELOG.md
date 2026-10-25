@@ -10,6 +10,7 @@ All notable changes to z-fastq will be documented in this file.
 
 - `sample`, `interleave`, and `deinterleave` take complete records straight from the read buffer and write output in whole pages, which roughly halves their time on plain input without raising peak memory beyond a few KiB.
 - `FileSink` writes whole pages and keeps a partial last page buffered until the next write or flush.
+- Interleaved fraction sampling, exact-count sampling in every mode, and `check --paired` / `--interleaved` also take complete records straight from the read buffer, and the exact-count output pass skips unselected records with less work: 5 to 20% less time on plain input.
 
 ### Added
 

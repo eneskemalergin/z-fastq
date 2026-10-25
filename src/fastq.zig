@@ -223,6 +223,11 @@ fn identifierFirstByteIsValid(byte: ?u8) bool {
 
 const STRUCTURAL_BLOCK_BYTES = 64;
 
+// The validation loops start on a cache-line boundary: on cores with a
+// decoded-instruction cache their speed otherwise shifts by up to a fifth
+// with where unrelated code changes happen to place them.
+const HOT_LOOP_ALIGNMENT = 64;
+
 pub fn newlineMask(comptime lanes: usize, block: *const [lanes]u8) @Int(.unsigned, lanes) {
     const Bytes = @Vector(lanes, u8);
     const bytes: Bytes = block.*;
@@ -235,7 +240,7 @@ const LineFeedSearch = struct {
     block_end: usize = 0,
     mask: @Int(.unsigned, @max(64, std.simd.suggestVectorLength(u8) orelse 1)) = 0,
 
-    fn find(self: *LineFeedSearch, comptime lanes: usize, bytes: []const u8, start: usize) ?usize {
+    fn find(self: *LineFeedSearch, comptime lanes: usize, bytes: []const u8, start: usize) align(HOT_LOOP_ALIGNMENT) ?usize {
         var offset = start;
         if (start >= self.block_start and start < self.block_end and self.block_end <= bytes.len) {
             const remaining = self.mask >> @intCast(start - self.block_start);
@@ -541,7 +546,7 @@ fn firstInvalidSequenceScalar(
     return null;
 }
 
-fn firstInvalidQuality(quality: []const u8) ?usize {
+fn firstInvalidQuality(quality: []const u8) align(HOT_LOOP_ALIGNMENT) ?usize {
     if (std.simd.suggestVectorLength(u8)) |vector_len| {
         return firstInvalidQualityVector(vector_len, quality);
     }
@@ -743,7 +748,7 @@ fn scanSequenceLineFor(
     comptime alphabet: Alphabet,
     bytes: []const u8,
     comptime allow_crlf: bool,
-) SequenceLineScan {
+) align(HOT_LOOP_ALIGNMENT) SequenceLineScan {
     const Bytes = @Vector(STRUCTURAL_BLOCK_BYTES, u8);
     var block_start: usize = 0;
     while (bytes.len - block_start >= STRUCTURAL_BLOCK_BYTES) {
@@ -838,7 +843,7 @@ fn scanCompleteRecord(
     max_line_bytes: usize,
     alphabet: Alphabet,
     initial_full_iupac: bool,
-) ?CompleteRecord {
+) align(HOT_LOOP_ALIGNMENT) ?CompleteRecord {
     const data = buffer[start..];
     const header_end = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start) orelse return null) - start;
     const header_len = lineContentLen(data[0..header_end]);
@@ -1363,6 +1368,7 @@ pub const Reader = struct {
 
     /// Consumes one record without returning its fields, or returns false at clean EOF.
     pub fn advance(self: *Reader) ReaderError!bool {
+        if (self.skipBufferedRecord()) return true;
         self.beginRecord();
         switch (try self.readBufferedRecord(.full, false, null, false)) {
             .incomplete => return self.advanceFallback(),
@@ -1551,6 +1557,64 @@ pub const Reader = struct {
         return span;
     }
 
+    /// Line limits, the `@` and `+` prefixes, and equal sequence and quality
+    /// lengths; `header` and `plus` are line contents including the prefix.
+    fn isStructurallyValid(
+        self: *const Reader,
+        header: []const u8,
+        sequence_len: usize,
+        plus: []const u8,
+        quality_len: usize,
+    ) bool {
+        return header.len <= self.options.max_line_bytes and
+            sequence_len <= self.options.max_line_bytes and
+            plus.len <= self.options.max_line_bytes and
+            headerPrefixIsValid(
+                if (header.len == 0) null else header[0],
+                if (header.len < 2) null else header[1],
+            ) and plus.len != 0 and plus[0] == '+' and
+            sequence_len == quality_len;
+    }
+
+    /// Skips a complete buffered record that passes the structural checks,
+    /// with the same state changes as the general path. Never refills; false
+    /// leaves the reader unchanged for the general path, which owns refills
+    /// and error reporting.
+    fn skipBufferedRecord(self: *Reader) bool {
+        if (self.machine.expected != .header) return false;
+        const buf = self.buf[0..self.fill_end];
+        const start = self.cursor;
+        var ends: [4]usize = undefined;
+        if (!self.line_feeds.findLines(4, buf, start, &ends)) return false;
+        const header = buf[start .. start + ends[0]];
+        const sequence = buf[start + ends[0] + 1 .. start + ends[1]];
+        const plus = buf[start + ends[1] + 1 .. start + ends[2]];
+        const quality = buf[start + ends[2] + 1 .. start + ends[3]];
+        const sequence_len = lineContentLen(sequence);
+        if (!self.isStructurallyValid(
+            header[0..lineContentLen(header)],
+            sequence_len,
+            plus[0..lineContentLen(plus)],
+            lineContentLen(quality),
+        )) return false;
+        const len = ends[3] + 1;
+        const end_offset = progressAfter(self.byte_offset, len) catch return false;
+        const next_index = std.math.add(u64, self.record_index, 1) catch return false;
+        self.record_offsets = .{
+            .header = self.byte_offset,
+            .sequence = self.byte_offset + ends[0] + 1,
+            .plus = self.byte_offset + ends[1] + 1,
+            .quality = self.byte_offset + ends[2] + 1,
+        };
+        self.current_record_offsets = null;
+        self.cursor = start + len;
+        self.byte_offset = end_offset;
+        self.record_index = next_index;
+        self.machine.sequence_len = sequence_len;
+        self.span_missed = false;
+        return true;
+    }
+
     fn consumeBufferedRecord(
         self: *Reader,
         ranges: [4]Range,
@@ -1560,18 +1624,12 @@ pub const Reader = struct {
         const record_start = self.cursor;
         const record_len = relative_ends[3] + 1;
         const sequence_len = ranges[1].end - ranges[1].start;
-        const valid = already_validated or valid: {
-            const header = ranges[0].slice(self.buf);
-            const plus = ranges[2].slice(self.buf);
-            break :valid header.len <= self.options.max_line_bytes and
-                sequence_len <= self.options.max_line_bytes and
-                plus.len <= self.options.max_line_bytes and
-                headerPrefixIsValid(
-                    if (header.len == 0) null else header[0],
-                    if (header.len < 2) null else header[1],
-                ) and plus.len != 0 and plus[0] == '+' and
-                sequence_len == ranges[3].end - ranges[3].start;
-        };
+        const valid = already_validated or self.isStructurallyValid(
+            ranges[0].slice(self.buf),
+            sequence_len,
+            ranges[2].slice(self.buf),
+            ranges[3].end - ranges[3].start,
+        );
         const next_offset = if (valid) self.offsetAfter(record_len) catch null else null;
         if (next_offset) |end_offset| {
             // The checked end also bounds every intermediate line offset.
@@ -2137,6 +2195,7 @@ pub fn nextValidatedHeader(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
 ) ReaderError!?ValidatedHeader {
+    if (reader.readRecordSpan(validator)) |span| return .{ .header = span.header(), .semantic_error = null };
     return reader.readValidatedHeader(validator);
 }
 

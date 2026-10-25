@@ -2287,7 +2287,16 @@ fn sampleInterleavedSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        var validated1 = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
+        var span1: ?fastq.RecordSpan = null;
+        if (interleavedSpanPairs(
+            &reader,
+            &validator,
+            options.pair_name_policy,
+            selection,
+            .{ writer, writer },
+            &span1,
+        ) catch return error.WriteFailed) |failure| return failure;
+        var validated1 = if (span1) |mate1| fastq.validatedSpan(mate1) else fastq.nextValidatedRecord(&reader, &validator) catch |err| {
             return pairCommandFailure(0, mapReaderFailure(&reader, err));
         } orelse return null;
         const record_index1 = reader.recordIndex() - 1;
@@ -3765,12 +3774,12 @@ fn deinterleaveSource(
 
     while (true) {
         var span1: ?fastq.RecordSpan = null;
-        if (try deinterleaveSpanPairs(
-            writer1,
-            writer2,
+        if (try interleavedSpanPairs(
             &reader,
             &validator,
             options.pair_name_policy,
+            null,
+            .{ writer1, writer2 },
             &span1,
         )) |failure| return failure;
         var validated1 = if (span1) |mate1| fastq.validatedSpan(mate1) else fastq.nextValidatedRecord(&reader, &validator) catch |err| {
@@ -3873,15 +3882,18 @@ fn deinterleaveSource(
     }
 }
 
-/// Writes pairs straight from the reader's buffer until a mate needs the
-/// general path; `pending1` returns mate 1 when only it was taken. Kept out
-/// of line so the per-pair loop has its own small frame.
-noinline fn deinterleaveSpanPairs(
-    writer1: *zfastq.Writer,
-    writer2: *zfastq.Writer,
+/// Takes interleaved pairs straight from the reader's buffer until a mate
+/// needs the general path; `pending1` returns mate 1 when only it was taken.
+/// Mate 1 goes to `writers[0]` and mate 2 to `writers[1]`; without a selection
+/// every pair is written. The selection draws once per pair, after both mates
+/// are taken, so a pair handed to the general path is drawn there. Kept out of
+/// line so the per-pair loop has its own small frame.
+noinline fn interleavedSpanPairs(
     reader: *zfastq.Reader,
     validator: *fastq.AdaptiveRecordValidator,
     policy: pairing.NamePolicy,
+    selection: ?*PairOutputSelector,
+    writers: [2]*zfastq.Writer,
     pending1: *?fastq.RecordSpan,
 ) DeinterleaveWriteError!?PairCommandFailure {
     while (fastq.nextRecordSpan(reader, validator)) |mate1| {
@@ -3890,6 +3902,7 @@ noinline fn deinterleaveSpanPairs(
             pending1.* = mate1;
             return null;
         };
+        const selected = if (selection) |pairs| pairs.selectPair() else true;
         if (!pairing.headersMatch(mate1.header(), mate2.header(), policy)) {
             const record_index2 = reader.recordIndex() - 1;
             return headerNameMismatch(
@@ -3901,11 +3914,12 @@ noinline fn deinterleaveSpanPairs(
                 .{ offset1, reader.currentRecordOffsets().?.header },
             );
         }
+        if (!selected) continue;
         if (!spanIsWritable(mate1) or !spanIsWritable(mate2)) {
             return pairCommandFailure(0, unwritableRecordFailure());
         }
-        writeRecordSpan(writer1, mate1) catch return error.Output1WriteFailed;
-        writeRecordSpan(writer2, mate2) catch return error.Output2WriteFailed;
+        writeRecordSpan(writers[0], mate1) catch return error.Output1WriteFailed;
+        writeRecordSpan(writers[1], mate2) catch return error.Output2WriteFailed;
     }
     return null;
 }
