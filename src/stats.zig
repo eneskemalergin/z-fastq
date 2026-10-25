@@ -2,6 +2,8 @@
 
 const std = @import("std");
 const fastq = @import("fastq.zig");
+const simd = @import("simd.zig");
+const build_options = @import("build_options");
 
 pub const StatsError = error{
     S005LengthMismatch,
@@ -130,7 +132,8 @@ const RecordTotals = struct {
     q30_bases: u64,
 };
 
-const PayloadTotals = struct {
+// Extern layout: the AVX2 copy of `payloadTotals` returns it across the object boundary.
+const PayloadTotals = extern struct {
     base_counts: [6]usize,
     quality_sum: u64,
     q20_bases: usize,
@@ -169,6 +172,64 @@ fn maxQualitySum(length: usize) ?u64 {
 }
 
 fn payloadTotals(
+    comptime sum_type: type,
+    sequence: []const u8,
+    quality: []const u8,
+    quality_error: *?QualityError,
+) StatsError!PayloadTotals {
+    // Long payloads take the AVX2 copy when the running CPU has it.
+    if (sum_type == u64 and simd.useAvx2(quality.len)) {
+        var totals: PayloadTotals = undefined;
+        var error_index: usize = undefined;
+        var error_byte: u8 = undefined;
+        switch (zfq_avx2_payload_totals(sequence.ptr, quality.ptr, quality.len, &totals, &error_index, &error_byte)) {
+            0 => return totals,
+            1 => {
+                quality_error.* = .{ .byte_index = error_index, .byte = error_byte };
+                return error.S006InvalidQuality;
+            },
+            else => return error.Overflow,
+        }
+    }
+    return payloadTotalsInline(sum_type, sequence, quality, quality_error);
+}
+
+extern fn zfq_avx2_payload_totals(
+    sequence: [*]const u8,
+    quality: [*]const u8,
+    len: usize,
+    totals: *PayloadTotals,
+    error_index: *usize,
+    error_byte: *u8,
+) callconv(.c) u8;
+
+comptime {
+    if (build_options.simd_object) @export(&avx2PayloadTotals, .{ .name = "zfq_avx2_payload_totals" });
+}
+
+/// 0 on success, 1 for an invalid quality byte (reported through the out
+/// parameters), 2 for counter overflow.
+fn avx2PayloadTotals(
+    sequence: [*]const u8,
+    quality: [*]const u8,
+    len: usize,
+    totals: *PayloadTotals,
+    error_index: *usize,
+    error_byte: *u8,
+) callconv(.c) u8 {
+    var quality_error: ?QualityError = null;
+    totals.* = payloadTotalsInline(u64, sequence[0..len], quality[0..len], &quality_error) catch |err| switch (err) {
+        error.S006InvalidQuality => {
+            error_index.* = quality_error.?.byte_index;
+            error_byte.* = quality_error.?.byte;
+            return 1;
+        },
+        else => return 2,
+    };
+    return 0;
+}
+
+fn payloadTotalsInline(
     comptime sum_type: type,
     sequence: []const u8,
     quality: []const u8,

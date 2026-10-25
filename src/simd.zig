@@ -55,8 +55,9 @@ pub inline fn useAvx2(len: usize) bool {
 
 comptime {
     if (build_options.simd_object) {
-        // The record scanner's AVX2 copy is compiled into the same object.
+        // The record scanner's and statistics' AVX2 copies are compiled into the same object.
         _ = @import("fastq.zig");
+        _ = @import("stats.zig");
         @export(&avx2FindNewline, .{ .name = "zfq_avx2_find_newline" });
         @export(&avx2CollectNewlines, .{ .name = "zfq_avx2_collect_newlines" });
         @export(&avx2ContainsNewline, .{ .name = "zfq_avx2_contains_newline" });
