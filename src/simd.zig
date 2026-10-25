@@ -47,8 +47,16 @@ extern fn zfq_avx2_find_newline(bytes: [*]const u8, len: usize) callconv(.c) usi
 extern fn zfq_avx2_collect_newlines(bytes: [*]const u8, len: usize, base: usize, ends: *[4]usize, count: usize) callconv(.c) usize;
 extern fn zfq_avx2_contains_newline(first: [*]const u8, second: ?[*]const u8, len: usize) callconv(.c) bool;
 
+/// True when a span of `len` bytes should take the separate AVX2 object: the
+/// running CPU has AVX2 and the span is long enough to repay the call.
+pub inline fn useAvx2(len: usize) bool {
+    return SELECT_AT_RUN_TIME and len >= AVX2_MIN_BYTES and cpuHasAvx2();
+}
+
 comptime {
     if (build_options.simd_object) {
+        // The record scanner's AVX2 copy is compiled into the same object.
+        _ = @import("fastq.zig");
         @export(&avx2FindNewline, .{ .name = "zfq_avx2_find_newline" });
         @export(&avx2CollectNewlines, .{ .name = "zfq_avx2_collect_newlines" });
         @export(&avx2ContainsNewline, .{ .name = "zfq_avx2_contains_newline" });

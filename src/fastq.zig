@@ -3,6 +3,7 @@
 const std = @import("std");
 const io_layer = @import("io.zig");
 const simd = @import("simd.zig");
+const build_options = @import("build_options");
 
 const ByteSource = io_layer.ByteSource;
 const ByteSink = io_layer.ByteSink;
@@ -235,7 +236,8 @@ pub fn newlineMask(comptime lanes: usize, block: *const [lanes]u8) @Int(.unsigne
 }
 
 // Saved positions remain valid only while the buffer's bytes and indexes stay unchanged.
-const LineFeedSearch = struct {
+// Extern layout: the AVX2 record scanner shares it across the object boundary.
+const LineFeedSearch = extern struct {
     block_start: usize = 0,
     block_end: usize = 0,
     mask: @Int(.unsigned, @max(64, std.simd.suggestVectorLength(u8) orelse 1)) = 0,
@@ -354,9 +356,6 @@ fn validateRecordVector(
     comptime alphabet: Alphabet,
     record: Record,
 ) ?SemanticError {
-    const Bytes = @Vector(vector_len, u8);
-    const Mask = @Vector(vector_len, bool);
-
     if (record.sequence.len < vector_len) {
         if (firstInvalidSequenceScalar(record.sequence, alphabet, 0)) |byte_index| {
             return semanticSequenceError(byte_index);
@@ -367,64 +366,94 @@ fn validateRecordVector(
         return null;
     }
 
+    const invalid: InvalidFields = if (simd.useAvx2(record.sequence.len))
+        @bitCast(zfq_avx2_invalid_fields(record.sequence.ptr, record.quality.ptr, record.sequence.len, @intFromEnum(alphabet)))
+    else
+        invalidFieldsVector(vector_len, alphabet, record.sequence, record.quality);
+    if (invalid.sequence) {
+        return semanticSequenceError(
+            firstInvalidSequenceScalar(record.sequence, alphabet, 0).?,
+        );
+    }
+    if (invalid.quality) {
+        return semanticQualityError(firstInvalidQualityScalar(record.quality, 0).?);
+    }
+    return null;
+}
+
+/// Whether any sequence or quality byte is invalid; the scalar scans find which.
+const InvalidFields = packed struct(u8) { sequence: bool, quality: bool, _: u6 = 0 };
+
+/// `seq` and `qual` have equal length, at least `vector_len`.
+fn invalidFieldsVector(
+    comptime vector_len: comptime_int,
+    comptime alphabet: Alphabet,
+    seq: []const u8,
+    qual: []const u8,
+) InvalidFields {
+    const Bytes = @Vector(vector_len, u8);
+    const Mask = @Vector(vector_len, bool);
+
     var sequence_invalid: Mask = @splat(false);
     var quality_invalid: Mask = @splat(false);
     var byte_index: usize = 0;
-    while (record.sequence.len - byte_index >= 4 * vector_len) : (byte_index += 4 * vector_len) {
-        const sequence0: Bytes = record.sequence[byte_index..][0..vector_len].*;
-        const sequence1: Bytes = record.sequence[byte_index + vector_len ..][0..vector_len].*;
-        const sequence2: Bytes = record.sequence[byte_index + 2 * vector_len ..][0..vector_len].*;
-        const sequence3: Bytes = record.sequence[byte_index + 3 * vector_len ..][0..vector_len].*;
+    while (seq.len - byte_index >= 4 * vector_len) : (byte_index += 4 * vector_len) {
+        const sequence0: Bytes = seq[byte_index..][0..vector_len].*;
+        const sequence1: Bytes = seq[byte_index + vector_len ..][0..vector_len].*;
+        const sequence2: Bytes = seq[byte_index + 2 * vector_len ..][0..vector_len].*;
+        const sequence3: Bytes = seq[byte_index + 3 * vector_len ..][0..vector_len].*;
         sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence0) |
             invalidSequenceVector(vector_len, alphabet, sequence1) |
             invalidSequenceVector(vector_len, alphabet, sequence2) |
             invalidSequenceVector(vector_len, alphabet, sequence3);
 
-        const quality0: Bytes = record.quality[byte_index..][0..vector_len].*;
-        const quality1: Bytes = record.quality[byte_index + vector_len ..][0..vector_len].*;
-        const quality2: Bytes = record.quality[byte_index + 2 * vector_len ..][0..vector_len].*;
-        const quality3: Bytes = record.quality[byte_index + 3 * vector_len ..][0..vector_len].*;
+        const quality0: Bytes = qual[byte_index..][0..vector_len].*;
+        const quality1: Bytes = qual[byte_index + vector_len ..][0..vector_len].*;
+        const quality2: Bytes = qual[byte_index + 2 * vector_len ..][0..vector_len].*;
+        const quality3: Bytes = qual[byte_index + 3 * vector_len ..][0..vector_len].*;
         quality_invalid |= invalidQualityVector(vector_len, quality0) |
             invalidQualityVector(vector_len, quality1) |
             invalidQualityVector(vector_len, quality2) |
             invalidQualityVector(vector_len, quality3);
     }
-    while (record.sequence.len - byte_index >= 2 * vector_len) : (byte_index += 2 * vector_len) {
-        const sequence0: Bytes = record.sequence[byte_index..][0..vector_len].*;
-        const sequence1: Bytes = record.sequence[byte_index + vector_len ..][0..vector_len].*;
+    while (seq.len - byte_index >= 2 * vector_len) : (byte_index += 2 * vector_len) {
+        const sequence0: Bytes = seq[byte_index..][0..vector_len].*;
+        const sequence1: Bytes = seq[byte_index + vector_len ..][0..vector_len].*;
         sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence0) |
             invalidSequenceVector(vector_len, alphabet, sequence1);
 
-        const quality0: Bytes = record.quality[byte_index..][0..vector_len].*;
-        const quality1: Bytes = record.quality[byte_index + vector_len ..][0..vector_len].*;
+        const quality0: Bytes = qual[byte_index..][0..vector_len].*;
+        const quality1: Bytes = qual[byte_index + vector_len ..][0..vector_len].*;
         quality_invalid |= invalidQualityVector(vector_len, quality0) |
             invalidQualityVector(vector_len, quality1);
     }
-    if (record.sequence.len - byte_index >= vector_len) {
-        const sequence: Bytes = record.sequence[byte_index..][0..vector_len].*;
+    if (seq.len - byte_index >= vector_len) {
+        const sequence: Bytes = seq[byte_index..][0..vector_len].*;
         sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence);
-        const quality: Bytes = record.quality[byte_index..][0..vector_len].*;
+        const quality: Bytes = qual[byte_index..][0..vector_len].*;
         quality_invalid |= invalidQualityVector(vector_len, quality);
         byte_index += vector_len;
     }
-    if (byte_index < record.sequence.len) {
-        const tail_start = record.sequence.len - vector_len;
-        const active = uncheckedTailMask(vector_len, byte_index - tail_start);
-        const sequence: Bytes = record.sequence[tail_start..][0..vector_len].*;
-        sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence) & active;
-        const quality: Bytes = record.quality[tail_start..][0..vector_len].*;
-        quality_invalid |= invalidQualityVector(vector_len, quality) & active;
+    if (byte_index < seq.len) {
+        // The last vector overlaps bytes already checked; rechecking them
+        // cannot change whether any byte is invalid.
+        const tail_start = seq.len - vector_len;
+        const sequence: Bytes = seq[tail_start..][0..vector_len].*;
+        sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence);
+        const quality: Bytes = qual[tail_start..][0..vector_len].*;
+        quality_invalid |= invalidQualityVector(vector_len, quality);
     }
 
-    if (@reduce(.Or, sequence_invalid)) {
-        return semanticSequenceError(
-            firstInvalidSequenceScalar(record.sequence, alphabet, 0).?,
-        );
-    }
-    if (@reduce(.Or, quality_invalid)) {
-        return semanticQualityError(firstInvalidQualityScalar(record.quality, 0).?);
-    }
-    return null;
+    return .{ .sequence = @reduce(.Or, sequence_invalid), .quality = @reduce(.Or, quality_invalid) };
+}
+
+extern fn zfq_avx2_invalid_fields(sequence: [*]const u8, quality: [*]const u8, len: usize, alphabet: u8) callconv(.c) u8;
+
+fn avx2InvalidFields(sequence: [*]const u8, quality: [*]const u8, len: usize, alphabet: u8) callconv(.c) u8 {
+    const vector_len = comptime std.simd.suggestVectorLength(u8).?;
+    return @bitCast(switch (@as(Alphabet, @enumFromInt(alphabet))) {
+        inline else => |known| invalidFieldsVector(vector_len, known, sequence[0..len], quality[0..len]),
+    });
 }
 
 fn semanticSequenceError(byte_index: usize) SemanticError {
@@ -504,10 +533,9 @@ fn firstInvalidSequenceVector(
         byte_index += vector_len;
     }
     if (byte_index < sequence.len) {
-        const tail_start = sequence.len - vector_len;
-        const active = uncheckedTailMask(vector_len, byte_index - tail_start);
-        const bytes: Bytes = sequence[tail_start..][0..vector_len].*;
-        invalid |= invalidSequenceVector(vector_len, alphabet, bytes) & active;
+        // Overlapping bytes were already checked; see the record validator.
+        const bytes: Bytes = sequence[sequence.len - vector_len ..][0..vector_len].*;
+        invalid |= invalidSequenceVector(vector_len, alphabet, bytes);
     }
     if (!@reduce(.Or, invalid)) return null;
     return firstInvalidSequenceScalar(sequence, alphabet, 0);
@@ -576,10 +604,9 @@ fn firstInvalidQualityVector(
         byte_index += vector_len;
     }
     if (byte_index < quality.len) {
-        const tail_start = quality.len - vector_len;
-        const active = uncheckedTailMask(vector_len, byte_index - tail_start);
-        const bytes: Bytes = quality[tail_start..][0..vector_len].*;
-        invalid |= invalidQualityVector(vector_len, bytes) & active;
+        // Overlapping bytes were already checked; see the record validator.
+        const bytes: Bytes = quality[quality.len - vector_len ..][0..vector_len].*;
+        invalid |= invalidQualityVector(vector_len, bytes);
     }
     if (!@reduce(.Or, invalid)) return null;
     return firstInvalidQualityScalar(quality, 0);
@@ -591,14 +618,6 @@ fn invalidQualityVector(
 ) @Vector(vector_len, bool) {
     const Bytes = @Vector(vector_len, u8);
     return (quality < @as(Bytes, @splat(33))) | (quality > @as(Bytes, @splat(126)));
-}
-
-fn uncheckedTailMask(
-    comptime vector_len: comptime_int,
-    checked_prefix: usize,
-) @Vector(vector_len, bool) {
-    const Indexes = @Vector(vector_len, usize);
-    return std.simd.iota(usize, vector_len) >= @as(Indexes, @splat(checked_prefix));
 }
 
 fn firstInvalidQualityScalar(quality: []const u8, start_index: usize) ?usize {
@@ -831,12 +850,63 @@ fn classifySemanticByte(
 
 // --- Buffered record validation ---
 
-const CompleteRecord = struct {
+const CompleteRecord = extern struct {
     line_ends: [4]usize,
     use_full_iupac: bool,
 };
 
-fn scanCompleteRecord(
+/// `sequence_len_hint` (the previous record's sequence length) picks the AVX2
+/// copy for long records on CPUs that have it; short records stay inline.
+inline fn scanCompleteRecord(
+    buffer: []const u8,
+    start: usize,
+    line_feeds: *LineFeedSearch,
+    max_line_bytes: usize,
+    alphabet: Alphabet,
+    initial_full_iupac: bool,
+    sequence_len_hint: usize,
+) ?CompleteRecord {
+    if (simd.useAvx2(sequence_len_hint)) {
+        var checked: CompleteRecord = undefined;
+        if (!zfq_avx2_scan_complete_record(buffer.ptr, buffer.len, start, line_feeds, max_line_bytes, @intFromEnum(alphabet), initial_full_iupac, &checked)) return null;
+        return checked;
+    }
+    return scanCompleteRecordInline(buffer, start, line_feeds, max_line_bytes, alphabet, initial_full_iupac);
+}
+
+extern fn zfq_avx2_scan_complete_record(
+    buffer: [*]const u8,
+    len: usize,
+    start: usize,
+    line_feeds: *LineFeedSearch,
+    max_line_bytes: usize,
+    alphabet: u8,
+    initial_full_iupac: bool,
+    checked: *CompleteRecord,
+) callconv(.c) bool;
+
+comptime {
+    if (build_options.simd_object) {
+        @export(&avx2ScanCompleteRecord, .{ .name = "zfq_avx2_scan_complete_record" });
+        @export(&avx2InvalidFields, .{ .name = "zfq_avx2_invalid_fields" });
+    }
+}
+
+fn avx2ScanCompleteRecord(
+    buffer: [*]const u8,
+    len: usize,
+    start: usize,
+    line_feeds: *LineFeedSearch,
+    max_line_bytes: usize,
+    alphabet: u8,
+    initial_full_iupac: bool,
+    checked: *CompleteRecord,
+) callconv(.c) bool {
+    checked.* = scanCompleteRecordInline(buffer[0..len], start, line_feeds, max_line_bytes, @enumFromInt(alphabet), initial_full_iupac) orelse return false;
+    return true;
+}
+
+fn scanCompleteRecordInline(
     buffer: []const u8,
     start: usize,
     line_feeds: *LineFeedSearch,
@@ -1432,6 +1502,7 @@ pub const Reader = struct {
                 self.options.max_line_bytes,
                 validator.?.alphabet,
                 validator.?.use_full_iupac,
+                self.machine.sequence_len,
             )
         else
             null;
@@ -1529,6 +1600,7 @@ pub const Reader = struct {
             self.options.max_line_bytes,
             validator.alphabet,
             validator.use_full_iupac,
+            self.machine.sequence_len,
         ) orelse {
             self.span_missed = true;
             return null;
@@ -2567,6 +2639,7 @@ pub const CheckScanner = struct {
             self.max_line_bytes,
             self.alphabet,
             self.use_full_iupac,
+            self.machine.sequence_len,
         ) orelse return null;
         const record_len = complete.line_ends[3] + 1;
         const next_offset = progressAfter(self.byte_offset, record_len) catch return null;
@@ -5231,6 +5304,54 @@ test "[unit] - [check scanner]: complete record path commits only proved records
     }
 }
 
+test "[property] - [validation]: long records get the same verdict on every kernel path" {
+    // Long records take the AVX2 object when the running CPU has it.
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 1024, 1031, 4101 }) |len| {
+        const data = try allocator.alloc(u8, 2 * len + 7);
+        defer allocator.free(data);
+        const sequence = data[3..][0..len];
+        const quality = data[len + 6 ..][0..len];
+        const Bad = struct { field: SemanticField, at: usize };
+        const cases = [_]?Bad{
+            null,
+            .{ .field = .sequence, .at = 0 },
+            .{ .field = .sequence, .at = len / 2 },
+            .{ .field = .sequence, .at = len - 1 },
+            .{ .field = .quality, .at = 0 },
+            .{ .field = .quality, .at = len / 2 },
+            .{ .field = .quality, .at = len - 1 },
+        };
+        inline for (.{ Alphabet.iupac, Alphabet.acgtn }) |alphabet| {
+            for (cases) |case| {
+                @memcpy(data[0..3], "@r\n");
+                for (sequence, 0..) |*byte, i| byte.* = "ACGT"[i % 4];
+                @memcpy(data[len + 3 ..][0..3], "\n+\n");
+                for (quality, 0..) |*byte, i| byte.* = @intCast(33 + i % 94);
+                data[data.len - 1] = '\n';
+                if (case) |bad| switch (bad.field) {
+                    .sequence => sequence[bad.at] = 'X',
+                    .quality => quality[bad.at] = ' ',
+                };
+
+                var inline_feeds: LineFeedSearch = .{};
+                var dispatched_feeds: LineFeedSearch = .{};
+                const inline_result = scanCompleteRecordInline(data, 0, &inline_feeds, len, alphabet, false);
+                const dispatched = scanCompleteRecord(data, 0, &dispatched_feeds, len, alphabet, false, len);
+                try std.testing.expectEqualDeep(inline_result, dispatched);
+                try std.testing.expectEqual(case == null, dispatched != null);
+
+                const record: Record = .{ .header = "r", .id = "r", .sequence = sequence, .plus = "", .quality = quality };
+                const semantic = validateRecord(record, .{ .alphabet = alphabet });
+                if (case) |bad| {
+                    try std.testing.expectEqual(bad.field, semantic.?.field);
+                    try std.testing.expectEqual(bad.at, semantic.?.byte_index);
+                } else try std.testing.expect(semantic == null);
+            }
+        }
+    }
+}
+
 test "[unit] - [check scanner]: adaptive IUPAC state survives a chunk seam" {
     var scanner = CheckScanner.init(.{}, .{});
     _ = try scanner.feed("@r\nR");
@@ -5257,7 +5378,7 @@ test "[property] - [check scanner]: complete records accept mixed LF and CRLF en
         const plus_start = sequence_start + 2 + endings[1].len;
         const quality_start = plus_start + 1 + endings[2].len;
         var line_feeds: LineFeedSearch = .{};
-        const complete = scanCompleteRecord(data, 0, &line_feeds, 2, .iupac, false);
+        const complete = scanCompleteRecord(data, 0, &line_feeds, 2, .iupac, false, 0);
         try std.testing.expect(complete != null);
         try std.testing.expectEqualDeep([4]usize{
             sequence_start - 1, plus_start - 1, quality_start - 1, data.len - 1,
@@ -5271,7 +5392,7 @@ test "[property] - [check scanner]: complete records accept mixed LF and CRLF en
         try std.testing.expect(scanner.atRecordBoundary());
         for (0..data.len) |cut| {
             line_feeds = .{};
-            try std.testing.expect(scanCompleteRecord(data[0..cut], 0, &line_feeds, 2, .iupac, false) == null);
+            try std.testing.expect(scanCompleteRecord(data[0..cut], 0, &line_feeds, 2, .iupac, false, 0) == null);
         }
         for (1..data.len + 2) |chunk_len| {
             try expectCheckOutcome(

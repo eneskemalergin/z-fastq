@@ -11,6 +11,7 @@ All notable changes to z-fastq will be documented in this file.
 - `sample`, `interleave`, and `deinterleave` take complete records straight from the read buffer and write output in whole pages, which roughly halves their time on plain input without raising peak memory beyond a few KiB.
 - `FileSink` writes whole pages and keeps a partial last page buffered until the next write or flush.
 - Interleaved fraction sampling, exact-count sampling in every mode, and `check --paired` / `--interleaved` also take complete records straight from the read buffer, and the exact-count output pass skips unselected records with less work: 5 to 20% less time on plain input.
+- On CPUs with AVX2, records with sequences of 1 KiB or more are validated with 32-byte vectors, selected at run time: about a third less time for `check` on PacBio reads and 15 to 20% for `check` and `sample` on ONT reads. Validation of every record also skips a redundant tail mask, about 5% fewer instructions on short reads.
 
 ### Added
 

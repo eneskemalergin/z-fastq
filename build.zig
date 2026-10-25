@@ -71,6 +71,8 @@ pub fn build(b: *std.Build) void {
         query.cpu_features_add.addFeature(@intFromEnum(std.Target.x86.Feature.avx2));
         const object_options = b.addOptions();
         object_options.addOption(bool, "simd_object", true);
+        object_options.addOption(KernelBackend, "kernel_backend", kernel_backend);
+        object_options.addOption(Avx2Mode, "simd_avx2", .direct);
         const module = b.createModule(.{
             .root_source_file = b.path("src/simd.zig"),
             .target = b.resolveTargetQuery(query),
