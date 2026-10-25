@@ -8,7 +8,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use needletail::parse_fastx_file;
+use needletail::{FastxReader, parse_fastx_file, parse_fastx_stdin};
 
 #[path = "../stats.rs"]
 mod stats;
@@ -63,7 +63,10 @@ fn usage_error(argument: Option<OsString>) -> ! {
 }
 
 fn usage(output: &mut impl Write) -> io::Result<()> {
-    writeln!(output, "Usage: needletail-adapter <count|stats> <in.fastq>")?;
+    writeln!(
+        output,
+        "Usage: needletail-adapter <count|stats> <in.fastq|->"
+    )?;
     writeln!(output, "       needletail-adapter --version")
 }
 
@@ -85,7 +88,7 @@ fn version(output: &mut impl Write) -> io::Result<()> {
 }
 
 fn run_count(path: &Path) {
-    let mut reader = parse_fastx_file(path).unwrap_or_else(|error| fail_path(path, error));
+    let mut reader = open(path);
     let mut reads = 0_u64;
     while let Some(record) = reader.next() {
         record.unwrap_or_else(|error| fail_path(path, error));
@@ -101,7 +104,7 @@ fn run_count(path: &Path) {
 }
 
 fn run_stats(path: &Path) {
-    let mut reader = parse_fastx_file(path).unwrap_or_else(|error| fail_path(path, error));
+    let mut reader = open(path);
     let mut aggregate = stats::Stats::default();
     while let Some(record) = reader.next() {
         let record = record.unwrap_or_else(|error| fail_path(path, error));
@@ -119,6 +122,16 @@ fn run_stats(path: &Path) {
         .write_human(&mut output, path.display())
         .unwrap_or_else(|error| fail("stdout", error));
     output.flush().unwrap_or_else(|error| fail("stdout", error));
+}
+
+/// Opens a path, or standard input for `-`.
+fn open(path: &Path) -> Box<dyn FastxReader> {
+    let reader = if path == Path::new("-") {
+        parse_fastx_stdin()
+    } else {
+        parse_fastx_file(path)
+    };
+    reader.unwrap_or_else(|error| fail_path(path, error))
 }
 
 fn fail_path(path: &Path, error: impl std::fmt::Display) -> ! {

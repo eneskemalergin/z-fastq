@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const io_layer = @import("io.zig");
+const simd = @import("simd.zig");
 
 const ByteSource = io_layer.ByteSource;
 const ByteSink = io_layer.ByteSink;
@@ -1399,7 +1400,7 @@ pub const Reader = struct {
                 };
             } else {
                 const quality_start = relative_ends[2] + 1;
-                const quality_lf = std.mem.findScalar(u8, bytes[quality_start..], '\n') orelse
+                const quality_lf = simd.findNewline(bytes[quality_start..]) orelse
                     return .incomplete;
                 relative_ends[3] = quality_start + quality_lf;
             }
@@ -1751,7 +1752,7 @@ pub const Reader = struct {
         while (true) {
             if (self.cursor < self.fill_end) {
                 const haystack = self.buf[self.cursor..self.fill_end];
-                if (std.mem.findScalar(u8, haystack, '\n')) |rel| {
+                if (simd.findNewline(haystack)) |rel| {
                     if (retain) {
                         try self.appendLineBytes(field_index, content_start, haystack[0..rel], true);
                     } else {
