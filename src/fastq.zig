@@ -810,12 +810,36 @@ fn classifySemanticBytes(
     start_index: usize,
 ) error{ArithmeticLimit}!void {
     if (failure.* != null) return;
-    const relative = switch (field) {
+    const relative = if (simd.useAvx2(bytes.len))
+        avx2FirstInvalid(field, alphabet, use_full_iupac, bytes)
+    else
+        firstInvalidChunk(field, alphabet, use_full_iupac, bytes);
+    failure.* = std.math.add(usize, start_index, relative orelse return) catch
+        return error.ArithmeticLimit;
+}
+
+fn firstInvalidChunk(
+    field: SemanticField,
+    alphabet: Alphabet,
+    use_full_iupac: *bool,
+    bytes: []const u8,
+) ?usize {
+    return switch (field) {
         .sequence => firstInvalidCheckSequence(bytes, alphabet, use_full_iupac),
         .quality => firstInvalidQuality(bytes),
-    } orelse return;
-    failure.* = std.math.add(usize, start_index, relative) catch
-        return error.ArithmeticLimit;
+    };
+}
+
+fn avx2FirstInvalid(field: SemanticField, alphabet: Alphabet, use_full_iupac: *bool, bytes: []const u8) ?usize {
+    const index = zfq_avx2_first_invalid(@intFromEnum(field), @intFromEnum(alphabet), use_full_iupac, bytes.ptr, bytes.len);
+    return if (index == bytes.len) null else index;
+}
+
+extern fn zfq_avx2_first_invalid(field: u8, alphabet: u8, use_full_iupac: *bool, bytes: [*]const u8, len: usize) callconv(.c) usize;
+
+/// The first invalid byte of a sequence or quality chunk, or `len` when none.
+fn avx2FirstInvalidExport(field: u8, alphabet: u8, use_full_iupac: *bool, bytes: [*]const u8, len: usize) callconv(.c) usize {
+    return firstInvalidChunk(@enumFromInt(field), @enumFromInt(alphabet), use_full_iupac, bytes[0..len]) orelse len;
 }
 
 fn classifySemanticByte(
@@ -889,6 +913,7 @@ comptime {
     if (build_options.simd_object) {
         @export(&avx2ScanCompleteRecord, .{ .name = "zfq_avx2_scan_complete_record" });
         @export(&avx2InvalidFields, .{ .name = "zfq_avx2_invalid_fields" });
+        @export(&avx2FirstInvalidExport, .{ .name = "zfq_avx2_first_invalid" });
     }
 }
 
@@ -5347,6 +5372,17 @@ test "[property] - [validation]: long records get the same verdict on every kern
                     try std.testing.expectEqual(bad.field, semantic.?.field);
                     try std.testing.expectEqual(bad.at, semantic.?.byte_index);
                 } else try std.testing.expect(semantic == null);
+
+                // The streaming classifier sees the same fields as chunks.
+                inline for (.{ SemanticField.sequence, SemanticField.quality }) |field| {
+                    const chunk = if (field == .sequence) sequence else quality;
+                    var inline_iupac = false;
+                    var dispatched_iupac = false;
+                    var failure: ?usize = null;
+                    try classifySemanticBytes(field, alphabet, &dispatched_iupac, &failure, chunk, 0);
+                    try std.testing.expectEqual(firstInvalidChunk(field, alphabet, &inline_iupac, chunk), failure);
+                    try std.testing.expectEqual(inline_iupac, dispatched_iupac);
+                }
             }
         }
     }

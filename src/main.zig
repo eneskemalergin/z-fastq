@@ -2447,10 +2447,24 @@ fn sampleFractionSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
+        // One draw per record, made before reading it: an unselected record
+        // is validated without being copied.
+        const selected = selector.selectRecord();
         if (fastq.nextRecordSpan(&reader, &validator)) |span| {
-            if (!selector.selectRecord()) continue;
+            if (!selected) continue;
             if (!spanIsWritable(span)) return unwritableRecordFailure();
             try writeRecordSpan(writer, span);
+            continue;
+        }
+        if (!selected) {
+            const header = fastq.nextValidatedHeader(&reader, &validator) catch |err| {
+                return mapReaderFailure(&reader, err);
+            } orelse return null;
+            if (mapCurrentSemanticFailure(
+                header.semantic_error,
+                &reader,
+                reader.recordIndex() - 1,
+            )) |failure| return failure;
             continue;
         }
         var next = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
@@ -2463,7 +2477,6 @@ fn sampleFractionSource(
             &reader,
             reader.recordIndex() - 1,
         )) |failure| return failure;
-        if (!selector.selectRecord()) continue;
         if (recordHasUnwritableEnding(validated.record, validated.canonical_span)) {
             return unwritableRecordFailure();
         }
