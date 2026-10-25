@@ -6,6 +6,15 @@ All notable changes to z-fastq will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- `sample`, `interleave`, and `deinterleave` take complete records straight from the read buffer and write output in whole pages, which roughly halves their time on plain input without raising peak memory beyond a few KiB.
+- `FileSink` writes whole pages and keeps a partial last page buffered until the next write or flush.
+
+### Added
+
+- `FileSink.initStreaming` writes at the file handle's current position, for standard output and pipes.
+
 ## [0.1.0]
 
 The first public release. z-fastq is a single-threaded command-line toolkit for plain and gzip-compressed FASTQ on Linux x86-64, built around bounded streaming memory, strict validation, reproducible selection, and a small Zig module for applications that need the reader, writer, validation, and statistics building blocks. FASTQ-producing commands write plain four-line records with LF endings; the CLI does not write gzip output.

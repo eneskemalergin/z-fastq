@@ -1068,6 +1068,38 @@ fn fieldStorageLimit(max_line_bytes: usize) usize {
     return std.math.add(usize, max_line_bytes, 1) catch std.math.maxInt(usize);
 }
 
+/// A complete, valid record borrowed from the reader's buffer until the next
+/// advance: its raw bytes, including any CR before each LF, and the relative
+/// position of each line's LF.
+pub const RecordSpan = struct {
+    bytes: []const u8,
+    line_ends: [4]usize,
+    /// Every line ends in LF alone, so `bytes` is canonical output.
+    canonical: bool,
+
+    fn contentEnd(self: RecordSpan, line: usize) usize {
+        const end = self.line_ends[line];
+        return end - @intFromBool(self.bytes[end - 1] == '\r');
+    }
+
+    /// Header line content after `@`.
+    pub fn header(self: RecordSpan) []const u8 {
+        return self.bytes[1..self.contentEnd(0)];
+    }
+
+    /// Record fields without line endings; `id` is empty.
+    pub fn record(self: RecordSpan) Record {
+        const header_bytes = self.header();
+        return .{
+            .header = header_bytes,
+            .id = header_bytes[0..0],
+            .sequence = self.bytes[self.line_ends[0] + 1 .. self.contentEnd(1)],
+            .plus = self.bytes[self.line_ends[1] + 2 .. self.contentEnd(2)],
+            .quality = self.bytes[self.line_ends[2] + 1 .. self.contentEnd(3)],
+        };
+    }
+};
+
 /// Streaming parser constructed with `init`; fields are implementation state.
 /// The copied source wrapper's referenced adapter must outlive the reader.
 pub const Reader = struct {
@@ -1087,6 +1119,10 @@ pub const Reader = struct {
     current_record_offsets: ?RecordOffsets = null,
     transport_storage: []u8,
     pending_refill: ?struct { bytes: []u8, cursor: usize, end: usize } = null,
+    /// The complete-record scan already failed at the cursor, so the general
+    /// path skips repeating it. Skipping never changes a result: that path
+    /// validates the fields itself.
+    span_missed: bool = false,
 
     const Transport = union(enum) {
         owned: io_layer.ByteSourceReader,
@@ -1371,12 +1407,18 @@ pub const Reader = struct {
         validator: ?*AdaptiveRecordValidator,
         comptime allow_refill: bool,
     ) ReaderError!BufferedRecordResult(projection) {
-        if (self.machine.expected != .header) return .incomplete;
+        if (self.machine.expected != .header) {
+            self.span_missed = false;
+            return .incomplete;
+        }
+        // A refill clears the flag: the failed scan saw other bytes.
         if (self.cursor == self.fill_end and !try self.refill()) return .eof;
+        const span_missed = self.span_missed;
+        self.span_missed = false;
 
         var relative_ends: [4]usize = undefined;
         var checkpoint: ?PayloadCheckpoint = null;
-        const complete = if (projection == .validated or projection == .validated_header)
+        const complete = if ((projection == .validated or projection == .validated_header) and !span_missed)
             scanCompleteRecord(
                 self.buf[0..self.fill_end],
                 self.cursor,
@@ -1464,6 +1506,49 @@ pub const Reader = struct {
             .{ .record = .{ .payload = payload, .checkpoint = checkpoint } }
         else
             .{ .record = payload };
+    }
+
+    /// Takes a complete, valid record straight from the buffered bytes, with
+    /// the same state changes as the general buffered path. Never refills;
+    /// null leaves the reader unchanged for the general path, which owns
+    /// refills, saved records, and error reporting.
+    inline fn readRecordSpan(self: *Reader, validator: *AdaptiveRecordValidator) ?RecordSpan {
+        if (self.span_missed or self.machine.expected != .header) return null;
+        const buf = self.buf[0..self.fill_end];
+        const start = self.cursor;
+        const checked = scanCompleteRecord(
+            buf,
+            start,
+            &self.line_feeds,
+            self.options.max_line_bytes,
+            validator.alphabet,
+            validator.use_full_iupac,
+        ) orelse {
+            self.span_missed = true;
+            return null;
+        };
+        const ends = checked.line_ends;
+        const len = ends[3] + 1;
+        const end_offset = progressAfter(self.byte_offset, len) catch return null;
+        const next_index = std.math.add(u64, self.record_index, 1) catch return null;
+        var canonical = true;
+        for (ends) |end| canonical = canonical and buf[start + end - 1] != '\r';
+        const span: RecordSpan = .{ .bytes = buf[start..][0..len], .line_ends = ends, .canonical = canonical };
+
+        const offsets: RecordOffsets = .{
+            .header = self.byte_offset,
+            .sequence = self.byte_offset + ends[0] + 1,
+            .plus = self.byte_offset + ends[1] + 1,
+            .quality = self.byte_offset + ends[2] + 1,
+        };
+        self.record_offsets = offsets;
+        self.current_record_offsets = offsets;
+        self.cursor = start + len;
+        self.byte_offset = end_offset;
+        self.record_index = next_index;
+        self.machine.sequence_len = span.contentEnd(1) - (ends[0] + 1);
+        validator.use_full_iupac = checked.use_full_iupac;
+        return span;
     }
 
     fn consumeBufferedRecord(
@@ -1696,6 +1781,7 @@ pub const Reader = struct {
 
     fn refill(self: *Reader) ReaderError!bool {
         self.line_feeds = .{};
+        self.span_missed = false;
         if (self.pending_refill) |pending| {
             std.debug.assert(self.cursor == self.fill_end);
             self.buf = pending.bytes;
@@ -2058,6 +2144,31 @@ pub fn nextValidatedRecord(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
 ) ReaderError!?ValidatedRecord {
+    if (reader.readRecordSpan(validator)) |span| return validatedSpan(span);
+    return readValidatedRecord(reader, validator);
+}
+
+/// Never refills; null means the next record is not complete in the buffer
+/// or needs the general path, so read it with `nextValidatedRecord`.
+pub inline fn nextRecordSpan(
+    reader: *Reader,
+    validator: *AdaptiveRecordValidator,
+) ?RecordSpan {
+    return reader.readRecordSpan(validator);
+}
+
+pub fn validatedSpan(span: RecordSpan) ValidatedRecord {
+    return .{
+        .record = span.record(),
+        .canonical_span = if (span.canonical) span.bytes else null,
+        .semantic_error = null,
+    };
+}
+
+fn readValidatedRecord(
+    reader: *Reader,
+    validator: *AdaptiveRecordValidator,
+) ReaderError!?ValidatedRecord {
     reader.beginRecord();
     return switch (try reader.readBufferedRecord(.validated, true, validator, true)) {
         .incomplete => nextFallbackValidatedRecord(reader, validator),
@@ -2089,6 +2200,14 @@ pub fn nextBufferedWithSpan(
 
 /// Never refills; null means no complete buffered record.
 pub fn nextBufferedValidatedRecord(
+    reader: *Reader,
+    validator: *AdaptiveRecordValidator,
+) ReaderError!?ValidatedRecord {
+    if (reader.readRecordSpan(validator)) |span| return validatedSpan(span);
+    return readBufferedValidatedRecord(reader, validator);
+}
+
+fn readBufferedValidatedRecord(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
 ) ReaderError!?ValidatedRecord {
@@ -2126,7 +2245,16 @@ pub fn nextValidatedMatePreservingRecord(
     first: *ValidatedRecord,
     validator: *AdaptiveRecordValidator,
 ) ReaderError!?ValidatedRecord {
-    if (try nextBufferedValidatedRecord(reader, validator)) |second| return second;
+    if (reader.readRecordSpan(validator)) |span| return validatedSpan(span);
+    return readMatePreservingRecord(reader, first, validator);
+}
+
+fn readMatePreservingRecord(
+    reader: *Reader,
+    first: *ValidatedRecord,
+    validator: *AdaptiveRecordValidator,
+) ReaderError!?ValidatedRecord {
+    if (try readBufferedValidatedRecord(reader, validator)) |second| return second;
     if (!reader.canBufferIncompleteRecord()) return null;
     // Separate fallback fields can overlap the destination before they are copied.
     if (first.record.sequence.ptr == reader.fallback_fields[1].storage.ptr) return null;

@@ -332,15 +332,40 @@ fn writerFlush(ctx: *anyopaque) WriteError!void {
 }
 
 /// Buffered push adapter over a borrowed file handle and caller-owned buffer.
+/// It writes whole pages and keeps a partial last page buffered until the
+/// next write or flush: a write that ends inside a page makes the kernel
+/// update that page again on the next write, about twice the copy cost on
+/// page-cache file systems. A buffer shorter than a page writes everything
+/// it holds.
 pub const FileSink = struct {
+    /// Unbuffered file writer that owns positioning and write errors.
     file_writer: std.Io.File.Writer,
+    writer: std.Io.Writer,
 
+    /// Writes from offset 0, falling back to streaming where the handle
+    /// cannot seek, like `std.Io.File.writer`.
     pub fn init(
         io: std.Io,
         file: std.Io.File,
         write_buf: []u8,
     ) FileSink {
-        return .{ .file_writer = file.writer(io, write_buf) };
+        return wrap(file.writer(io, &.{}), write_buf);
+    }
+
+    /// Writes at the handle's current position, like `std.Io.File.writerStreaming`.
+    pub fn initStreaming(
+        io: std.Io,
+        file: std.Io.File,
+        write_buf: []u8,
+    ) FileSink {
+        return wrap(file.writerStreaming(io, &.{}), write_buf);
+    }
+
+    fn wrap(file_writer: std.Io.File.Writer, write_buf: []u8) FileSink {
+        return .{
+            .file_writer = file_writer,
+            .writer = .{ .vtable = &FILE_WRITER_VTABLE, .buffer = write_buf },
+        };
     }
 
     pub fn byteSink(self: *FileSink) ByteSink {
@@ -351,6 +376,40 @@ pub const FileSink = struct {
     }
 };
 
+const FILE_WRITER_VTABLE = std.Io.Writer.VTable{
+    .drain = fileSinkDrain,
+    .flush = fileSinkFlushWriter,
+};
+
+fn fileSinkDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    const self: *FileSink = @alignCast(@fieldParentPtr("writer", w));
+    const out = &self.file_writer.interface;
+    if (w.buffer.len == 0) return out.writeSplat(data, splat);
+    var consumed: usize = 0;
+    fill: for (data, 0..) |bytes, index| {
+        const times = if (index + 1 == data.len) splat else 1;
+        for (0..times) |_| {
+            const n = @min(bytes.len, w.buffer.len - w.end);
+            @memcpy(w.buffer[w.end..][0..n], bytes[0..n]);
+            w.end += n;
+            consumed += n;
+            if (n < bytes.len) break :fill;
+        }
+    }
+    const page = std.heap.page_size_min;
+    const whole = if (w.end >= page) w.end - w.end % page else w.end;
+    try out.writeAll(w.buffer[0..whole]);
+    @memmove(w.buffer[0 .. w.end - whole], w.buffer[whole..w.end]);
+    w.end -= whole;
+    return consumed;
+}
+
+fn fileSinkFlushWriter(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    const self: *FileSink = @alignCast(@fieldParentPtr("writer", w));
+    try self.file_writer.interface.writeAll(w.buffer[0..w.end]);
+    w.end = 0;
+}
+
 const FILE_SINK_VTABLE = ByteSink.VTable{
     .write = fileSinkWrite,
     .writeVec = fileSinkWriteVec,
@@ -359,17 +418,17 @@ const FILE_SINK_VTABLE = ByteSink.VTable{
 
 fn fileSinkWrite(ctx: *anyopaque, data: []const u8) WriteError!void {
     const self: *FileSink = @ptrCast(@alignCast(ctx));
-    self.file_writer.interface.writeAll(data) catch return error.WriteFailed;
+    self.writer.writeAll(data) catch return error.WriteFailed;
 }
 
 fn fileSinkWriteVec(ctx: *anyopaque, data: []const []const u8) WriteError!void {
     const self: *FileSink = @ptrCast(@alignCast(ctx));
-    writeVecToWriter(&self.file_writer.interface, data) catch return error.WriteFailed;
+    writeVecToWriter(&self.writer, data) catch return error.WriteFailed;
 }
 
 fn fileSinkFlush(ctx: *anyopaque) WriteError!void {
     const self: *FileSink = @ptrCast(@alignCast(ctx));
-    self.file_writer.interface.flush() catch return error.WriteFailed;
+    self.writer.flush() catch return error.WriteFailed;
 }
 
 test "[property] - [gzip direct delivery]: preserves bytes across members" {

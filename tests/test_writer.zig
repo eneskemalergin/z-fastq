@@ -210,6 +210,49 @@ test "[integration] - [file sink]: writes and flushes after init returns" {
     try std.testing.expectEqualStrings("@read1\nACGT\n+\n!!!!\n", actual[0..n]);
 }
 
+test "[property] - [file sink]: page-sized writes keep every byte in order" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pattern: [3 * 4096 + 777]u8 = undefined;
+    for (&pattern, 0..) |*byte, index| byte.* = @truncate(index *% 31 +% index / 251);
+
+    // Buffers below, between, and on page multiples keep partial pages across drains.
+    for ([_]usize{ 100, 4096 + 100, 2 * 4096 }) |buffer_len| {
+        const file = try tmp.dir.createFile(io, "sink", .{ .read = true, .truncate = true });
+        defer file.close(io);
+        var write_buf: [2 * 4096]u8 = undefined;
+        var file_sink = zfastq.io.plain.FileSink.init(io, file, write_buf[0..buffer_len]);
+        const sink = file_sink.byteSink();
+
+        var expected: std.ArrayList(u8) = .empty;
+        defer expected.deinit(std.testing.allocator);
+        var offset: usize = 0;
+        var step: usize = 1;
+        while (offset < pattern.len) : (step = step * 7 % 5003 + 1) {
+            const piece = pattern[offset..@min(pattern.len, offset + step)];
+            if (step % 3 == 0) {
+                try sink.writeVec(&.{ piece[0 .. piece.len / 2], piece[piece.len / 2 ..] });
+            } else {
+                try sink.write(piece);
+            }
+            try expected.appendSlice(std.testing.allocator, piece);
+            offset += piece.len;
+        }
+        var splat_parts = [_][]const u8{ "head", "xy" };
+        try file_sink.writer.writeSplatAll(&splat_parts, 3);
+        try expected.appendSlice(std.testing.allocator, "headxyxyxy");
+        splat_parts = .{ "tail", "never" };
+        try file_sink.writer.writeSplatAll(&splat_parts, 0);
+        try expected.appendSlice(std.testing.allocator, "tail");
+        try sink.flush();
+
+        const actual = try tmp.dir.readFileAlloc(io, "sink", std.testing.allocator, .unlimited);
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualSlices(u8, expected.items, actual);
+    }
+}
+
 test "[integration] - [plain adapters]: standard reader and writer preserve bytes" {
     const input = "@r\nA\n+\n!\n";
     var fixed_reader = std.Io.Reader.fixed(input);

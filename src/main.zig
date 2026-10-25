@@ -1080,6 +1080,34 @@ fn writeCheckedRecord(
     }
 }
 
+/// A span is writable unless a field still ends in CR once its line ending
+/// is removed, which canonical LF output cannot represent.
+fn spanIsWritable(span: fastq.RecordSpan) bool {
+    return span.canonical or !fastq.recordHasTerminalCr(span.record());
+}
+
+fn writeRecordSpan(writer: *zfastq.Writer, span: fastq.RecordSpan) error{WriteFailed}!void {
+    if (span.canonical) return fastq.writeCanonicalRecordSpan(writer, span.bytes);
+    return fastq.writeRecordFields(writer, span.record());
+}
+
+fn headerNameMismatch(
+    header1: []const u8,
+    header2: []const u8,
+    policy: pairing.NamePolicy,
+    pair_index: u64,
+    record_indexes: [2]u64,
+    header_offsets: [2]u64,
+) PairCommandFailure {
+    return .{ .pair = .{ .name_mismatch = .{
+        .pair_index = pair_index,
+        .records = .{
+            .init(pairing.parseName(header1, policy), record_indexes[0], header_offsets[0]),
+            .init(pairing.parseName(header2, policy), record_indexes[1], header_offsets[1]),
+        },
+    } } };
+}
+
 fn recordStagingLimit(max_line_bytes: usize) error{ArithmeticLimit}!usize {
     const fields = std.math.mul(usize, max_line_bytes, 4) catch
         return error.ArithmeticLimit;
@@ -1751,15 +1779,14 @@ fn checkPairedSources(
             record2.?.header,
             options.pair_name_policy,
         )) {
-            const name1 = pairing.parseName(record1.?.header, options.pair_name_policy);
-            const name2 = pairing.parseName(record2.?.header, options.pair_name_policy);
-            return .{ .pair = .{ .name_mismatch = .{
-                .pair_index = record_index1,
-                .records = .{
-                    .init(name1, record_index1, offsets1.header),
-                    .init(name2, record_index2, offsets2.header),
-                },
-            } } };
+            return headerNameMismatch(
+                record1.?.header,
+                record2.?.header,
+                options.pair_name_policy,
+                record_index1,
+                .{ record_index1, record_index2 },
+                .{ offsets1.header, offsets2.header },
+            );
         }
 
         if (exact_selector) |selector| {
@@ -2061,9 +2088,8 @@ fn runSample(
         return 3;
     };
     var stdout_buffer: [64 * 1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    var sink_adapter = io_layer.WriterSink.init(&stdout_writer.interface);
-    var writer = zfastq.Writer.init(sink_adapter.byteSink());
+    var stdout_sink = io_layer.FileSink.initStreaming(io, .stdout(), &stdout_buffer);
+    var writer = zfastq.Writer.init(stdout_sink.byteSink());
     const failure = (switch (mode) {
         .fraction => |fraction| blk: {
             var selector = sampling.Selector.init(fraction, options.seed);
@@ -2164,9 +2190,8 @@ fn runPairSampleCommand(
         return 3;
     };
     var stdout_buffer: [64 * 1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    var sink_adapter = io_layer.WriterSink.init(&stdout_writer.interface);
-    var writer = zfastq.Writer.init(sink_adapter.byteSink());
+    var stdout_sink = io_layer.FileSink.initStreaming(io, .stdout(), &stdout_buffer);
+    var writer = zfastq.Writer.init(stdout_sink.byteSink());
     const failure = (switch (mode) {
         .fraction => |fraction| blk: {
             var selector = sampling.Selector.init(fraction, options.seed);
@@ -2339,15 +2364,14 @@ fn sampleInterleavedSource(
                 record2.header,
                 options.pair_name_policy,
             )) {
-                const name1 = pairing.parseName(record1.header, options.pair_name_policy);
-                const name2 = pairing.parseName(record2.header, options.pair_name_policy);
-                return .{ .pair = .{ .name_mismatch = .{
-                    .pair_index = record_index1 / 2,
-                    .records = .{
-                        .init(name1, record_index1, offsets1.header),
-                        .init(name2, record_index2, offsets2.header),
-                    },
-                } } };
+                return headerNameMismatch(
+                    record1.header,
+                    record2.header,
+                    options.pair_name_policy,
+                    record_index1 / 2,
+                    .{ record_index1, record_index2 },
+                    .{ offsets1.header, offsets2.header },
+                );
             }
         } else {
             const name1 = stored_name.name();
@@ -2413,48 +2437,29 @@ fn sampleFractionSource(
     defer reader.deinit();
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
-    while (true) switch (nextValidatedSampleRecord(&reader, &validator)) {
-        .done => return null,
-        .failure => |failure| return failure,
-        .record => |validated| {
+    while (true) {
+        if (fastq.nextRecordSpan(&reader, &validator)) |span| {
             if (!selector.selectRecord()) continue;
-            if (recordHasUnwritableEnding(validated.record, validated.canonical_span)) {
-                return unwritableRecordFailure();
-            }
-            try writeCheckedRecord(writer, null, validated.record, validated.canonical_span);
-        },
-    };
-}
-
-const ValidatedSampleRecord = struct {
-    record: zfastq.Record,
-    canonical_span: ?[]const u8,
-};
-
-const SampleRecordOutcome = union(enum) {
-    done,
-    record: ValidatedSampleRecord,
-    failure: CommandFailure,
-};
-
-fn nextValidatedSampleRecord(
-    reader: *zfastq.Reader,
-    validator: *fastq.AdaptiveRecordValidator,
-) SampleRecordOutcome {
-    const validated = fastq.nextValidatedRecord(reader, validator) catch |err| {
-        return .{ .failure = mapReaderFailure(reader, err) };
-    } orelse return .done;
-    if (mapCurrentSemanticFailure(
-        validated.semantic_error,
-        reader,
-        reader.recordIndex() - 1,
-    )) |failure| {
-        return .{ .failure = failure };
+            if (!spanIsWritable(span)) return unwritableRecordFailure();
+            try writeRecordSpan(writer, span);
+            continue;
+        }
+        var next = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
+            return mapReaderFailure(&reader, err);
+        };
+        // A pointer capture reads the record where the reader built it.
+        const validated = if (next) |*validated| validated else return null;
+        if (mapCurrentSemanticFailure(
+            validated.semantic_error,
+            &reader,
+            reader.recordIndex() - 1,
+        )) |failure| return failure;
+        if (!selector.selectRecord()) continue;
+        if (recordHasUnwritableEnding(validated.record, validated.canonical_span)) {
+            return unwritableRecordFailure();
+        }
+        try writeCheckedRecord(writer, null, validated.record, validated.canonical_span);
     }
-    return .{ .record = .{
-        .record = validated.record,
-        .canonical_span = validated.canonical_span,
-    } };
 }
 
 const FileSnapshot = struct {
@@ -3362,16 +3367,15 @@ fn runInterleave(
         return 3;
     };
     var stdout_buffer: [64 * 1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    var sink_adapter = io_layer.WriterSink.init(&stdout_writer.interface);
-    var writer = zfastq.Writer.init(sink_adapter.byteSink());
+    var stdout_sink = io_layer.FileSink.initStreaming(io, .stdout(), &stdout_buffer);
+    var writer = zfastq.Writer.init(stdout_sink.byteSink());
 
     const failure = interleaveInputs(
         io,
         allocator,
         inputs,
         &writer,
-        &stdout_writer.interface,
+        &stdout_sink.writer,
         options,
     ) catch {
         writer.flush() catch {};
@@ -3388,6 +3392,44 @@ fn runInterleave(
         exit_code = @max(exit_code, 3);
     };
     return exit_code;
+}
+
+/// Writes pairs straight from both readers' buffers until a mate needs the
+/// general path; `pending1` returns mate 1 when only it was taken. Kept out
+/// of line so the per-pair loop has its own small frame.
+noinline fn interleaveSpanPairs(
+    writer: *zfastq.Writer,
+    reader1: *zfastq.Reader,
+    reader2: *zfastq.Reader,
+    validator1: *fastq.AdaptiveRecordValidator,
+    validator2: *fastq.AdaptiveRecordValidator,
+    selection: *PairOutputSelector,
+    policy: pairing.NamePolicy,
+    pending1: *?fastq.RecordSpan,
+) error{WriteFailed}!?PairCommandFailure {
+    while (fastq.nextRecordSpan(reader1, validator1)) |mate1| {
+        const mate2 = fastq.nextRecordSpan(reader2, validator2) orelse {
+            pending1.* = mate1;
+            return null;
+        };
+        if (!pairing.headersMatch(mate1.header(), mate2.header(), policy)) {
+            const record_index1 = reader1.recordIndex() - 1;
+            return headerNameMismatch(
+                mate1.header(),
+                mate2.header(),
+                policy,
+                record_index1,
+                .{ record_index1, reader2.recordIndex() - 1 },
+                .{ reader1.currentRecordOffsets().?.header, reader2.currentRecordOffsets().?.header },
+            );
+        }
+        if (!selection.selectPair()) continue;
+        if (!spanIsWritable(mate1)) return pairCommandFailure(0, unwritableRecordFailure());
+        if (!spanIsWritable(mate2)) return pairCommandFailure(1, unwritableRecordFailure());
+        try writeRecordSpan(writer, mate1);
+        try writeRecordSpan(writer, mate2);
+    }
+    return null;
 }
 
 fn validateInterleaveInputs(io: std.Io, inputs: []const []const u8) ?u8 {
@@ -3454,21 +3496,31 @@ fn interleaveSources(
     var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        const validated1 = fastq.nextValidatedRecord(&reader1, &validator1) catch |err| {
+        var span1: ?fastq.RecordSpan = null;
+        if (try interleaveSpanPairs(
+            writer,
+            &reader1,
+            &reader2,
+            &validator1,
+            &validator2,
+            selection,
+            options.pair_name_policy,
+            &span1,
+        )) |failure| return failure;
+        var next1 = if (span1) |mate1| fastq.validatedSpan(mate1) else fastq.nextValidatedRecord(&reader1, &validator1) catch |err| {
             return pairCommandFailure(0, mapReaderFailure(&reader1, err));
         };
-        const validated2 = fastq.nextValidatedRecord(&reader2, &validator2) catch |err| {
+        var next2 = fastq.nextValidatedRecord(&reader2, &validator2) catch |err| {
             return pairCommandFailure(1, mapReaderFailure(&reader2, err));
         };
-        const record1 = if (validated1) |value| value.record else null;
-        const record2 = if (validated2) |value| value.record else null;
-        const canonical_span1 = if (validated1) |value| value.canonical_span else null;
-        const canonical_span2 = if (validated2) |value| value.canonical_span else null;
+        // Pointer captures read both records where the readers built them.
+        const maybe1: ?*const fastq.ValidatedRecord = if (next1) |*value| value else null;
+        const maybe2: ?*const fastq.ValidatedRecord = if (next2) |*value| value else null;
 
-        if (record1 == null and record2 == null) return null;
-        if (record1 == null or record2 == null) {
-            const remaining_side: u1 = if (record1 != null) 0 else 1;
-            const pair_index = if (record1 != null)
+        if (maybe1 == null and maybe2 == null) return null;
+        if (maybe1 == null or maybe2 == null) {
+            const remaining_side: u1 = if (maybe1 != null) 0 else 1;
+            const pair_index = if (maybe1 != null)
                 reader1.recordIndex() - 1
             else
                 reader2.recordIndex() - 1;
@@ -3482,19 +3534,25 @@ fn interleaveSources(
             } } };
         }
 
+        const validated1 = maybe1.?;
+        const validated2 = maybe2.?;
+        const record1 = &validated1.record;
+        const record2 = &validated2.record;
+        const canonical_span1 = validated1.canonical_span;
+        const canonical_span2 = validated2.canonical_span;
         const record_index1 = reader1.recordIndex() - 1;
         const record_index2 = reader2.recordIndex() - 1;
         const offsets1 = reader1.currentRecordOffsets().?;
         const offsets2 = reader2.currentRecordOffsets().?;
         if (mapSemanticFailure(
-            validated1.?.semantic_error,
+            validated1.semantic_error,
             offsets1,
             record_index1,
         )) |failure| {
             return pairCommandFailure(0, failure);
         }
         if (mapSemanticFailure(
-            validated2.?.semantic_error,
+            validated2.semantic_error,
             offsets2,
             record_index2,
         )) |failure| {
@@ -3502,31 +3560,30 @@ fn interleaveSources(
         }
 
         if (!pairing.headersMatch(
-            record1.?.header,
-            record2.?.header,
+            record1.header,
+            record2.header,
             options.pair_name_policy,
         )) {
-            const name1 = pairing.parseName(record1.?.header, options.pair_name_policy);
-            const name2 = pairing.parseName(record2.?.header, options.pair_name_policy);
-            return .{ .pair = .{ .name_mismatch = .{
-                .pair_index = record_index1,
-                .records = .{
-                    .init(name1, record_index1, offsets1.header),
-                    .init(name2, record_index2, offsets2.header),
-                },
-            } } };
+            return headerNameMismatch(
+                record1.header,
+                record2.header,
+                options.pair_name_policy,
+                record_index1,
+                .{ record_index1, record_index2 },
+                .{ offsets1.header, offsets2.header },
+            );
         }
 
         if (!selection.selectPair()) continue;
-        if (recordHasUnwritableEnding(record1.?, canonical_span1)) {
+        if (recordHasUnwritableEnding(record1.*, canonical_span1)) {
             return pairCommandFailure(0, unwritableRecordFailure());
         }
-        if (recordHasUnwritableEnding(record2.?, canonical_span2)) {
+        if (recordHasUnwritableEnding(record2.*, canonical_span2)) {
             return pairCommandFailure(1, unwritableRecordFailure());
         }
 
-        try writeCheckedRecord(writer, direct_writer, record1.?, canonical_span1);
-        try writeCheckedRecord(writer, direct_writer, record2.?, canonical_span2);
+        try writeCheckedRecord(writer, direct_writer, record1.*, canonical_span1);
+        try writeCheckedRecord(writer, direct_writer, record2.*, canonical_span2);
     }
 }
 
@@ -3707,7 +3764,16 @@ fn deinterleaveSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        var validated1 = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
+        var span1: ?fastq.RecordSpan = null;
+        if (try deinterleaveSpanPairs(
+            writer1,
+            writer2,
+            &reader,
+            &validator,
+            options.pair_name_policy,
+            &span1,
+        )) |failure| return failure;
+        var validated1 = if (span1) |mate1| fastq.validatedSpan(mate1) else fastq.nextValidatedRecord(&reader, &validator) catch |err| {
             return pairCommandFailure(0, mapReaderFailure(&reader, err));
         } orelse return null;
         const record_index1 = reader.recordIndex() - 1;
@@ -3721,23 +3787,26 @@ fn deinterleaveSource(
 
         const unwritable1 = recordHasUnwritableEnding(validated1.record, validated1.canonical_span);
         var record1_storage: InterleavedFirstRecordStorage = .reader;
-        const paired_record2 = (if (semantic1 == null)
+        var paired_record2 = (if (semantic1 == null)
             fastq.nextValidatedMatePreservingRecord(&reader, &validated1, &validator)
         else
             fastq.nextBufferedValidatedRecord(&reader, &validator)) catch |err| {
             return pairCommandFailure(0, mapReaderFailure(&reader, err));
         };
-        const record1 = validated1.record;
+        // Pointers read both records where the reader built them.
+        const record1 = &validated1.record;
         const canonical_span1 = validated1.canonical_span;
-        const validated2 = paired_record2 orelse record: {
+        var later_record2: fastq.ValidatedRecord = undefined;
+        const validated2 = if (paired_record2) |*paired| paired else record: {
             @branchHint(.cold);
             if (semantic1 != null) {
-                break :record fastq.nextValidatedRecord(
+                later_record2 = fastq.nextValidatedRecord(
                     &reader,
                     &validator,
                 ) catch |err| {
                     return pairCommandFailure(0, mapReaderFailure(&reader, err));
                 } orelse return missingInterleavedMateFailure(record_index1);
+                break :record &later_record2;
             }
 
             const preserved = nextAfterPreservingInterleavedMate1(
@@ -3745,16 +3814,17 @@ fn deinterleaveSource(
                 &reader,
                 &retained_record_storage,
                 &staged_record,
-                record1,
+                record1.*,
                 canonical_span1,
                 staging_limit,
                 &validator,
             ) catch |err| return mapPreservedMateFailure(&reader, err);
             record1_storage = preserved.first_storage;
-            break :record preserved.record orelse return missingInterleavedMateFailure(record_index1);
+            later_record2 = preserved.record orelse return missingInterleavedMateFailure(record_index1);
+            break :record &later_record2;
         };
 
-        const record2 = validated2.record;
+        const record2 = &validated2.record;
         const canonical_span2 = validated2.canonical_span;
         if (semantic1) |details| {
             return pairCommandFailure(0, details);
@@ -3776,18 +3846,17 @@ fn deinterleaveSource(
             .staged => staged_record.items[1 .. 1 + header1_len],
         };
         if (!pairing.headersMatch(header1, record2.header, options.pair_name_policy)) {
-            const name1 = pairing.parseName(header1, options.pair_name_policy);
-            const name2 = pairing.parseName(record2.header, options.pair_name_policy);
-            return .{ .pair = .{ .name_mismatch = .{
-                .pair_index = record_index1 / 2,
-                .records = .{
-                    .init(name1, record_index1, offsets1.header),
-                    .init(name2, record_index2, offsets2.header),
-                },
-            } } };
+            return headerNameMismatch(
+                header1,
+                record2.header,
+                options.pair_name_policy,
+                record_index1 / 2,
+                .{ record_index1, record_index2 },
+                .{ offsets1.header, offsets2.header },
+            );
         }
 
-        if (unwritable1 or recordHasUnwritableEnding(record2, canonical_span2)) {
+        if (unwritable1 or recordHasUnwritableEnding(record2.*, canonical_span2)) {
             return pairCommandFailure(0, unwritableRecordFailure());
         }
         writePreservedInterleavedMate1(
@@ -3795,13 +3864,50 @@ fn deinterleaveSource(
             &reader,
             &retained_record_storage,
             staged_record.items,
-            record1,
+            record1.*,
             canonical_span1,
             record1_storage,
         ) catch return error.Output1WriteFailed;
-        writeCheckedRecord(writer2, null, record2, canonical_span2) catch
+        writeCheckedRecord(writer2, null, record2.*, canonical_span2) catch
             return error.Output2WriteFailed;
     }
+}
+
+/// Writes pairs straight from the reader's buffer until a mate needs the
+/// general path; `pending1` returns mate 1 when only it was taken. Kept out
+/// of line so the per-pair loop has its own small frame.
+noinline fn deinterleaveSpanPairs(
+    writer1: *zfastq.Writer,
+    writer2: *zfastq.Writer,
+    reader: *zfastq.Reader,
+    validator: *fastq.AdaptiveRecordValidator,
+    policy: pairing.NamePolicy,
+    pending1: *?fastq.RecordSpan,
+) DeinterleaveWriteError!?PairCommandFailure {
+    while (fastq.nextRecordSpan(reader, validator)) |mate1| {
+        const offset1 = reader.currentRecordOffsets().?.header;
+        const mate2 = fastq.nextRecordSpan(reader, validator) orelse {
+            pending1.* = mate1;
+            return null;
+        };
+        if (!pairing.headersMatch(mate1.header(), mate2.header(), policy)) {
+            const record_index2 = reader.recordIndex() - 1;
+            return headerNameMismatch(
+                mate1.header(),
+                mate2.header(),
+                policy,
+                (record_index2 - 1) / 2,
+                .{ record_index2 - 1, record_index2 },
+                .{ offset1, reader.currentRecordOffsets().?.header },
+            );
+        }
+        if (!spanIsWritable(mate1) or !spanIsWritable(mate2)) {
+            return pairCommandFailure(0, unwritableRecordFailure());
+        }
+        writeRecordSpan(writer1, mate1) catch return error.Output1WriteFailed;
+        writeRecordSpan(writer2, mate2) catch return error.Output2WriteFailed;
+    }
+    return null;
 }
 
 fn flushDeinterleaveWriters(
