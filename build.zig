@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
         })
     else
         requested_target;
-    const strip = optimize == .ReleaseFast;
+    const strip = b.option(bool, "strip", "Strip debug information (default: on for ReleaseFast)") orelse (optimize == .ReleaseFast);
     const kernel_backend = b.option(
         KernelBackend,
         "kernel-backend",
