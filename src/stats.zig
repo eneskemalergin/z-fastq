@@ -556,8 +556,10 @@ fn payloadTotalsVector(
         base_counts[3] += sumBaseLanes(vector_len, t_lanes);
         base_counts[4] += sumBaseLanes(vector_len, n_lanes);
     }
-    base_counts[5] = sequence.len -
-        (base_counts[0] + base_counts[1] + base_counts[2] + base_counts[3] + base_counts[4]);
+    if (parts != .quality) {
+        base_counts[5] = sequence.len -
+            (base_counts[0] + base_counts[1] + base_counts[2] + base_counts[3] + base_counts[4]);
+    }
     return .{
         .base_counts = base_counts,
         .quality_sum = quality_sum,
@@ -648,11 +650,9 @@ test "[property] - [statistics]: vector payload totals match the scalar path at 
             );
             if (length < vector_len) continue;
             inline for (.{ Parts.both, Parts.sequence, Parts.quality }) |parts| {
-                const sequence_arg = if (parts == .quality) sequence_part[0..0] else sequence_part;
-                const quality_arg = if (parts == .sequence) quality_part[0..0] else quality_part;
                 try std.testing.expectEqualDeep(
-                    try payloadTotalsScalar(u64, parts, sequence_arg, quality_arg, &quality_error),
-                    try payloadTotalsVector(vector_len, parts, sequence_arg, quality_arg, &quality_error),
+                    try payloadTotalsScalar(u64, parts, sequence_part, quality_part, &quality_error),
+                    try payloadTotalsVector(vector_len, parts, sequence_part, quality_part, &quality_error),
                 );
             }
         }
