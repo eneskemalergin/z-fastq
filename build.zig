@@ -151,7 +151,9 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     // The CLI's test binary also runs the in-file tests of every source file it imports.
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
+    const source_tests = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
+    test_step.dependOn(&source_tests.step);
+    b.step("test-src", "Run the in-file tests of src/").dependOn(&source_tests.step);
     for (suites) |suite| {
         const module = b.createModule(.{
             .root_source_file = b.path(suite.path),
@@ -166,5 +168,7 @@ pub fn build(b: *std.Build) void {
             run.step.dependOn(b.getInstallStep());
         }
         test_step.dependOn(&run.step);
+        const name = std.fs.path.stem(suite.path)["test_".len..];
+        b.step(b.fmt("test-{s}", .{name}), b.fmt("Run {s}", .{suite.path})).dependOn(&run.step);
     }
 }
