@@ -431,23 +431,45 @@ pub fn countSlice(
     return scanner.record_index;
 }
 
-test "[unit] - [dense layout]: construction derives complete record offsets" {
-    const layout = DenseLayout.fromRecordEnd(11, 2).?;
-
-    try std.testing.expect(layout.sequence_start == 3);
-    try std.testing.expect(layout.sequence_end == 5);
-    try std.testing.expect(layout.plus_start == 6);
-    try std.testing.expect(layout.quality_start == 8);
-    try std.testing.expect(layout.quality_end == 10);
-    try std.testing.expect(layout.record_stride == 11);
+test "[edge] - [dense layout]: record geometry is derived when it fits and rejected when it cannot" {
+    const max = std.math.maxInt(usize);
+    const Row = struct { record_bytes: usize, seq_len: usize, expected: ?DenseLayout };
+    const rows = [_]Row{
+        .{
+            .record_bytes = 11,
+            .seq_len = 2,
+            .expected = .{
+                .sequence_start = 3,
+                .sequence_end = 5,
+                .plus_start = 6,
+                .quality_start = 8,
+                .quality_end = 10,
+                .record_stride = 11,
+            },
+        },
+        .{ .record_bytes = 0, .seq_len = 0, .expected = null },
+        .{ .record_bytes = 8, .seq_len = 2, .expected = null },
+        .{ .record_bytes = max, .seq_len = max, .expected = null },
+    };
+    for (rows) |row| {
+        try std.testing.expectEqualDeep(row.expected, DenseLayout.fromRecordEnd(row.record_bytes, row.seq_len));
+    }
 }
 
-test "[failure] - [dense layout]: construction rejects impossible geometry" {
-    const max = std.math.maxInt(usize);
+test "[unit] - [dense layout]: confirmation waits for two matching records" {
+    const short = "@a\nAC\n+\n!!\n";
+    const long = "@longer\nA\n+\n!\n";
+    var scan = Scanner.init(.{ .max_line_bytes = 64 });
 
-    try std.testing.expect(DenseLayout.fromRecordEnd(0, 0) == null);
-    try std.testing.expect(DenseLayout.fromRecordEnd(8, 2) == null);
-    try std.testing.expect(DenseLayout.fromRecordEnd(max, max) == null);
+    try std.testing.expectEqual(short.len, try scan.feed(short));
+    try std.testing.expect(!scan.layout_confirmed);
+    try std.testing.expectEqual(short.len, try scan.feed(short));
+    try std.testing.expect(scan.layout_confirmed);
+
+    try std.testing.expectEqual(long.len, try scan.feed(long));
+    try std.testing.expect(!scan.layout_confirmed);
+    try std.testing.expectEqual(long.len, try scan.feed(long));
+    try std.testing.expect(scan.layout_confirmed);
 }
 
 test "[property] - [count scanner]: dense validation checks every field region" {
@@ -628,26 +650,6 @@ test "[edge] - [count scanner]: counts and error locations cross 32 bits with an
     }
 }
 
-test "[edge] - [count scanner]: fast progress rejects maximum offset and record count" {
-    const data = "@r\nA\n+\n!\n";
-
-    var offset = Scanner.init(.{});
-    offset.fast_path_enabled = true;
-    offset.byte_offset = std.math.maxInt(u64);
-
-    try std.testing.expectError(error.ArithmeticLimit, offset.feed(data));
-    try std.testing.expectEqual(std.math.maxInt(u64), offset.byte_offset);
-    try std.testing.expectEqual(@as(u64, 0), offset.record_index);
-
-    var records = Scanner.init(.{});
-    records.fast_path_enabled = true;
-    records.record_index = std.math.maxInt(u64);
-
-    try std.testing.expectError(error.ArithmeticLimit, records.feed(data));
-    try std.testing.expectEqual(std.math.maxInt(u64), records.record_index);
-    try std.testing.expectEqual(@as(u64, 0), records.byte_offset);
-}
-
 test "[property] - [dense exit]: short tails preserve prediction and changed records relearn" {
     const record = "@r1\nAAAA\n+\n!!!!\n";
     const longer = "@longer-id\nAA\n+\n!!\n";
@@ -676,7 +678,7 @@ test "[property] - [dense exit]: short tails preserve prediction and changed rec
     }
 }
 
-test "[edge] - [dense exit]: checked progress and line-limit commit boundaries stay intact" {
+test "[failure] - [count scanner]: arithmetic and line-limit errors keep the last completed record" {
     const record = "@r1\nAAAA\n+\n!!!!\n";
     const changed = "@longer\nAA\n+\n!!\n";
     for ([_]bool{ false, true }) |overflow_offset| {
@@ -702,20 +704,33 @@ test "[edge] - [dense exit]: checked progress and line-limit commit boundaries s
     try std.testing.expectEqual(@as(u64, record.len * 2), limited.byte_offset);
 }
 
-test "[edge] - [count scanner]: incremental progress rejects maximum offset and record count" {
+test "[edge] - [count scanner]: byte-offset and record-count limits reject the record on both paths" {
     const data = "@r\nA\n+\n!\n";
+    const max = std.math.maxInt(u64);
+    for ([_]bool{ false, true }) |fast_path_enabled| {
+        var offset = Scanner.init(.{});
+        offset.fast_path_enabled = fast_path_enabled;
+        offset.byte_offset = max;
+        try std.testing.expectError(error.ArithmeticLimit, offset.feed(data));
+        try std.testing.expectEqual(max, offset.byte_offset);
+        try std.testing.expectEqual(@as(u64, 0), offset.record_index);
 
-    var offset = Scanner.init(.{});
-    offset.byte_offset = std.math.maxInt(u64);
+        // The byte offset after a record-count error is not pinned: the fast path
+        // commits a feed's bytes together, while the line path commits each line.
+        var records = Scanner.init(.{});
+        records.fast_path_enabled = fast_path_enabled;
+        records.record_index = max;
+        try std.testing.expectError(error.ArithmeticLimit, records.feed(data));
+        try std.testing.expectEqual(max, records.record_index);
+    }
+}
 
-    try std.testing.expectError(error.ArithmeticLimit, offset.feed(data));
-    try std.testing.expectEqual(std.math.maxInt(u64), offset.byte_offset);
-    try std.testing.expectEqual(@as(u64, 0), offset.record_index);
-
-    var records = Scanner.init(.{});
-    records.record_index = std.math.maxInt(u64);
-
-    try std.testing.expectError(error.ArithmeticLimit, records.feed(data));
-    try std.testing.expectEqual(std.math.maxInt(u64), records.record_index);
-    try std.testing.expectEqual(@as(u64, data.len), records.byte_offset);
+test "[edge] - [count scanner]: record-count overflow on the second record of one feed is rejected" {
+    const record = "@r\nA\n+\n!\n";
+    for ([_]bool{ false, true }) |fast_path_enabled| {
+        var scanner = Scanner.init(.{});
+        scanner.fast_path_enabled = fast_path_enabled;
+        scanner.record_index = std.math.maxInt(u64) - 1;
+        try std.testing.expectError(error.ArithmeticLimit, scanner.feed(record ** 2));
+    }
 }

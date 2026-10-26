@@ -120,13 +120,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "z-fastq", .module = lib_module },
     };
 
-    const fastq_test_module = b.createModule(.{
-        .root_source_file = b.path("src/fastq.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    fastq_test_module.addOptions("build_options", build_options);
-    for ([_]*std.Build.Module{ lib_module, exe.root_module, fastq_test_module }) |module| {
+    for ([_]*std.Build.Module{ lib_module, exe.root_module }) |module| {
         module.addImport("zipir", zipir);
         if (avx2_object) |object| module.addObject(object);
     }
@@ -147,7 +141,7 @@ pub fn build(b: *std.Build) void {
     const suites = [_]Suite{
         .{ .path = "tests/test_reader.zig", .imports = &import_lib, .runs_binary = false },
         .{ .path = "tests/test_writer.zig", .imports = &import_lib, .runs_binary = false },
-        .{ .path = "tests/test_count.zig" },
+        .{ .path = "tests/test_count.zig", .imports = &import_lib },
         .{ .path = "tests/test_stats.zig", .imports = &import_lib },
         .{ .path = "tests/test_check.zig" },
         .{ .path = "tests/test_sample.zig", .imports = &.{.{ .name = "sample_internal", .module = sample_internal_module }} },
@@ -156,9 +150,8 @@ pub fn build(b: *std.Build) void {
     };
 
     const test_step = b.step("test", "Run unit tests");
-    for ([_]*std.Build.Module{ fastq_test_module, exe.root_module }) |module| {
-        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
-    }
+    // The CLI's test binary also runs the in-file tests of every source file it imports.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
     for (suites) |suite| {
         const module = b.createModule(.{
             .root_source_file = b.path(suite.path),

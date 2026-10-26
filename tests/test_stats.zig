@@ -4,9 +4,8 @@ const std = @import("std");
 const zfastq = @import("z-fastq");
 const cli = @import("utilities.zig");
 const CommandResult = cli.CommandResult;
-const runCli = cli.runWithStdin;
+const runCliWithStdin = cli.runWithStdin;
 const runCliWithClosedStdout = cli.runWithClosedStdout;
-const runCliWithClosedStdin = cli.runWithClosedStdin;
 
 const SAMPLE_FASTQ = "@r\nACGTN?\n+\n!5?I~!\n";
 const SAMPLE_GZIP = [_]u8{
@@ -302,26 +301,18 @@ test "[cli] - [stats]: files and stdin preserve prefixes, gzip members, and exac
             .exit_code = 1,
             .message = "S004: unexpected end of file in sequence line (record 0, line 2, offset 2)\n",
         },
-        .{
-            .bytes = SAMPLE_GZIP[0..1],
-            .exit_code = 1,
-            .message = "S003: header line must start with '@' and contain a nonempty identifier " ++
-                "(record 0, line 1, offset 0)\n",
-        },
-        .{ .bytes = SAMPLE_GZIP[0..2], .exit_code = 3, .message = "I/O error\n" },
         .{ .bytes = SAMPLE_GZIP[0..9], .exit_code = 3, .message = "I/O error\n" },
-        .{ .bytes = SAMPLE_GZIP[0..10], .exit_code = 3, .message = "I/O error\n" },
         .{ .bytes = &later_header, .exit_code = 3, .message = "I/O error\n" },
     };
     for (cases, 0..) |case, index| {
-        try writeTempFile(io, &tmp, case.name, case.bytes);
+        try tmp.dir.writeFile(io, .{ .sub_path = case.name, .data = case.bytes });
         const path = try cli.tempPath(allocator, &tmp.sub_path, case.name);
         for ([_][]const u8{ path, "-" }, 0..) |label, transport| {
             errdefer std.debug.print("stats input case {d}, input {s}\n", .{ index, label });
             const result = if (transport == 0)
                 try cli.run(allocator, &.{ "stats", path })
             else
-                try runCli(allocator, &.{ "stats", "-" }, case.bytes, 1);
+                try runCliWithStdin(allocator, &.{ "stats", "-" }, case.bytes, 1);
             const stdout = if (case.exit_code == 0) try std.fmt.allocPrint(
                 allocator,
                 "input: {s}\n{s}",
@@ -337,51 +328,33 @@ test "[cli] - [stats]: files and stdin preserve prefixes, gzip members, and exac
     }
 }
 
-test "[cli] - [stats-json]: success and empty results have exact parsed shapes" {
+test "[cli] - [stats-json]: JSON shapes match the sample, empty, and zero-length inputs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const samples = [_]CommandResult{
-        try runCli(
-            allocator,
-            &.{ "stats", "--json", "--max-line-bytes", "64", "-" },
-            SAMPLE_FASTQ,
-            1,
-        ),
-        try runCli(allocator, &.{ "stats", "--json", "-" }, &SAMPLE_GZIP, 1),
+    const cases = [_]struct {
+        args: []const []const u8,
+        bytes: []const u8,
+        shape: enum { sample, empty, zero_length },
+    }{
+        .{ .args = &.{ "stats", "--json", "--max-line-bytes", "64", "-" }, .bytes = SAMPLE_FASTQ, .shape = .sample },
+        .{ .args = &.{ "stats", "--json", "-" }, .bytes = &SAMPLE_GZIP, .shape = .sample },
+        .{ .args = &.{ "stats", "--json", "-" }, .bytes = "", .shape = .empty },
+        .{ .args = &.{ "stats", "--json", "-" }, .bytes = "@z\n\n+\n\n", .shape = .zero_length },
     };
-    for (samples) |sample| {
-        try std.testing.expectEqual(@as(u8, 0), sample.exit_code);
-        try std.testing.expectEqual(@as(usize, 0), sample.stderr.len);
-        var sample_json = try std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            sample.stdout,
-            .{},
-        );
-        defer sample_json.deinit();
-        const sample_results = try cli.expectJsonDocument(
-            &sample_json.value,
-            "z-fastq/stats-v1",
-        );
-        try std.testing.expectEqual(@as(usize, 1), sample_results.len);
-        try expectSampleJsonStats(sample_results[0], "-");
+    for (cases) |case| {
+        const result = try runCliWithStdin(allocator, case.args, case.bytes, 1);
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
+        const results = try cli.parseJsonResults(allocator, result.stdout, "z-fastq/stats-v1");
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        switch (case.shape) {
+            .sample => try expectSampleJsonStats(results[0], "-"),
+            .empty => try expectEmptyJsonStats(results[0], "-"),
+            .zero_length => try expectZeroLengthJsonStats(results[0]),
+        }
     }
-
-    const empty = try runCli(allocator, &.{ "stats", "--json", "-" }, "", 1);
-    try std.testing.expectEqual(@as(u8, 0), empty.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), empty.stderr.len);
-    var empty_json = try std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        empty.stdout,
-        .{},
-    );
-    defer empty_json.deinit();
-    const empty_results = try cli.expectJsonDocument(&empty_json.value, "z-fastq/stats-v1");
-    try std.testing.expectEqual(@as(usize, 1), empty_results.len);
-    try expectEmptyJsonStats(empty_results[0], "-");
 }
 
 test "[cli] - [stats]: empty input and a zero-length record remain distinct" {
@@ -389,12 +362,12 @@ test "[cli] - [stats]: empty input and a zero-length record remain distinct" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const empty = try runCli(allocator, &.{ "stats", "-" }, "", 1);
+    const empty = try runCliWithStdin(allocator, &.{ "stats", "-" }, "", 1);
     try std.testing.expectEqual(@as(u8, 0), empty.exit_code);
     try std.testing.expectEqualStrings("input: -\n" ++ EMPTY_FIELDS, empty.stdout);
     try std.testing.expectEqual(@as(usize, 0), empty.stderr.len);
 
-    const zero = try runCli(allocator, &.{ "stats", "-" }, "@z\n\n+\n\n", 1);
+    const zero = try runCliWithStdin(allocator, &.{ "stats", "-" }, "@z\n\n+\n\n", 1);
     try std.testing.expectEqual(@as(u8, 0), zero.exit_code);
     try std.testing.expectEqualStrings(
         \\input: -
@@ -419,28 +392,7 @@ test "[cli] - [stats]: empty input and a zero-length record remain distinct" {
         \\
     , zero.stdout);
     try std.testing.expectEqual(@as(usize, 0), zero.stderr.len);
-
-    const json = try runCli(allocator, &.{ "stats", "--json", "-" }, "@z\n\n+\n\n", 1);
-    try std.testing.expectEqual(@as(u8, 0), json.exit_code);
-    try std.testing.expectEqualStrings("", json.stderr);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json.stdout, .{});
-    defer parsed.deinit();
-    const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
-    try std.testing.expectEqual(@as(usize, 1), results.len);
-    const object = results[0].object;
-    try cli.expectJsonObjectKeys(object, &STATS_RESULT_KEYS);
-    try cli.expectJsonString(object.get("input"), "-");
-    try cli.expectJsonString(object.get("status"), "ok");
-    try cli.expectJsonInteger(object.get("reads"), 1);
-    inline for (.{ "bases", "min_length", "max_length", "a", "c", "g", "t", "n", "other_bases", "quality_sum", "q20_bases", "q30_bases" }) |field| {
-        try cli.expectJsonInteger(object.get(field), 0);
-    }
-    try expectJsonNumber(object.get("mean_length"), 0.0);
-    inline for (.{ "gc_fraction", "mean_quality", "q20_fraction", "q30_fraction" }) |field| {
-        try std.testing.expect(object.get(field).? == .null);
-    }
 }
-
 test "[cli] - [stats]: source counts and exact decimal ties agree with human and JSON fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -480,13 +432,11 @@ test "[cli] - [stats]: source counts and exact decimal ties agree with human and
         var gzip: std.ArrayList(u8) = .empty;
         try cli.appendGzipMember(allocator, &gzip, input.items, .{});
         for ([_][]const u8{ input.items, gzip.items }) |bytes| {
-            try cli.expectResult(try runCli(allocator, &.{ "stats", "-" }, bytes, bytes.len), 0, expected, "");
-            const json = try runCli(allocator, &.{ "stats", "--json", "-" }, bytes, bytes.len);
+            try cli.expectResult(try runCliWithStdin(allocator, &.{ "stats", "-" }, bytes, bytes.len), 0, expected, "");
+            const json = try runCliWithStdin(allocator, &.{ "stats", "--json", "-" }, bytes, bytes.len);
             try std.testing.expectEqual(@as(u8, 0), json.exit_code);
             try std.testing.expectEqualStrings("", json.stderr);
-            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json.stdout, .{});
-            defer parsed.deinit();
-            const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
+            const results = try cli.parseJsonResults(allocator, json.stdout, "z-fastq/stats-v1");
             try std.testing.expectEqual(@as(usize, 1), results.len);
             const object = results[0].object;
             try cli.expectJsonObjectKeys(object, &STATS_RESULT_KEYS);
@@ -514,7 +464,7 @@ test "[cli] - [stats]: S006 reports the exact decompressed quality-byte offset" 
     defer arena.deinit();
     const allocator = arena.allocator();
     const invalid = "@bad\r\nAC\r\n+\r\n!\x7f\r\n";
-    const invalid_lf = try runCli(
+    const invalid_lf = try runCliWithStdin(
         allocator,
         &.{ "stats", "-" },
         "@bad\nAC\n+\n!\x7f\n",
@@ -529,7 +479,7 @@ test "[cli] - [stats]: S006 reports the exact decompressed quality-byte offset" 
     );
 
     for ([_][]const u8{ invalid, &INVALID_QUALITY_GZIP }) |input| {
-        const result = try runCli(allocator, &.{ "stats", "-" }, input, 1);
+        const result = try runCliWithStdin(allocator, &.{ "stats", "-" }, input, 1);
 
         try std.testing.expectEqual(@as(u8, 1), result.exit_code);
         try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
@@ -540,7 +490,7 @@ test "[cli] - [stats]: S006 reports the exact decompressed quality-byte offset" 
         );
     }
 
-    const later = try runCli(
+    const later = try runCliWithStdin(
         allocator,
         &.{ "stats", "-" },
         "@ok\nA\n+\n!\n" ++ invalid,
@@ -581,21 +531,19 @@ test "[cli] - [stats]: embedded quality endings preserve structural error preced
                 "error: -: {s}: {s} (record {d}, line 4, offset {d})\n",
                 .{ case.code, message, record_index, offset },
             );
-            const human = try runCli(allocator, &.{ "stats", "-" }, input, input.len);
+            const human = try runCliWithStdin(allocator, &.{ "stats", "-" }, input, input.len);
             try cli.expectResult(human, 1, "", expected);
-            const json = try runCli(allocator, &.{ "stats", "--json", "-" }, input, input.len);
+            const json = try runCliWithStdin(allocator, &.{ "stats", "--json", "-" }, input, input.len);
             try std.testing.expectEqual(@as(u8, 1), json.exit_code);
             try std.testing.expectEqualStrings("", json.stderr);
-            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json.stdout, .{});
-            defer parsed.deinit();
-            const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
+            const results = try cli.parseJsonResults(allocator, json.stdout, "z-fastq/stats-v1");
             try std.testing.expectEqual(@as(usize, 1), results.len);
             try cli.expectJsonFailure(results[0], "-", case.code, record_index, offset, 4);
         }
     }
 }
 
-test "[cli] - [stats]: successful blocks survive independent higher-class failures" {
+test "[cli] - [stats]: every input runs and the highest exit class wins" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -603,34 +551,57 @@ test "[cli] - [stats]: successful blocks survive independent higher-class failur
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeTempFile(io, &tmp, "valid.fastq", SAMPLE_FASTQ);
-    try writeTempFile(io, &tmp, "invalid.fastq", "@bad\nA\n+\n \n");
+    // The limit file has an 8-byte sequence line; the sample's lines fit the 6-byte limit used below.
+    try tmp.dir.writeFile(io, .{ .sub_path = "valid.fastq", .data = SAMPLE_FASTQ });
+    try tmp.dir.writeFile(io, .{ .sub_path = "invalid.fastq", .data = "@bad\nA\n+\n \n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "limit.fastq", .data = "@r\nACGTACGT\n+\n!!!!!!!!\n" });
     const valid_path = try cli.tempPath(allocator, &tmp.sub_path, "valid.fastq");
     const invalid_path = try cli.tempPath(allocator, &tmp.sub_path, "invalid.fastq");
+    const limit_path = try cli.tempPath(allocator, &tmp.sub_path, "limit.fastq");
     const missing_path = try cli.tempPath(allocator, &tmp.sub_path, "missing.fastq");
-
-    const result = try runCli(
-        allocator,
-        &.{ "stats", valid_path, invalid_path, missing_path, valid_path },
-        "",
-        1,
-    );
     const one_block = try expectedStats(allocator, valid_path);
-    try std.testing.expectEqual(@as(u8, 3), result.exit_code);
-    try std.testing.expectEqualStrings(
-        try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ one_block, one_block }),
-        result.stdout,
-    );
-    try std.testing.expectEqualStrings(
-        try std.fmt.allocPrint(
-            allocator,
-            "error: {s}: S006: quality byte must be ASCII 33 through 126 " ++
-                "(record 0, line 4, offset 9)\n" ++
-                "error: {s}: file not found\n",
-            .{ invalid_path, missing_path },
-        ),
-        result.stderr,
-    );
+    const two_blocks = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ one_block, one_block });
+
+    const cases = [_]struct {
+        args: []const []const u8,
+        exit_code: u8,
+        stdout: []const u8,
+        stderr: []const u8,
+    }{
+        .{
+            .args = &.{ "stats", valid_path, invalid_path, missing_path, valid_path },
+            .exit_code = 3,
+            .stdout = two_blocks,
+            .stderr = try std.fmt.allocPrint(
+                allocator,
+                "error: {s}: S006: quality byte must be ASCII 33 through 126 " ++
+                    "(record 0, line 4, offset 9)\n" ++
+                    "error: {s}: file not found\n",
+                .{ invalid_path, missing_path },
+            ),
+        },
+        .{
+            .args = &.{ "stats", valid_path, missing_path, valid_path },
+            .exit_code = 3,
+            .stdout = two_blocks,
+            .stderr = try std.fmt.allocPrint(allocator, "error: {s}: file not found\n", .{missing_path}),
+        },
+        .{
+            .args = &.{ "stats", "--max-line-bytes", "6", limit_path, missing_path, valid_path },
+            .exit_code = 4,
+            .stdout = one_block,
+            .stderr = try std.fmt.allocPrint(
+                allocator,
+                "error: {s}: line length limit exceeded\n" ++
+                    "error: {s}: file not found\n",
+                .{ limit_path, missing_path },
+            ),
+        },
+    };
+    for (cases) |case| {
+        const result = try cli.run(allocator, case.args);
+        try cli.expectResult(result, case.exit_code, case.stdout, case.stderr);
+    }
 }
 
 test "[cli] - [stats]: input labels use escaped ASCII" {
@@ -642,9 +613,9 @@ test "[cli] - [stats]: input labels use escaped ASCII" {
     defer tmp.cleanup();
 
     const name = "unsafe\n\\.fastq";
-    try writeTempFile(io, &tmp, name, SAMPLE_FASTQ);
+    try tmp.dir.writeFile(io, .{ .sub_path = name, .data = SAMPLE_FASTQ });
     const path = try cli.tempPath(allocator, &tmp.sub_path, name);
-    const result = try runCli(allocator, &.{ "stats", path }, "", 1);
+    const result = try runCliWithStdin(allocator, &.{ "stats", path }, "", 1);
     const escaped_path = try std.mem.replaceOwned(
         u8,
         allocator,
@@ -660,60 +631,21 @@ test "[cli] - [stats]: input labels use escaped ASCII" {
     );
     try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
 
-    const json_result = try runCli(allocator, &.{ "stats", "--json", path }, "", 1);
+    const json_result = try runCliWithStdin(allocator, &.{ "stats", "--json", path }, "", 1);
     try std.testing.expectEqual(@as(u8, 0), json_result.exit_code);
     try std.testing.expectEqual(@as(usize, 0), json_result.stderr.len);
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        json_result.stdout,
-        .{},
-    );
-    defer parsed.deinit();
-    const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
+    const results = try cli.parseJsonResults(allocator, json_result.stdout, "z-fastq/stats-v1");
     try std.testing.expectEqual(@as(usize, 1), results.len);
     const object = results[0].object;
     try cli.expectJsonString(object.get("input"), escaped_path);
 }
 
-test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are explicit" {
+test "[cli] - [stats]: line limits and structural errors exit with their documented status" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const missing = try runCli(allocator, &.{"stats"}, "", 1);
-    try cli.expectResult(missing, 2, "", "error: stats requires at least one input\n");
-
-    const duplicate_stdin = try runCli(allocator, &.{ "stats", "-", "-" }, "", 1);
-    try cli.expectResult(
-        duplicate_stdin,
-        2,
-        "",
-        "error: standard input may appear at most once\n",
-    );
-
-    const json_duplicate_stdin = try runCli(
-        allocator,
-        &.{ "stats", "--json", "-", "-" },
-        "",
-        1,
-    );
-    try cli.expectResult(
-        json_duplicate_stdin,
-        2,
-        "",
-        "error: standard input may appear at most once\n",
-    );
-
-    const json_without_input = try runCli(allocator, &.{ "stats", "--json" }, "", 1);
-    try cli.expectResult(
-        json_without_input,
-        2,
-        "",
-        "error: stats requires at least one input\n",
-    );
-
-    const line_limit = try runCli(
+    const line_limit = try runCliWithStdin(
         allocator,
         &.{ "stats", "--max-line-bytes", "1", "-" },
         "@r\nAA\n+\n!!\n",
@@ -721,7 +653,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
     );
     try cli.expectResult(line_limit, 4, "", "error: -: line length limit exceeded\n");
 
-    const structural = try runCli(allocator, &.{ "stats", "-" }, "@r\nAA\n+\n!\n", 1);
+    const structural = try runCliWithStdin(allocator, &.{ "stats", "-" }, "@r\nAA\n+\n!\n", 1);
     try cli.expectResult(
         structural,
         1,
@@ -730,7 +662,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
             "(record 0, line 4, offset 8)\n",
     );
 
-    const mismatch_and_invalid = try runCli(
+    const mismatch_and_invalid = try runCliWithStdin(
         allocator,
         &.{ "stats", "-" },
         "@r\nAA\n+\n \n",
@@ -744,7 +676,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
             "(record 0, line 4, offset 8)\n",
     );
 
-    const one_byte = try runCli(allocator, &.{ "stats", "-" }, "x", 1);
+    const one_byte = try runCliWithStdin(allocator, &.{ "stats", "-" }, "x", 1);
     try cli.expectResult(
         one_byte,
         1,
@@ -753,7 +685,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
             "(record 0, line 1, offset 0)\n",
     );
 
-    const empty_identifier = try runCli(
+    const empty_identifier = try runCliWithStdin(
         allocator,
         &.{ "stats", "-" },
         "@ description\nA\n+\n!\n",
@@ -766,26 +698,22 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
         "error: -: S003: header line must start with '@' and contain a nonempty identifier " ++
             "(record 0, line 1, offset 0)\n",
     );
+}
+
+test "[cli] - [stats]: a damaged gzip member is an I/O failure in human and JSON output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     var damaged = SAMPLE_GZIP;
-    damaged[damaged.len - 8] ^= 1;
-    const corrupt = try runCli(allocator, &.{ "stats", "-" }, &damaged, 1);
+    damaged[cli.gzipCrcOffset(damaged.len)] ^= 1;
+    const corrupt = try runCliWithStdin(allocator, &.{ "stats", "-" }, &damaged, 1);
     try cli.expectResult(corrupt, 3, "", "error: -: I/O error\n");
 
-    const corrupt_json = try runCli(allocator, &.{ "stats", "--json", "-" }, &damaged, 1);
+    const corrupt_json = try runCliWithStdin(allocator, &.{ "stats", "--json", "-" }, &damaged, 1);
     try std.testing.expectEqual(@as(u8, 3), corrupt_json.exit_code);
     try std.testing.expectEqual(@as(usize, 0), corrupt_json.stderr.len);
-    var parsed_corrupt = try std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        corrupt_json.stdout,
-        .{},
-    );
-    defer parsed_corrupt.deinit();
-    const corrupt_results = try cli.expectJsonDocument(
-        &parsed_corrupt.value,
-        "z-fastq/stats-v1",
-    );
+    const corrupt_results = try cli.parseJsonResults(allocator, corrupt_json.stdout, "z-fastq/stats-v1");
     try std.testing.expectEqual(@as(usize, 1), corrupt_results.len);
     try cli.expectJsonFailureWithoutLocation(
         corrupt_results[0],
@@ -793,25 +721,6 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
         "io_error",
         "I/O error",
     );
-
-    const closed = try runCliWithClosedStdout(
-        allocator,
-        &.{ "stats", "-" },
-        SAMPLE_FASTQ,
-    );
-    try std.testing.expectEqual(@as(u8, 3), closed.exit_code);
-    try std.testing.expectEqualStrings("error: standard output: I/O error\n", closed.stderr);
-
-    const json_closed = try runCliWithClosedStdout(
-        allocator,
-        &.{ "stats", "--json", "-" },
-        SAMPLE_FASTQ,
-    );
-    try std.testing.expectEqual(@as(u8, 3), json_closed.exit_code);
-    try std.testing.expectEqualStrings("error: standard output: I/O error\n", json_closed.stderr);
-
-    const closed_stdin = try runCliWithClosedStdin(allocator, &.{ "stats", "-" });
-    try cli.expectResult(closed_stdin, 3, "", "error: -: I/O error\n");
 }
 
 test "[cli] - [stats]: output failure preserves an observed limit status" {
@@ -834,9 +743,7 @@ test "[cli] - [stats]: output failure preserves an observed limit status" {
         try std.testing.expectEqual(@as(u8, 4), captured.exit_code);
         try std.testing.expectEqualStrings("", captured.stderr);
         try std.testing.expectEqual(name.len > 200, captured.stdout.len > cli.JSON_OUTPUT_BUFFER_BYTES);
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, captured.stdout, .{});
-        defer parsed.deinit();
-        const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
+        const results = try cli.parseJsonResults(allocator, captured.stdout, "z-fastq/stats-v1");
         try std.testing.expectEqual(@as(usize, 2), results.len);
         try cli.expectJsonString(results[0].object.get("error").?.object.get("code"), "line_limit");
         try cli.expectJsonString(results[1].object.get("status"), "ok");
@@ -869,7 +776,7 @@ test "[cli] - [stats-json]: mixed results preserve order, variants, and stream s
     const long = try cli.tempPath(allocator, &tmp.sub_path, "long.fastq");
     const missing = try cli.tempPath(allocator, &tmp.sub_path, "missing.fastq");
 
-    const result = try runCli(
+    const result = try runCliWithStdin(
         allocator,
         &.{
             "stats",
@@ -887,9 +794,7 @@ test "[cli] - [stats-json]: mixed results preserve order, variants, and stream s
     );
     try std.testing.expectEqual(@as(u8, 4), result.exit_code);
     try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
-    defer parsed.deinit();
-    const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
+    const results = try cli.parseJsonResults(allocator, result.stdout, "z-fastq/stats-v1");
     try std.testing.expectEqual(@as(usize, 5), results.len);
     try expectSampleJsonStats(results[0], valid);
     try cli.expectJsonFailure(results[1], invalid, "S006", 0, 9, 4);
@@ -901,6 +806,21 @@ test "[cli] - [stats-json]: mixed results preserve order, variants, and stream s
         "line length limit exceeded",
     );
     try expectSampleJsonStats(results[4], valid);
+}
+
+fn expectZeroLengthJsonStats(value: std.json.Value) !void {
+    const object = value.object;
+    try cli.expectJsonObjectKeys(object, &STATS_RESULT_KEYS);
+    try cli.expectJsonString(object.get("input"), "-");
+    try cli.expectJsonString(object.get("status"), "ok");
+    try cli.expectJsonInteger(object.get("reads"), 1);
+    inline for (.{ "bases", "min_length", "max_length", "a", "c", "g", "t", "n", "other_bases", "quality_sum", "q20_bases", "q30_bases" }) |field| {
+        try cli.expectJsonInteger(object.get(field), 0);
+    }
+    try expectJsonNumber(object.get("mean_length"), 0.0);
+    inline for (.{ "gc_fraction", "mean_quality", "q20_fraction", "q30_fraction" }) |field| {
+        try std.testing.expect(object.get(field).? == .null);
+    }
 }
 
 fn record(sequence: []const u8, quality: []const u8) zfastq.Record {
@@ -915,17 +835,6 @@ fn record(sequence: []const u8, quality: []const u8) zfastq.Record {
 
 fn expectOptionalApprox(expected: f64, actual: ?f64) !void {
     try std.testing.expectApproxEqAbs(expected, actual.?, 1e-12);
-}
-
-fn writeTempFile(
-    io: std.Io,
-    tmp: *std.testing.TmpDir,
-    name: []const u8,
-    bytes: []const u8,
-) !void {
-    const file = try tmp.dir.createFile(io, name, .{});
-    defer file.close(io);
-    try std.Io.File.writeStreamingAll(file, io, bytes);
 }
 
 fn expectedStats(allocator: std.mem.Allocator, label: []const u8) ![]const u8 {

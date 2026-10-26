@@ -4280,14 +4280,31 @@ fn testTempPath(allocator: std.mem.Allocator, sub_path: []const u8, name: []cons
     return std.fmt.allocPrint(allocator, TEST_TEMP_PATH, .{ sub_path, name });
 }
 
+/// Returns the per-input command failure; a structural pair failure is a test error here.
+fn commandFailure(failure: PairCommandFailure) error{ExpectedCommandFailure}!@FieldType(PairCommandFailure, "command") {
+    return switch (failure) {
+        .command => |command| command,
+        .pair => error.ExpectedCommandFailure,
+    };
+}
+
+/// The rejection exact sampling reports when an input's snapshot changed before or during sampling.
+fn expectInputChanged(failure: CommandFailure) !void {
+    try std.testing.expectEqualStrings("input_changed", failure.code);
+    try std.testing.expectEqualStrings("input changed during exact sampling", failure.message);
+    try std.testing.expectEqual(@as(u8, 3), failure.exit_code);
+}
+
 test "[unit] - [interleaved staging]: releases oversized slack before a smaller mate" {
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = tracking.allocator();
     var staging: std.ArrayList(u8) = .empty;
-    defer staging.deinit(std.testing.allocator);
+    defer staging.deinit(allocator);
     const old_capacity = zfastq.limits.DEFAULT_READER_BUFFER_BYTES * 2;
-    try staging.ensureTotalCapacityPrecise(std.testing.allocator, old_capacity);
+    try staging.ensureTotalCapacityPrecise(allocator, old_capacity);
 
     try stageCanonicalRecord(
-        std.testing.allocator,
+        allocator,
         &staging,
         .{
             .header = "pair/1",
@@ -4301,7 +4318,7 @@ test "[unit] - [interleaved staging]: releases oversized slack before a smaller 
     );
 
     try std.testing.expectEqualStrings("@pair/1\nA\n+\n!\n", staging.items);
-    try std.testing.expect(staging.capacity < old_capacity);
+    try std.testing.expectEqual(old_capacity, tracking.freed_bytes);
 }
 
 test "[unit] - [machine output]: handled non-lint errors share one exact shape" {
@@ -4448,148 +4465,189 @@ test "[edge] - [stats-json]: preserves the maximum u64 counter" {
     try std.testing.expectEqualStrings("18446744073709551615", result.number_string);
 }
 
-test "[property] - [stats command]: records larger than the read buffer need no allocation" {
-    // A 4-byte stream buffer makes every record cross it.
-    var source = zfastq.io.plain.SliceSource.init("@r\nAc\n+\n!5\n@s\nNG\n+\nI?\n");
-    var buffer: [4]u8 = undefined;
-    var stream = io_layer.ByteSourceReader.init(source.byteSource(), &buffer);
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = 0,
-    });
+test "[edge] - [stats command]: streamed totals match fixed totals at each buffer size" {
+    // Two reads with 4 bases; quality bytes 0, 20, 40, 30 sum to 90.
+    const valid = "@r\r\nAc\r\n+\r\n!5\r\n@s\nNG\n+\nI?\n";
+    // The space is below the quality range; it is the second record's first quality byte.
+    const invalid = "@r\nAc\n+\n!5\n@s\nNG\n+\n I\n";
+    for ([_]usize{ 1, 4, 7, 64 }) |buffer_len| {
+        var storage: [64]u8 = undefined;
+        var source = zfastq.io.plain.SliceSource.init(valid);
+        var stream = io_layer.ByteSourceReader.init(source.byteSource(), storage[0..buffer_len]);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = 0,
+        });
 
-    const outcome = collectStats(failing.allocator(), &stream.interface, .{});
-    const result = switch (outcome) {
-        .success => |stats| stats.result(),
-        .failure => return error.UnexpectedFailure,
-    };
-    try std.testing.expect(!failing.has_induced_failure);
-    try std.testing.expectEqual(@as(u64, 2), result.reads);
-    try std.testing.expectEqual(@as(u64, 4), result.bases);
-    try std.testing.expectEqual(@as(u64, 1), result.a);
-    try std.testing.expectEqual(@as(u64, 1), result.c);
-    try std.testing.expectEqual(@as(u64, 1), result.g);
-    try std.testing.expectEqual(@as(u64, 1), result.n);
-    try std.testing.expectEqual(@as(u64, 0 + 20 + 40 + 30), result.quality_sum);
-    try std.testing.expectEqual(@as(u64, 3), result.q20_bases);
-    try std.testing.expectEqual(@as(u64, 2), result.q30_bases);
-}
-
-test "[property] - [stats command]: streamed records match buffered totals and failures" {
-    const allocator = std.testing.allocator;
-    var data: std.ArrayList(u8) = .empty;
-    defer data.deinit(allocator);
-    var prng = std.Random.DefaultPrng.init(17);
-    const random = prng.random();
-    var long_quality_start: usize = 0;
-    for (0..40) |index| {
-        const len: usize = switch (index % 5) {
-            0 => 0,
-            1 => 3,
-            2 => 70,
-            3 => 300,
-            else => 1000 + random.uintLessThan(usize, 2000),
-        };
-        const eol: []const u8 = if (index % 3 == 0) "\r\n" else "\n";
-        try data.appendSlice(allocator, "@r");
-        try data.appendSlice(allocator, eol);
-        for (0..len) |_| try data.append(allocator, "ACGTNacgtnRY"[random.uintLessThan(usize, 12)]);
-        try data.appendSlice(allocator, eol);
-        try data.append(allocator, '+');
-        try data.appendSlice(allocator, eol);
-        if (len > 1000) long_quality_start = data.items.len;
-        for (0..len) |_| try data.append(allocator, 33 + random.uintLessThan(u8, 94));
-        try data.appendSlice(allocator, eol);
-    }
-
-    // The whole input in one buffer takes the buffered path for every record.
-    var whole = std.Io.Reader.fixed(data.items);
-    const reference = switch (collectStats(allocator, &whole, .{})) {
-        .success => |stats| stats.result(),
-        .failure => return error.UnexpectedFailure,
-    };
-    for ([_]usize{ 1, 7, 64, 333, 4096 }) |buffer_len| {
-        const buffer = try allocator.alloc(u8, buffer_len);
-        defer allocator.free(buffer);
-        var source = zfastq.io.plain.SliceSource.init(data.items);
-        var stream = io_layer.ByteSourceReader.init(source.byteSource(), buffer);
-        const streamed = switch (collectStats(allocator, &stream.interface, .{})) {
+        const outcome = collectStats(failing.allocator(), &stream.interface, .{});
+        const result = switch (outcome) {
             .success => |stats| stats.result(),
             .failure => return error.UnexpectedFailure,
         };
-        try std.testing.expectEqualDeep(reference, streamed);
-    }
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(@as(u64, 2), result.reads);
+        try std.testing.expectEqual(@as(u64, 4), result.bases);
+        try std.testing.expectEqual(@as(u64, 1), result.a);
+        try std.testing.expectEqual(@as(u64, 1), result.c);
+        try std.testing.expectEqual(@as(u64, 1), result.g);
+        try std.testing.expectEqual(@as(u64, 1), result.n);
+        try std.testing.expectEqual(@as(u64, 90), result.quality_sum);
+        try std.testing.expectEqual(@as(u64, 3), result.q20_bases);
+        try std.testing.expectEqual(@as(u64, 2), result.q30_bases);
 
-    // An invalid quality byte reports the same failure on either path.
-    for ([_]usize{ 0, 17, 700 }) |offset| {
-        const original = data.items[long_quality_start + offset];
-        data.items[long_quality_start + offset] = ' ';
-        defer data.items[long_quality_start + offset] = original;
-        var whole_bad = std.Io.Reader.fixed(data.items);
-        const expected = switch (collectStats(allocator, &whole_bad, .{})) {
+        var invalid_source = zfastq.io.plain.SliceSource.init(invalid);
+        var invalid_stream = io_layer.ByteSourceReader.init(invalid_source.byteSource(), storage[0..buffer_len]);
+        const failure = switch (collectStats(std.testing.allocator, &invalid_stream.interface, .{})) {
             .success => return error.ExpectedFailure,
             .failure => |failure| failure,
         };
-        var buffer: [64]u8 = undefined;
-        var source = zfastq.io.plain.SliceSource.init(data.items);
-        var stream = io_layer.ByteSourceReader.init(source.byteSource(), &buffer);
-        const actual = switch (collectStats(allocator, &stream.interface, .{})) {
-            .success => return error.ExpectedFailure,
-            .failure => |failure| failure,
-        };
-        try std.testing.expectEqualStrings(expected.code, actual.code);
-        try std.testing.expectEqualStrings(expected.message, actual.message);
-        try std.testing.expectEqual(expected.record_index, actual.record_index);
-        try std.testing.expectEqual(expected.byte_offset, actual.byte_offset);
-        try std.testing.expectEqual(expected.line_in_record, actual.line_in_record);
+        try std.testing.expectEqualStrings("S006", failure.code);
+        try std.testing.expectEqualStrings("quality byte must be ASCII 33 through 126", failure.message);
+        try std.testing.expectEqual(@as(?u64, 1), failure.record_index);
+        try std.testing.expectEqual(@as(?u64, 19), failure.byte_offset);
+        try std.testing.expectEqual(@as(?u3, 4), failure.line_in_record);
     }
 }
 
-test "[integration] - [stats command]: handled failures preserve input order and exit precedence" {
-    const Capture = struct {
-        dir: std.Io.Dir,
-        stdout: std.Io.Writer,
-        stderr: std.Io.Writer,
-        opened: usize = 0,
-        closed: usize = 0,
+/// A standard I/O runtime over the testing runtime, which serves every operation not overridden
+/// here. Paths open relative to `dir`. It counts
+/// opened and closed files, positional writes and streaming reads. Standard output is captured
+/// when `stdout` is set; standard error is captured into `stderr` or discarded. The
+/// `fail_write`th positional write (1-based; 0 never fails) returns `error.NoSpaceLeft`.
+const FakeIo = struct {
+    dir: std.Io.Dir,
+    stdout: ?*std.Io.Writer = null,
+    stderr: ?*std.Io.Writer = null,
+    /// Replaces the first opened path as soon as it opens.
+    replace_first_open: ?FirstOpenReplacement = null,
+    fail_write: usize = 0,
+    /// The nth streaming read (1-based; 0 never fails) returns `error.InputOutput`.
+    fail_read: usize = 0,
+    opened: usize = 0,
+    closed: usize = 0,
+    writes: usize = 0,
+    reads: usize = 0,
+    vtable: @TypeOf(std.Io.failing.vtable.*) = undefined,
 
-        fn openFile(
-            ctx: ?*anyopaque,
-            _: std.Io.Dir,
-            path: []const u8,
-            options: std.Io.Dir.OpenFileOptions,
-        ) std.Io.File.OpenError!std.Io.File {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            const file = try self.dir.openFile(std.testing.io, path, options);
-            self.opened += 1;
-            return file;
-        }
-
-        fn closeFiles(ctx: ?*anyopaque, files: []const std.Io.File) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            for (files) |file| file.close(std.testing.io);
-            self.closed += files.len;
-        }
-
-        fn operate(ctx: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            if (operation == .file_write_streaming) {
-                const write = operation.file_write_streaming;
-                const writer = if (write.file.handle == std.Io.File.stdout().handle)
-                    &self.stdout
-                else if (write.file.handle == std.Io.File.stderr().handle)
-                    &self.stderr
-                else
-                    return std.testing.io.operate(operation);
-                return .{ .file_write_streaming = writer.writeSplatHeader(
-                    write.header,
-                    write.data,
-                    write.splat,
-                ) catch error.NoSpaceLeft };
-            }
-            return std.testing.io.operate(operation);
-        }
+    const FirstOpenReplacement = union(enum) {
+        /// Renames the path aside and writes these bytes under its name.
+        rewrite: []const u8,
+        /// Renames the path aside and hard-links this source under its name.
+        link: []const u8,
     };
 
+    fn io(self: *FakeIo) std.Io {
+        self.vtable = std.testing.io.vtable.*;
+        self.vtable.dirOpenFile = openFile;
+        self.vtable.dirCreateFile = createFile;
+        self.vtable.fileClose = closeFiles;
+        self.vtable.fileReadPositional = readPositional;
+        self.vtable.fileWritePositional = writePositional;
+        self.vtable.operate = operate;
+        return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    fn openFile(
+        ctx: ?*anyopaque,
+        _: std.Io.Dir,
+        path: []const u8,
+        options: std.Io.Dir.OpenFileOptions,
+    ) std.Io.File.OpenError!std.Io.File {
+        const self: *FakeIo = @ptrCast(@alignCast(ctx.?));
+        const file = try self.dir.openFile(std.testing.io, path, options);
+        errdefer file.close(std.testing.io);
+        self.opened += 1;
+        if (self.opened == 1) {
+            if (self.replace_first_open) |replacement| {
+                self.replaceFirstInput(path, replacement) catch return error.Unexpected;
+            }
+        }
+        return file;
+    }
+
+    fn replaceFirstInput(self: *FakeIo, path: []const u8, replacement: FirstOpenReplacement) !void {
+        const io_runtime = std.testing.io;
+        var saved_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const saved = try std.fmt.bufPrint(&saved_buffer, "{s}.saved", .{path});
+        try self.dir.rename(path, self.dir, saved, io_runtime);
+        switch (replacement) {
+            .rewrite => |bytes| try self.dir.writeFile(io_runtime, .{ .sub_path = path, .data = bytes }),
+            .link => |source| try self.dir.hardLink(source, self.dir, path, io_runtime, .{}),
+        }
+    }
+
+    fn createFile(
+        ctx: ?*anyopaque,
+        _: std.Io.Dir,
+        path: []const u8,
+        options: std.Io.Dir.CreateFileOptions,
+    ) std.Io.File.OpenError!std.Io.File {
+        const self: *FakeIo = @ptrCast(@alignCast(ctx.?));
+        return self.dir.createFile(std.testing.io, path, options);
+    }
+
+    fn closeFiles(ctx: ?*anyopaque, files: []const std.Io.File) void {
+        const self: *FakeIo = @ptrCast(@alignCast(ctx.?));
+        for (files) |file| file.close(std.testing.io);
+        self.closed += files.len;
+    }
+
+    fn readPositional(
+        _: ?*anyopaque,
+        file: std.Io.File,
+        data: []const []u8,
+        offset: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        const io_runtime = std.testing.io;
+        return io_runtime.vtable.fileReadPositional(io_runtime.userdata, file, data, offset);
+    }
+
+    fn writePositional(
+        ctx: ?*anyopaque,
+        file: std.Io.File,
+        header: []const u8,
+        data: []const []const u8,
+        splat: usize,
+        offset: u64,
+    ) std.Io.File.WritePositionalError!usize {
+        const self: *FakeIo = @ptrCast(@alignCast(ctx.?));
+        self.writes += 1;
+        if (self.writes == self.fail_write) return error.NoSpaceLeft;
+        const io_runtime = std.testing.io;
+        return io_runtime.vtable.fileWritePositional(io_runtime.userdata, file, header, data, splat, offset);
+    }
+
+    fn operate(ctx: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        const self: *FakeIo = @ptrCast(@alignCast(ctx.?));
+        switch (operation) {
+            .file_read_streaming => {
+                self.reads += 1;
+                if (self.reads == self.fail_read) return .{ .file_read_streaming = error.InputOutput };
+            },
+            .file_write_streaming => |write| {
+                if (write.file.handle == std.Io.File.stdout().handle) {
+                    if (self.stdout) |stdout| return .{ .file_write_streaming = stdout.writeSplatHeader(
+                        write.header,
+                        write.data,
+                        write.splat,
+                    ) catch error.NoSpaceLeft };
+                } else if (write.file.handle == std.Io.File.stderr().handle) {
+                    if (self.stderr) |stderr| return .{ .file_write_streaming = stderr.writeSplatHeader(
+                        write.header,
+                        write.data,
+                        write.splat,
+                    ) catch error.NoSpaceLeft };
+                    var discarded = write.header.len;
+                    for (write.data) |data| discarded += data.len * write.splat;
+                    return .{ .file_write_streaming = discarded };
+                }
+            },
+            else => {},
+        }
+        return std.testing.io.operate(operation);
+    }
+};
+
+test "[failure] - [stats command]: a closed standard output keeps the partial report and the limit status" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4609,101 +4667,40 @@ test "[integration] - [stats command]: handled failures preserve input order and
         "a: 1\nc: 0\ng: 0\nt: 0\nn: 0\nother_bases: 0\ngc_fraction: 0.000000\n" ++
         "quality_sum: 0\nmean_quality: 0.000000\nq20_bases: 0\nq20_fraction: 0.000000\n" ++
         "q30_bases: 0\nq30_fraction: 0.000000\n";
+    // Standard output holds the first report and a partial second one, then fails.
     const partial = block ++ "\ninput: small.fastq\n";
-    const cases = [_]struct {
-        inputs: []const []const u8,
-        stdout: []const u8,
-        stderr: []const u8,
-        status: u8,
-        opened: usize,
-        stdout_capacity: usize = 1024,
-    }{
-        .{
-            .inputs = &.{ "missing.fastq", "small.fastq" },
-            .stdout = block,
-            .stderr = "error: missing.fastq: file not found\n",
-            .status = 3,
-            .opened = 1,
-        },
-        .{
-            .inputs = &.{ "limit.fastq", "missing.fastq", "small.fastq" },
-            .stdout = block,
-            .stderr = "error: limit.fastq: line length limit exceeded\n" ++
-                "error: missing.fastq: file not found\n",
-            .status = 4,
-            .opened = 2,
-        },
-        .{
-            .inputs = &.{ "small.fastq", "missing.fastq", "small.fastq" },
-            .stdout = block ++ "\n" ++ block,
-            .stderr = "error: missing.fastq: file not found\n",
-            .status = 3,
-            .opened = 2,
-        },
-        .{
-            .inputs = &.{ "small.fastq", "limit.fastq", "small.fastq", "small.fastq" },
-            .stdout = partial,
-            .stderr = "error: limit.fastq: line length limit exceeded\n" ++
-                "error: standard output: I/O error\n",
-            .status = 4,
-            .opened = 3,
-            .stdout_capacity = partial.len,
-        },
-    };
-    var vtable = std.Io.failing.vtable.*;
-    vtable.dirOpenFile = Capture.openFile;
-    vtable.fileClose = Capture.closeFiles;
-    vtable.operate = Capture.operate;
-    for (cases) |case| {
-        var stdout_buffer: [1024]u8 = undefined;
-        var stderr_buffer: [256]u8 = undefined;
-        var capture: Capture = .{
-            .dir = tmp.dir,
-            .stdout = .fixed(stdout_buffer[0..case.stdout_capacity]),
-            .stderr = .fixed(&stderr_buffer),
-        };
-        var bounded = std.heap.FixedBufferAllocator.init(storage);
+    var stdout_buffer: [partial.len]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buffer);
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+    var fake: FakeIo = .{ .dir = tmp.dir, .stdout = &stdout, .stderr = &stderr };
+    var bounded = std.heap.FixedBufferAllocator.init(storage);
 
-        const status = runStats(
-            .{ .userdata = &capture, .vtable = &vtable },
-            bounded.allocator(),
-            case.inputs,
-            .{ .max_line_bytes = window + 1 },
-            false,
-        );
+    const inputs = [_][]const u8{ "small.fastq", "limit.fastq", "small.fastq", "small.fastq" };
+    const status = runStats(
+        fake.io(),
+        bounded.allocator(),
+        &inputs,
+        .{ .max_line_bytes = window + 1 },
+        false,
+    );
 
-        try std.testing.expectEqual(case.status, status);
-        try std.testing.expectEqualStrings(case.stdout, capture.stdout.buffered());
-        try std.testing.expectEqualStrings(case.stderr, capture.stderr.buffered());
-        try std.testing.expectEqual(case.opened, capture.opened);
-        try std.testing.expectEqual(capture.opened, capture.closed);
-        try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
-    }
+    try std.testing.expectEqual(@as(u8, 4), status);
+    try std.testing.expectEqualStrings(partial, stdout.buffered());
+    try std.testing.expectEqualStrings(
+        "error: limit.fastq: line length limit exceeded\n" ++
+            "error: standard output: I/O error\n",
+        stderr.buffered(),
+    );
+    try std.testing.expectEqual(@as(usize, 3), fake.opened);
+    try std.testing.expectEqual(fake.opened, fake.closed);
+    try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
 }
 
 fn snapshotTestFile(io: std.Io, path: []const u8) !FileSnapshot {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     return fileSnapshot(file, io);
-}
-
-test "[unit] - [exact sample]: every retained file-change signal is compared" {
-    const baseline = FileSnapshot{
-        .inode = 17,
-        .size = 23,
-        .mtime_nanoseconds = 29,
-    };
-    try std.testing.expect(sameFileSnapshot(baseline, baseline));
-
-    var changed = baseline;
-    changed.inode += 1;
-    try std.testing.expect(!sameFileSnapshot(baseline, changed));
-    changed = baseline;
-    changed.size += 1;
-    try std.testing.expect(!sameFileSnapshot(baseline, changed));
-    changed = baseline;
-    changed.mtime_nanoseconds += 1;
-    try std.testing.expect(!sameFileSnapshot(baseline, changed));
 }
 
 test "[failure] - [exact sample]: selection allocation failure precedes later block format error" {
@@ -4746,6 +4743,8 @@ test "[failure] - [exact sample]: selection allocation failure precedes later bl
 
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqualStrings("out_of_memory", failure.code);
+    try std.testing.expectEqualStrings("out of memory", failure.message);
+    try std.testing.expectEqual(@as(u8, 3), failure.exit_code);
     try std.testing.expectEqual(@as(u64, 2), selector.record_count);
 }
 
@@ -4786,8 +4785,7 @@ test "[failure] - [exact sample]: final record-count change keeps a valid prefix
         },
     )).?;
 
-    try std.testing.expectEqualStrings("input_changed", failure.code);
-    try std.testing.expectEqual(@as(u8, 3), failure.exit_code);
+    try expectInputChanged(failure);
     try std.testing.expectEqualStrings("@one\nA\n+\n!\n", sink.written());
 }
 
@@ -4820,8 +4818,7 @@ test "[failure] - [exact sample]: changed metadata stops the second pass before 
         },
     )).?;
 
-    try std.testing.expectEqualStrings("input_changed", failure.code);
-    try std.testing.expectEqual(@as(u8, 3), failure.exit_code);
+    try expectInputChanged(failure);
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
 }
 
@@ -4863,9 +4860,47 @@ test "[failure] - [exact sample]: a FIFO replacement reports input changed on re
             return error.ExpectedFailure;
         },
     };
-    try std.testing.expectEqualStrings("input_changed", failure.code);
-    try std.testing.expectEqual(@as(u8, 3), failure.exit_code);
+    try expectInputChanged(failure);
 }
+
+test "[failure] - [exact sample]: a failed read in the first pass reports io error before any selection" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "records.fastq", .data = "@one\nA\n+\n!\n" });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, "records.fastq" });
+    var fake: FakeIo = .{ .dir = std.Io.Dir.cwd(), .fail_read = 1 };
+    var record_input: RecordInput = undefined;
+    var selector = sampling.ExactSelector.init(1, 11);
+    defer selector.deinit(std.testing.allocator);
+
+    const failure = switch (sampleExactFirstPass(
+        fake.io(),
+        std.testing.allocator,
+        &record_input,
+        path,
+        &selector,
+        .{
+            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+            .alphabet = .iupac,
+            .fraction = null,
+            .count = 1,
+            .seed = 11,
+        },
+    )) {
+        .success => return error.ExpectedFailure,
+        .failure => |failure| failure,
+    };
+    try std.testing.expectEqualStrings("io_error", failure.code);
+    try std.testing.expectEqualStrings("I/O error", failure.message);
+    try std.testing.expectEqual(@as(u8, 3), failure.exit_code);
+    try std.testing.expectEqual(@as(u64, 0), selector.record_count);
+}
+
+/// The gzip magic, deflate method, no flags, a zero modification time and extra flags, unknown
+/// operating system, then the final stored block's header byte (BFINAL set, BTYPE 00).
+const gzip_stored_member_header = [_]u8{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255, 1 };
 
 fn writeExactTestInput(
     io: std.Io,
@@ -4880,7 +4915,8 @@ fn writeExactTestInput(
     var output = file.writer(io, &buffer);
     if (gzip) {
         const len = std.math.cast(u16, bytes.len) orelse return error.TestFixtureTooLarge;
-        try output.interface.writeAll(&.{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255, 1 });
+        try output.interface.writeAll(&gzip_stored_member_header);
+        // A stored block stores LEN and its one's complement NLEN before its bytes.
         try output.interface.writeInt(u16, len, .little);
         try output.interface.writeInt(u16, ~len, .little);
         try output.interface.writeAll(bytes);
@@ -4975,9 +5011,7 @@ test "[integration] - [exact sample]: selected records are revalidated after met
                 );
                 if (selection != .unselected and case.valid_output == null) {
                     try std.testing.expect(failure != null);
-                    try std.testing.expectEqualStrings("input_changed", failure.?.code);
-                    try std.testing.expectEqualStrings("input changed during exact sampling", failure.?.message);
-                    try std.testing.expectEqual(@as(u8, 3), failure.?.exit_code);
+                    try expectInputChanged(failure.?);
                 } else {
                     try std.testing.expect(failure == null);
                 }
@@ -5157,6 +5191,8 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
     const path = try testTempPath(allocator, &tmp.sub_path, "pairs");
     defer allocator.free(path);
     const small_prefix = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n";
+    // The first pair starts this many bytes before the reader buffer ends, so its mate one crosses the refill.
+    const refill_margin = 300;
     const options = SampleOptions{
         .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
         .alphabet = .iupac,
@@ -5166,36 +5202,37 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
         .pair_mode = .interleaved,
     };
     const staging_limit = recordStagingLimit(options.max_line_bytes);
-    const Change = enum { valid, alphabet1, quality1, alphabet2, quality2, name, structure, write };
-    for ([_]InterleavedFirstRecordStorage{ .reader, .staged, .retained }) |storage| {
+    // The name change lands inside the 192-byte identifier that both mates share.
+    const header_len = 192;
+    const name_change_offset = 180;
+    const Change = enum { valid, alphabet2, name, structure, write };
+    for ([_]InterleavedFirstRecordStorage{ .reader, .retained }) |storage| {
         var input: std.ArrayList(u8) = .empty;
         defer input.deinit(allocator);
         if (storage == .reader) {
             // Put the selected pair across the transport refill while both mates stay small.
             try input.appendSlice(allocator, "@a/1 ");
-            try input.appendNTimes(allocator, 'x', zfastq.limits.DEFAULT_READER_BUFFER_BYTES - 300 - small_prefix.len - 1);
+            try input.appendNTimes(allocator, 'x', zfastq.limits.DEFAULT_READER_BUFFER_BYTES - refill_margin - small_prefix.len - 1);
             try input.appendSlice(allocator, small_prefix[4..]);
         } else try input.appendSlice(allocator, small_prefix);
         const prefix_len = input.items.len;
         var header_starts: [2]usize = undefined;
         var sequence_starts: [2]usize = undefined;
         var plus_starts: [2]usize = undefined;
-        var quality_starts: [2]usize = undefined;
         for (0..2) |mate| {
-            const field_len: usize = if (storage == .retained or (storage == .staged and mate == 1))
+            const field_len: usize = if (storage == .retained)
                 zfastq.limits.DEFAULT_READER_BUFFER_BYTES
             else
                 8;
             try input.append(allocator, '@');
             header_starts[mate] = input.items.len;
-            try input.appendNTimes(allocator, 'b', 192);
+            try input.appendNTimes(allocator, 'b', header_len);
             try input.appendSlice(allocator, if (mate == 0) "/1\n" else "/2\n");
             sequence_starts[mate] = input.items.len;
             try input.appendNTimes(allocator, if (mate == 0) 'A' else 'T', field_len);
             try input.append(allocator, '\n');
             plus_starts[mate] = input.items.len;
             try input.appendSlice(allocator, "+\n");
-            quality_starts[mate] = input.items.len;
             try input.appendNTimes(allocator, '!', field_len);
             try input.append(allocator, '\n');
         }
@@ -5256,11 +5293,8 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
                 @memcpy(changed, input.items);
                 switch (change) {
                     .valid, .write => {},
-                    .alphabet1 => changed[sequence_starts[0]] = '.',
-                    .quality1 => changed[quality_starts[0]] = ' ',
                     .alphabet2 => changed[sequence_starts[1]] = '.',
-                    .quality2 => changed[quality_starts[1]] = 0x7f,
-                    .name => changed[header_starts[1] + 180] = 'c',
+                    .name => changed[header_starts[1] + name_change_offset] = 'c',
                     .structure => {
                         changed[sequence_starts[0]] = '.';
                         changed[plus_starts[1]] = 'x';
@@ -5312,6 +5346,10 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
 }
 
 test "[integration] - [interleaved exact sample]: preserves the first mate parse failure" {
+    // Every line of this input fits; only the changed plus line fails the second pass.
+    const small_line_limit = 64;
+    // The byte offset the diagnostic reports for the malformed plus line in `changed`.
+    const plus_line_offset: u64 = 40;
     var record_inputs: [2]RecordInput = undefined;
     const SnapshotChangingSink = struct {
         inner: io_layer.SliceSink,
@@ -5343,7 +5381,7 @@ test "[integration] - [interleaved exact sample]: preserves the first mate parse
     const original = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n@b/1\nA\n+\n!\n@b/2\nT\n+\n#\n";
     const changed = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n@b/1\nA\n+\n!\n@b/2\nT\nx\n#\n";
     const options = SampleOptions{
-        .max_line_bytes = 64,
+        .max_line_bytes = small_line_limit,
         .alphabet = .iupac,
         .fraction = null,
         .count = 2,
@@ -5361,7 +5399,7 @@ test "[integration] - [interleaved exact sample]: preserves the first mate parse
             var sink = SnapshotChangingSink{
                 .inner = io_layer.SliceSink.init(&output),
                 .path = path,
-                .mtime = if (case == .metadata_changed) snapshot.mtime_nanoseconds + 1_000_000_000 else null,
+                .mtime = if (case == .metadata_changed) snapshot.mtime_nanoseconds + std.time.ns_per_s else null,
             };
             var writer = zfastq.Writer.init(.{
                 .ctx = &sink,
@@ -5378,7 +5416,7 @@ test "[integration] - [interleaved exact sample]: preserves the first mate parse
                 if (select_all) .empty else .{ .low_words = &.{2}, .middle_bytes = &.{0} },
                 snapshot,
                 2,
-                260,
+                recordStagingLimit(options.max_line_bytes),
                 options,
             )).?;
             try std.testing.expect(failure == .command);
@@ -5386,8 +5424,7 @@ test "[integration] - [interleaved exact sample]: preserves the first mate parse
             const details = failure.command.details;
             if (case == .metadata_changed) {
                 try std.testing.expect(sink.changed);
-                try std.testing.expectEqualStrings("input_changed", details.code);
-                try std.testing.expectEqual(@as(u8, 3), details.exit_code);
+                try expectInputChanged(details);
                 try std.testing.expect(details.record_index == null);
                 try std.testing.expect(details.line_in_record == null);
                 try std.testing.expect(details.byte_offset == null);
@@ -5397,7 +5434,7 @@ test "[integration] - [interleaved exact sample]: preserves the first mate parse
                 try std.testing.expectEqual(@as(u8, 1), details.exit_code);
                 try std.testing.expectEqual(@as(?u64, 3), details.record_index);
                 try std.testing.expectEqual(@as(?u3, 3), details.line_in_record);
-                try std.testing.expectEqual(@as(?u64, 40), details.byte_offset);
+                try std.testing.expectEqual(@as(?u64, plus_line_offset), details.byte_offset);
             }
             try std.testing.expectEqualStrings(if (select_all) original[0..22] else "", sink.inner.written());
         }
@@ -5454,12 +5491,9 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
             1,
             options,
         )).?;
-        const command = switch (failure) {
-            .command => |command| command,
-            .pair => return error.ExpectedCommandFailure,
-        };
+        const command = try commandFailure(failure);
         try std.testing.expectEqual(@as(u1, @intCast(changed_input)), command.input_index);
-        try std.testing.expectEqualStrings("input_changed", command.details.code);
+        try expectInputChanged(command.details);
         try std.testing.expectEqual(@as(usize, 0), sink.written().len);
     }
 
@@ -5488,11 +5522,8 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
             .pair_mode = .interleaved,
         },
     )).?;
-    const command = switch (failure) {
-        .command => |command| command,
-        .pair => return error.ExpectedCommandFailure,
-    };
-    try std.testing.expectEqualStrings("input_changed", command.details.code);
+    const command = try commandFailure(failure);
+    try expectInputChanged(command.details);
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
 }
 
@@ -5538,10 +5569,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         2,
         paired_options,
     )).?;
-    const count_command = switch (count_failure) {
-        .command => |command| command,
-        .pair => return error.ExpectedCommandFailure,
-    };
+    const count_command = try commandFailure(count_failure);
     try std.testing.expectEqualStrings("input_changed", count_command.details.code);
     try std.testing.expectEqualStrings(first_pair, paired_sink.written());
 
@@ -5573,11 +5601,8 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
             .pair_mode = .interleaved,
         },
     )).?;
-    const odd_command = switch (odd_failure) {
-        .command => |command| command,
-        .pair => return error.ExpectedCommandFailure,
-    };
-    try std.testing.expectEqualStrings("input_changed", odd_command.details.code);
+    const odd_command = try commandFailure(odd_failure);
+    try expectInputChanged(odd_command.details);
     try std.testing.expectEqualStrings(first_pair, interleaved_sink.written());
 
     const structural_r1 = "@bad/1\nA\n+\n!\n";
@@ -5601,40 +5626,40 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         1,
         paired_options,
     )).?;
-    const structural_command = switch (structural_failure) {
-        .command => |command| command,
-        .pair => return error.ExpectedCommandFailure,
-    };
+    const structural_command = try commandFailure(structural_failure);
     try std.testing.expectEqual(@as(u1, 1), structural_command.input_index);
     try std.testing.expectEqualStrings("S001", structural_command.details.code);
+    try std.testing.expectEqual(@as(u8, 1), structural_command.details.exit_code);
     try std.testing.expectEqual(@as(usize, 0), structural_sink.written().len);
 }
 
-test "[property] - [paired identifiers]: storage reuses its largest allocation and releases failures" {
-    const bytes = try std.testing.allocator.alloc(u8, 256 * 1024 + 1);
-    defer std.testing.allocator.free(bytes);
-    @memset(bytes, 'r');
-    bytes[bytes.len - 1] = 'z';
-    const Exercise = struct {
-        fn run(allocator: std.mem.Allocator, name: []const u8) !void {
-            var tracking = std.testing.FailingAllocator.init(allocator, .{});
-            {
-                var storage: std.ArrayList(u8) = .empty;
-                defer storage.deinit(tracking.allocator());
-                try storeNormalizedId(tracking.allocator(), &storage, name[0..3]);
-                try storeNormalizedId(tracking.allocator(), &storage, name);
-                const allocated = tracking.allocated_bytes;
-                for ([_]usize{ 7, name.len, 0, name.len }) |len| {
-                    try storeNormalizedId(tracking.allocator(), &storage, name[0..len]);
-                    try std.testing.expectEqualStrings(name[0..len], storage.items);
-                    try std.testing.expectEqual(name.len, storage.capacity);
-                    try std.testing.expectEqual(allocated, tracking.allocated_bytes);
-                }
-            }
-            try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+test "[unit] - [paired identifiers]: storage reuses its largest allocation" {
+    // One byte past the reader buffer, so the first long store must grow the storage.
+    const name = try std.testing.allocator.alloc(u8, zfastq.limits.DEFAULT_READER_BUFFER_BYTES + 1);
+    defer std.testing.allocator.free(name);
+    @memset(name, 'r');
+    name[name.len - 1] = 'z';
+    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    {
+        var storage: std.ArrayList(u8) = .empty;
+        defer storage.deinit(tracking.allocator());
+        try storeNormalizedId(tracking.allocator(), &storage, name[0..3]);
+        try storeNormalizedId(tracking.allocator(), &storage, name);
+        const allocated = tracking.allocated_bytes;
+        for ([_]usize{ 7, name.len, 0, name.len }) |len| {
+            try storeNormalizedId(tracking.allocator(), &storage, name[0..len]);
+            try std.testing.expectEqualStrings(name[0..len], storage.items);
+            try std.testing.expectEqual(allocated, tracking.allocated_bytes);
         }
-    };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{bytes});
+    }
+    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+
+    // The second allocation grows the storage for the long name; failing it reports out of memory.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var storage: std.ArrayList(u8) = .empty;
+    defer storage.deinit(failing.allocator());
+    try storeNormalizedId(failing.allocator(), &storage, name[0..3]);
+    try std.testing.expectError(error.OutOfMemory, storeNormalizedId(failing.allocator(), &storage, name));
 }
 
 fn exerciseExactAllocations(allocator: std.mem.Allocator) !void {
@@ -5644,6 +5669,27 @@ fn exerciseExactAllocations(allocator: std.mem.Allocator) !void {
         "@a/1\nA\n+\n!\n@a/2\nT\n+\n!\n" ++
         "@b/1\nC\n+\n#\n@b/2\nG\n+\n#\n" ++
         "@c/1\nG\n+\n$\n@c/2\nC\n+\n$\n";
+    // Outputs for exact counts 0 to 4 with seed 11, pinned from the three inputs above.
+    const record_a1 = "@a/1\nA\n+\n!\n";
+    const record_b1 = "@b/1\nC\n+\n#\n";
+    const record_c1 = "@c/1\nG\n+\n$\n";
+    const pair_a = "@a/1\nA\n+\n!\n@a/2\nT\n+\n!\n";
+    const pair_b = "@b/1\nC\n+\n#\n@b/2\nG\n+\n#\n";
+    const pair_c = "@c/1\nG\n+\n$\n@c/2\nC\n+\n$\n";
+    const none_outputs = [_][]const u8{
+        "",
+        record_a1,
+        record_a1 ++ record_c1,
+        record_a1 ++ record_b1 ++ record_c1,
+        record_a1 ++ record_b1 ++ record_c1,
+    };
+    const pair_outputs = [_][]const u8{
+        "",
+        pair_a,
+        pair_a ++ pair_c,
+        pair_a ++ pair_b ++ pair_c,
+        pair_a ++ pair_b ++ pair_c,
+    };
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5684,9 +5730,11 @@ fn exerciseExactAllocations(allocator: std.mem.Allocator) !void {
                 }
             }
             try std.testing.expectEqual(descriptors, try openDescriptorCount());
-            const copies: usize = if (mode == .none) 1 else 2;
-            try std.testing.expectEqual(@as(usize, @intCast(@min(count, 3))) * copies * (r1.len / 3), sink.written().len);
-            if (count >= 3) try std.testing.expectEqualStrings(if (mode == .none) r1 else interleaved, sink.written());
+            const expected = switch (mode) {
+                .none => none_outputs[@intCast(count)],
+                .paired, .interleaved => pair_outputs[@intCast(count)],
+            };
+            try std.testing.expectEqualStrings(expected, sink.written());
         }
     }
 }
@@ -5702,43 +5750,6 @@ fn openDescriptorCount() !usize {
 }
 
 test "[integration] - [paired inputs]: identity follows open descriptors after path replacement" {
-    const Capture = struct {
-        dir: std.Io.Dir,
-        aliases: bool,
-        opened: usize = 0,
-        closed: usize = 0,
-        early_reads: usize = 0,
-
-        fn openFile(ctx: ?*anyopaque, _: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            const io = std.testing.io;
-            const file = try std.Io.Dir.cwd().openFile(io, path, options);
-            errdefer file.close(io);
-            self.opened += 1;
-            if (self.opened == 1) {
-                self.dir.rename("r1", self.dir, "saved", io) catch return error.Unexpected;
-                if (self.aliases) {
-                    self.dir.writeFile(io, .{ .sub_path = "r1", .data = "replacement" }) catch return error.Unexpected;
-                } else {
-                    self.dir.hardLink("r2", self.dir, "r1", io, .{}) catch return error.Unexpected;
-                }
-            }
-            return file;
-        }
-
-        fn closeFiles(ctx: ?*anyopaque, files: []const std.Io.File) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            for (files) |file| file.close(std.testing.io);
-            self.closed += files.len;
-        }
-
-        fn operate(ctx: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            if (operation == .file_read_streaming and self.aliases) self.early_reads += 1;
-            return std.testing.io.operate(operation);
-        }
-    };
-
     const r1 = "@same\nA\n+\n!\n";
     const r2 = "@same\nT\n+\n#\n";
     for ([_]bool{ false, true }) |aliases| {
@@ -5750,22 +5761,22 @@ test "[integration] - [paired inputs]: identity follows open descriptors after p
         } else {
             try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "r2", .data = r2 });
         }
-        var capture: Capture = .{ .dir = tmp.dir, .aliases = aliases };
-        var vtable = std.Io.failing.vtable.*;
-        vtable.dirOpenFile = Capture.openFile;
-        vtable.fileClose = Capture.closeFiles;
-        vtable.operate = Capture.operate;
-        var output: [128]u8 = undefined;
-        var sink = io_layer.SliceSink.init(&output);
-        var writer = zfastq.Writer.init(sink.byteSink());
-        const descriptors = try openDescriptorCount();
         const r1_path = try testTempPath(std.testing.allocator, &tmp.sub_path, "r1");
         defer std.testing.allocator.free(r1_path);
         const r2_path = try testTempPath(std.testing.allocator, &tmp.sub_path, "r2");
         defer std.testing.allocator.free(r2_path);
+        // The first open replaces the path it opened; the aliased pair must be refused before any read.
+        var fake: FakeIo = .{
+            .dir = std.Io.Dir.cwd(),
+            .replace_first_open = if (aliases) .{ .rewrite = "replacement" } else .{ .link = r2_path },
+        };
+        var output: [128]u8 = undefined;
+        var sink = io_layer.SliceSink.init(&output);
+        var writer = zfastq.Writer.init(sink.byteSink());
+        const descriptors = try openDescriptorCount();
 
         const failure = try interleaveInputs(
-            .{ .userdata = &capture, .vtable = &vtable },
+            fake.io(),
             std.testing.allocator,
             &.{ r1_path, r2_path },
             &writer,
@@ -5776,13 +5787,13 @@ test "[integration] - [paired inputs]: identity follows open descriptors after p
         if (aliases) {
             try std.testing.expectEqual(@as(u8, 2), failure.?.exitCode());
             try std.testing.expectEqualStrings("same_input", failure.?.command.details.code);
+            try std.testing.expectEqual(@as(usize, 0), fake.reads);
         } else {
             try std.testing.expect(failure == null);
         }
         try std.testing.expectEqualStrings(if (aliases) "" else r1 ++ r2, sink.written());
-        try std.testing.expectEqual(@as(usize, 0), capture.early_reads);
-        try std.testing.expectEqual(@as(usize, 1), capture.opened);
-        try std.testing.expectEqual(@as(usize, 2), capture.closed);
+        try std.testing.expectEqual(@as(usize, 1), fake.opened);
+        try std.testing.expectEqual(@as(usize, 2), fake.closed);
         try std.testing.expectEqual(descriptors, try openDescriptorCount());
     }
 }
@@ -5808,106 +5819,88 @@ test "[integration] - [output aliases]: rejection closes inputs on both exact pa
         identities[index] = try fileIdentity(io, file);
     }
     const descriptors = try openDescriptorCount();
-    for (0..8) |_| {
-        var input1: RecordInput = undefined;
-        var input2: RecordInput = undefined;
-        const stream_failure = initRecordInput(&input1, io, paths[0], identities[0]).?;
-        try std.testing.expectEqualStrings("same_output", stream_failure.code);
+    var input1: RecordInput = undefined;
+    var input2: RecordInput = undefined;
+    const stream_failure = initRecordInput(&input1, io, paths[0], identities[0]).?;
+    try std.testing.expectEqualStrings("same_output", stream_failure.code);
+    try std.testing.expectEqual(descriptors, try openDescriptorCount());
+    for ([_]?FileSnapshot{ null, snapshots[0] }) |snapshot| {
+        const failure = initExactInput(&input1, io, paths[0], snapshot, identities[0]).failure;
+        try std.testing.expectEqualStrings(if (snapshot == null) "same_output" else "input_changed", failure.code);
         try std.testing.expectEqual(descriptors, try openDescriptorCount());
-        for ([_]?FileSnapshot{ null, snapshots[0] }) |snapshot| {
-            const failure = initExactInput(&input1, io, paths[0], snapshot, identities[0]).failure;
-            try std.testing.expectEqualStrings(if (snapshot == null) "same_output" else "input_changed", failure.code);
-            try std.testing.expectEqual(descriptors, try openDescriptorCount());
-        }
-
-        var output: [128]u8 = undefined;
-        var sink = io_layer.SliceSink.init(&output);
-        var writer = zfastq.Writer.init(sink.byteSink());
-        var options: SampleOptions = .{
-            .max_line_bytes = 8192,
-            .alphabet = .iupac,
-            .fraction = null,
-            .count = 1,
-            .seed = 11,
-            .output_identity = identities[0],
-        };
-        const single_failure = (try sampleExactSecondPass(
-            true,
-            io,
-            allocator,
-            &record_inputs[0],
-            paths[0],
-            &writer,
-            .empty,
-            snapshots[0],
-            1,
-            options,
-        )).?;
-        try std.testing.expectEqualStrings("input_changed", single_failure.code);
-        try std.testing.expectEqual(@as(u8, 3), single_failure.exit_code);
-        const interleaved_failure = (try sampleExactInterleavedSecondPass(
-            true,
-            io,
-            allocator,
-            &record_inputs[0],
-            paths[0],
-            &writer,
-            .empty,
-            snapshots[0],
-            1,
-            recordStagingLimit(options.max_line_bytes),
-            options,
-        )).?;
-        try std.testing.expectEqualStrings("input_changed", interleaved_failure.command.details.code);
-        try std.testing.expectEqual(@as(u8, 3), interleaved_failure.exitCode());
-        try std.testing.expectEqual(descriptors, try openDescriptorCount());
-        for (identities, 0..) |identity, side| {
-            options.output_identity = identity;
-            const paired_stream = initPairedRecordInputs(&input1, &input2, io, &paths, identity).?;
-            try std.testing.expectEqualStrings("same_output", paired_stream.command.details.code);
-            try std.testing.expectEqual(@as(u1, @intCast(side)), paired_stream.command.input_index);
-            try std.testing.expectEqual(descriptors, try openDescriptorCount());
-            const paired_failure = (try sampleExactPairedSecondPass(
-                true,
-                io,
-                allocator,
-                &record_inputs,
-                &paths,
-                &writer,
-                .empty,
-                snapshots,
-                1,
-                options,
-            )).?;
-            try std.testing.expectEqualStrings("input_changed", paired_failure.command.details.code);
-            try std.testing.expectEqual(@as(u8, 3), paired_failure.exitCode());
-            try std.testing.expectEqual(@as(u1, @intCast(side)), paired_failure.command.input_index);
-            try std.testing.expectEqual(descriptors, try openDescriptorCount());
-        }
-        try writer.flush();
-        try std.testing.expectEqual(@as(usize, 0), sink.written().len);
     }
+
+    var output: [128]u8 = undefined;
+    var sink = io_layer.SliceSink.init(&output);
+    var writer = zfastq.Writer.init(sink.byteSink());
+    var options: SampleOptions = .{
+        .max_line_bytes = 8192,
+        .alphabet = .iupac,
+        .fraction = null,
+        .count = 1,
+        .seed = 11,
+        .output_identity = identities[0],
+    };
+    const single_failure = (try sampleExactSecondPass(
+        true,
+        io,
+        allocator,
+        &record_inputs[0],
+        paths[0],
+        &writer,
+        .empty,
+        snapshots[0],
+        1,
+        options,
+    )).?;
+    try expectInputChanged(single_failure);
+    const interleaved_failure = (try sampleExactInterleavedSecondPass(
+        true,
+        io,
+        allocator,
+        &record_inputs[0],
+        paths[0],
+        &writer,
+        .empty,
+        snapshots[0],
+        1,
+        recordStagingLimit(options.max_line_bytes),
+        options,
+    )).?;
+    try std.testing.expectEqualStrings("input_changed", interleaved_failure.command.details.code);
+    try std.testing.expectEqual(@as(u8, 3), interleaved_failure.exitCode());
+    try std.testing.expectEqual(descriptors, try openDescriptorCount());
+    for (identities, 0..) |identity, side| {
+        options.output_identity = identity;
+        const paired_stream = initPairedRecordInputs(&input1, &input2, io, &paths, identity).?;
+        try std.testing.expectEqualStrings("same_output", paired_stream.command.details.code);
+        try std.testing.expectEqual(@as(u1, @intCast(side)), paired_stream.command.input_index);
+        try std.testing.expectEqual(descriptors, try openDescriptorCount());
+        const paired_failure = (try sampleExactPairedSecondPass(
+            true,
+            io,
+            allocator,
+            &record_inputs,
+            &paths,
+            &writer,
+            .empty,
+            snapshots,
+            1,
+            options,
+        )).?;
+        try std.testing.expectEqualStrings("input_changed", paired_failure.command.details.code);
+        try std.testing.expectEqual(@as(u8, 3), paired_failure.exitCode());
+        try std.testing.expectEqual(@as(u1, @intCast(side)), paired_failure.command.input_index);
+        try std.testing.expectEqual(descriptors, try openDescriptorCount());
+    }
+    try writer.flush();
+    try std.testing.expectEqual(@as(usize, 0), sink.written().len);
 }
 
-test "[integration] - [input resources]: repeated failures close owned files and preserve borrowed files" {
-    const QuietStderr = struct {
-        fn operate(_: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
-            if (operation == .file_write_streaming) {
-                const write = operation.file_write_streaming;
-                if (write.file.handle == std.Io.File.stderr().handle) {
-                    var discarded = write.header.len;
-                    for (write.data) |data| discarded += data.len * write.splat;
-                    return .{ .file_write_streaming = discarded };
-                }
-            }
-            return std.testing.io.operate(operation);
-        }
-    };
-
+test "[failure] - [input resources]: failed opens close owned files and keep borrowed files open" {
     const io = std.testing.io;
-    var quiet_vtable = io.vtable.*;
-    quiet_vtable.operate = QuietStderr.operate;
-    const quiet_io = std.Io{ .userdata = io.userdata, .vtable = &quiet_vtable };
+    // Standard error is discarded, and the outputs open relative to the working directory like the other paths.
+    var quiet: FakeIo = .{ .dir = std.Io.Dir.cwd() };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "r1", .data = "@a/1\nA\n+\n!\n" });
@@ -5926,88 +5919,85 @@ test "[integration] - [input resources]: repeated failures close owned files and
     changed.size += 1;
 
     const descriptors = try openDescriptorCount();
-    for (0..8) |_| {
-        var input: RecordInput = undefined;
-        try std.testing.expect(initRecordInput(&input, io, path, null) == null);
-        input.deinit(io);
-        try std.testing.expectEqualStrings("io_error", initRecordInput(&input, io, directory, null).?.code);
-        try std.testing.expectEqualStrings("usage", initExactInput(&input, io, directory, null, null).failure.code);
-        try std.testing.expectEqualStrings("input_changed", initExactInput(&input, io, path, changed, null).failure.code);
-        try std.testing.expectEqualStrings("input_changed", initExactInput(&input, io, missing, changed, null).failure.code);
-        try std.testing.expectEqual(descriptors, try openDescriptorCount());
+    var input: RecordInput = undefined;
+    try std.testing.expect(initRecordInput(&input, io, path, null) == null);
+    input.deinit(io);
+    const directory_failure = initRecordInput(&input, io, directory, null).?;
+    try std.testing.expectEqualStrings("io_error", directory_failure.code);
+    try std.testing.expectEqualStrings("input is a directory", directory_failure.message);
+    const usage_failure = initExactInput(&input, io, directory, null, null).failure;
+    try std.testing.expectEqualStrings("usage", usage_failure.code);
+    try std.testing.expectEqualStrings("exact-count sampling requires a regular file", usage_failure.message);
+    const changed_failure = initExactInput(&input, io, path, changed, null).failure;
+    try expectInputChanged(changed_failure);
+    const missing_failure = initExactInput(&input, io, missing, changed, null).failure;
+    try expectInputChanged(missing_failure);
+    try std.testing.expectEqual(descriptors, try openDescriptorCount());
 
-        const pairs = [_][2][]const u8{
-            .{ path, path },
-            .{ path, missing },
-            .{ missing, path },
-            .{ directory, path },
-            .{ path, directory },
-        };
-        for (pairs, 0..) |paths, index| {
-            var input1: RecordInput = undefined;
-            var input2: RecordInput = undefined;
-            const expected = if (index == 0) "same_input" else "io_error";
-            const stream_failure = initPairedRecordInputs(&input1, &input2, io, &paths, null).?;
-            try std.testing.expectEqualStrings(expected, stream_failure.command.details.code);
-            try std.testing.expectEqual(descriptors, try openDescriptorCount());
-            // Exact-count sampling rejects a directory as an invalid request.
-            const exact_expected = if (index >= 3) "usage" else expected;
-            const exact_failure = initExactPairedInputs(&input1, &input2, io, &paths, null, null).failure;
-            try std.testing.expectEqualStrings(exact_expected, exact_failure.command.details.code);
-            try std.testing.expectEqual(descriptors, try openDescriptorCount());
-        }
-
-        {
-            const borrowed = try tmp.dir.openFile(io, "r1", .{});
-            defer borrowed.close(io);
-            try input.init(io, borrowed, false);
-            input.deinit(io);
-            try std.testing.expectEqual(@as(u64, "@a/1\nA\n+\n!\n".len), (try borrowed.stat(io)).size);
-            const invalid: std.Io.File = .{ .handle = -1, .flags = .{ .nonblocking = false } };
-            for ([_][2]std.Io.File{ .{ invalid, borrowed }, .{ borrowed, invalid } }, 0..) |files, side| {
-                const failure = pairedFilesFailure(io, files[0], files[1], null).?;
-                try std.testing.expectEqual(@as(u8, 3), failure.exitCode());
-                try std.testing.expectEqual(@as(u1, @intCast(side)), failure.command.input_index);
-                try std.testing.expectEqualStrings("failed to inspect file", failure.command.details.message);
-            }
-        }
-        var output: [64]u8 = undefined;
-        var sink = io_layer.SliceSink.init(&output);
-        var writer = zfastq.Writer.init(sink.byteSink());
-        const inputs = [_][]const u8{ path, missing };
-        const failure = (try interleaveInputs(io, std.testing.allocator, &inputs, &writer, .{
-            .max_line_bytes = 8192,
-            .alphabet = .iupac,
-            .pair_name_policy = .illumina,
-        })).?;
-        try std.testing.expectEqual(@as(u1, 1), failure.command.input_index);
-        try std.testing.expectEqualStrings("io_error", failure.command.details.code);
-        try std.testing.expectEqual(@as(usize, 0), sink.written().len);
-        try std.testing.expectEqual(@as(u8, 3), runDeinterleave(quiet_io, std.testing.allocator, &.{path}, output_path, path, .{
-            .max_line_bytes = 8192,
-            .alphabet = .iupac,
-            .pair_name_policy = .illumina,
-        }));
+    const pairs = [_][2][]const u8{
+        .{ path, path },
+        .{ path, missing },
+        .{ missing, path },
+        .{ directory, path },
+        .{ path, directory },
+    };
+    for (pairs, 0..) |paths, index| {
+        var input1: RecordInput = undefined;
+        var input2: RecordInput = undefined;
+        const expected = if (index == 0) "same_input" else "io_error";
+        const stream_failure = initPairedRecordInputs(&input1, &input2, io, &paths, null).?;
+        try std.testing.expectEqualStrings(expected, stream_failure.command.details.code);
         try std.testing.expectEqual(descriptors, try openDescriptorCount());
-        // Output 2 already existed, so the output 1 it created is gone again.
-        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "out1", .{}));
+        // Exact-count sampling rejects a directory as an invalid request.
+        const exact_expected = if (index >= 3) "usage" else expected;
+        const exact_failure = initExactPairedInputs(&input1, &input2, io, &paths, null, null).failure;
+        try std.testing.expectEqualStrings(exact_expected, exact_failure.command.details.code);
+        try std.testing.expectEqual(descriptors, try openDescriptorCount());
     }
+
+    {
+        const borrowed = try tmp.dir.openFile(io, "r1", .{});
+        defer borrowed.close(io);
+        try input.init(io, borrowed, false);
+        input.deinit(io);
+        try std.testing.expectEqual(@as(u64, "@a/1\nA\n+\n!\n".len), (try borrowed.stat(io)).size);
+    }
+    var output: [64]u8 = undefined;
+    var sink = io_layer.SliceSink.init(&output);
+    var writer = zfastq.Writer.init(sink.byteSink());
+    const inputs = [_][]const u8{ path, missing };
+    const failure = (try interleaveInputs(io, std.testing.allocator, &inputs, &writer, .{
+        .max_line_bytes = 8192,
+        .alphabet = .iupac,
+        .pair_name_policy = .illumina,
+    })).?;
+    try std.testing.expectEqual(@as(u1, 1), failure.command.input_index);
+    try std.testing.expectEqualStrings("io_error", failure.command.details.code);
+    try std.testing.expectEqual(@as(usize, 0), sink.written().len);
+    try std.testing.expectEqual(@as(u8, 3), runDeinterleave(quiet.io(), std.testing.allocator, &.{path}, output_path, path, .{
+        .max_line_bytes = 8192,
+        .alphabet = .iupac,
+        .pair_name_policy = .illumina,
+    }));
+    try std.testing.expectEqual(descriptors, try openDescriptorCount());
+    // Output 2 already existed, so the output 1 it created is gone again.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "out1", .{}));
 }
 
-test "[regression] - [input resources]: plain input leaves the gzip decoder field unwritten" {
+test "[failure] - [paired inputs]: an unusable file handle is reported at its input index" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "plain.fastq", .data = "@r\nA\n+\n!\n" });
-    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, "plain.fastq" });
-    var input: RecordInput = undefined;
-    const gzip_bytes = std.mem.asBytes(&input.gzip);
-    @memset(gzip_bytes, 0x5a);
-
-    try std.testing.expect(initRecordInput(&input, io, path, null) == null);
-    defer input.deinit(io);
-    try std.testing.expect(std.mem.allEqual(u8, gzip_bytes, 0x5a));
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1", .data = "@a/1\nA\n+\n!\n" });
+    const borrowed = try tmp.dir.openFile(io, "r1", .{});
+    defer borrowed.close(io);
+    const invalid: std.Io.File = .{ .handle = -1, .flags = .{ .nonblocking = false } };
+    for ([_][2]std.Io.File{ .{ invalid, borrowed }, .{ borrowed, invalid } }, 0..) |files, side| {
+        const failure = pairedFilesFailure(io, files[0], files[1], null).?;
+        try std.testing.expectEqual(@as(u8, 3), failure.exitCode());
+        try std.testing.expectEqual(@as(u1, @intCast(side)), failure.command.input_index);
+        try std.testing.expectEqualStrings("failed to inspect file", failure.command.details.message);
+    }
 }
 
 fn pairAllocationFailure(failure: PairCommandFailure) error{ OutOfMemory, UnexpectedFailure } {
@@ -6020,12 +6010,14 @@ fn pairAllocationFailure(failure: PairCommandFailure) error{ OutOfMemory, Unexpe
     };
 }
 
-test "[failure] - [exact sample]: allocation failures in both passes release memory and descriptors" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseExactAllocations,
-        .{},
-    );
+test "[failure] - [exact sample]: an allocation failure in exact sampling releases memory and descriptors" {
+    try exerciseExactAllocations(std.testing.allocator);
+
+    // Every allocation in this body is first-pass reservoir growth, and the second pass allocates
+    // nothing for these inputs, so index 0 (the first reservoir growth) is the first induced failure.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, exerciseExactAllocations(failing.allocator()));
+    try std.testing.expect(failing.has_induced_failure);
 }
 
 test "[edge] - [paired exact sample]: target above pair count keeps indexes implicit" {
@@ -6053,35 +6045,13 @@ test "[edge] - [paired exact sample]: target above pair count keeps indexes impl
 
     try std.testing.expect(failure == null);
     try std.testing.expect(selector.finish() == .all);
-    try std.testing.expectEqual(@as(usize, 0), selector.indexes.capacity);
 }
 
 test "[failure] - [paired exact sample]: a read failure follows complete earlier pairs" {
-    const FailingSource = struct {
-        data: []const u8,
-        position: usize = 0,
-        fail_at: usize,
-
-        fn byteSource(self: *@This()) zfastq.io.ByteSource {
-            return .{ .ctx = self, .vtable = &vtable };
-        }
-
-        const vtable = zfastq.io.ByteSource.VTable{ .read = read };
-
-        fn read(ctx: *anyopaque, dest: []u8) error{ReadFailed}!usize {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (dest.len == 0) return 0;
-            if (self.position == self.fail_at) return error.ReadFailed;
-            const end = @min(self.fail_at, self.position + dest.len);
-            const amount = end - self.position;
-            @memcpy(dest[0..amount], self.data[self.position..end]);
-            self.position = end;
-            return amount;
-        }
-    };
     const first1 = "@a/1\nA\n+\n!\n";
     const first2 = "@a/2\nT\n+\n!\n";
-    var source1 = FailingSource{
+    // The first input fails right after its first complete pair.
+    var source1: ScriptedSource = .{
         .data = first1 ++ "@b/1\nC\n+\n#\n",
         .fail_at = first1.len,
     };
@@ -6106,47 +6076,30 @@ test "[failure] - [paired exact sample]: a read failure follows complete earlier
         &selector,
     ).?;
 
-    const command = switch (failure) {
-        .command => |command| command,
-        .pair => return error.ExpectedCommandFailure,
-    };
+    const command = try commandFailure(failure);
     try std.testing.expectEqual(@as(u1, 0), command.input_index);
     try std.testing.expectEqualStrings("io_error", command.details.code);
+    try std.testing.expectEqual(@as(u8, 3), command.details.exit_code);
     try std.testing.expectEqual(@as(u64, 1), selector.record_count);
 }
 
 test "[property] - [interleaved fraction sample]: source chunks preserve selected pairs" {
-    const ChunkedSource = struct {
-        data: []const u8,
-        chunk_len: usize,
-        position: usize = 0,
-
-        fn read(ctx: *anyopaque, dest: []u8) error{ReadFailed}!usize {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            const amount = @min(dest.len, self.chunk_len, self.data.len - self.position);
-            @memcpy(dest[0..amount], self.data[self.position..][0..amount]);
-            self.position += amount;
-            return amount;
-        }
-    };
     const data = "@a/1 left\r\nAC\r\n+left\r\n!#\r\n@a/2 right\nGT\n+right\n$%\n" ++
         "@b/1\nG\n+\n&\n@b/2\nC\n+\n'\n" ++
         "@c/1\nTTA\n+one\n()*\n@c/2\nAAT\n+two\n+,-";
     // Seed 11 at one half selects pair indexes 0 and 2.
     const expected = "@a/1 left\nAC\n+left\n!#\n@a/2 right\nGT\n+right\n$%\n" ++
         "@c/1\nTTA\n+one\n()*\n@c/2\nAAT\n+two\n+,-\n";
-    for (1..data.len + 1) |chunk_len| {
-        var source: ChunkedSource = .{ .data = data, .chunk_len = chunk_len };
+    // Reads of one byte, two bytes, and the whole input.
+    for ([_]usize{ 1, 2, data.len }) |chunk_len| {
+        var source: ScriptedSource = .{ .data = data, .first_chunk = chunk_len, .chunk_len = chunk_len };
         var output: [expected.len]u8 = undefined;
         var sink = io_layer.SliceSink.init(&output);
         var writer = zfastq.Writer.init(sink.byteSink());
         var selector = sampling.Selector.init(.{ .probability = 0.5 }, 11);
         var selection: PairOutputSelector = .{ .fraction = &selector };
 
-        var stream = try TestStream.init(.{
-            .ctx = &source,
-            .vtable = &.{ .read = ChunkedSource.read },
-        });
+        var stream = try TestStream.init(source.byteSource());
         defer stream.deinit();
         const failure = try sampleInterleavedSource(
             std.testing.allocator,
@@ -6218,14 +6171,16 @@ test "[edge] - [single fraction sample]: fraction zero reads without a record re
     }
 }
 
-test "[edge] - [paired fraction sample]: fraction zero keeps buffered mate one borrowed" {
+test "[edge] - [paired fraction sample]: fraction zero reads buffered mate one without allocating" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var input_bytes: std.ArrayList(u8) = .empty;
     defer input_bytes.deinit(std.testing.allocator);
+    // Mate one is a 128 KiB header that fits in the reader buffer, so it is read in place.
+    const long_header_len = 128 * 1024;
     try input_bytes.appendSlice(std.testing.allocator, "@large/1 ");
-    try input_bytes.appendNTimes(std.testing.allocator, 'x', 128 * 1024);
+    try input_bytes.appendNTimes(std.testing.allocator, 'x', long_header_len);
     try input_bytes.appendSlice(
         std.testing.allocator,
         "\nA\n+\n!\n@large/2\nT\n+\n#\n",
@@ -6266,18 +6221,30 @@ test "[edge] - [paired fraction sample]: fraction zero keeps buffered mate one b
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
 }
 
-const InterleavedTestSource = struct {
+/// A byte source over `data`. Its first read returns at most `first_chunk` bytes, later reads
+/// at most `chunk_len`, and a read at `fail_at` returns `error.ReadFailed` instead of data.
+const ScriptedSource = struct {
     data: []const u8,
-    first_chunk: usize,
+    first_chunk: usize = std.math.maxInt(usize),
+    chunk_len: usize = std.math.maxInt(usize),
+    fail_at: ?usize = null,
     position: usize = 0,
 
+    fn byteSource(self: *ScriptedSource) zfastq.io.ByteSource {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable = zfastq.io.ByteSource.VTable{ .read = read };
+
     fn read(ctx: *anyopaque, dest: []u8) error{ReadFailed}!usize {
-        const self: *@This() = @ptrCast(@alignCast(ctx));
-        const size = if (self.position == 0) self.first_chunk else 3;
-        const n = @min(size, @min(dest.len, self.data.len - self.position));
-        @memcpy(dest[0..n], self.data[self.position..][0..n]);
-        self.position += n;
-        return n;
+        const self: *ScriptedSource = @ptrCast(@alignCast(ctx));
+        const end = self.fail_at orelse self.data.len;
+        if (self.position == self.fail_at) return error.ReadFailed;
+        const limit = if (self.position == 0) self.first_chunk else self.chunk_len;
+        const amount = @min(dest.len, limit, end - self.position);
+        @memcpy(dest[0..amount], self.data[self.position..][0..amount]);
+        self.position += amount;
+        return amount;
     }
 };
 
@@ -6291,13 +6258,12 @@ test "[property] - [interleaved input]: small pairs need no preservation allocat
     }) |mates| {
         const input = try std.mem.concat(std.testing.allocator, u8, &mates);
         defer std.testing.allocator.free(input);
-        for ([_]usize{ mates[0].len, mates[0].len + 7 }) |first_chunk| {
+        // The second read point lands 7 bytes into the second mate's header.
+        const into_second_header = 7;
+        for ([_]usize{ mates[0].len, mates[0].len + into_second_header }) |first_chunk| {
             for (0..4) |command| {
-                var source: InterleavedTestSource = .{ .data = input, .first_chunk = first_chunk };
-                var stream = try TestStream.init(.{
-                    .ctx = &source,
-                    .vtable = &.{ .read = InterleavedTestSource.read },
-                });
+                var source: ScriptedSource = .{ .data = input, .first_chunk = first_chunk, .chunk_len = 3 };
+                var stream = try TestStream.init(source.byteSource());
                 defer stream.deinit();
                 const bytes = &stream.reader.interface;
                 var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
@@ -6318,7 +6284,7 @@ test "[property] - [interleaved input]: small pairs need no preservation allocat
                         .pair_mode = .interleaved,
                         .pair_name_policy = .illumina,
                     }, null),
-                    1, 2 => try sampleInterleavedSource(failing.allocator(), bytes, &writer1, &selection, 260, .{
+                    1, 2 => try sampleInterleavedSource(failing.allocator(), bytes, &writer1, &selection, recordStagingLimit(64), .{
                         .max_line_bytes = 64,
                         .alphabet = .iupac,
                         .fraction = if (command == 1) .none else .all,
@@ -6327,7 +6293,7 @@ test "[property] - [interleaved input]: small pairs need no preservation allocat
                         .pair_mode = .interleaved,
                         .pair_name_policy = .illumina,
                     }),
-                    3 => try deinterleaveSource(failing.allocator(), bytes, &writer1, &writer2, 260, .{
+                    3 => try deinterleaveSource(failing.allocator(), bytes, &writer1, &writer2, recordStagingLimit(64), .{
                         .max_line_bytes = 64,
                         .alphabet = .iupac,
                         .pair_name_policy = .illumina,
@@ -6349,36 +6315,9 @@ test "[property] - [interleaved input]: small pairs need no preservation allocat
     }
 }
 
-test "[failure] - [deinterleave]: preserves CRLF output on a failed write" {
-    const first = "@pair/1\r\nR\r\n+left\r\n!\r\n";
-    const second = "@pair/2\r\nT\r\n+right\r\n#\r\n";
-    var source: InterleavedTestSource = .{ .data = first ++ second, .first_chunk = first.len };
-    var output: ["@pair/1\nR\n+left\n!\n".len - 1]u8 = undefined;
-    var sink1 = io_layer.SliceSink.init(&output);
-    var sink2 = io_layer.SliceSink.init(&.{});
-    var writer1 = zfastq.Writer.init(sink1.byteSink());
-    var writer2 = zfastq.Writer.init(sink2.byteSink());
-
-    var stream = try TestStream.init(.{
-        .ctx = &source,
-        .vtable = &.{ .read = InterleavedTestSource.read },
-    });
-    defer stream.deinit();
-    try std.testing.expectError(error.Output1WriteFailed, deinterleaveSource(
-        std.testing.allocator,
-        &stream.reader.interface,
-        &writer1,
-        &writer2,
-        260,
-        .{ .max_line_bytes = 64, .alphabet = .iupac, .pair_name_policy = .illumina },
-    ));
-    // Canonical staging submits the complete mate to this all-or-error sink.
-    try std.testing.expectEqualStrings("", sink1.written());
-    try std.testing.expectEqualStrings("", sink2.written());
-}
-
 const DeinterleaveTestSink = struct {
     buffer: [256]u8 = undefined,
+    capacity: usize = 256,
     length: usize = 0,
     fail_write: bool = false,
     fail_flush: bool = false,
@@ -6398,7 +6337,7 @@ const DeinterleaveTestSink = struct {
         if (self.fail_write) return error.WriteFailed;
         const end = std.math.add(usize, self.length, bytes.len) catch
             return error.WriteFailed;
-        if (end > self.buffer.len) return error.WriteFailed;
+        if (end > self.capacity) return error.WriteFailed;
         @memcpy(self.buffer[self.length..end], bytes);
         self.length = end;
     }
@@ -6410,59 +6349,102 @@ const DeinterleaveTestSink = struct {
     }
 };
 
-test "[failure] - [deinterleave]: identifies both output write positions" {
-    const input = "@pair/1\nA\n+left\n!\n@pair/2\nT\n+right\n#\n";
-    const options = DeinterleaveOptions{
-        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-        .alphabet = .iupac,
-        .pair_name_policy = .illumina,
+test "[failure] - [interleave]: a write failure after the first mate keeps only that mate" {
+    const mate1 = "@pair/1\nA\n+left\n!\n";
+    const mate2 = "@pair/2\nT\n+right\n#\n";
+    var source1 = io_layer.SliceSource.init(mate1);
+    var source2 = io_layer.SliceSource.init(mate2);
+    var stream1 = try TestStream.init(source1.byteSource());
+    defer stream1.deinit();
+    var stream2 = try TestStream.init(source2.byteSource());
+    defer stream2.deinit();
+    // The sink holds exactly the first mate, so the second mate's first write is refused.
+    var sink = DeinterleaveTestSink{ .capacity = mate1.len };
+    var writer = zfastq.Writer.init(sink.byteSink());
+    var selection: PairOutputSelector = .all;
+
+    try std.testing.expectError(error.WriteFailed, interleaveSources(
+        std.testing.allocator,
+        &stream1.reader.interface,
+        &stream2.reader.interface,
+        &writer,
+        &selection,
+        .{
+            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+            .alphabet = .iupac,
+            .pair_name_policy = .illumina,
+        },
+    ));
+    try std.testing.expectEqualStrings(mate1, sink.buffer[0..sink.length]);
+}
+
+test "[failure] - [deinterleave]: names the output whose write failed and writes nothing partial" {
+    const lf_input = "@pair/1\nA\n+left\n!\n@pair/2\nT\n+right\n#\n";
+    const crlf_first_mate = "@pair/1\r\nR\r\n+left\r\n!\r\n";
+    const crlf_input = crlf_first_mate ++ "@pair/2\r\nT\r\n+right\r\n#\r\n";
+    const first_mate = "@pair/1\nA\n+left\n!\n";
+    const cases = [_]struct {
+        input: []const u8,
+        fail_output1: bool = false,
+        fail_output2: bool = false,
+        output1_capacity: usize = 256,
+        max_line_bytes: usize = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+        first_chunk: usize = std.math.maxInt(usize),
+        chunk_len: usize = std.math.maxInt(usize),
+        expected_error: anyerror,
+        expected_output1: []const u8,
+    }{
+        .{
+            .input = lf_input,
+            .fail_output1 = true,
+            .expected_error = error.Output1WriteFailed,
+            .expected_output1 = "",
+        },
+        .{
+            .input = lf_input,
+            .fail_output2 = true,
+            .expected_error = error.Output2WriteFailed,
+            .expected_output1 = first_mate,
+        },
+        // Canonical staging submits the complete mate as one write, so a sink one byte short accepts none of it.
+        .{
+            .input = crlf_input,
+            .output1_capacity = first_mate.len - 1,
+            .max_line_bytes = 64,
+            .first_chunk = crlf_first_mate.len,
+            .chunk_len = 3,
+            .expected_error = error.Output1WriteFailed,
+            .expected_output1 = "",
+        },
     };
-    const staging_limit = recordStagingLimit(options.max_line_bytes);
-
-    {
-        var source = io_layer.SliceSource.init(input);
+    for (cases) |case| {
+        const options = DeinterleaveOptions{
+            .max_line_bytes = case.max_line_bytes,
+            .alphabet = .iupac,
+            .pair_name_policy = .illumina,
+        };
+        var source: ScriptedSource = .{
+            .data = case.input,
+            .first_chunk = case.first_chunk,
+            .chunk_len = case.chunk_len,
+        };
         var stream = try TestStream.init(source.byteSource());
         defer stream.deinit();
-        var sink1 = DeinterleaveTestSink{ .fail_write = true };
-        var sink2 = DeinterleaveTestSink{};
+        var sink1 = DeinterleaveTestSink{ .fail_write = case.fail_output1, .capacity = case.output1_capacity };
+        var sink2 = DeinterleaveTestSink{ .fail_write = case.fail_output2 };
         var writer1 = zfastq.Writer.init(sink1.byteSink());
         var writer2 = zfastq.Writer.init(sink2.byteSink());
 
-        try std.testing.expectError(
-            error.Output1WriteFailed,
-            deinterleaveSource(
-                std.testing.allocator,
-                &stream.reader.interface,
-                &writer1,
-                &writer2,
-                staging_limit,
-                options,
-            ),
-        );
+        try std.testing.expectError(case.expected_error, deinterleaveSource(
+            std.testing.allocator,
+            &stream.reader.interface,
+            &writer1,
+            &writer2,
+            recordStagingLimit(options.max_line_bytes),
+            options,
+        ));
+        try std.testing.expectEqualStrings(case.expected_output1, sink1.buffer[0..sink1.length]);
         try std.testing.expectEqual(@as(usize, 0), sink2.length);
-    }
-
-    {
-        var source = io_layer.SliceSource.init(input);
-        var stream = try TestStream.init(source.byteSource());
-        defer stream.deinit();
-        var sink1 = DeinterleaveTestSink{};
-        var sink2 = DeinterleaveTestSink{ .fail_write = true };
-        var writer1 = zfastq.Writer.init(sink1.byteSink());
-        var writer2 = zfastq.Writer.init(sink2.byteSink());
-
-        try std.testing.expectError(
-            error.Output2WriteFailed,
-            deinterleaveSource(
-                std.testing.allocator,
-                &stream.reader.interface,
-                &writer1,
-                &writer2,
-                staging_limit,
-                options,
-            ),
-        );
-        try std.testing.expectEqualStrings("@pair/1\nA\n+left\n!\n", sink1.buffer[0..sink1.length]);
     }
 }
 
@@ -6490,80 +6472,6 @@ test "[failure] - [deinterleave]: flushes outputs in order and stops after failu
 }
 
 test "[integration] - [deinterleave]: output flush failures preserve diagnostics and exit precedence" {
-    const Capture = struct {
-        dir: std.Io.Dir,
-        stderr: std.Io.Writer,
-        fail_write: usize,
-        writes: usize = 0,
-        closed: usize = 0,
-
-        fn openFile(
-            ctx: ?*anyopaque,
-            _: std.Io.Dir,
-            path: []const u8,
-            options: std.Io.Dir.OpenFileOptions,
-        ) std.Io.File.OpenError!std.Io.File {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            return self.dir.openFile(std.testing.io, path, options);
-        }
-
-        fn createFile(
-            ctx: ?*anyopaque,
-            _: std.Io.Dir,
-            path: []const u8,
-            options: std.Io.Dir.CreateFileOptions,
-        ) std.Io.File.OpenError!std.Io.File {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            return self.dir.createFile(std.testing.io, path, options);
-        }
-
-        fn closeFiles(ctx: ?*anyopaque, files: []const std.Io.File) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            for (files) |file| file.close(std.testing.io);
-            self.closed += files.len;
-        }
-
-        fn readPositional(
-            _: ?*anyopaque,
-            file: std.Io.File,
-            data: []const []u8,
-            offset: u64,
-        ) std.Io.File.ReadPositionalError!usize {
-            const io = std.testing.io;
-            return io.vtable.fileReadPositional(io.userdata, file, data, offset);
-        }
-
-        fn writePositional(
-            ctx: ?*anyopaque,
-            file: std.Io.File,
-            header: []const u8,
-            data: []const []const u8,
-            splat: usize,
-            offset: u64,
-        ) std.Io.File.WritePositionalError!usize {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            self.writes += 1;
-            if (self.writes == self.fail_write) return error.NoSpaceLeft;
-            const io = std.testing.io;
-            return io.vtable.fileWritePositional(io.userdata, file, header, data, splat, offset);
-        }
-
-        fn operate(ctx: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            if (operation == .file_write_streaming) {
-                const write = operation.file_write_streaming;
-                if (write.file.handle == std.Io.File.stderr().handle) {
-                    return .{ .file_write_streaming = self.stderr.writeSplatHeader(
-                        write.header,
-                        write.data,
-                        write.splat,
-                    ) catch error.NoSpaceLeft };
-                }
-            }
-            return std.testing.io.operate(operation);
-        }
-    };
-
     const r1 = "@ok/1\nA\n+\n!\n";
     const r2 = "@ok/2\nT\n+\n#\n";
     const cases = [_]struct { tail: []const u8, exit_code: u8, stderr: []const u8 }{
@@ -6580,13 +6488,6 @@ test "[integration] - [deinterleave]: output flush failures preserve diagnostics
             .stderr = "error: input: line length limit exceeded\n",
         },
     };
-    var vtable = std.Io.failing.vtable.*;
-    vtable.dirOpenFile = Capture.openFile;
-    vtable.dirCreateFile = Capture.createFile;
-    vtable.fileClose = Capture.closeFiles;
-    vtable.fileReadPositional = Capture.readPositional;
-    vtable.fileWritePositional = Capture.writePositional;
-    vtable.operate = Capture.operate;
     for (cases) |case| {
         for (0..3) |fail_write| {
             var tmp = std.testing.tmpDir(.{});
@@ -6597,14 +6498,15 @@ test "[integration] - [deinterleave]: output flush failures preserve diagnostics
             const bytes = try std.mem.concat(allocator, u8, &.{ r1, r2, case.tail });
             try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input", .data = bytes });
             var stderr_buffer: [512]u8 = undefined;
-            var capture: Capture = .{
+            var stderr: std.Io.Writer = .fixed(&stderr_buffer);
+            var fake: FakeIo = .{
                 .dir = tmp.dir,
-                .stderr = .fixed(&stderr_buffer),
+                .stderr = &stderr,
                 .fail_write = fail_write,
             };
 
             const status = runDeinterleave(
-                .{ .userdata = &capture, .vtable = &vtable },
+                fake.io(),
                 std.testing.allocator,
                 &.{"input"},
                 "out1",
@@ -6612,16 +6514,16 @@ test "[integration] - [deinterleave]: output flush failures preserve diagnostics
                 .{ .max_line_bytes = 8, .alphabet = .iupac, .pair_name_policy = .illumina },
             );
 
-            const expected_status = if (fail_write == 0) case.exit_code else @max(case.exit_code, 3);
+            const expected_status = if (fail_write == 0) case.exit_code else @max(case.exit_code, IO_FAILURE.exit_code);
             const expected_stderr = if (fail_write == 0) case.stderr else try std.fmt.allocPrint(
                 allocator,
                 "{s}error: out{d}: I/O error\n",
                 .{ case.stderr, fail_write },
             );
             try std.testing.expectEqual(expected_status, status);
-            try std.testing.expectEqualStrings(expected_stderr, capture.stderr.buffered());
-            try std.testing.expectEqual(@as(usize, if (fail_write == 1) 1 else 2), capture.writes);
-            try std.testing.expectEqual(@as(usize, 3), capture.closed);
+            try std.testing.expectEqualStrings(expected_stderr, stderr.buffered());
+            try std.testing.expectEqual(@as(usize, if (fail_write == 1) 1 else 2), fake.writes);
+            try std.testing.expectEqual(@as(usize, 3), fake.closed);
             const output1 = try tmp.dir.readFileAlloc(std.testing.io, "out1", allocator, .limited(64));
             const output2 = try tmp.dir.readFileAlloc(std.testing.io, "out2", allocator, .limited(64));
             try std.testing.expectEqualStrings(if (fail_write == 1) "" else r1, output1);
@@ -6680,64 +6582,79 @@ test "[failure] - [deinterleave]: staging allocation failure emits no output" {
     try std.testing.expectEqualStrings("out_of_memory", command_failure.code);
     try std.testing.expectEqual(@as(usize, 0), sink1.length);
     try std.testing.expectEqual(@as(usize, 0), sink2.length);
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseRetainedPairAllocations,
-        .{input.items},
-    );
 }
 
-test "[failure] - [deinterleave]: both fallback owners survive allocation and output failures" {
-    const first_field_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES - 7;
-    const second_field_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES;
+/// Mate one's record is 2 * first_len + 12 bytes, two bytes short of two reader buffers.
+const fallback_first_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES - 7;
+const fallback_second_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES;
+/// Header, both mate lines and the plus line of mate one, with the two sequence and quality fields.
+const fallback_first_record_len = "@pair/1\n".len + fallback_first_len + "\n+\n".len + fallback_first_len + "\n".len;
+
+fn fallbackPairInput(allocator: std.mem.Allocator) !std.ArrayList(u8) {
     var input: std.ArrayList(u8) = .empty;
+    errdefer input.deinit(allocator);
+    try input.appendSlice(allocator, "@pair/1\n");
+    try input.appendNTimes(allocator, 'A', fallback_first_len);
+    try input.appendSlice(allocator, "\n+\n");
+    try input.appendNTimes(allocator, '!', fallback_first_len);
+    try input.appendSlice(allocator, "\n@pair/2\n");
+    try input.appendNTimes(allocator, 'T', fallback_second_len);
+    try input.appendSlice(allocator, "\n+\n");
+    try input.appendNTimes(allocator, '#', fallback_second_len);
+    try input.append(allocator, '\n');
+    return input;
+}
+
+test "[edge] - [deinterleave]: mate one is retained across the reader refill" {
+    var input = try fallbackPairInput(std.testing.allocator);
     defer input.deinit(std.testing.allocator);
-    try input.appendSlice(std.testing.allocator, "@pair/1\n");
-    try input.appendNTimes(std.testing.allocator, 'A', first_field_len);
-    try input.appendSlice(std.testing.allocator, "\n+\n");
-    try input.appendNTimes(std.testing.allocator, '!', first_field_len);
-    try input.appendSlice(std.testing.allocator, "\n@pair/2\n");
-    try input.appendNTimes(std.testing.allocator, 'T', second_field_len);
-    try input.appendSlice(std.testing.allocator, "\n+\n");
-    try input.appendNTimes(std.testing.allocator, '#', second_field_len);
-    try input.append(std.testing.allocator, '\n');
 
-    {
-        var source = io_layer.SliceSource.init(input.items);
-        var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-        defer reader.deinit();
-        var retained: fastq.RetainedRecordStorage = .{};
-        defer retained.deinit(std.testing.allocator);
-        var staging: std.ArrayList(u8) = .empty;
-        defer staging.deinit(std.testing.allocator);
-        var span: ?[]const u8 = null;
-        var validator = fastq.AdaptiveRecordValidator.init(.{});
-        const record1 = (try fastq.nextWithSpan(&reader, &span)).?;
-        try std.testing.expect((try fastq.nextBufferedWithSpan(&reader, &span)) == null);
-        const next = try nextAfterPreservingInterleavedMate1(
-            std.testing.allocator,
-            &reader,
-            &retained,
-            &staging,
-            record1,
-            null,
-            recordStagingLimit(reader.options.max_line_bytes),
-            &validator,
-        );
-        try std.testing.expect(next.first_storage == .retained);
-        try std.testing.expectEqual(@as(usize, 0), staging.capacity);
-        try std.testing.expect(std.mem.allEqual(u8, record1.sequence, 'A'));
-        try std.testing.expectEqual(second_field_len, next.record.?.record.sequence.len);
-        try std.testing.expect(std.mem.allEqual(u8, next.record.?.record.sequence, 'T'));
-        try std.testing.expect(next.record.?.semantic_error == null);
-    }
-
-    try std.testing.checkAllAllocationFailures(
+    var source = io_layer.SliceSource.init(input.items);
+    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
+    defer reader.deinit();
+    var retained: fastq.RetainedRecordStorage = .{};
+    defer retained.deinit(std.testing.allocator);
+    var staging: std.ArrayList(u8) = .empty;
+    defer staging.deinit(std.testing.allocator);
+    var span: ?[]const u8 = null;
+    var validator = fastq.AdaptiveRecordValidator.init(.{});
+    const record1 = (try fastq.nextWithSpan(&reader, &span)).?;
+    try std.testing.expect((try fastq.nextBufferedWithSpan(&reader, &span)) == null);
+    const next = try nextAfterPreservingInterleavedMate1(
         std.testing.allocator,
-        exerciseRetainedPairAllocations,
-        .{input.items},
+        &reader,
+        &retained,
+        &staging,
+        record1,
+        null,
+        recordStagingLimit(reader.options.max_line_bytes),
+        &validator,
     );
+    try std.testing.expect(next.first_storage == .retained);
+    try std.testing.expect(std.mem.allEqual(u8, record1.sequence, 'A'));
+    try std.testing.expectEqual(fallback_second_len, next.record.?.record.sequence.len);
+    try std.testing.expect(std.mem.allEqual(u8, next.record.?.record.sequence, 'T'));
+    try std.testing.expect(next.record.?.semantic_error == null);
+}
 
+test "[failure] - [deinterleave]: retained pair storage reports out of memory on a later allocation" {
+    var input = try fallbackPairInput(std.testing.allocator);
+    defer input.deinit(std.testing.allocator);
+    try exerciseRetainedPairAllocations(std.testing.allocator, input.items);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 1,
+    });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        exerciseRetainedPairAllocations(failing.allocator(), input.items),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "[failure] - [deinterleave]: a failed output write or a one-byte staging limit emits no partial pair" {
+    var input = try fallbackPairInput(std.testing.allocator);
+    defer input.deinit(std.testing.allocator);
     const output = try std.testing.allocator.alloc(u8, input.items.len);
     defer std.testing.allocator.free(output);
     const options = DeinterleaveOptions{
@@ -6769,7 +6686,7 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
             );
             if (failure_mode == 0) try std.testing.expectEqual(@as(usize, 0), sink2.written().len);
             if (failure_mode == 1) {
-                try std.testing.expectEqualStrings(input.items[0 .. 2 * first_field_len + 12], sink1.written());
+                try std.testing.expectEqualStrings(input.items[0..fallback_first_record_len], sink1.written());
             }
         } else {
             const failure = (try result).?;
@@ -6778,7 +6695,16 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
             try std.testing.expectEqual(@as(usize, 0), sink2.written().len);
         }
     }
+}
 
+test "[failure] - [deinterleave]: malformed pairs fail with their diagnostic before any output" {
+    var input = try fallbackPairInput(std.testing.allocator);
+    defer input.deinit(std.testing.allocator);
+    const options = DeinterleaveOptions{
+        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+        .alphabet = .iupac,
+        .pair_name_policy = .illumina,
+    };
     const split = std.mem.find(u8, input.items, "@pair/2").?;
     for (0..5) |failure_mode| {
         if (failure_mode == 1) input.items[input.items.len - 2] = ' ';
@@ -6805,10 +6731,22 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
             options,
         )).?;
         switch (failure_mode) {
-            0, 4 => try std.testing.expectEqualStrings("S005", failure.command.details.code),
-            1 => try std.testing.expectEqualStrings("S006", failure.command.details.code),
-            2 => try std.testing.expect(failure.pair == .name_mismatch),
-            3 => try std.testing.expect(failure.pair == .count_mismatch),
+            0, 4 => {
+                try std.testing.expectEqualStrings("S005", failure.command.details.code);
+                try std.testing.expectEqualStrings("sequence and quality lengths differ", failure.command.details.message);
+            },
+            1 => {
+                try std.testing.expectEqualStrings("S006", failure.command.details.code);
+                try std.testing.expectEqualStrings("quality byte must be ASCII 33 through 126", failure.command.details.message);
+            },
+            2 => {
+                try std.testing.expect(failure.pair == .name_mismatch);
+                try std.testing.expectEqualStrings("paired identifiers or mate markers do not match", failure.pair.message());
+            },
+            3 => {
+                try std.testing.expect(failure.pair == .count_mismatch);
+                try std.testing.expectEqualStrings("paired input is missing a mate", failure.pair.message());
+            },
             else => unreachable,
         }
         try std.testing.expectEqual(@as(usize, 0), sink1.length);

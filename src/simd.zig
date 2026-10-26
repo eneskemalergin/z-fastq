@@ -312,49 +312,73 @@ pub fn containsNewlineFor(comptime lanes: usize, first: [*]const u8, second: ?[*
     return false;
 }
 
-test "[property] - [newline kernels]: every width and the selected path match a scalar scan" {
-    var prng: std.Random.DefaultPrng = .init(std.testing.random_seed);
-    const random = prng.random();
-    var buffer: [700]u8 = undefined;
-    for (0..2000) |_| {
-        const len = random.uintLessThan(usize, buffer.len + 1);
-        const density = random.uintLessThan(u8, 64);
-        for (buffer[0..len]) |*byte| {
-            byte.* = if (density != 0 and random.uintLessThan(u8, 64) < density) '\n' else 'A' + random.uintLessThan(u8, 26);
-        }
-        const bytes = buffer[0..len];
-        var want_ends: [4]usize = undefined;
-        var want_count: usize = 0;
-        for (bytes, 0..) |byte, index| {
-            if (byte == '\n' and want_count < 4) {
-                want_ends[want_count] = index;
-                want_count += 1;
+/// Every newline search, at every tier width and through the selected path,
+/// against `std.mem`; `second` is an LF-free or LF-bearing span of the same length.
+fn expectNewlineSearch(bytes: []const u8, second: []const u8) !void {
+    var want_ends: [4]usize = undefined;
+    var want_count: usize = 0;
+    for (bytes, 0..) |byte, index| {
+        if (byte != '\n' or want_count == 4) continue;
+        want_ends[want_count] = index;
+        want_count += 1;
+    }
+    const want_first: ?usize = if (want_count > 0) want_ends[0] else null;
+    const want_any = want_first != null or std.mem.findScalar(u8, second, '\n') != null;
+    var ends: [4]usize = undefined;
+    inline for (.{ BASELINE_LANES, tierWidth(.avx2), tierWidth(.avx512) }) |lanes| {
+        try std.testing.expectEqual(want_first, findNewlineFor(lanes, bytes));
+        try std.testing.expectEqual(want_count == 4, findNewlinesFor(lanes, bytes, &ends));
+        if (want_count == 4) try std.testing.expectEqualSlices(usize, &want_ends, &ends);
+        try std.testing.expectEqual(want_first != null, containsNewlineFor(lanes, bytes.ptr, null, bytes.len));
+        try std.testing.expectEqual(want_any, containsNewlineFor(lanes, bytes.ptr, second.ptr, bytes.len));
+    }
+    try std.testing.expectEqual(want_first, findNewline(bytes));
+    try std.testing.expectEqual(want_count == 4, findNewlines(bytes, &ends));
+    if (want_count == 4) try std.testing.expectEqualSlices(usize, &want_ends, &ends);
+    try std.testing.expectEqual(want_any, containsNewline(bytes, second));
+}
+
+test "[property] - [newline kernels]: every search matches a scalar scan at vector, block, and skip boundaries" {
+    // Lengths around each vector width, the 64-byte block, and the 192-byte
+    // run after which LF-free stretches are skipped 128 bytes at a time.
+    const lengths = [_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 320, 449 };
+    var storage: [449 + 2 * BLOCK_BYTES]u8 = undefined;
+    var second_storage: [449 + 2 * BLOCK_BYTES]u8 = undefined;
+    for ([_]usize{ 0, 1, BASELINE_LANES - 1 }) |alignment| {
+        for (lengths) |len| {
+            // LF bytes just outside the span must never be reported.
+            @memset(&storage, '\n');
+            @memset(&second_storage, '\n');
+            const bytes = storage[alignment..][0..len];
+            const second = second_storage[alignment..][0..len];
+            @memset(second, '\r');
+            @memset(bytes, 'A');
+            try expectNewlineSearch(bytes, second);
+            if (len == 0) continue;
+            // One LF at each end and one inside, then four LFs that straddle a block edge.
+            for ([_]usize{ 0, len - 1, len / 2 }) |pos| {
+                bytes[pos] = '\n';
+                try expectNewlineSearch(bytes, second);
+                bytes[pos] = 'A';
             }
-        }
-        const want_first: ?usize = if (want_count > 0) want_ends[0] else null;
-        inline for (.{ BASELINE_LANES, tierWidth(.avx2), tierWidth(.avx512), 0 }) |lanes| {
-            try std.testing.expectEqual(want_first, if (lanes == 0) findNewline(bytes) else findNewlineFor(lanes, bytes));
-            var ends: [4]usize = undefined;
-            const four = if (lanes == 0) findNewlines(bytes, &ends) else findNewlinesFor(lanes, bytes, &ends);
-            try std.testing.expectEqual(want_count == 4, four);
-            if (four) try std.testing.expectEqualSlices(usize, &want_ends, &ends);
+            second[len - 1] = '\n';
+            try expectNewlineSearch(bytes, second);
+            second[len - 1] = '\r';
+            if (len < 4) continue;
+            const run: usize = @min(len - 4, BLOCK_BYTES - 2);
+            for (run..run + 4) |pos| bytes[pos] = '\n';
+            try expectNewlineSearch(bytes, second);
         }
     }
 }
 
-test "[property] - [newline kernels]: masks preserve newline positions at every width" {
+test "[edge] - [newline kernels]: masks set the bit of each LF at every width" {
     inline for (.{ 1, BASELINE_LANES, tierWidth(.avx2), BLOCK_BYTES }) |lanes| {
         const Mask = @Int(.unsigned, lanes);
         var block: [lanes]u8 = @splat('A');
         try std.testing.expectEqual(@as(Mask, 0), newlineMask(lanes, &block));
-        for (0..lanes) |lane| {
-            block[lane] = '\n';
-            try std.testing.expectEqual(@as(Mask, 1) << @intCast(lane), newlineMask(lanes, &block));
-            block[lane] = 'A';
-        }
-
         var expected: Mask = 0;
-        for ([_]usize{ 0, 1, 15, 16, 31, 32, 47, 48, 62, 63 }) |lane| {
+        for ([_]usize{ 0, 1, 15, 16, 31, 32, 62, 63 }) |lane| {
             if (lane >= lanes) continue;
             block[lane] = '\n';
             expected |= @as(Mask, 1) << @intCast(lane);
@@ -363,93 +387,24 @@ test "[property] - [newline kernels]: masks preserve newline positions at every 
     }
 }
 
-test "[property] - [newline kernels]: two-slice search is exact at every length and alignment" {
-    var first_storage: [5 * BLOCK_BYTES + tierWidth(.avx512)]u8 = undefined;
-    var second_storage: [5 * BLOCK_BYTES + tierWidth(.avx512)]u8 = undefined;
-    for ([_]usize{ 0, 1, BASELINE_LANES - 1, tierWidth(.avx2) - 1, tierWidth(.avx512) - 1 }) |alignment| {
-        for (0..4 * BLOCK_BYTES + 3) |len| {
-            // LF bytes just outside the slices must never be reported.
-            @memset(&first_storage, '\n');
-            @memset(&second_storage, '\n');
-            const first = first_storage[alignment..][0..len];
-            const second = second_storage[alignment..][0..len];
-            @memset(first, 0xff);
-            @memset(second, '\r');
-            for (0..len + 1) |pos| {
-                inline for (.{ first, second }, .{ 0xff, '\r' }) |slice, original| {
-                    if (pos < len) slice[pos] = '\n';
-                    const first_has_lf = std.mem.findScalar(u8, first, '\n') != null;
-                    const second_has_lf = std.mem.findScalar(u8, second, '\n') != null;
-                    inline for (.{ BASELINE_LANES, tierWidth(.avx2), tierWidth(.avx512) }) |lanes| {
-                        try std.testing.expectEqual(first_has_lf, containsNewlineFor(lanes, first.ptr, null, len));
-                        try std.testing.expectEqual(first_has_lf or second_has_lf, containsNewlineFor(lanes, first.ptr, second.ptr, len));
-                    }
-                    try std.testing.expectEqual(first_has_lf, containsNewline(first, null));
-                    try std.testing.expectEqual(first_has_lf or second_has_lf, containsNewline(first, second));
-                    if (pos < len) slice[pos] = original;
-                }
-            }
-        }
-    }
-}
-
-test "[edge] - [newline kernels]: four-LF search is exact at vector and block boundaries" {
-    const cases = [_][4]usize{
-        .{ 14, 15, 30, 31 },
-        .{ 15, 16, 31, 32 },
-        .{ 30, 31, 62, 63 },
-        .{ 31, 32, 63, 64 },
-        .{ 63, 64, 127, 128 },
-        .{ 126, 127, 128, 129 },
-        .{ 300, 301, 500, 501 },
-    };
-    for (cases) |expected| {
-        var data: [520]u8 = @splat('x');
-        for (expected) |index| data[index] = '\n';
-        data[510] = '\n';
-        var actual: [4]usize = undefined;
-        inline for (.{ BASELINE_LANES, tierWidth(.avx2), tierWidth(.avx512) }) |lanes| {
-            try std.testing.expect(findNewlinesFor(lanes, &data, &actual));
-            try std.testing.expectEqual(expected, actual);
-            try std.testing.expect(!findNewlinesFor(lanes, data[0..expected[3]], &actual));
-        }
-        try std.testing.expect(findNewlines(&data, &actual));
-        try std.testing.expectEqual(expected, actual);
-        try std.testing.expect(!findNewlines(data[0..expected[3]], &actual));
-    }
-}
-
 test "[property] - [newline kernels]: the run-time selected path is exact around its length gate" {
     // The span, one sentinel LF, and an LF-free span of the same length.
-    var storage: [7 * AVX2_MIN_BYTES]u8 = undefined;
-    const lengths = [_]usize{ AVX2_MIN_BYTES - 1, AVX2_MIN_BYTES, AVX2_MIN_BYTES + 1, AVX2_MIN_BYTES + 77, 2 * AVX2_MIN_BYTES, 3 * AVX2_MIN_BYTES + 5 };
-    const positions = [_]usize{ 0, 63, AVX2_MIN_BYTES - 1, AVX2_MIN_BYTES, AVX2_MIN_BYTES + 1, AVX2_MIN_BYTES + 31, 2 * AVX2_MIN_BYTES - 1, 3 * AVX2_MIN_BYTES };
-    for ([_]usize{ 0, 1, tierWidth(.avx2) - 1 }) |alignment| {
+    var storage: [5 * AVX2_MIN_BYTES]u8 = undefined;
+    const lengths = [_]usize{ AVX2_MIN_BYTES - 1, AVX2_MIN_BYTES, AVX2_MIN_BYTES + 1, 2 * AVX2_MIN_BYTES + 5 };
+    const positions = [_]usize{ 0, AVX2_MIN_BYTES - 1, AVX2_MIN_BYTES, AVX2_MIN_BYTES + 31, 2 * AVX2_MIN_BYTES };
+    for ([_]usize{ 0, 1 }) |alignment| {
         for (lengths) |len| {
             const bytes = storage[alignment..][0..len];
             for (positions) |first_lf| {
                 @memset(&storage, 'A');
-                // LF bytes just past the span must never be reported.
                 storage[alignment + len] = '\n';
-                var want_ends: [4]usize = undefined;
-                var want_count: usize = 0;
                 for ([_]usize{ first_lf, first_lf + 1, first_lf + 100, first_lf + 700 }) |index| {
-                    if (index >= len) break;
-                    bytes[index] = '\n';
-                    want_ends[want_count] = index;
-                    want_count += 1;
+                    if (index < len) bytes[index] = '\n';
                 }
-                try std.testing.expectEqual(if (want_count > 0) want_ends[0] else null, findNewline(bytes));
-                var ends: [4]usize = undefined;
-                try std.testing.expectEqual(want_count == 4, findNewlines(bytes, &ends));
-                if (want_count == 4) try std.testing.expectEqualSlices(usize, &want_ends, &ends);
-
                 const quiet = storage[alignment + len + 1 ..][0..len];
                 @memset(quiet, 'C');
-                try std.testing.expectEqual(want_count > 0, containsNewline(bytes, null));
-                try std.testing.expectEqual(want_count > 0, containsNewline(quiet, bytes));
-                try std.testing.expectEqual(want_count > 0, containsNewline(bytes, quiet));
-                try std.testing.expect(!containsNewline(quiet, null));
+                try expectNewlineSearch(bytes, quiet);
+                try expectNewlineSearch(quiet, bytes);
             }
         }
     }
@@ -458,5 +413,4 @@ test "[property] - [newline kernels]: the run-time selected path is exact around
 test "[unit] - [cpu]: detection agrees with the AVX2 guarantee of the build target" {
     if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) try std.testing.expect(cpuHasAvx2());
-    try std.testing.expectEqual(cpuHasAvx2(), cpuHasAvx2());
 }

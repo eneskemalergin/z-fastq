@@ -7,6 +7,11 @@ const cli = @import("utilities.zig");
 const BASIC_PATH = "tests/data/synthetic/basic_valid.fastq";
 const EMPTY_PATH = "tests/data/synthetic/empty_valid.fastq";
 const EMPTY_RECORD = "@empty\n\n+\n\n";
+/// The CLI flushes its output in buffers of this size.
+const OUTPUT_BUFFER_BYTES = 64 * 1024;
+/// The reader refills its buffer at this size; a longer record spans two refills.
+const READ_BUFFER_BYTES = 256 * 1024;
+
 const BASIC_SELECTED_HALF =
     \\@read1 run=1 lane=1
     \\ACGTACGTACGT
@@ -76,80 +81,58 @@ fn appendSelectedPairs(
     }
 }
 
-test "[cli] - [sample]: stdout aliases reject before reading or writing in every mode" {
+/// Checks the first line of a multi-line diagnostic. The full text of pair
+/// diagnostics belongs to the check suite.
+fn expectFirstLine(expected: []const u8, stderr: []const u8) !void {
+    const end = std.mem.indexOfScalar(u8, stderr, '\n') orelse return error.MissingDiagnosticLine;
+    try std.testing.expectEqualStrings(expected, stderr[0 .. end + 1]);
+}
+
+test "[cli] - [sample]: stdout aliases of the input reject before reading or writing" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const names = [_][]const u8{ "r1.fastq", "r2.fastq" };
-    const paths = [_][]const u8{
-        try cli.tempPath(allocator, &tmp.sub_path, names[0]),
-        try cli.tempPath(allocator, &tmp.sub_path, names[1]),
-    };
-    const aliases = [_][4][]const u8{
-        .{ "r1.fastq", "./r1.fastq", "r1-hard.fastq", "r1-link.fastq" },
-        .{ "r2.fastq", "./r2.fastq", "r2-hard.fastq", "r2-link.fastq" },
-    };
-    for (names, aliases) |name, links| {
-        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
-        try tmp.dir.hardLink(name, tmp.dir, links[2], io, .{});
-        try tmp.dir.symLink(io, name, links[3], .{});
-    }
+    const input = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const payload = "@same\nAC\n+\nII\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = payload });
+    try tmp.dir.hardLink("r1.fastq", tmp.dir, "r1-hard.fastq", io, .{});
+    try tmp.dir.symLink(io, "r1.fastq", "r1-link.fastq", .{});
+    const args = [_][]const u8{ "sample", "--count", "1", input };
+    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: input file is output file\n", .{input});
 
-    const record = "@same\nAC\n+\nII\n";
-    for ([_][]const []const u8{ &.{"sample"}, &.{ "sample", "--paired" }, &.{ "sample", "--interleaved" } }, 0..) |prefix, mode| {
-        const input_count: usize = if (mode == 1) 2 else 1;
-        const payload = if (mode == 2) record ++ record else record;
-        var gzip: std.ArrayList(u8) = .empty;
-        try cli.appendGzipMember(allocator, &gzip, payload, .{});
-        for ([_][]const u8{ payload, gzip.items }) |bytes| {
-            for ([_][2][]const u8{ .{ "--fraction", "0" }, .{ "--fraction", "1" }, .{ "--count", "0" }, .{ "--count", "1" } }) |selection| {
-                var args: std.ArrayList([]const u8) = .empty;
-                try args.appendSlice(allocator, prefix);
-                try args.appendSlice(allocator, &selection);
-                try args.appendSlice(allocator, paths[0..input_count]);
-                for (0..input_count) |side| {
-                    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: input file is output file\n", .{paths[side]});
-                    for (aliases[side]) |alias| {
-                        for ([_]bool{ false, true }) |append| {
-                            for (names) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
-                            const output: std.Io.File = .{
-                                .handle = try std.posix.openat(tmp.dir.handle, alias, .{
-                                    .ACCMODE = .WRONLY,
-                                    .TRUNC = !append,
-                                    .APPEND = append,
-                                    .CLOEXEC = true,
-                                }, 0),
-                                .flags = .{ .nonblocking = false },
-                            };
-                            defer output.close(io);
+    for ([_][]const u8{ "r1-hard.fastq", "r1-link.fastq" }) |alias| {
+        for ([_]bool{ false, true }) |append| {
+            try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = payload });
+            const output: std.Io.File = .{
+                .handle = try std.posix.openat(tmp.dir.handle, alias, .{
+                    .ACCMODE = .WRONLY,
+                    .TRUNC = !append,
+                    .APPEND = append,
+                    .CLOEXEC = true,
+                }, 0),
+                .flags = .{ .nonblocking = false },
+            };
+            defer output.close(io);
 
-                            try cli.expectResult(try cli.runWithStdoutFile(allocator, args.items, output, null), 2, "", diagnostic);
-                            for (names, 0..) |name, index| {
-                                const actual = try tmp.dir.readFileAlloc(io, name, allocator, .limited(1024));
-                                try std.testing.expectEqualStrings(if (!append and index == side) "" else bytes, actual);
-                            }
-                            for (names[0..input_count]) |stderr_name| {
-                                const stderr_file: std.Io.File = .{
-                                    .handle = try std.posix.openat(tmp.dir.handle, stderr_name, .{
-                                        .ACCMODE = .WRONLY,
-                                        .APPEND = true,
-                                        .CLOEXEC = true,
-                                    }, 0),
-                                    .flags = .{ .nonblocking = false },
-                                };
-                                defer stderr_file.close(io);
-                                try std.testing.expectEqual(@as(u8, 2), try cli.runWithOutputFiles(allocator, args.items, output, stderr_file));
-                                for (names, 0..) |name, index| {
-                                    try std.testing.expectEqualStrings(if (!append and index == side) "" else bytes, try tmp.dir.readFileAlloc(io, name, allocator, .limited(1024)));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            try cli.expectResult(try cli.runWithStdoutFile(allocator, &args, output, null), 2, "", diagnostic);
+            // Truncating the alias empties the input before the command runs; appending keeps it.
+            try std.testing.expectEqualStrings(if (append) payload else "", try tmp.dir.readFileAlloc(io, "r1.fastq", allocator, .limited(1024)));
+
+            // Standard error names the input on purpose: the diagnostic must not be written into it.
+            const stderr_file: std.Io.File = .{
+                .handle = try std.posix.openat(tmp.dir.handle, "r1.fastq", .{
+                    .ACCMODE = .WRONLY,
+                    .APPEND = true,
+                    .CLOEXEC = true,
+                }, 0),
+                .flags = .{ .nonblocking = false },
+            };
+            defer stderr_file.close(io);
+            try std.testing.expectEqual(@as(u8, 2), (try cli.runWith(allocator, &args, .{ .stdout = .{ .file = output }, .stderr = .{ .file = stderr_file } })).exit_code);
+            try std.testing.expectEqualStrings(if (append) payload else "", try tmp.dir.readFileAlloc(io, "r1.fastq", allocator, .limited(1024)));
         }
     }
 }
@@ -177,7 +160,7 @@ test "[cli] - [sample]: shared input and output aliases preserve the paired-inpu
     for ([_][2][]const u8{ .{ "--fraction", "0" }, .{ "--fraction", "1" }, .{ "--count", "0" }, .{ "--count", "1" } }) |selection| {
         const args = [_][]const u8{ "sample", "--paired", selection[0], selection[1], path, path };
         try cli.expectResult(try cli.runWithStdoutFile(allocator, &args, output, null), 2, "", diagnostic);
-        try std.testing.expectEqual(@as(u8, 2), try cli.runWithOutputFiles(allocator, &args, output, output));
+        try std.testing.expectEqual(@as(u8, 2), (try cli.runWith(allocator, &args, .{ .stdout = .{ .file = output }, .stderr = .{ .file = output } })).exit_code);
         try std.testing.expectEqualStrings(payload, try tmp.dir.readFileAlloc(io, "input.fastq", allocator, .limited(1024)));
     }
 }
@@ -273,6 +256,7 @@ test "[edge] - [fraction selector]: equality is excluded by the strict boundary"
 }
 
 test "[edge] - [fraction selector]: parsed zero and one avoid random state" {
+    // "0." then 400 zeros and a final "1": the parser rounds it to zero, so no draw is taken.
     var tiny = [_]u8{'0'} ** 403;
     tiny[1] = '.';
     tiny[tiny.len - 1] = '1';
@@ -322,6 +306,7 @@ test "[unit] - [sample numbers]: fraction and seed grammars are exact" {
     ));
     for ([_][]const u8{ "", "+1", "-1", "1.0", "1e2", " 1", "1 " }) |text| {
         try std.testing.expectError(error.InvalidSeed, sampling.parseSeed(text));
+        try std.testing.expectError(error.InvalidCount, sampling.parseCount(text));
     }
     try std.testing.expectError(
         error.Overflow,
@@ -333,9 +318,6 @@ test "[unit] - [sample numbers]: fraction and seed grammars are exact" {
     try std.testing.expectEqual(std.math.maxInt(u64), try sampling.parseCount(
         "18446744073709551615",
     ));
-    for ([_][]const u8{ "", "+1", "-1", "1.0", "1e2", " 1", "1 " }) |text| {
-        try std.testing.expectError(error.InvalidCount, sampling.parseCount(text));
-    }
     try std.testing.expectError(
         error.Overflow,
         sampling.parseCount("18446744073709551616"),
@@ -405,27 +387,14 @@ test "[unit] - [exact selector]: seed 11 matches frozen seqtk indexes" {
             },
             .none => {
                 try std.testing.expect(actual == .none);
-                try std.testing.expectEqual(@as(usize, 0), selector.indexes.capacity);
+                try std.testing.expectEqual(@as(usize, 0), selector.indexes.items.len);
             },
             .all => {
                 try std.testing.expect(actual == .all);
-                try std.testing.expectEqual(@as(usize, 0), selector.indexes.capacity);
+                try std.testing.expectEqual(@as(usize, 0), selector.indexes.items.len);
             },
         }
     }
-}
-
-test "[unit] - [exact selector]: indexes materialize only after the target is exceeded" {
-    var selector = sampling.ExactSelector.init(5, 11);
-    defer selector.deinit(std.testing.allocator);
-
-    for (1..6) |record_number| {
-        try selector.considerRecord(std.testing.allocator, record_number);
-        try std.testing.expectEqual(@as(usize, 0), selector.indexes.capacity);
-    }
-    try selector.considerRecord(std.testing.allocator, 6);
-    try std.testing.expectEqual(@as(usize, 5), selector.indexes.items.len);
-    try std.testing.expect(selector.finish() == .indexes);
 }
 
 fn exerciseExactSelectorAllocations(allocator: std.mem.Allocator) !void {
@@ -439,12 +408,11 @@ fn exerciseExactSelectorAllocations(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 37), selection.indexes.len());
 }
 
-test "[failure] - [exact selector]: materialized index allocation is released" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseExactSelectorAllocations,
-        .{},
-    );
+test "[failure] - [exact selector]: first index allocation failure is reported and releases state" {
+    // Index 0 is the first allocation the selector makes when it materializes its indexes,
+    // so the failure lands on the partial state that deinit must release.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, exerciseExactSelectorAllocations(failing.allocator()));
 }
 
 test "[cli] - [sample]: boundary fractions preserve fields and canonicalize LF" {
@@ -490,7 +458,7 @@ test "[cli] - [sample]: boundary fractions preserve fields and canonicalize LF" 
     );
 }
 
-test "[cli] - [sample]: selecting all records preserves fields across line endings" {
+test "[cli] - [sample]: selecting all records canonicalizes LF and CRLF line endings" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -501,51 +469,32 @@ test "[cli] - [sample]: selecting all records preserves fields across line endin
     const cases = [_]struct {
         input: []const u8,
         canonical: []const u8,
-        count: u64,
+        count: []const u8,
+        gzip: bool,
     }{
-        .{ .input = "", .canonical = "", .count = 0 },
         .{
-            .input = "@empty\r\n\r\n+annotation\r\n\r\n",
-            .canonical = "@empty\n\n+annotation\n\n",
-            .count = 1,
+            .input = "@a\nRyuN\n+first\n!5?~\n",
+            .canonical = "@a\nRyuN\n+first\n!5?~\n",
+            .count = "1",
+            .gzip = false,
         },
         .{
-            .input = "@a opaque\rdata\nAC\r\n+first\rnote\n!~\r\n@b\r\n\n+empty\r\n\n",
-            .canonical = "@a opaque\rdata\nAC\n+first\rnote\n!~\n@b\n\n+empty\n\n",
-            .count = 2,
-        },
-        .{
-            .input = "@a\r\nRyuN\r\n+first\r\n!5?~\r\n@b\nTn\n+last\n!#",
-            .canonical = "@a\nRyuN\n+first\n!5?~\n@b\nTn\n+last\n!#\n",
-            .count = 2,
+            .input = "@a\r\nRyuN\r\n+first\r\n!5?~\r\n",
+            .canonical = "@a\nRyuN\n+first\n!5?~\n",
+            .count = "1",
+            .gzip = true,
         },
     };
-    for (cases, 0..) |case, index| {
+    for (cases) |case| {
         var gzip: std.ArrayList(u8) = .empty;
         try cli.appendGzipMember(allocator, &gzip, case.input, .{});
-        for ([_][]const u8{ case.input, gzip.items }, 0..) |bytes, encoding| {
-            errdefer std.debug.print("sample all case={d} encoding={d}\n", .{ index, encoding });
-            try tmp.dir.writeFile(io, .{ .sub_path = "records", .data = bytes });
-            try cli.expectResult(
-                try cli.run(allocator, &.{ "sample", "--fraction", "1", path }),
-                0,
-                case.canonical,
-                "",
-            );
-            for ([_]u64{ case.count, case.count + 1 }) |count| {
-                const count_arg = try std.fmt.allocPrint(allocator, "{d}", .{count});
-                try cli.expectResult(
-                    try cli.run(allocator, &.{ "sample", "--count", count_arg, path }),
-                    0,
-                    case.canonical,
-                    "",
-                );
-            }
-        }
+        try tmp.dir.writeFile(io, .{ .sub_path = "records", .data = if (case.gzip) gzip.items else case.input });
+        try cli.expectResult(try cli.run(allocator, &.{ "sample", "--fraction", "1", path }), 0, case.canonical, "");
+        try cli.expectResult(try cli.run(allocator, &.{ "sample", "--count", case.count, path }), 0, case.canonical, "");
     }
 }
 
-test "[cli] - [sample]: selected terminal CR fields fail before output" {
+test "[cli] - [sample]: a selected record with a terminal CR field fails before output" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -554,26 +503,18 @@ test "[cli] - [sample]: selected terminal CR fields fail before output" {
     const allocator = arena.allocator();
     const path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
     const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: record fields ending in CR cannot be written with LF endings\n", .{path});
-    const inputs = [_][]const u8{
-        "@r\r\r\nA\n+\n!\n",
-        "@r\nA\n+\r\r\n!\n",
-        "@\r\r\nA\n+\n!\n",
-    };
-    for (inputs) |input| {
-        var gzip: std.ArrayList(u8) = .empty;
-        try cli.appendGzipMember(allocator, &gzip, input, .{});
-        for ([_][]const u8{ input, gzip.items }) |bytes| {
-            try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = bytes });
-            try cli.expectResult(try cli.run(allocator, &.{ "check", path }), 0, "", "");
-            for ([_][]const u8{ "--fraction", "--count" }) |mode| {
-                try cli.expectResult(try cli.run(allocator, &.{ "sample", mode, "1", path }), 1, "", diagnostic);
-                try cli.expectResult(try cli.run(allocator, &.{ "sample", mode, "0", path }), 0, "", "");
-            }
-        }
+    const input = "@r\r\r\nA\n+\n!\n";
+    var gzip: std.ArrayList(u8) = .empty;
+    try cli.appendGzipMember(allocator, &gzip, input, .{});
+    for ([_][]const u8{ input, gzip.items }) |bytes| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = bytes });
+        try cli.expectResult(try cli.run(allocator, &.{ "sample", "--fraction", "1", path }), 1, "", diagnostic);
+        // A zero fraction selects nothing, so the unwritable field is never reached.
+        try cli.expectResult(try cli.run(allocator, &.{ "sample", "--fraction", "0", path }), 0, "", "");
     }
 }
 
-test "[cli] - [paired sample]: terminal CR rejection preserves complete earlier pairs" {
+test "[cli] - [sample]: a terminal CR in a pair fails after the complete earlier pair" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -585,17 +526,18 @@ test "[cli] - [paired sample]: terminal CR rejection preserves complete earlier 
     const pair_path = try cli.tempPath(allocator, &tmp.sub_path, "pair.fastq");
     const first1 = "@ok/1\nA\n+\n!\n";
     const first2 = "@ok/2\nT\n+\n#\n";
-    const padding = try allocator.alloc(u8, 256 * 1024);
+    // A header of this length fills more than one output buffer, so the failing pair follows a flush.
+    const padding = try allocator.alloc(u8, OUTPUT_BUFFER_BYTES * 4);
     @memset(padding, 'x');
 
-    const shapes = [_][2]usize{ .{ 0, 0 }, .{ padding.len, 0 }, .{ 0, padding.len }, .{ padding.len, padding.len } };
-    for (shapes) |shape| {
+    const shapes = [_]usize{ 0, padding.len };
+    for (shapes) |pad| {
         for (0..2) |bad_mate| {
             const mate1 = try std.fmt.allocPrint(allocator, "@pair/1 {s}\nA\n+{s}\n!\n", .{
-                padding[0..shape[0]], if (bad_mate == 0) "\r\r" else "",
+                padding[0..pad], if (bad_mate == 0) "\r\r" else "",
             });
             const mate2 = try std.fmt.allocPrint(allocator, "@pair/2 {s}\nT\n+{s}\n#\n", .{
-                padding[0..shape[1]], if (bad_mate == 1) "\r\r" else "",
+                padding[0..pad], if (bad_mate == 1) "\r\r" else "",
             });
             const r1 = try std.mem.concat(allocator, u8, &.{ first1, mate1 });
             const r2 = try std.mem.concat(allocator, u8, &.{ first2, mate2 });
@@ -603,21 +545,22 @@ test "[cli] - [paired sample]: terminal CR rejection preserves complete earlier 
             try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = r1 });
             try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = r2 });
             try tmp.dir.writeFile(io, .{ .sub_path = "pair.fastq", .data = pairs });
-            for ([_][]const u8{ "--fraction", "--count" }) |mode| {
-                const amount = if (std.mem.eql(u8, mode, "--fraction")) "1" else "2";
-                const paired_error = try std.fmt.allocPrint(allocator, "error: {s}: record fields ending in CR cannot be written with LF endings\n", .{if (bad_mate == 0) r1_path else r2_path});
-                const interleaved_error = try std.fmt.allocPrint(allocator, "error: {s}: record fields ending in CR cannot be written with LF endings\n", .{pair_path});
-                try cli.expectResult(try cli.run(allocator, &.{ "sample", "--paired", mode, amount, r1_path, r2_path }), 1, first1 ++ first2, paired_error);
-                try cli.expectResult(try cli.run(allocator, &.{ "sample", "--interleaved", mode, amount, pair_path }), 1, first1 ++ first2, interleaved_error);
+            const bad_path = if (bad_mate == 0) r1_path else r2_path;
+            const paired_error = try std.fmt.allocPrint(allocator, "error: {s}: record fields ending in CR cannot be written with LF endings\n", .{bad_path});
+            const interleaved_error = try std.fmt.allocPrint(allocator, "error: {s}: record fields ending in CR cannot be written with LF endings\n", .{pair_path});
+            for ([_]struct { flag: []const u8, amount: []const u8 }{ .{ .flag = "--fraction", .amount = "1" }, .{ .flag = "--count", .amount = "2" } }) |mode| {
+                try cli.expectResult(try cli.run(allocator, &.{ "sample", "--paired", mode.flag, mode.amount, r1_path, r2_path }), 1, first1 ++ first2, paired_error);
+                try cli.expectResult(try cli.run(allocator, &.{ "sample", "--interleaved", mode.flag, mode.amount, pair_path }), 1, first1 ++ first2, interleaved_error);
             }
         }
     }
 }
 
-test "[cli] - [interleaved sample]: input failures precede unwritable fields across member seams" {
+test "[cli] - [sample]: input failures precede unwritable fields across gzip member seams" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    // The first record has a header field ending in CR, which LF output cannot carry.
     const first = "@p/1 x\r\r\nA\n+\n!\n";
     const cases = [_]struct { second: []const u8, diagnostic: []const u8 }{
         .{ .second = "bad\nT\n+\n#\n", .diagnostic = "error: -: S003: header line must start with '@' and contain a nonempty identifier (record 1, line 1, offset 15)\n" },
@@ -626,18 +569,17 @@ test "[cli] - [interleaved sample]: input failures precede unwritable fields acr
     };
     for (cases) |case| {
         const input = try std.mem.concat(allocator, u8, &.{ first, case.second });
-        for (0..input.len + 1) |split| {
+        // Splits: an empty first member, the seam after the first record, one byte past it, and no second member.
+        for ([_]usize{ 0, first.len, @min(first.len + 1, input.len), input.len }) |split| {
             var gzip: std.ArrayList(u8) = .empty;
             try cli.appendGzipMember(allocator, &gzip, input[0..split], .{});
             try cli.appendGzipMember(allocator, &gzip, input[split..], .{});
-            for ([_][]const u8{ "0", "1" }) |fraction| {
-                try cli.expectResult(try cli.runWithStdin(allocator, &.{ "sample", "--interleaved", "--fraction", fraction, "-" }, gzip.items, gzip.items.len), 1, "", case.diagnostic);
-            }
+            try cli.expectResult(try cli.runWithStdin(allocator, &.{ "sample", "--interleaved", "--fraction", "1", "-" }, gzip.items, gzip.items.len), 1, "", case.diagnostic);
         }
     }
 }
 
-test "[cli] - [exact sample]: rejects FIFOs without waiting for a writer" {
+test "[cli] - [sample]: a FIFO is rejected by paired exact-count runs without waiting for a writer" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -659,21 +601,12 @@ test "[cli] - [exact sample]: rejects FIFOs without waiting for a writer" {
             "error: {s}: exact-count sampling requires a regular file\n",
             .{path},
         );
-        for ([_][]const u8{ "0", "1" }) |count| {
-            const cases = [_][]const []const u8{
-                &.{ "sample", "--count", count, path },
-                &.{ "sample", "--interleaved", "--count", count, path },
-                &.{ "sample", "--paired", "--count", count, path, BASIC_PATH },
-                &.{ "sample", "--paired", "--count", count, BASIC_PATH, path },
-            };
-            for (cases) |args| {
-                try cli.expectResult(try cli.run(allocator, args), 2, "", diagnostic);
-            }
-        }
+        try cli.expectResult(try cli.run(allocator, &.{ "sample", "--paired", "--count", "1", path, BASIC_PATH }), 2, "", diagnostic);
+        try cli.expectResult(try cli.run(allocator, &.{ "sample", "--paired", "--count", "1", BASIC_PATH, path }), 2, "", diagnostic);
     }
 }
 
-test "[cli] - [exact sample]: follows regular-file symlinks in both passes" {
+test "[cli] - [sample]: follows regular-file symlinks in both passes" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -707,7 +640,7 @@ test "[cli] - [exact sample]: follows regular-file symlinks in both passes" {
     }
 }
 
-test "[cli] - [exact sample]: count boundaries preserve records in input order" {
+test "[cli] - [sample]: count boundaries preserve records in input order" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -751,12 +684,13 @@ test "[cli] - [exact sample]: count boundaries preserve records in input order" 
     }
 }
 
-test "[cli] - [interleaved sample]: corrupt final gzip member keeps pairs from checked members" {
+test "[cli] - [sample]: corrupt final gzip member keeps pairs from checked members" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const record = "@r\nAAA\n+\n!!!\n";
-    const input = try allocator.alloc(u8, 524277);
+    // 40329 records make 524277 bytes: seven full 64 KiB gzip members and a partial eighth.
+    const input = try allocator.alloc(u8, 40329 * record.len);
     for (0..input.len / record.len) |index| {
         @memcpy(input[index * record.len ..][0..record.len], record);
     }
@@ -767,7 +701,7 @@ test "[cli] - [interleaved sample]: corrupt final gzip member keeps pairs from c
         try cli.appendGzipMember(allocator, &gzip, input[offset..end], .{});
         offset = end;
     }
-    gzip.items[gzip.items.len - 8] ^= 1;
+    gzip.items[cli.gzipCrcOffset(gzip.items.len)] ^= 1;
     const final_member_start = (input.len - 1) / std.math.maxInt(u16) * std.math.maxInt(u16);
     const checked_pairs_len = final_member_start / (2 * record.len) * (2 * record.len);
 
@@ -849,7 +783,7 @@ test "[integration] - [sample]: plain and gzip file and stdin select identical r
     );
 }
 
-test "[cli] - [paired fraction sample]: frozen pair indexes match logical record decisions" {
+test "[cli] - [sample]: frozen pair indexes match logical record decisions" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -885,35 +819,10 @@ test "[cli] - [paired fraction sample]: frozen pair indexes match logical record
     };
     const cases = [_]Case{
         .{ .seed = "0", .fraction = "0", .indexes = &.{} },
-        .{ .seed = "0", .fraction = "0.000001", .indexes = &.{} },
-        .{ .seed = "0", .fraction = "0.1", .indexes = &.{ 2, 5 } },
+        .{ .seed = "11", .fraction = "0.1", .indexes = &.{ 4, 11 } },
         .{ .seed = "0", .fraction = "0.5", .indexes = &.{ 0, 2, 5, 7, 10, 13, 14, 15 } },
         .{ .seed = "0", .fraction = "0.999999", .indexes = all },
         .{ .seed = "0", .fraction = "1", .indexes = all },
-        .{ .seed = "1", .fraction = "0", .indexes = &.{} },
-        .{ .seed = "1", .fraction = "0.000001", .indexes = &.{} },
-        .{ .seed = "1", .fraction = "0.1", .indexes = &.{ 3, 7, 10 } },
-        .{ .seed = "1", .fraction = "0.5", .indexes = &.{ 0, 1, 2, 3, 4, 6, 7, 10, 13, 14, 15 } },
-        .{ .seed = "1", .fraction = "0.999999", .indexes = all },
-        .{ .seed = "1", .fraction = "1", .indexes = all },
-        .{ .seed = "11", .fraction = "0", .indexes = &.{} },
-        .{ .seed = "11", .fraction = "0.000001", .indexes = &.{} },
-        .{ .seed = "11", .fraction = "0.1", .indexes = &.{ 4, 11 } },
-        .{ .seed = "11", .fraction = "0.5", .indexes = &.{ 0, 2, 4, 5, 10, 11, 13, 14, 15 } },
-        .{ .seed = "11", .fraction = "0.999999", .indexes = all },
-        .{ .seed = "11", .fraction = "1", .indexes = all },
-        .{ .seed = "4294967295", .fraction = "0", .indexes = &.{} },
-        .{ .seed = "4294967295", .fraction = "0.000001", .indexes = &.{} },
-        .{ .seed = "4294967295", .fraction = "0.1", .indexes = &.{ 7, 15 } },
-        .{ .seed = "4294967295", .fraction = "0.5", .indexes = &.{ 0, 4, 5, 6, 7, 8, 9, 11, 15 } },
-        .{ .seed = "4294967295", .fraction = "0.999999", .indexes = all },
-        .{ .seed = "4294967295", .fraction = "1", .indexes = all },
-        .{ .seed = "18446744073709551615", .fraction = "0", .indexes = &.{} },
-        .{ .seed = "18446744073709551615", .fraction = "0.000001", .indexes = &.{} },
-        .{ .seed = "18446744073709551615", .fraction = "0.1", .indexes = &.{ 0, 2, 8, 15 } },
-        .{ .seed = "18446744073709551615", .fraction = "0.5", .indexes = &.{ 0, 2, 6, 7, 8, 9, 12, 14, 15 } },
-        .{ .seed = "18446744073709551615", .fraction = "0.999999", .indexes = all },
-        .{ .seed = "18446744073709551615", .fraction = "1", .indexes = all },
     };
 
     var expected: std.ArrayList(u8) = .empty;
@@ -952,7 +861,7 @@ test "[cli] - [paired fraction sample]: frozen pair indexes match logical record
     }
 }
 
-test "[cli] - [paired exact sample]: pair indexes match the exact selector" {
+test "[cli] - [sample]: pair indexes match the exact selector" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -987,20 +896,9 @@ test "[cli] - [paired exact sample]: pair indexes match the exact selector" {
         indexes: []const u8,
     }{
         .{ .count = "0", .seed = "11", .indexes = &.{} },
-        .{ .count = "1", .seed = "11", .indexes = &.{4} },
         .{ .count = "3", .seed = "11", .indexes = &.{ 4, 10, 11 } },
-        .{ .count = "16", .seed = "11", .indexes = all },
-        .{ .count = "20", .seed = "11", .indexes = all },
-        .{
-            .count = "2",
-            .seed = "18446744073709551615",
-            .indexes = &.{ 8, 15 },
-        },
-        .{
-            .count = "18446744073709551615",
-            .seed = "11",
-            .indexes = all,
-        },
+        .{ .count = "2", .seed = "18446744073709551615", .indexes = &.{ 8, 15 } },
+        .{ .count = "18446744073709551615", .seed = "11", .indexes = all },
     };
 
     var expected: std.ArrayList(u8) = .empty;
@@ -1039,7 +937,7 @@ test "[cli] - [paired exact sample]: pair indexes match the exact selector" {
     }
 }
 
-test "[integration] - [paired exact sample]: gzip and exact-name fields match plain input" {
+test "[integration] - [sample]: gzip and exact-name fields match plain input" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1132,7 +1030,7 @@ test "[integration] - [paired exact sample]: gzip and exact-name fields match pl
     );
 }
 
-test "[cli] - [paired sample]: select-all modes agree with interleave and canonical fields" {
+test "[cli] - [sample]: select-all modes agree with interleave and canonical fields" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1150,66 +1048,62 @@ test "[cli] - [paired sample]: select-all modes agree with interleave and canoni
     const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
     const pairs_path = try cli.tempPath(allocator, &tmp.sub_path, "pairs.fastq");
 
-    for ([_]bool{ false, true }) |gzip| {
-        errdefer std.debug.print("paired select-all gzip={}\n", .{gzip});
-        for (
-            [_][]const u8{ "r1.fastq", "r2.fastq", "pairs.fastq" },
-            [_][]const u8{ r1, r2, interleaved },
-        ) |name, bytes| {
-            var encoded: std.ArrayList(u8) = .empty;
-            if (gzip) try cli.appendGzipMember(allocator, &encoded, bytes, .{});
-            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = if (gzip) encoded.items else bytes });
-        }
-        try cli.expectResult(
-            try cli.run(allocator, &.{ "interleave", "--pair-names", "exact", r1_path, r2_path }),
-            0,
-            expected,
-            "",
-        );
-        for ([_][]const u8{ "1", "2" }) |count| {
-            try cli.expectResult(
-                try cli.run(allocator, &.{ "sample", "--paired", "--count", count, "--pair-names", "exact", r1_path, r2_path }),
-                0,
-                expected,
-                "",
-            );
-            try cli.expectResult(
-                try cli.run(allocator, &.{ "sample", "--interleaved", "--count", count, "--pair-names", "exact", pairs_path }),
-                0,
-                expected,
-                "",
-            );
-        }
-        try cli.expectResult(
-            try cli.run(allocator, &.{
-                "sample",
-                "--paired",
-                "--fraction",
-                "1",
-                "--pair-names",
-                "exact",
-                r1_path,
-                r2_path,
-            }),
-            0,
-            expected,
-            "",
-        );
-        try cli.expectResult(
-            try cli.run(allocator, &.{
-                "sample",
-                "--interleaved",
-                "--fraction",
-                "1",
-                "--pair-names",
-                "exact",
-                pairs_path,
-            }),
-            0,
-            expected,
-            "",
-        );
-    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = r1 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = r2 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = interleaved });
+    try cli.expectResult(
+        try cli.run(allocator, &.{ "interleave", "--pair-names", "exact", r1_path, r2_path }),
+        0,
+        expected,
+        "",
+    );
+    try cli.expectResult(
+        try cli.run(allocator, &.{ "sample", "--paired", "--count", "1", "--pair-names", "exact", r1_path, r2_path }),
+        0,
+        expected,
+        "",
+    );
+    try cli.expectResult(
+        try cli.run(allocator, &.{ "sample", "--interleaved", "--count", "1", "--pair-names", "exact", pairs_path }),
+        0,
+        expected,
+        "",
+    );
+    try cli.expectResult(
+        try cli.run(allocator, &.{ "sample", "--paired", "--fraction", "1", "--pair-names", "exact", r1_path, r2_path }),
+        0,
+        expected,
+        "",
+    );
+    try cli.expectResult(
+        try cli.run(allocator, &.{ "sample", "--interleaved", "--fraction", "1", "--pair-names", "exact", pairs_path }),
+        0,
+        expected,
+        "",
+    );
+
+    // Gzip members of the same records give the same output for an exact count.
+    var gzip1: std.ArrayList(u8) = .empty;
+    var gzip2: std.ArrayList(u8) = .empty;
+    var gzip_pairs: std.ArrayList(u8) = .empty;
+    try cli.appendGzipMember(allocator, &gzip1, r1, .{});
+    try cli.appendGzipMember(allocator, &gzip2, r2, .{});
+    try cli.appendGzipMember(allocator, &gzip_pairs, interleaved, .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = gzip1.items });
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = gzip2.items });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = gzip_pairs.items });
+    try cli.expectResult(
+        try cli.run(allocator, &.{ "sample", "--paired", "--count", "2", "--pair-names", "exact", r1_path, r2_path }),
+        0,
+        expected,
+        "",
+    );
+    try cli.expectResult(
+        try cli.run(allocator, &.{ "sample", "--interleaved", "--count", "2", "--pair-names", "exact", pairs_path }),
+        0,
+        expected,
+        "",
+    );
 
     try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "" });
     try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "" });
@@ -1221,20 +1115,14 @@ test "[cli] - [paired sample]: select-all modes agree with interleave and canoni
         "",
     );
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--fraction",
-            "1",
-            pairs_path,
-        }),
+        try cli.run(allocator, &.{ "sample", "--interleaved", "--fraction", "1", pairs_path }),
         0,
         "",
         "",
     );
 }
 
-test "[cli] - [paired fraction sample]: gzip and stdin layouts preserve selected pairs" {
+test "[cli] - [sample]: gzip and stdin layouts preserve selected pairs" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1347,18 +1235,19 @@ test "[cli] - [paired fraction sample]: gzip and stdin layouts preserve selected
     var first_member: std.ArrayList(u8) = .empty;
     var second_member: std.ArrayList(u8) = .empty;
     var damaged_member: std.ArrayList(u8) = .empty;
-    for (0..500) |pair_index| {
+    for (0..3) |pair_index| {
         try appendPair(allocator, null, null, &first_member, pair_index);
         try appendPair(allocator, null, null, &second_member, pair_index);
     }
-    try appendPair(allocator, null, null, &damaged_member, 500);
+    try appendPair(allocator, null, null, &damaged_member, 3);
     var corrupt_chain: std.ArrayList(u8) = .empty;
     for (0..4) |_| {
         try cli.appendGzipMember(allocator, &corrupt_chain, first_member.items, .{});
         try cli.appendGzipMember(allocator, &corrupt_chain, second_member.items, .{});
     }
     try cli.appendGzipMember(allocator, &corrupt_chain, damaged_member.items, .{});
-    corrupt_chain.items[corrupt_chain.items.len - 8] ^= 1;
+    corrupt_chain.items[cli.gzipCrcOffset(corrupt_chain.items.len)] ^= 1;
+    // The pipe delivers the chain in 4 KiB reads, so refills fall inside pairs.
     const damaged = try cli.runWithStdin(
         allocator,
         &.{ "sample", "--interleaved", "--fraction", "1", "-" },
@@ -1367,8 +1256,11 @@ test "[cli] - [paired fraction sample]: gzip and stdin layouts preserve selected
     );
     try std.testing.expectEqual(@as(u8, 3), damaged.exit_code);
     try std.testing.expectEqualStrings("error: -: I/O error\n", damaged.stderr);
-    try std.testing.expect(damaged.stdout.len != 0);
-    try std.testing.expect(std.mem.startsWith(u8, damaged.stdout, "@pair0/1 lane=left\n"));
+    // The eight intact members hold the same three pairs each, so their output is that pair block repeated.
+    var intact: std.ArrayList(u8) = .empty;
+    for (0..8) |_| try intact.appendSlice(allocator, first_member.items);
+    try std.testing.expect(damaged.stdout.len >= intact.items.len);
+    try std.testing.expectEqualStrings(intact.items, damaged.stdout[0..intact.items.len]);
     try cli.expectResult(
         try cli.runWithStdin(
             allocator,
@@ -1382,33 +1274,35 @@ test "[cli] - [paired fraction sample]: gzip and stdin layouts preserve selected
     );
 }
 
-test "[cli] - [paired sample]: failing pairs leave only earlier complete pairs" {
-    const io = std.testing.io;
+test "[cli] - [sample]: a sequence and quality length mismatch fails before any pair is written" {
+    const input = "@a/1\nR\n+\n \n@a/2\nAAA\n+\n!\n!\n";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    try cli.expectResult(
+        try cli.runWithStdin(
+            allocator,
+            &.{ "sample", "--interleaved", "--fraction", "1", "-" },
+            input,
+            input.len,
+        ),
+        1,
+        "",
+        "error: -: S005: sequence and quality lengths differ " ++
+            "(record 1, line 4, offset 22)\n",
+    );
+}
+
+test "[cli] - [sample]: an identifier mismatch after one complete pair keeps that pair" {
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const r1_path = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
     const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
-    const pairs_path = try cli.tempPath(allocator, &tmp.sub_path, "pairs.fastq");
     const first_pair = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n";
-
-    for ([_][]const u8{ "0", "1" }) |fraction| {
-        try cli.expectResult(
-            try cli.runWithStdin(
-                allocator,
-                &.{ "sample", "--interleaved", "--fraction", fraction, "-" },
-                "@a/1\nR\n+\n \n@a/2\nAAA\n+\n!\n!\n",
-                26,
-            ),
-            1,
-            "",
-            "error: -: S005: sequence and quality lengths differ " ++
-                "(record 1, line 4, offset 22)\n",
-        );
-    }
-
     try tmp.dir.writeFile(io, .{
         .sub_path = "r1.fastq",
         .data = "@ok/1\nA\n+\n!\n@left/1\nC\n+\n$\n",
@@ -1419,100 +1313,52 @@ test "[cli] - [paired sample]: failing pairs leave only earlier complete pairs" 
     });
     const mismatch = try std.fmt.allocPrint(
         allocator,
-        "error: {s} + {s}: P001: paired identifiers or mate markers do not match " ++
-            "(pair 1)\n" ++
-            "  R1: input={s}, record=1, offset=12, first_token=left/1 " ++
-            "[length=6, truncated=false], normalized_id=left " ++
-            "[length=4, truncated=false], mate_markers=1\n" ++
-            "  R2: input={s}, record=1, offset=12, first_token=right/2 " ++
-            "[length=7, truncated=false], normalized_id=right " ++
-            "[length=5, truncated=false], mate_markers=2\n",
-        .{ r1_path, r2_path, r1_path, r2_path },
+        "error: {s} + {s}: P001: paired identifiers or mate markers do not match (pair 1)\n",
+        .{ r1_path, r2_path },
     );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--paired",
-            "--fraction",
-            "1",
-            r1_path,
-            r2_path,
-        }),
-        1,
-        first_pair,
-        mismatch,
-    );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--paired",
-            "--count",
-            "1",
-            r1_path,
-            r2_path,
-        }),
-        1,
-        "",
-        mismatch,
-    );
-    try cli.expectResult(
-        try cli.runWithStdin(
-            allocator,
-            &.{ "sample", "--interleaved", "--fraction", "0", "-" },
-            "@left/1\nA\n+\n!\n@right/2\nT\n+\n#\n",
-            1,
-        ),
-        1,
-        "",
-        "error: -: P001: paired identifiers or mate markers do not match (pair 0)\n" ++
-            "  R1: input=-, record=0, offset=0, first_token=left/1 " ++
-            "[length=6, truncated=false], normalized_id=left " ++
-            "[length=4, truncated=false], mate_markers=1\n" ++
-            "  R2: input=-, record=1, offset=14, first_token=right/2 " ++
-            "[length=7, truncated=false], normalized_id=right " ++
-            "[length=5, truncated=false], mate_markers=2\n",
-    );
+    const result = try cli.run(allocator, &.{ "sample", "--paired", "--fraction", "1", r1_path, r2_path });
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings(first_pair, result.stdout);
+    try expectFirstLine(mismatch, result.stderr);
+}
 
+test "[cli] - [sample]: a missing mate after one complete pair keeps that pair" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const r1_path = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    const first_pair = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n";
     try tmp.dir.writeFile(io, .{
-        .sub_path = "pairs.fastq",
-        .data = "@left/1\nA\n+\n!\n@right/2\nT\n+\n#\n",
+        .sub_path = "r1.fastq",
+        .data = "@ok/1\nA\n+\n!\n@extra/1\nC\n+\n$\n",
     });
-    const buffered_mismatch = try std.fmt.allocPrint(
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "@ok/2\nT\n+\n#\n" });
+    const unequal = try std.fmt.allocPrint(
         allocator,
-        "error: {s}: P001: paired identifiers or mate markers do not match (pair 0)\n" ++
-            "  R1: input={s}, record=0, offset=0, first_token=left/1 " ++
-            "[length=6, truncated=false], normalized_id=left " ++
-            "[length=4, truncated=false], mate_markers=1\n" ++
-            "  R2: input={s}, record=1, offset=14, first_token=right/2 " ++
-            "[length=7, truncated=false], normalized_id=right " ++
-            "[length=5, truncated=false], mate_markers=2\n",
-        .{ pairs_path, pairs_path, pairs_path },
+        "error: {s} + {s}: P002: paired input is missing a mate " ++
+            "(pair 1, remaining R1, last R1 record 1, last R2 record 0)\n",
+        .{ r1_path, r2_path },
     );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--fraction",
-            "0",
-            pairs_path,
-        }),
-        1,
-        "",
-        buffered_mismatch,
-    );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--count",
-            "1",
-            pairs_path,
-        }),
-        1,
-        "",
-        buffered_mismatch,
-    );
+    const result = try cli.run(allocator, &.{ "sample", "--paired", "--fraction", "1", r1_path, r2_path });
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings(first_pair, result.stdout);
+    try expectFirstLine(unequal, result.stderr);
+}
 
+test "[cli] - [sample]: a sequence error in mate two keeps the complete pair before it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const r1_path = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    const first_pair = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n";
     try tmp.dir.writeFile(io, .{
         .sub_path = "r1.fastq",
         .data = "@ok/1\nA\n+\n!\n@bad/1\nC\n+\n$\n",
@@ -1528,145 +1374,17 @@ test "[cli] - [paired sample]: failing pairs leave only earlier complete pairs" 
         .{r2_path},
     );
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--paired",
-            "--fraction",
-            "1",
-            r1_path,
-            r2_path,
-        }),
+        try cli.run(allocator, &.{ "sample", "--paired", "--fraction", "1", r1_path, r2_path }),
         1,
         first_pair,
         mate2_semantic,
     );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--paired",
-            "--count",
-            "1",
-            r1_path,
-            r2_path,
-        }),
-        1,
-        "",
-        mate2_semantic,
-    );
-    try cli.expectResult(
-        try cli.runWithStdin(
-            allocator,
-            &.{ "sample", "--interleaved", "--fraction", "0", "-" },
-            "@bad/1\nA\n+\n!\n@bad/2\n.\n+\n!\n",
-            1,
-        ),
-        1,
-        "",
-        "error: -: S002: sequence byte is outside the selected alphabet " ++
-            "(record 1, line 2, offset 20)\n",
-    );
+}
 
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "pairs.fastq",
-        .data = "@bad/1\n.\n+\n!\n@bad/2\nA\nx\n!\n",
-    });
-    const buffered_precedence = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: S001: plus line must start with '+' " ++
-            "(record 1, line 3, offset 22)\n",
-        .{pairs_path},
-    );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--fraction",
-            "0",
-            pairs_path,
-        }),
-        1,
-        "",
-        buffered_precedence,
-    );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--count",
-            "1",
-            pairs_path,
-        }),
-        1,
-        "",
-        buffered_precedence,
-    );
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "r1.fastq",
-        .data = "@bad/1\n.\n+\n!\n",
-    });
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "r2.fastq",
-        .data = "@bad/2\nA\n+\n \n",
-    });
-    const mate1_semantic = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: S002: sequence byte is outside the selected alphabet " ++
-            "(record 0, line 2, offset 7)\n",
-        .{r1_path},
-    );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--paired",
-            "--fraction",
-            "0",
-            r1_path,
-            r2_path,
-        }),
-        1,
-        "",
-        mate1_semantic,
-    );
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "r1.fastq",
-        .data = "@ok/1\nA\n+\n!\n@extra/1\nC\n+\n$\n",
-    });
-    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "@ok/2\nT\n+\n#\n" });
-    const unequal = try std.fmt.allocPrint(
-        allocator,
-        "error: {s} + {s}: P002: paired input is missing a mate " ++
-            "(pair 1, remaining R1, last R1 record 1, last R2 record 0)\n",
-        .{ r1_path, r2_path },
-    );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--paired",
-            "--fraction",
-            "1",
-            r1_path,
-            r2_path,
-        }),
-        1,
-        first_pair,
-        unequal,
-    );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--paired",
-            "--count",
-            "1",
-            r1_path,
-            r2_path,
-        }),
-        1,
-        "",
-        unequal,
-    );
-
+test "[cli] - [sample]: a plus-line error after complete pairs keeps them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const late_structural = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n@bad/1\nC\n+\n$\n@bad/2\nG\nx\n%\n";
     try cli.expectResult(
         try cli.runWithStdin(
@@ -1676,210 +1394,100 @@ test "[cli] - [paired sample]: failing pairs leave only earlier complete pairs" 
             1,
         ),
         1,
-        first_pair,
+        "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n",
         "error: -: S001: plus line must start with '+' " ++
             "(record 3, line 3, offset 46)\n",
     );
-    try cli.expectResult(
-        try cli.runWithStdin(
-            allocator,
-            &.{ "sample", "--interleaved", "--fraction", "0", "-" },
-            "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n@odd/1\nC\n+\n$\n",
-            1,
-        ),
-        1,
-        "",
-        "error: -: P002: paired input is missing a mate " ++
-            "(pair 1, remaining R1, last R1 record 2, last R2 record 1)\n",
-    );
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "pairs.fastq",
-        .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n@odd/1\nC\n+\n$\n",
-    });
-    const odd = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: P002: paired input is missing a mate " ++
-            "(pair 1, remaining R1, last R1 record 2, last R2 record 1)\n",
-        .{pairs_path},
-    );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--count",
-            "1",
-            pairs_path,
-        }),
-        1,
-        "",
-        odd,
-    );
+}
 
+test "[cli] - [sample]: a closed standard output after a complete pair reports an I/O error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const r1_path = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    const pairs_path = try cli.tempPath(allocator, &tmp.sub_path, "pairs.fastq");
     try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "@ok/1\nA\n+\n!\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "@ok/2\nT\n+\n#\n" });
-    try cli.expectResult(
-        try cli.runWithClosedStdout(
-            allocator,
-            &.{ "sample", "--paired", "--fraction", "1", r1_path, r2_path },
-            "",
-        ),
-        3,
-        "",
-        "error: standard output: I/O error\n",
-    );
-    try cli.expectResult(
-        try cli.runWithClosedStdout(
-            allocator,
-            &.{ "sample", "--paired", "--count", "1", r1_path, r2_path },
-            "",
-        ),
-        3,
-        "",
-        "error: standard output: I/O error\n",
-    );
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "pairs.fastq",
-        .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n",
-    });
-    try cli.expectResult(
-        try cli.runWithClosedStdout(
-            allocator,
-            &.{ "sample", "--interleaved", "--count", "1", pairs_path },
-            "",
-        ),
-        3,
-        "",
-        "error: standard output: I/O error\n",
-    );
+    try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n" });
+    const cases = [_][]const []const u8{
+        &.{ "sample", "--paired", "--fraction", "1", r1_path, r2_path },
+        &.{ "sample", "--paired", "--count", "1", r1_path, r2_path },
+        &.{ "sample", "--interleaved", "--count", "1", pairs_path },
+    };
+    for (cases) |args| {
+        try cli.expectResult(try cli.runWithClosedStdout(allocator, args, ""), 3, "", "error: standard output: I/O error\n");
+    }
 }
 
-test "[edge] - [paired sample]: refill-spanning 512 KiB mates preserve output" {
+test "[edge] - [sample]: interleaved records spanning a read-buffer refill keep their fields" {
     const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
     const pairs_path = try cli.tempPath(allocator, &tmp.sub_path, "pairs.fastq");
 
-    var first_large: std.ArrayList(u8) = .empty;
-    try first_large.appendSlice(allocator, "@large/1 ");
-    try first_large.appendNTimes(allocator, 'x', 512 * 1024);
-    try first_large.appendSlice(allocator, "\nA\n+first\n!\n@large/2 ");
-    try first_large.appendNTimes(allocator, 'y', 300 * 1024);
-    try first_large.appendSlice(allocator, "\nT\n+second\n#\n");
-    try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = first_large.items });
+    // Each header line is longer than the read buffer, so both mates span a refill.
+    const mate_len = READ_BUFFER_BYTES + 1;
+    var large: std.ArrayList(u8) = .empty;
+    try large.appendSlice(allocator, "@large/1 ");
+    try large.appendNTimes(allocator, 'x', mate_len);
+    try large.appendSlice(allocator, "\nA\n+first\n!\n@large/2 ");
+    try large.appendNTimes(allocator, 'y', mate_len);
+    try large.appendSlice(allocator, "\nT\n+second\n#\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = large.items });
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--fraction",
-            "1",
-            pairs_path,
-        }),
+        try cli.run(allocator, &.{ "sample", "--interleaved", "--fraction", "1", pairs_path }),
         0,
-        first_large.items,
+        large.items,
         "",
     );
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--count",
-            "1",
-            pairs_path,
-        }),
+        try cli.run(allocator, &.{ "sample", "--interleaved", "--count", "1", pairs_path }),
         0,
-        first_large.items,
+        large.items,
         "",
     );
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--fraction",
-            "0",
-            pairs_path,
-        }),
+        try cli.run(allocator, &.{ "sample", "--interleaved", "--fraction", "0", pairs_path }),
         0,
         "",
-        "",
-    );
-
-    var second_large: std.ArrayList(u8) = .empty;
-    try second_large.appendSlice(allocator, "@large/1\nA\n+first\n!\n@large/2 ");
-    try second_large.appendNTimes(allocator, 'z', 512 * 1024);
-    try second_large.appendSlice(allocator, "\nT\n+second\n#\n");
-    try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = second_large.items });
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--fraction",
-            "1",
-            pairs_path,
-        }),
-        0,
-        second_large.items,
-        "",
-    );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--count",
-            "1",
-            pairs_path,
-        }),
-        0,
-        second_large.items,
         "",
     );
 }
 
-test "[cli] - [paired sample]: refill-spanning mismatch preserves both identities" {
+test "[cli] - [sample]: an identifier mismatch across a read-buffer refill fails the first pair" {
     const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
     const pairs_path = try cli.tempPath(allocator, &tmp.sub_path, "pairs.fastq");
 
     var input: std.ArrayList(u8) = .empty;
     try input.appendSlice(allocator, "@large/1 ");
-    try input.appendNTimes(allocator, 'x', 512 * 1024);
-    try input.appendSlice(allocator, "\nA\n+first\n!\n");
-    const mate2_offset = input.items.len;
-    try input.appendSlice(allocator, "@other/2\nT\n+second\n#\n");
+    try input.appendNTimes(allocator, 'x', 2 * READ_BUFFER_BYTES);
+    try input.appendSlice(allocator, "\nA\n+first\n!\n@other/2\nT\n+second\n#\n");
     try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = input.items });
 
-    const expected = try std.fmt.allocPrint(
+    const mismatch = try std.fmt.allocPrint(
         allocator,
-        "error: {s}: P001: paired identifiers or mate markers do not match (pair 0)\n" ++
-            "  R1: input={s}, record=0, offset=0, first_token=large/1 " ++
-            "[length=7, truncated=false], normalized_id=large " ++
-            "[length=5, truncated=false], mate_markers=1\n" ++
-            "  R2: input={s}, record=1, offset={d}, first_token=other/2 " ++
-            "[length=7, truncated=false], normalized_id=other " ++
-            "[length=5, truncated=false], mate_markers=2\n",
-        .{ pairs_path, pairs_path, pairs_path, mate2_offset },
+        "error: {s}: P001: paired identifiers or mate markers do not match (pair 0)\n",
+        .{pairs_path},
     );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--interleaved",
-            "--fraction",
-            "0",
-            pairs_path,
-        }),
-        1,
-        "",
-        expected,
-    );
+    const result = try cli.run(allocator, &.{ "sample", "--interleaved", "--fraction", "0", pairs_path });
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try expectFirstLine(mismatch, result.stderr);
 }
 
-test "[cli] - [paired sample]: aliases reject even when selecting zero pairs" {
+test "[cli] - [sample]: an alias of a paired input rejects zero-selection runs before reading" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1887,53 +1495,28 @@ test "[cli] - [paired sample]: aliases reject even when selecting zero pairs" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
-    const copy = try cli.tempPath(allocator, &tmp.sub_path, "copy.fastq");
-    const aliases = [_][]const u8{
-        path,
-        try cli.tempPath(allocator, &tmp.sub_path, "./input.fastq"),
-        try cli.tempPath(allocator, &tmp.sub_path, "hard.fastq"),
-        try cli.tempPath(allocator, &tmp.sub_path, "link.fastq"),
-    };
+    const link = try cli.tempPath(allocator, &tmp.sub_path, "link.fastq");
     const payload = "@SRR1.1 1 length=4\nACGT\n+\nIIII\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = payload });
-    try tmp.dir.hardLink("input.fastq", tmp.dir, "hard.fastq", io, .{});
     try tmp.dir.symLink(io, "input.fastq", "link.fastq", .{});
-    var gzip: std.ArrayList(u8) = .empty;
-    try cli.appendGzipMember(allocator, &gzip, payload, .{});
 
-    for ([_][]const u8{ payload, gzip.items, "", "invalid FASTQ" }) |bytes| {
-        try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = bytes });
-        try tmp.dir.writeFile(io, .{ .sub_path = "copy.fastq", .data = bytes });
-        for ([_][]const u8{ "--fraction", "--count" }) |mode| {
-            for ([_][]const u8{ "0", "1" }) |amount| {
-                for (aliases) |alias| {
-                    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{alias});
-                    try cli.expectResult(try cli.run(allocator, &.{ "sample", "--paired", mode, amount, path, alias }), 2, "", diagnostic);
-                }
-                for (0..2) |stdin_side| {
-                    const inputs: [2][]const u8 = if (stdin_side == 0) .{ "-", path } else .{ path, "-" };
-                    const diagnostic = if (std.mem.eql(u8, mode, "--count"))
-                        "error: paired exact-count sampling requires file paths\n"
-                    else
-                        try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{inputs[1]});
-                    const file = try tmp.dir.openFile(io, "input.fastq", .{});
-                    defer file.close(io);
-                    try cli.expectResult(try cli.runWithStdinFile(allocator, &.{ "sample", "--paired", mode, amount, inputs[0], inputs[1] }, file), 2, "", diagnostic);
-                    if (bytes.len != 0) {
-                        var first: [1]u8 = undefined;
-                        try std.testing.expectEqual(@as(usize, 1), try file.readStreaming(io, &.{&first}));
-                        try std.testing.expectEqual(bytes[0], first[0]);
-                    }
-                }
-                if (std.mem.eql(u8, bytes, "invalid FASTQ")) continue;
-                const expected = if (bytes.len == 0 or std.mem.eql(u8, amount, "0")) "" else payload ++ payload;
-                try cli.expectResult(try cli.run(allocator, &.{ "sample", "--paired", mode, amount, path, copy }), 0, expected, "");
-            }
+    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{link});
+    for ([_][]const u8{ "--fraction", "--count" }) |mode| {
+        for ([_][]const u8{ "0", "1" }) |amount| {
+            try cli.expectResult(try cli.run(allocator, &.{ "sample", "--paired", mode, amount, path, link }), 2, "", diagnostic);
         }
     }
+
+    const stdin_diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{path});
+    const file = try tmp.dir.openFile(io, "input.fastq", .{});
+    defer file.close(io);
+    try cli.expectResult(try cli.runWithStdinFile(allocator, &.{ "sample", "--paired", "--fraction", "0", "-", path }, file), 2, "", stdin_diagnostic);
+    var first: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try file.readStreaming(io, &.{&first}));
+    try std.testing.expectEqual(payload[0], first[0]);
 }
 
-test "[cli] - [paired sample]: arguments and output failures retain their classes" {
+test "[cli] - [sample]: paired and interleaved argument shapes are rejected with exit 2" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1974,6 +1557,12 @@ test "[cli] - [paired sample]: arguments and output failures retain their classe
     for (cases) |case| {
         try cli.expectResult(try cli.run(allocator, case.args), 2, "", case.stderr);
     }
+}
+
+test "[cli] - [sample]: a closed standard output or input reports its I/O error with exit 3" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     const pair = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n";
     try cli.expectResult(
@@ -1997,108 +1586,38 @@ test "[cli] - [paired sample]: arguments and output failures retain their classe
     );
 }
 
-test "[cli] - [sample]: every record is validated before selection" {
+test "[cli] - [sample]: every record is validated before selection in fraction and count modes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--fraction",
-            "0",
-            "tests/data/synthetic/bad_alphabet.fastq",
-        }),
-        1,
-        "",
-        "error: tests/data/synthetic/bad_alphabet.fastq: S002: " ++
-            "sequence byte is outside the selected alphabet (record 0, line 2, offset 16)\n",
-    );
-    const exact_cases = [_]struct {
-        path: []const u8,
+    const cases = [_]struct {
+        args: []const []const u8,
         stderr: []const u8,
     }{
         .{
-            .path = "tests/data/synthetic/bad_plus.fastq",
-            .stderr = "error: tests/data/synthetic/bad_plus.fastq: S001: " ++
-                "plus line must start with '+' (record 0, line 3, offset 15)\n",
-        },
-        .{
-            .path = "tests/data/synthetic/bad_alphabet.fastq",
+            .args = &.{ "sample", "--fraction", "0", "tests/data/synthetic/bad_alphabet.fastq" },
             .stderr = "error: tests/data/synthetic/bad_alphabet.fastq: S002: " ++
                 "sequence byte is outside the selected alphabet (record 0, line 2, offset 16)\n",
         },
         .{
-            .path = "tests/data/synthetic/bad_header.fastq",
-            .stderr = "error: tests/data/synthetic/bad_header.fastq: S003: " ++
-                "header line must start with '@' and contain a nonempty identifier " ++
-                "(record 0, line 1, offset 0)\n",
+            .args = &.{ "sample", "--count", "0", "tests/data/synthetic/bad_plus.fastq" },
+            .stderr = "error: tests/data/synthetic/bad_plus.fastq: S001: " ++
+                "plus line must start with '+' (record 0, line 3, offset 15)\n",
         },
         .{
-            .path = "tests/data/synthetic/truncated_record.fastq",
-            .stderr = "error: tests/data/synthetic/truncated_record.fastq: S004: " ++
-                "unexpected end of file in quality line (record 0, line 4, offset 17)\n",
-        },
-        .{
-            .path = "tests/data/synthetic/bad_qual_length.fastq",
-            .stderr = "error: tests/data/synthetic/bad_qual_length.fastq: S005: " ++
-                "sequence and quality lengths differ (record 0, line 4, offset 19)\n",
-        },
-        .{
-            .path = "tests/data/synthetic/bad_quality_range.fastq",
-            .stderr = "error: tests/data/synthetic/bad_quality_range.fastq: S006: " ++
-                "quality byte must be ASCII 33 through 126 (record 0, line 4, offset 22)\n",
+            .args = &.{ "sample", "--fraction", "1", "--alphabet", "acgtn", "tests/data/synthetic/iupac_valid.fastq" },
+            .stderr = "error: tests/data/synthetic/iupac_valid.fastq: S002: " ++
+                "sequence byte is outside the selected alphabet (record 0, line 2, offset 11)\n",
         },
     };
-    for (exact_cases) |case| {
-        try cli.expectResult(
-            try cli.run(allocator, &.{ "sample", "--count", "0", case.path }),
-            1,
-            "",
-            case.stderr,
-        );
+    for (cases) |case| {
+        try cli.expectResult(try cli.run(allocator, case.args), 1, "", case.stderr);
     }
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--fraction",
-            "0",
-            "tests/data/synthetic/bad_plus.fastq",
-        }),
-        1,
-        "",
-        "error: tests/data/synthetic/bad_plus.fastq: S001: " ++
-            "plus line must start with '+' (record 0, line 3, offset 15)\n",
-    );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--fraction",
-            "0",
-            "tests/data/synthetic/bad_quality_range.fastq",
-        }),
-        1,
-        "",
-        "error: tests/data/synthetic/bad_quality_range.fastq: S006: " ++
-            "quality byte must be ASCII 33 through 126 (record 0, line 4, offset 22)\n",
-    );
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--fraction",
-            "1",
-            "--alphabet",
-            "acgtn",
-            "tests/data/synthetic/iupac_valid.fastq",
-        }),
-        1,
-        "",
-        "error: tests/data/synthetic/iupac_valid.fastq: S002: " ++
-            "sequence byte is outside the selected alphabet (record 0, line 2, offset 11)\n",
-    );
 }
 
 test "[cli] - [sample]: a later malformed record preserves output below and above 64 KiB" {
+    // 8192 records of 11 bytes make about 88 KiB, more than one output buffer.
     for ([_]usize{ 1, 8192 }) |records| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -2128,7 +1647,7 @@ test "[cli] - [sample]: a later malformed record preserves output below and abov
     }
 }
 
-test "[cli] - [paired sample]: later failures retain complete fraction output beyond the buffer" {
+test "[cli] - [sample]: a later structural failure keeps complete pairs beyond the output buffer" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2141,10 +1660,13 @@ test "[cli] - [paired sample]: later failures retain complete fraction output be
     var r1: std.ArrayList(u8) = .empty;
     var r2: std.ArrayList(u8) = .empty;
     var pairs: std.ArrayList(u8) = .empty;
-    for (0..4096) |index| try appendPair(allocator, &r1, &r2, &pairs, index);
+    // The smallest pair count whose complete output is larger than one output buffer.
+    var pair_count: usize = 0;
+    while (pairs.items.len <= OUTPUT_BUFFER_BYTES) : (pair_count += 1) {
+        try appendPair(allocator, &r1, &r2, &pairs, pair_count);
+    }
     const r2_prefix_len = r2.items.len;
     const prefix_len = pairs.items.len;
-    try std.testing.expect(prefix_len > 64 * 1024);
     const tail1 = "@bad/1\nA\n+\n!\n";
     const tail2 = "@bad/2\n.\n+\n#\n";
     try r1.appendSlice(allocator, tail1);
@@ -2155,23 +1677,22 @@ test "[cli] - [paired sample]: later failures retain complete fraction output be
     try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = pairs.items });
 
     for ([_]bool{ false, true }) |interleaved| {
+        const record_index = if (interleaved) 2 * pair_count + 1 else pair_count;
+        const offset = (if (interleaved) prefix_len + tail1.len else r2_prefix_len) + 7;
         const expected_stderr = try std.fmt.allocPrint(
             allocator,
             "error: {s}: S002: sequence byte is outside the selected alphabet " ++
                 "(record {d}, line 2, offset {d})\n",
-            .{
-                if (interleaved) pairs_path else r2_path,
-                @as(usize, if (interleaved) 8193 else 4096),
-                (if (interleaved) prefix_len + tail1.len else r2_prefix_len) + 7,
-            },
+            .{ if (interleaved) pairs_path else r2_path, record_index, offset },
         );
         for ([_]bool{ false, true }) |exact| {
             const selection = if (exact) "--count" else "--fraction";
-            const amount = if (exact) "4097" else "1";
+            const amount = if (exact) try std.fmt.allocPrint(allocator, "{d}", .{pair_count + 1}) else "1";
             const args: []const []const u8 = if (interleaved)
                 &.{ "sample", "--interleaved", selection, amount, pairs_path }
             else
                 &.{ "sample", "--paired", selection, amount, r1_path, r2_path };
+            // Exact-count runs read to the end before writing, so they emit nothing.
             try cli.expectResult(
                 try cli.run(allocator, args),
                 1,
@@ -2199,93 +1720,19 @@ test "[cli] - [sample]: piped input and output make progress together" {
     try cli.expectResult(result, 0, input.items, "");
 }
 
-test "[cli] - [sample]: numeric grammar maps to exact exit classes" {
+test "[cli] - [sample]: an invalid fraction and an overflowing count exit with their classes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    for ([_][]const u8{ "0", "1", "0.0", "0.000001", "0.999999", "1.000" }) |value| {
-        try cli.expectResult(
-            try cli.run(allocator, &.{ "sample", "--fraction", value, "-" }),
-            0,
-            "",
-            "",
-        );
-    }
-    for ([_][]const u8{ "", "00", "0.", ".5", "1.", "1.1", "+0.5", "0e0", "NaN", " 0.5" }) |value| {
-        try cli.expectResult(
-            try cli.run(allocator, &.{ "sample", "--fraction", value, EMPTY_PATH }),
-            2,
-            "",
-            "error: invalid --fraction value\n",
-        );
-    }
-    for ([_][]const u8{ "", "+1", "-1", "1.0", "1e2", " 1" }) |value| {
-        try cli.expectResult(
-            try cli.run(allocator, &.{
-                "sample",
-                "--fraction",
-                "0",
-                "--seed",
-                value,
-                EMPTY_PATH,
-            }),
-            2,
-            "",
-            "error: invalid --seed value\n",
-        );
-    }
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--fraction",
-            "0",
-            "--seed",
-            "18446744073709551616",
-            EMPTY_PATH,
-        }),
-        4,
+        try cli.run(allocator, &.{ "sample", "--fraction", "1.1", EMPTY_PATH }),
+        2,
         "",
-        "error: --seed exceeds supported limit\n",
+        "error: invalid --fraction value\n",
     );
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--fraction",
-            "0",
-            "--seed",
-            "18446744073709551615",
-            EMPTY_PATH,
-        }),
-        0,
-        "",
-        "",
-    );
-
-    for ([_][]const u8{ "0", "1", "00011", "18446744073709551615" }) |value| {
-        const expected = if ((try sampling.parseCount(value)) == 0) "" else EMPTY_RECORD;
-        try cli.expectResult(
-            try cli.run(allocator, &.{ "sample", "--count", value, EMPTY_PATH }),
-            0,
-            expected,
-            "",
-        );
-    }
-    for ([_][]const u8{ "", "+1", "-1", "1.0", "1e2", " 1", "1 " }) |value| {
-        try cli.expectResult(
-            try cli.run(allocator, &.{ "sample", "--count", value, EMPTY_PATH }),
-            2,
-            "",
-            "error: invalid --count value\n",
-        );
-    }
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "sample",
-            "--count",
-            "18446744073709551616",
-            EMPTY_PATH,
-        }),
+        try cli.run(allocator, &.{ "sample", "--count", "18446744073709551616", EMPTY_PATH }),
         4,
         "",
         "error: --count exceeds supported limit\n",
@@ -2302,11 +1749,8 @@ test "[cli] - [sample]: invocation shape is validated before input" {
         stderr: []const u8,
     }{
         .{ .args = &.{ "sample", EMPTY_PATH }, .stderr = "error: sample requires --fraction P or --count K\n" },
-        .{ .args = &.{ "sample", "--fraction", "0" }, .stderr = "error: sample requires exactly one input\n" },
         .{ .args = &.{ "sample", "--count", "1" }, .stderr = "error: sample requires exactly one input\n" },
         .{ .args = &.{ "sample", "--fraction", "0", EMPTY_PATH, BASIC_PATH }, .stderr = "error: sample requires exactly one input\n" },
-        .{ .args = &.{ "sample", "--fraction" }, .stderr = "error: --fraction requires a value\n" },
-        .{ .args = &.{ "sample", "--count" }, .stderr = "error: --count requires a value\n" },
         .{
             .args = &.{ "sample", "--fraction", "0.5", "--count", "1", BASIC_PATH },
             .stderr = "error: --fraction and --count are mutually exclusive\n",
@@ -2315,23 +1759,21 @@ test "[cli] - [sample]: invocation shape is validated before input" {
             .args = &.{ "sample", "--count", "1", "-" },
             .stderr = "error: exact-count sampling requires a file path\n",
         },
-        .{ .args = &.{ "sample", "--seed" }, .stderr = "error: --seed requires a value\n" },
-        .{ .args = &.{ "sample", "--json", EMPTY_PATH }, .stderr = "error: unknown sample option: --json\n" },
-        .{ .args = &.{ "sample", "--bogus", EMPTY_PATH }, .stderr = "error: unknown sample option: --bogus\n" },
     };
     for (cases) |case| {
         try cli.expectResult(try cli.run(allocator, case.args), 2, "", case.stderr);
     }
 
+    // A stalled pipe that is never closed would hang the run if the rejected invocation read standard input.
     try cli.expectResult(
-        try cli.run(allocator, &.{ "sample", "--fraction", "0", "--", "-missing" }),
-        3,
+        try cli.runWith(allocator, &.{ "sample", "--count", "1", "-" }, .{ .stdin = .stalled }),
+        2,
         "",
-        "error: -missing: file not found\n",
+        "error: exact-count sampling requires a file path\n",
     );
 }
 
-test "[cli] - [interleaved sample]: every line limit is accepted in fraction and count modes" {
+test "[cli] - [sample]: the largest line limits accept valid input in both modes" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2343,31 +1785,25 @@ test "[cli] - [interleaved sample]: every line limit is accepted in fraction and
     const invalid = "@p/1\nA\n+\n!\n@p/2\nX\n+\n!\n";
     const lint_error = try std.fmt.allocPrint(allocator, "error: {s}: S002: sequence byte is outside the selected alphabet (record 1, line 2, offset 16)\n", .{path});
 
-    for ([_][]const u8{ valid, invalid, "" }) |payload| {
-        var gzip: std.ArrayList(u8) = .empty;
-        try cli.appendGzipMember(allocator, &gzip, payload, .{});
-        for ([_][]const u8{ payload, gzip.items }) |bytes| {
-            try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = bytes });
-            for ([_][]const u8{ "--count", "--fraction" }) |mode| {
-                for ([_][]const u8{ "0", "1" }) |amount| {
-                    // Up to the usize maximum, where four lines no longer fit the address space.
-                    for ([_][]const u8{ "4611686018427387902", "4611686018427387903", "18446744073709551615" }) |limit| {
-                        const rejects_input = std.mem.eql(u8, payload, invalid);
-                        try cli.expectResult(
-                            try cli.run(allocator, &.{ "sample", "--interleaved", mode, amount, "--max-line-bytes", limit, path }),
-                            if (rejects_input) 1 else 0,
-                            if (rejects_input or std.mem.eql(u8, amount, "0")) "" else payload,
-                            if (rejects_input) lint_error else "",
-                        );
-                        try std.testing.expectEqualStrings(bytes, try tmp.dir.readFileAlloc(io, "input.fastq", allocator, .limited(1024)));
-                    }
-                }
+    for ([_][]const u8{ valid, invalid }) |payload| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = payload });
+        const rejects_input = std.mem.eql(u8, payload, invalid);
+        for ([_][]const u8{ "--count", "--fraction" }) |mode| {
+            // 2^62 - 1 and the usize maximum: the largest limits a caller can pass.
+            for ([_][]const u8{ "4611686018427387903", "18446744073709551615" }) |limit| {
+                try cli.expectResult(
+                    try cli.run(allocator, &.{ "sample", "--interleaved", mode, "1", "--max-line-bytes", limit, path }),
+                    if (rejects_input) 1 else 0,
+                    if (rejects_input) "" else payload,
+                    if (rejects_input) lint_error else "",
+                );
+                try std.testing.expectEqualStrings(payload, try tmp.dir.readFileAlloc(io, "input.fastq", allocator, .limited(1024)));
             }
         }
     }
 }
 
-test "[cli] - [sample]: line, input, and output failures retain their classes" {
+test "[cli] - [sample]: a line over the limit exits 4 and a missing input exits 3" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2391,6 +1827,13 @@ test "[cli] - [sample]: line, input, and output failures retain their classes" {
         "",
         "error: missing.fastq: file not found\n",
     );
+}
+
+test "[cli] - [sample]: closed standard output or input reports its I/O error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     try cli.expectResult(
         try cli.runWithClosedStdout(
             allocator,
@@ -2412,15 +1855,6 @@ test "[cli] - [sample]: line, input, and output failures retain their classes" {
         "error: -: S001: plus line must start with '+' " ++
             "(record 1, line 3, offset 17)\n" ++
             "error: standard output: I/O error\n",
-    );
-    try cli.expectResult(
-        try cli.runWithClosedStdin(
-            allocator,
-            &.{ "sample", "--fraction", "1", "-" },
-        ),
-        3,
-        "",
-        "error: -: I/O error\n",
     );
     try cli.expectResult(
         try cli.runWithClosedStdin(

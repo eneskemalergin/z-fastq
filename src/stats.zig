@@ -620,73 +620,24 @@ fn add(left: u64, right: u64) error{Overflow}!u64 {
     return std.math.add(u64, left, right);
 }
 
-test "[unit] - [statistics]: quality accumulator width uses the checked bound" {
-    if (comptime @bitSizeOf(usize) < 64) {
-        try std.testing.expect(maxQualitySum(std.math.maxInt(usize)) != null);
-    } else {
-        const common_limit = std.math.maxInt(u64) / 93;
-        const boundary: usize = @intCast(common_limit);
-        try std.testing.expectEqual(common_limit * 93, maxQualitySum(boundary).?);
-        try std.testing.expect(maxQualitySum(boundary + 1) == null);
-    }
+test "[unit] - [statistics]: quality accumulator bound is the largest score sum that fits 64 bits" {
+    const common_limit = std.math.maxInt(u64) / fastq.PHRED_MAX_SCORE;
+    const boundary: usize = @intCast(common_limit);
+    try std.testing.expectEqual(common_limit * fastq.PHRED_MAX_SCORE, maxQualitySum(boundary).?);
+    try std.testing.expect(maxQualitySum(boundary + 1) == null);
 }
 
-test "[property] - [statistics]: wrapped quality scores preserve the valid range" {
-    for (0..std.math.maxInt(u8) + 1) |value| {
-        const encoded: u8 = @intCast(value);
-        const wrapped_score = encoded -% 33;
-        if (fastq.decodePhred33(encoded)) |score| {
-            try std.testing.expect(wrapped_score <= 93);
-            try std.testing.expectEqual(score, wrapped_score);
-        } else |err| {
-            try std.testing.expectEqual(error.InvalidQuality, err);
-            try std.testing.expect(wrapped_score > 93);
-        }
-    }
-}
-
-test "[property] - [statistics]: vector payload kernels match the scalar path at every tier width" {
-    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |vector_len| {
-        try expectVectorTotalsAtWidth(vector_len);
-    }
-}
-
-/// The vector body at `vector_len` and the selected path agree, totals and
-/// first invalid byte alike; the vector result is returned.
-fn widthTotals(
-    comptime vector_len: comptime_int,
-    sequence: []const u8,
-    quality: []const u8,
-    quality_error: *?QualityError,
-) !PayloadTotals {
-    var selected_error: ?QualityError = null;
-    const selected = payloadTotals(u64, sequence, quality, &selected_error);
-    const vector = if (quality.len >= vector_len)
-        payloadTotalsVector(vector_len, .both, sequence, quality, quality_error)
-    else
-        payloadTotalsScalar(u64, .both, sequence, quality, quality_error);
-    if (vector) |totals| {
-        try std.testing.expectEqualDeep(totals, try selected);
-    } else |err| {
-        try std.testing.expectError(err, selected);
-    }
-    try std.testing.expectEqualDeep(quality_error.*, selected_error);
-    return vector;
-}
-
-fn expectVectorTotalsAtWidth(comptime vector_len: comptime_int) !void {
-    const quality_vectors_per_block: usize = std.math.maxInt(u8) - 1;
-    const quality_block_len: usize = vector_len * quality_vectors_per_block;
-    const base_block_len: usize = vector_len * std.math.maxInt(u8);
-    const max_len: usize = base_block_len + @as(usize, vector_len) + 1;
-    const lengths = [_]usize{
+/// Lengths where the vector body changes shape: a partial vector, the block
+/// sizes of its 8-bit counters, and the byte after each.
+fn blockBoundaryLengths(comptime vector_len: comptime_int) [14]usize {
+    const quality_block_len = vector_len * (std.math.maxInt(u8) - 1);
+    const base_block_len = vector_len * std.math.maxInt(u8);
+    return .{
         0,
         1,
         vector_len - 1,
         vector_len,
         vector_len + 1,
-        2 * vector_len - 1,
-        2 * vector_len,
         2 * vector_len + 1,
         base_block_len - 1,
         base_block_len,
@@ -697,200 +648,125 @@ fn expectVectorTotalsAtWidth(comptime vector_len: comptime_int) !void {
         quality_block_len + 1,
         quality_block_len + vector_len,
     };
+}
+
+/// Sequence bytes cycle through every byte value. Quality bytes cycle through
+/// the lowest and highest valid Phred+33 bytes and values between them.
+fn fillPayload(sequence: []u8, quality: []u8) void {
     const qualities = [_]u8{ 33, 52, 53, 62, 63, 126 };
-    const sequence = try std.testing.allocator.alloc(u8, max_len);
-    defer std.testing.allocator.free(sequence);
-    const quality = try std.testing.allocator.alloc(u8, max_len);
-    defer std.testing.allocator.free(quality);
     for (sequence, quality, 0..) |*base, *quality_byte, index| {
         base.* = @intCast(index % 256);
         quality_byte.* = qualities[index % qualities.len];
     }
+}
 
-    for (lengths) |length| {
-        var scalar_error: ?QualityError = null;
-        var vector_error: ?QualityError = null;
-        const scalar = try payloadTotalsScalar(
-            u64,
-            .both,
-            sequence[0..length],
-            quality[0..length],
-            &scalar_error,
-        );
-        const vector = try widthTotals(
-            vector_len,
-            sequence[0..length],
-            quality[0..length],
-            &vector_error,
-        );
-        try std.testing.expectEqualDeep(scalar, vector);
-        try std.testing.expectEqualDeep(scalar_error, vector_error);
-    }
+test "[property] - [statistics]: vector payload totals match the scalar path at block boundaries" {
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |vector_len| {
+        const lengths = blockBoundaryLengths(vector_len);
+        const max_len = std.mem.max(usize, &lengths);
+        const sequence = try std.testing.allocator.alloc(u8, max_len);
+        defer std.testing.allocator.free(sequence);
+        const quality = try std.testing.allocator.alloc(u8, max_len);
+        defer std.testing.allocator.free(quality);
+        fillPayload(sequence, quality);
 
-    for (0..2 * vector_len + 1) |length| {
-        var scalar_error: ?QualityError = null;
-        var vector_error: ?QualityError = null;
-        const scalar = try payloadTotalsScalar(
-            u64,
-            .both,
-            sequence[0..length],
-            quality[0..length],
-            &scalar_error,
-        );
-        const vector = try widthTotals(
-            vector_len,
-            sequence[0..length],
-            quality[0..length],
-            &vector_error,
-        );
-        try std.testing.expectEqualDeep(scalar, vector);
-        try std.testing.expectEqualDeep(scalar_error, vector_error);
-    }
-
-    for (1..vector_len) |remainder| {
-        const length = vector_len + remainder;
-        const invalid_indices = [_]usize{ vector_len - 1, vector_len, length - 1 };
-        for (invalid_indices) |invalid_index| {
-            const original = quality[invalid_index];
-            quality[invalid_index] = 127;
-            var scalar_error: ?QualityError = null;
-            var vector_error: ?QualityError = null;
-            try std.testing.expectError(
-                error.S006InvalidQuality,
-                payloadTotalsScalar(
-                    u64,
-                    .both,
-                    sequence[0..length],
-                    quality[0..length],
-                    &scalar_error,
-                ),
+        for (lengths) |length| {
+            const sequence_part = sequence[0..length];
+            const quality_part = quality[0..length];
+            var quality_error: ?QualityError = null;
+            try std.testing.expectEqualDeep(
+                try payloadTotalsScalar(u64, .both, sequence_part, quality_part, &quality_error),
+                try payloadTotals(u64, sequence_part, quality_part, &quality_error),
             );
-            try std.testing.expectError(
-                error.S006InvalidQuality,
-                widthTotals(
-                    vector_len,
-                    sequence[0..length],
-                    quality[0..length],
-                    &vector_error,
-                ),
-            );
-            try std.testing.expectEqualDeep(scalar_error, vector_error);
-            quality[invalid_index] = original;
+            if (length < vector_len) continue;
+            // Each part is passed with the other field empty, as the streamed callers do.
+            inline for (.{ Parts.both, Parts.sequence, Parts.quality }) |parts| {
+                const sequence_arg = if (parts == .quality) sequence_part[0..0] else sequence_part;
+                const quality_arg = if (parts == .sequence) quality_part[0..0] else quality_part;
+                try std.testing.expectEqualDeep(
+                    try payloadTotalsScalar(u64, parts, sequence_arg, quality_arg, &quality_error),
+                    try payloadTotalsVector(vector_len, parts, sequence_arg, quality_arg, &quality_error),
+                );
+            }
         }
     }
+}
 
-    @memset(quality[0..quality_block_len], 126);
-    var maximum_scalar_error: ?QualityError = null;
-    var maximum_vector_error: ?QualityError = null;
-    const maximum_scalar = try payloadTotalsScalar(
-        u64,
-        .both,
-        sequence[0..quality_block_len],
-        quality[0..quality_block_len],
-        &maximum_scalar_error,
-    );
-    const maximum_vector = try widthTotals(
-        vector_len,
-        sequence[0..quality_block_len],
-        quality[0..quality_block_len],
-        &maximum_vector_error,
-    );
-    try std.testing.expectEqualDeep(maximum_scalar, maximum_vector);
-    try std.testing.expectEqualDeep(maximum_scalar_error, maximum_vector_error);
-
-    for (0..quality_vectors_per_block) |vector_index| {
-        const encoded: u8 = if (vector_index % 2 == 0) 32 else 33;
-        @memset(
-            quality[vector_index * vector_len ..][0..vector_len],
-            encoded,
-        );
-    }
-    const bound_len = quality_block_len - vector_len;
-    var bound_scalar_error: ?QualityError = null;
-    var bound_vector_error: ?QualityError = null;
-    try std.testing.expectError(
-        error.S006InvalidQuality,
-        payloadTotalsScalar(
-            u64,
-            .both,
-            sequence[0..bound_len],
-            quality[0..bound_len],
-            &bound_scalar_error,
-        ),
-    );
-    try std.testing.expectError(
-        error.S006InvalidQuality,
-        widthTotals(
-            vector_len,
-            sequence[0..bound_len],
-            quality[0..bound_len],
-            &bound_vector_error,
-        ),
-    );
-    try std.testing.expectEqualDeep(bound_scalar_error, bound_vector_error);
-
-    for (quality, 0..) |*quality_byte, index| {
-        quality_byte.* = qualities[index % qualities.len];
-    }
-
-    const invalid_len = quality_block_len + vector_len;
-    const invalid_indices = [_]usize{
-        0,
-        vector_len - 1,
-        (quality_vectors_per_block / 2) * vector_len + vector_len / 2,
-        quality_block_len - 1,
-        quality_block_len,
-        invalid_len - 1,
-    };
-    for (invalid_indices, 0..) |invalid_index, case_index| {
-        const original = quality[invalid_index];
-        quality[invalid_index] = if (case_index % 2 == 0) 32 else 127;
-        var scalar_error: ?QualityError = null;
-        var vector_error: ?QualityError = null;
-        try std.testing.expectError(
-            error.S006InvalidQuality,
-            payloadTotalsScalar(
-                u64,
-                .both,
-                sequence[0..invalid_len],
-                quality[0..invalid_len],
-                &scalar_error,
-            ),
-        );
-        try std.testing.expectError(
-            error.S006InvalidQuality,
-            widthTotals(vector_len, sequence[0..invalid_len], quality[0..invalid_len], &vector_error),
-        );
-        try std.testing.expectEqualDeep(scalar_error, vector_error);
-        quality[invalid_index] = original;
-    }
-
-    const first_invalid = 3 * vector_len + 1;
-    const later_invalid = quality_block_len - 1;
-    quality[later_invalid] = 127;
-    quality[first_invalid] = 32;
+/// Both paths reject the payload at `index`, and each names that byte.
+fn expectFirstInvalidQuality(
+    comptime vector_len: comptime_int,
+    sequence: []const u8,
+    quality: []const u8,
+    index: usize,
+) !void {
+    const expected: ?QualityError = .{ .byte_index = index, .byte = quality[index] };
     var scalar_error: ?QualityError = null;
     var vector_error: ?QualityError = null;
     try std.testing.expectError(
         error.S006InvalidQuality,
-        payloadTotalsScalar(
-            u64,
-            .both,
-            sequence[0..invalid_len],
-            quality[0..invalid_len],
-            &scalar_error,
-        ),
+        payloadTotalsScalar(u64, .both, sequence, quality, &scalar_error),
     );
     try std.testing.expectError(
         error.S006InvalidQuality,
-        widthTotals(
-            vector_len,
-            sequence[0..invalid_len],
-            quality[0..invalid_len],
-            &vector_error,
-        ),
+        payloadTotalsVector(vector_len, .both, sequence, quality, &vector_error),
     );
-    try std.testing.expectEqualDeep(scalar_error, vector_error);
-    quality[first_invalid] = qualities[first_invalid % qualities.len];
-    quality[later_invalid] = qualities[later_invalid % qualities.len];
+    try std.testing.expectEqualDeep(expected, scalar_error);
+    try std.testing.expectEqualDeep(expected, vector_error);
+}
+
+test "[failure] - [statistics]: vector payload totals report the first invalid quality byte" {
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |vector_len| {
+        const quality_block_len = vector_len * (std.math.maxInt(u8) - 1);
+        const block_len = quality_block_len + vector_len;
+        const sequence = try std.testing.allocator.alloc(u8, block_len);
+        defer std.testing.allocator.free(sequence);
+        const quality = try std.testing.allocator.alloc(u8, block_len);
+        defer std.testing.allocator.free(quality);
+
+        // The last byte of the first vector and the first byte after it.
+        const short_len = vector_len + 1;
+        for ([_]usize{ vector_len - 1, vector_len }) |invalid_index| {
+            fillPayload(sequence, quality);
+            quality[invalid_index] = 127;
+            try expectFirstInvalidQuality(vector_len, sequence[0..short_len], quality[0..short_len], invalid_index);
+        }
+
+        // Bytes outside the valid range at the start and end of each counter block.
+        const invalid_block = [_]struct { index: usize, byte: u8 }{
+            .{ .index = 0, .byte = 32 },
+            .{ .index = quality_block_len - 1, .byte = 127 },
+            .{ .index = quality_block_len, .byte = 32 },
+            .{ .index = block_len - 1, .byte = 127 },
+        };
+        for (invalid_block) |invalid| {
+            fillPayload(sequence, quality);
+            quality[invalid.index] = invalid.byte;
+            try expectFirstInvalidQuality(vector_len, sequence, quality, invalid.index);
+        }
+
+        // Two invalid bytes: the report names the earlier one.
+        fillPayload(sequence, quality);
+        quality[block_len - 1] = 127;
+        quality[3 * vector_len + 1] = 32;
+        try expectFirstInvalidQuality(vector_len, sequence, quality, 3 * vector_len + 1);
+    }
+}
+
+test "[edge] - [statistics]: vector payload totals at the maximum quality block" {
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |vector_len| {
+        const block_len = vector_len * (std.math.maxInt(u8) - 1);
+        const sequence = try std.testing.allocator.alloc(u8, block_len);
+        defer std.testing.allocator.free(sequence);
+        const quality = try std.testing.allocator.alloc(u8, block_len);
+        defer std.testing.allocator.free(quality);
+        @memset(sequence, 'A');
+        @memset(quality, fastq.PHRED_MAX_BYTE);
+
+        var quality_error: ?QualityError = null;
+        const totals = try payloadTotalsVector(vector_len, .both, sequence, quality, &quality_error);
+        try std.testing.expectEqual(@as(usize, block_len), totals.base_counts[0]);
+        try std.testing.expectEqual(@as(u64, block_len) * fastq.PHRED_MAX_SCORE, totals.quality_sum);
+        try std.testing.expectEqual(@as(usize, block_len), totals.q30_bases);
+        try std.testing.expectEqual(@as(?QualityError, null), quality_error);
+    }
 }

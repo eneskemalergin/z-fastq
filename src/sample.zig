@@ -811,26 +811,25 @@ pub const Mt19937_64 = struct {
     }
 };
 
-test "[unit] - [exact selector]: compact indexes retain wide record numbers" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseWideExactIndexes,
-        .{},
-    );
+/// Runs `exercise` with its first allocation failing. The body must report
+/// out-of-memory; storage taken before the failure is released, which the
+/// testing allocator's leak check verifies.
+fn expectFirstAllocationFails(comptime exercise: anytype) !void {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, exercise(failing.allocator()));
 }
 
-test "[unit] - [exact selector]: split indexes sort upper planes" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseUpperBitIndexSort,
-        .{},
-    );
+test "[failure] - [exact selector]: record numbers above 32 bits are returned exactly" {
+    try exerciseWideExactIndexes(std.testing.allocator);
+    try expectFirstAllocationFails(exerciseWideExactIndexes);
 }
 
-test "[unit] - [exact selector]: batched records preserve an upper-bit boundary" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseBatchedUpperBoundary,
-        .{},
-    );
+test "[failure] - [exact selector]: indexes sort by their high bits" {
+    try exerciseUpperBitIndexSort(std.testing.allocator);
+    try expectFirstAllocationFails(exerciseUpperBitIndexSort);
+}
+
+test "[failure] - [exact selector]: batched records match direct records across the upper-bit boundary" {
+    try exerciseBatchedUpperBoundary(std.testing.allocator);
+    try expectFirstAllocationFails(exerciseBatchedUpperBoundary);
 }

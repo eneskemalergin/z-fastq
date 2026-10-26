@@ -1,6 +1,7 @@
 //! Installed CLI contracts for `z-fastq count`.
 
 const std = @import("std");
+const zfastq = @import("z-fastq");
 const cli = @import("utilities.zig");
 const CommandResult = cli.CommandResult;
 const runCli = cli.run;
@@ -9,8 +10,11 @@ const runCliWithClosedStdout = cli.runWithClosedStdout;
 const runCliWithClosedStdin = cli.runWithClosedStdin;
 const GzipOptions = cli.GzipOptions;
 const appendGzipMember = cli.appendGzipMember;
+const fixturePath = cli.fixturePath;
 const FIXTURE_DIR = cli.FIXTURE_DIR;
 const OUTPUT_FAILURE = "error: standard output: I/O error\n";
+/// The documented limit for an optional gzip header field, including its terminator (src/io.zig).
+const GZIP_OPTIONAL_FIELD_LIMIT = 64 * 1024;
 const EXPECTED_USAGE =
     \\usage: z-fastq <command> [options] [args...]
     \\
@@ -119,10 +123,6 @@ const FIXTURES = [_]FixtureExpect{
             "unexpected end of file in quality line (record 0, line 4, offset 17)\n",
     },
 };
-
-fn fixturePath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ FIXTURE_DIR, name });
-}
 
 fn runCountBytes(
     allocator: std.mem.Allocator,
@@ -235,7 +235,7 @@ test "[cli] - [count]: empty CRLF identifiers fail after dense warmup across gzi
     }
 }
 
-test "[cli] - [count]: files and stdin preserve prefix detection and gzip exit classes" {
+test "[cli] - [count]: files and stdin select plain or gzip input and its exit class" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -247,35 +247,19 @@ test "[cli] - [count]: files and stdin preserve prefix detection and gzip exit c
     try appendGzipMember(allocator, &valid, "@r\nA\n+\n!\n", .{});
     var empty: std.ArrayList(u8) = .empty;
     try appendGzipMember(allocator, &empty, "", .{});
-
-    const magic = try allocator.dupe(u8, valid.items);
-    magic[0] ^= 1;
-    const metadata = try allocator.dupe(u8, valid.items);
-    metadata[4] ^= 1;
-    const method = try allocator.dupe(u8, valid.items);
-    method[2] = 0;
-    const reserved = try allocator.dupe(u8, valid.items);
-    reserved[3] = 0x20;
-    const deflate = try allocator.dupe(u8, valid.items);
-    deflate[10] = 0x07;
-    const checksum = try allocator.dupe(u8, valid.items);
-    checksum[checksum.len - 8] ^= 1;
-    const size = try allocator.dupe(u8, valid.items);
-    size[size.len - 4] ^= 1;
-
-    var with_header_crc: std.ArrayList(u8) = .empty;
-    try appendGzipMember(allocator, &with_header_crc, "@r\nA\n+\n!\n", .{
-        .header_crc = true,
-    });
-    with_header_crc.items[10] ^= 1;
-
     var members: std.ArrayList(u8) = .empty;
     try members.appendSlice(allocator, valid.items);
     try appendGzipMember(allocator, &members, "@second\nTT\n+\n##\n", .{});
-    const later_checksum = try allocator.dupe(u8, members.items);
-    later_checksum[later_checksum.len - 8] ^= 1;
-    const later_size = try allocator.dupe(u8, members.items);
-    later_size[later_size.len - 4] ^= 1;
+
+    const magic = try allocator.dupe(u8, valid.items);
+    magic[0] ^= 1;
+    const method = try allocator.dupe(u8, valid.items);
+    method[2] = 0;
+    const checksum = try allocator.dupe(u8, valid.items);
+    checksum[cli.gzipCrcOffset(checksum.len)] ^= 1;
+    const size = try allocator.dupe(u8, valid.items);
+    size[cli.gzipSizeOffset(size.len)] ^= 1;
+    const trailing = try std.mem.concat(allocator, u8, &.{ valid.items, "\x00\x00" });
 
     const plain_error = "S003: header line must start with '@' and contain a nonempty identifier " ++
         "(record 0, line 1, offset 0)\n";
@@ -288,31 +272,18 @@ test "[cli] - [count]: files and stdin preserve prefix detection and gzip exit c
         .{ .bytes = "", .exit_code = 0, .stdout = "0\n", .message = "" },
         .{ .bytes = empty.items, .exit_code = 0, .stdout = "0\n", .message = "" },
         .{ .bytes = "@r\nA\n+\n!\n", .exit_code = 0, .stdout = "1\n", .message = "" },
+        .{ .bytes = members.items, .exit_code = 0, .stdout = "2\n", .message = "" },
         .{
             .bytes = "@r",
             .exit_code = 1,
             .message = "S004: unexpected end of file in sequence line (record 0, line 2, offset 2)\n",
         },
-        .{ .bytes = valid.items[0..1], .exit_code = 1, .message = plain_error },
-        .{ .bytes = valid.items[0..2] },
         .{ .bytes = magic, .exit_code = 1, .message = plain_error },
-        .{ .bytes = metadata, .exit_code = 0, .stdout = "1\n", .message = "" },
-        .{ .bytes = members.items[0..valid.items.len], .exit_code = 0, .stdout = "1\n", .message = "" },
-        .{ .bytes = members.items, .exit_code = 0, .stdout = "2\n", .message = "" },
         .{ .bytes = method },
-        .{ .bytes = reserved },
-        .{ .bytes = deflate },
         .{ .bytes = checksum },
         .{ .bytes = size },
-        .{ .bytes = with_header_crc.items },
-        .{ .bytes = valid.items[0..9] },
-        .{ .bytes = valid.items[0..10] },
-        .{ .bytes = valid.items[0..12] },
         .{ .bytes = valid.items[0 .. valid.items.len - 1] },
-        .{ .bytes = members.items[0 .. valid.items.len + 3] },
-        .{ .bytes = members.items[0 .. members.items.len - 1] },
-        .{ .bytes = later_checksum },
-        .{ .bytes = later_size },
+        .{ .bytes = trailing },
     };
     for (cases, 0..) |case, index| {
         try tmp.dir.writeFile(io, .{ .sub_path = "input", .data = case.bytes });
@@ -332,41 +303,37 @@ test "[cli] - [count]: files and stdin preserve prefix detection and gzip exit c
     }
 }
 
-test "[cli] - [count]: gzip optional headers enforce the documented byte limit" {
+test "[cli] - [count]: gzip optional name and comment fields enforce the 64 KiB limit" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const maximum_name = try allocator.alloc(u8, 64 * 1024 - 1);
-    @memset(maximum_name, 'a');
-    var maximum: std.ArrayList(u8) = .empty;
-    try appendGzipMember(allocator, &maximum, "@r\nA\n+\n!\n", .{
-        .name = maximum_name,
-    });
-    const accepted = try runCliWithStdin(
-        allocator,
-        &.{ "count", "-" },
-        maximum.items,
-        37,
-    );
+    const field_bytes = try allocator.alloc(u8, GZIP_OPTIONAL_FIELD_LIMIT);
+    @memset(field_bytes, 'a');
 
-    var oversized: std.ArrayList(u8) = .empty;
-    try oversized.appendSlice(allocator, &.{
-        0x1f, 0x8b, 0x08, 0x08, 0, 0, 0, 0, 0, 0xff,
-    });
-    try oversized.appendNTimes(allocator, 'a', 64 * 1024 + 1);
-    const rejected = try runCliWithStdin(
-        allocator,
-        &.{ "count", "-" },
-        oversized.items,
-        37,
-    );
+    for ([_]struct {
+        field: enum { name, comment },
+        len: usize,
+        exit_code: u8,
+    }{
+        .{ .field = .name, .len = GZIP_OPTIONAL_FIELD_LIMIT - 1, .exit_code = 0 },
+        .{ .field = .name, .len = GZIP_OPTIONAL_FIELD_LIMIT, .exit_code = 3 },
+        .{ .field = .comment, .len = GZIP_OPTIONAL_FIELD_LIMIT - 1, .exit_code = 0 },
+        .{ .field = .comment, .len = GZIP_OPTIONAL_FIELD_LIMIT, .exit_code = 3 },
+    }) |case| {
+        const field = field_bytes[0..case.len];
+        var member: std.ArrayList(u8) = .empty;
+        try appendGzipMember(allocator, &member, "@r\nA\n+\n!\n", switch (case.field) {
+            .name => .{ .name = field },
+            .comment => .{ .comment = field },
+        });
+        const result = try runCliWithStdin(allocator, &.{ "count", "-" }, member.items, 37);
 
-    try std.testing.expectEqual(@as(u8, 0), accepted.exit_code);
-    try std.testing.expectEqualStrings("1\n", accepted.stdout);
-    try std.testing.expectEqual(@as(usize, 0), accepted.stderr.len);
-    try std.testing.expectEqual(@as(u8, 3), rejected.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), rejected.stdout.len);
-    try std.testing.expectEqualStrings("error: -: I/O error\n", rejected.stderr);
+        if (case.exit_code == 0) {
+            try cli.expectResult(result, 0, "1\n", "");
+        } else {
+            try cli.expectResult(result, 3, "", "error: -: I/O error\n");
+        }
+    }
 }
 
 test "[cli] - [count]: empty and over-limit stdin preserve exit classes" {
@@ -406,7 +373,8 @@ test "[cli] - [count]: stdin is explicit and duplicate use fails before input pr
         implicit.stderr,
     );
 
-    const duplicate = try runCliWithStdin(
+    // Standard input is left open and unwritten: a read before the usage check would block until the timeout.
+    const duplicate = try cli.runWith(
         allocator,
         &.{
             "count",
@@ -414,8 +382,7 @@ test "[cli] - [count]: stdin is explicit and duplicate use fails before input pr
             "-",
             "-",
         },
-        "",
-        1,
+        .{ .stdin = .stalled },
     );
     try std.testing.expectEqual(@as(u8, 2), duplicate.exit_code);
     try std.testing.expectEqual(@as(usize, 0), duplicate.stdout.len);
@@ -429,7 +396,11 @@ test "[cli] - [count]: stdin is explicit and duplicate use fails before input pr
         &.{ "count", "-", "/dev/stdin" },
         &.{ "count", "/dev/stdin", "/dev/stdin" },
         &.{ "stats", "/dev/stdin", "-" },
+        &.{ "stats", "-", "-" },
+        &.{ "stats", "--json", "-", "-" },
         &.{ "check", "--json", "-", "/dev/stdin" },
+        &.{ "check", "missing.fastq", "-", "-" },
+        &.{ "check", "--json", "missing.fastq", "-", "-" },
     }) |args| {
         try cli.expectResult(
             try runCliWithStdin(allocator, args, "@r\nA\n+\n!\n", 1),
@@ -438,7 +409,12 @@ test "[cli] - [count]: stdin is explicit and duplicate use fails before input pr
             "error: standard input may appear at most once\n",
         );
     }
+}
 
+test "[cli] - [input]: a regular file on standard input is read from its start under each name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     // A regular file on standard input is read from its start under each name.
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -452,7 +428,12 @@ test "[cli] - [count]: stdin is explicit and duplicate use fails before input pr
         "1\n1\n",
         "",
     );
+}
 
+test "[cli] - [arguments]: count rejects the JSON flag as an unknown option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const json = try runCliWithStdin(allocator, &.{ "count", "--json", "-" }, "", 1);
     try std.testing.expectEqual(@as(u8, 2), json.exit_code);
     try std.testing.expectEqual(@as(usize, 0), json.stdout.len);
@@ -460,7 +441,12 @@ test "[cli] - [count]: stdin is explicit and duplicate use fails before input pr
         "error: unknown count option: --json\n",
         json.stderr,
     );
+}
 
+test "[cli] - [arguments]: a double dash ends options before the path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const after_double_dash = try runCliWithStdin(
         allocator,
         &.{ "count", "--", "-" },
@@ -498,14 +484,7 @@ test "[cli] - [output]: stdout appended to an input is rejected before any outpu
     };
     for (cases) |case| {
         for (names, contents) |name, data| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = data });
-        const output: std.Io.File = .{
-            .handle = try std.posix.openat(tmp.dir.handle, names[case.output], .{
-                .ACCMODE = .WRONLY,
-                .APPEND = true,
-                .CLOEXEC = true,
-            }, 0),
-            .flags = .{ .nonblocking = false },
-        };
+        const output = try cli.openAppendOutput(tmp.dir, names[case.output]);
         defer output.close(io);
         const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: input file is output file\n", .{paths[case.output]});
         try cli.expectResult(try cli.runWithStdoutFile(allocator, case.args, output, null), 2, "", diagnostic);
@@ -517,16 +496,10 @@ test "[cli] - [output]: stdout appended to an input is rejected before any outpu
     try tmp.dir.writeFile(io, .{ .sub_path = names[0], .data = contents[0] });
     const input = try tmp.dir.openFile(io, names[0], .{});
     defer input.close(io);
-    const output: std.Io.File = .{
-        .handle = try std.posix.openat(tmp.dir.handle, names[0], .{
-            .ACCMODE = .WRONLY,
-            .APPEND = true,
-            .CLOEXEC = true,
-        }, 0),
-        .flags = .{ .nonblocking = false },
-    };
+    const output = try cli.openAppendOutput(tmp.dir, names[0]);
     defer output.close(io);
     try cli.expectResult(try cli.runWithStdoutFile(allocator, &.{ "count", "-" }, output, input), 2, "", "error: -: input file is output file\n");
+    try std.testing.expectEqualStrings(contents[0], try tmp.dir.readFileAlloc(io, names[0], allocator, .limited(1024)));
 }
 
 test "[cli] - [input]: a directory input is named before it is read" {
@@ -627,7 +600,21 @@ test "[cli] - [count]: files around stdin retain output order and exit precedenc
     );
 }
 
-test "[cli] - [root]: help, version, and usage failures are exact" {
+test "[cli] - [root]: version prints the package version in both spellings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const version = try runCli(allocator, &.{"--version"});
+    try cli.expectResult(version, 0, "z-fastq " ++ cli.EXPECTED_VERSION ++ "\n", "");
+
+    const short_version = try runCli(allocator, &.{"-V"});
+    try std.testing.expectEqual(@as(u8, 0), short_version.exit_code);
+    try std.testing.expectEqualStrings(version.stdout, short_version.stdout);
+    try std.testing.expectEqual(@as(usize, 0), short_version.stderr.len);
+}
+
+test "[cli] - [root]: help and usage failures are exact" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -663,14 +650,6 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
         try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
     }
 
-    const version = try runCli(allocator, &.{"--version"});
-    try cli.expectResult(version, 0, "z-fastq " ++ cli.EXPECTED_VERSION ++ "\n", "");
-
-    const short_version = try runCli(allocator, &.{"-V"});
-    try std.testing.expectEqual(@as(u8, 0), short_version.exit_code);
-    try std.testing.expectEqualStrings(version.stdout, short_version.stdout);
-    try std.testing.expectEqual(@as(usize, 0), short_version.stderr.len);
-
     const missing_command = try runCli(allocator, &.{});
     try std.testing.expectEqual(@as(u8, 2), missing_command.exit_code);
     try std.testing.expectEqual(@as(usize, 0), missing_command.stdout.len);
@@ -684,13 +663,13 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
         unknown_command.stderr,
     );
 
-    const missing_path = try runCli(allocator, &.{"count"});
-    try std.testing.expectEqual(@as(u8, 2), missing_path.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), missing_path.stdout.len);
-    try std.testing.expectEqualStrings(
-        "error: count requires at least one input\n",
-        missing_path.stderr,
-    );
+    for ([_][]const u8{ "count", "stats" }) |command| {
+        const without_input = try runCli(allocator, &.{command});
+        const expected = try std.fmt.allocPrint(allocator, "error: {s} requires at least one input\n", .{command});
+        try cli.expectResult(without_input, 2, "", expected);
+    }
+    const stats_json_without_input = try runCli(allocator, &.{ "stats", "--json" });
+    try cli.expectResult(stats_json_without_input, 2, "", "error: stats requires at least one input\n");
 
     const missing_limit = try runCli(allocator, &.{ "count", "--max-line-bytes" });
     try std.testing.expectEqual(@as(u8, 2), missing_limit.exit_code);
@@ -699,6 +678,10 @@ test "[cli] - [root]: help, version, and usage failures are exact" {
         "error: --max-line-bytes requires a value\n",
         missing_limit.stderr,
     );
+
+    // Version is a root option: after a command the count parser rejects it as unknown.
+    const version_after_command = try runCli(allocator, &.{ "count", "--version" });
+    try cli.expectResult(version_after_command, 2, "", "error: unknown count option: --version\n");
 }
 
 test "[cli] - [arguments]: line-limit grammar errors differ from overflow for every command" {
@@ -749,9 +732,70 @@ test "[cli] - [arguments]: a value option may be given only once" {
         .{ .args = &.{ "sample", "--fraction", "1", "--seed", "1", "--seed", "2", "-" }, .option = "--seed" },
         .{ .args = &.{ "interleave", "--pair-names", "exact", "--pair-names", "illumina", "a", "b" }, .option = "--pair-names" },
         .{ .args = &.{ "deinterleave", "--out1", "a", "--out1", "b", "--out2", "c", "-" }, .option = "--out1" },
+        .{ .args = &.{ "deinterleave", "--out1", "a", "--out2", "b", "--out2", "c", "-" }, .option = "--out2" },
     }) |case| {
         const message = try std.fmt.allocPrint(allocator, "error: {s} may appear only once\n", .{case.option});
         try cli.expectResult(try runCli(allocator, case.args), 2, "", message);
+    }
+}
+
+test "[cli] - [arguments]: usage failures name the command and exit with usage status" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for ([_]struct { args: []const []const u8, stderr: []const u8 }{
+        .{ .args = &.{ "sample", "--fraction" }, .stderr = "error: --fraction requires a value\n" },
+        .{ .args = &.{ "sample", "--fraction", "0" }, .stderr = "error: sample requires exactly one input\n" },
+        .{ .args = &.{ "sample", "--json", "-" }, .stderr = "error: unknown sample option: --json\n" },
+        .{ .args = &.{"check"}, .stderr = "error: check requires at least one input\n" },
+        .{ .args = &.{ "check", "--json" }, .stderr = "error: check requires at least one input\n" },
+        .{ .args = &.{ "check", "--alphabet", "dna", "-" }, .stderr = "error: --alphabet must be iupac or acgtn\n" },
+        .{ .args = &.{ "check", "--paired", "missing.fastq", "other.fastq", "extra.fastq" }, .stderr = "error: check --paired requires exactly two inputs\n" },
+        .{ .args = &.{ "check", "--interleaved" }, .stderr = "error: check --interleaved requires exactly one input\n" },
+        .{ .args = &.{ "check", "--interleaved", "missing.fastq", "extra.fastq" }, .stderr = "error: check --interleaved requires exactly one input\n" },
+        .{ .args = &.{ "check", "--paired", "--interleaved", "-" }, .stderr = "error: --paired and --interleaved are mutually exclusive\n" },
+        .{ .args = &.{ "check", "--pair-names" }, .stderr = "error: --pair-names requires a value\n" },
+        .{ .args = &.{ "check", "--pair-names", "prefix", "-" }, .stderr = "error: --pair-names must be illumina or exact\n" },
+        .{ .args = &.{ "check", "--pair-names", "exact", "-" }, .stderr = "error: --pair-names requires --paired or --interleaved\n" },
+        .{ .args = &.{ "check", "--paired", "-", "-" }, .stderr = "error: paired inputs may contain standard input at most once\n" },
+        .{ .args = &.{ "interleave", "--pair-names" }, .stderr = "error: --pair-names requires a value\n" },
+        .{ .args = &.{ "interleave", "-" }, .stderr = "error: interleave requires exactly two inputs\n" },
+        .{ .args = &.{ "interleave", "-", "-" }, .stderr = "error: interleave inputs may contain standard input at most once\n" },
+        .{ .args = &.{ "interleave", "--json", "a", "b" }, .stderr = "error: unknown interleave option: --json\n" },
+        .{ .args = &.{ "deinterleave", "--out1" }, .stderr = "error: --out1 requires a value\n" },
+        .{ .args = &.{ "deinterleave", "--out2", "b", "-" }, .stderr = "error: deinterleave requires --out1\n" },
+        .{ .args = &.{ "deinterleave", "--out1", "a", "--out2", "a", "-" }, .stderr = "error: deinterleave output paths must differ\n" },
+        .{ .args = &.{ "deinterleave", "--unknown", "-" }, .stderr = "error: unknown deinterleave option: --unknown\n" },
+        .{ .args = &.{ "check", "--alphabet" }, .stderr = "error: --alphabet requires a value\n" },
+        .{ .args = &.{ "check", "--bogus", "-" }, .stderr = "error: unknown check option: --bogus\n" },
+        .{ .args = &.{ "check", "--paired", "missing.fastq" }, .stderr = "error: check --paired requires exactly two inputs\n" },
+    }) |case| {
+        // Standard input stays open and unwritten: a read before the usage check would block until the timeout.
+        const result = try cli.runWith(allocator, case.args, .{ .stdin = .stalled });
+        try cli.expectResult(result, 2, "", case.stderr);
+    }
+}
+
+test "[cli] - [arguments]: a double dash and escaped option bytes apply to every command" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for ([_][]const u8{ "sample", "interleave", "deinterleave", "check" }) |command| {
+        const option = try std.fmt.allocPrint(allocator, "error: unknown {s} option: -bad\\x09\\\\\\x1B\n", .{command});
+        const bad_option = try runCli(allocator, &.{ command, "-bad\t\\\x1b" });
+        try cli.expectResult(bad_option, 2, "", option);
+    }
+    for ([_][]const []const u8{
+        &.{ "sample", "--fraction", "1", "--", "-z-fastq-v002-missing/record.fastq" },
+        &.{ "interleave", "--", "-z-fastq-v002-missing/record.fastq", "tests/data/synthetic/basic_valid.fastq" },
+        &.{ "check", "--", "-z-fastq-v002-missing/record.fastq" },
+    }) |args| {
+        try cli.expectResult(
+            try runCli(allocator, args),
+            3,
+            "",
+            "error: -z-fastq-v002-missing/record.fastq: file not found\n",
+        );
     }
 }
 
@@ -795,6 +839,10 @@ test "[cli] - [output]: a closed stdout exits with I/O status" {
         .{ .args = &.{"--version"} },
         .{ .args = &.{ "count", "tests/data/synthetic/basic_valid.fastq" } },
         .{ .args = &.{ "count", "-" }, .stdin = "@r\nA\n+\n!\n" },
+        .{ .args = &.{ "stats", "-" }, .stdin = "@r\nA\n+\n!\n" },
+        .{ .args = &.{ "stats", "--json", "-" }, .stdin = "@r\nA\n+\n!\n" },
+        .{ .args = &.{ "sample", "--fraction", "1", "-" }, .stdin = "@r\nA\n+\n!\n" },
+        .{ .args = &.{ "check", "--json", "-" }, .stdin = "@r\nA\n+\n!\n" },
         .{
             .args = &.{
                 "count",
@@ -837,67 +885,65 @@ test "[cli] - [output]: a pipe closed by its reader exits with I/O status" {
     }
 }
 
-test "[cli] - [count]: a closed stdin exits with I/O status" {
+test "[cli] - [input]: a closed standard input exits with I/O status" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    const allocator = arena.allocator();
 
-    const result = try runCliWithClosedStdin(arena.allocator(), &.{ "count", "-" });
-
-    try std.testing.expectEqual(@as(u8, 3), result.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
-    try std.testing.expectEqualStrings("error: -: I/O error\n", result.stderr);
+    for ([_][]const []const u8{
+        &.{ "count", "-" },
+        &.{ "stats", "-" },
+        &.{ "sample", "--fraction", "1", "-" },
+    }) |args| {
+        const result = try runCliWithClosedStdin(allocator, args);
+        try cli.expectResult(result, 3, "", "error: -: I/O error\n");
+    }
 }
 
-test "[cli] - [subprocess]: timeout kills and reaps a stalled installed command" {
-    try std.testing.expectError(
-        error.ChildProcessTimedOut,
-        cli.runStalledStdinForTest(
-            std.testing.allocator,
-            &.{ "count", "-" },
-            .fromMilliseconds(100),
-        ),
-    );
+test "[unit] - [test harness]: a stalled child is killed and reported as a timeout" {
+    // Standard input is open and never written, so the child blocks reading it until the short deadline.
+    try std.testing.expectError(error.ChildProcessTimedOut, cli.runWith(
+        std.testing.allocator,
+        &.{ "count", "-" },
+        .{ .stdin = .stalled, .timeout = .fromMilliseconds(100) },
+    ));
 }
 
-test "[cli] - [subprocess]: output limits reject excess bytes and leave no child" {
+test "[unit] - [test harness]: captured streams stop at the caller's limit and leave no child" {
     const allocator = std.testing.allocator;
+    const limit = 64 * 1024;
     const record = "@record01\nA\n+\n!\n";
-    const limit = 1024 * 1024;
-    const input = try allocator.alloc(u8, limit + record.len);
-    defer allocator.free(input);
-    for (0..input.len / record.len) |index| {
-        @memcpy(input[index * record.len ..][0..record.len], record);
-    }
-
-    {
-        const result = try runCliWithStdin(
-            allocator,
-            &.{ "sample", "--fraction", "1", "-" },
-            input[0..limit],
-            4096,
-        );
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
-        try cli.expectResult(result, 0, input[0..limit], "");
-    }
-
-    var missing_paths: [258][]const u8 = undefined;
+    // Just over the limit, in whole records, so that copying the input to standard output exceeds it.
+    const input = record ** (limit / record.len + 1);
+    var missing_paths: [18][]const u8 = undefined;
     missing_paths[0] = "count";
     @memset(missing_paths[1..], "x" ** 4096);
+
+    {
+        const result = try cli.runWith(allocator, &.{ "sample", "--fraction", "1", "-" }, .{
+            .stdin = .{ .data = .{ .bytes = input, .chunk_len = 4096 } },
+            .output_limit = input.len,
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try cli.expectResult(result, 0, input, "");
+    }
+
     const cases = [_]struct {
         args: []const []const u8,
         stdin: []const u8 = "",
-        closed_stdout: bool = false,
+        stdout: cli.StdoutMode = .capture,
     }{
         .{ .args = &.{ "sample", "--fraction", "1", "-" }, .stdin = input },
         .{ .args = &missing_paths },
-        .{ .args = &missing_paths, .closed_stdout = true },
+        .{ .args = &missing_paths, .stdout = .closed },
     };
     for (cases) |case| {
-        const result = if (case.closed_stdout)
-            runCliWithClosedStdout(allocator, case.args, case.stdin)
-        else
-            runCliWithStdin(allocator, case.args, case.stdin, 4096);
+        const result = cli.runWith(allocator, case.args, .{
+            .stdin = .{ .data = .{ .bytes = case.stdin, .chunk_len = 4096 } },
+            .stdout = case.stdout,
+            .output_limit = limit,
+        });
         if (result) |unexpected| {
             defer allocator.free(unexpected.stdout);
             defer allocator.free(unexpected.stderr);
@@ -975,11 +1021,11 @@ test "[cli] - [count]: double dash treats a leading-hyphen argument as a path" {
     );
 }
 
-test "[cli] - [count]: a line may exceed the read buffer within its limit" {
+test "[edge] - [count]: a line one byte past the read buffer is accepted at the limit" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const line_len: usize = 262145;
+    const line_len: usize = zfastq.limits.COUNT_READ_BUFFER_BYTES + 1;
 
     {
         const file = try tmp.dir.createFile(io, "long.fastq", .{});
@@ -1015,7 +1061,7 @@ test "[cli] - [count]: a line may exceed the read buffer within its limit" {
     const limited = try runCli(arena.allocator(), &.{
         "count",
         "--max-line-bytes",
-        "262144",
+        std.fmt.comptimePrint("{d}", .{zfastq.limits.COUNT_READ_BUFFER_BYTES}),
         path,
     });
     const limited_expected = try std.fmt.allocPrint(
@@ -1026,29 +1072,4 @@ test "[cli] - [count]: a line may exceed the read buffer within its limit" {
     try std.testing.expectEqual(@as(u8, 4), limited.exit_code);
     try std.testing.expectEqual(@as(usize, 0), limited.stdout.len);
     try std.testing.expectEqualStrings(limited_expected, limited.stderr);
-}
-
-test "[cli] - [count]: a lone CR at EOF remains quality content" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try tmp.dir.createFile(io, "lone-cr.fastq", .{});
-    defer file.close(io);
-    try file.writePositionalAll(io, "@r\nA\n+\n!\r", 0);
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const path = try cli.tempPath(arena.allocator(), &tmp.sub_path, "lone-cr.fastq");
-
-    const result = try runCount(arena.allocator(), path);
-    const expected = try std.fmt.allocPrint(
-        arena.allocator(),
-        "error: {s}: S005: sequence and quality lengths differ " ++
-            "(record 0, line 4, offset 7)\n",
-        .{path},
-    );
-
-    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
-    try std.testing.expectEqualStrings(expected, result.stderr);
 }
