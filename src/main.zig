@@ -7,6 +7,7 @@ const io_layer = @import("io.zig");
 const pairing = @import("pair.zig");
 const sampling = @import("sample.zig");
 const statistics = @import("stats.zig");
+const qc = @import("qc.zig");
 
 pub const std_options: std.Options = .{ .networking = false };
 
@@ -3925,20 +3926,31 @@ fn runProcess(
         }
     };
 
-    var stats = [2]zfastq.Stats{ .{}, .{} };
+    var mate_qc = [2]qc.MateQc{ .{}, .{} };
+    defer for (&mate_qc) |*collector| collector.deinit(allocator);
     var counts: ProcessCounts = .{};
     var failed_output: ?u1 = null;
-    const input_failure = processSources(
+    const processed = processSources(
         allocator,
         .{ input1.stream(), input2.stream() },
         .{ &outputs[0].writer, &outputs[1].writer },
-        &stats,
+        &mate_qc,
         &counts,
         options,
     ) catch |err| failure: {
         failed_output = if (err == error.Output1WriteFailed) 0 else 1;
         break :failure null;
     };
+
+    var input_failure = processed;
+    var stats = [2]zfastq.Stats{ .{}, .{} };
+    for (&mate_qc, &stats, 0..) |*collector, *mate_stats, index| {
+        collector.finish();
+        mate_stats.* = collector.stats() catch |err| stats: {
+            if (input_failure == null) input_failure = pairCommandFailure(@intCast(index), qcFailure(err));
+            break :stats .{};
+        };
+    }
 
     var exit_code: u8 = 0;
     if (input_failure) |failure| {
@@ -3967,6 +3979,7 @@ fn runProcess(
         .status_ok = exit_code == 0,
         .counts = counts,
         .stats = &stats,
+        .qc = &mate_qc,
         .input_failure = input_failure,
         .failed_output = if (failed_output) |index| paths[index] else null,
     };
@@ -3979,6 +3992,14 @@ fn runProcess(
     writeProcessReport(&json, report) catch return reportFailed(io, report_path, report_to_stdout, exit_code);
     report_writer.interface.flush() catch return reportFailed(io, report_path, report_to_stdout, exit_code);
     return exit_code;
+}
+
+fn qcFailure(err: (error{OutOfMemory} || statistics.StatsError)) CommandFailure {
+    return switch (err) {
+        error.OutOfMemory => OUT_OF_MEMORY,
+        error.Overflow => STATISTICS_LIMIT,
+        error.S005LengthMismatch, error.S006InvalidQuality => CommandFailure.plain("io_error", "quality validation failed without details", 3),
+    };
 }
 
 fn reportFailed(io: std.Io, path: []const u8, to_stdout: bool, exit_code: u8) u8 {
@@ -4051,12 +4072,13 @@ fn removeCreatedOutputs(io: std.Io, outputs: []RecordOutput) void {
 }
 
 const ProcessPairs = struct {
+    allocator: std.mem.Allocator,
     reader1: *zfastq.Reader,
     reader2: *zfastq.Reader,
     validator1: *fastq.AdaptiveRecordValidator,
     validator2: *fastq.AdaptiveRecordValidator,
     writers: [2]*zfastq.Writer,
-    stats: *[2]zfastq.Stats,
+    qc: *[2]qc.MateQc,
     counts: *ProcessCounts,
     max_pairs: ?u64,
     policy: pairing.NamePolicy,
@@ -4066,15 +4088,15 @@ const ProcessPairs = struct {
         return self.counts.read == cap;
     }
 
-    fn emit(
+    inline fn emit(
         self: *ProcessPairs,
         records: [2]zfastq.Record,
         spans: [2]?[]const u8,
     ) DeinterleaveWriteError!?PairCommandFailure {
         self.counts.read += 1;
-        for (self.stats, records, [_]*zfastq.Reader{ self.reader1, self.reader2 }, 0..) |*mate_stats, record, reader, index| {
-            mate_stats.addRecord(record) catch |err| {
-                return pairCommandFailure(@intCast(index), statsFailure(mate_stats, reader, err));
+        for (self.qc, records, 0..) |*collector, record, index| {
+            collector.addRead(self.allocator, record.sequence, record.quality) catch |err| {
+                return pairCommandFailure(@intCast(index), qcFailure(err));
             };
         }
         writeCheckedRecord(self.writers[0], records[0], spans[0]) catch return error.Output1WriteFailed;
@@ -4119,7 +4141,7 @@ fn processSources(
     allocator: std.mem.Allocator,
     sources: [2]*std.Io.Reader,
     writers: [2]*zfastq.Writer,
-    stats: *[2]zfastq.Stats,
+    mate_qc: *[2]qc.MateQc,
     counts: *ProcessCounts,
     options: ProcessOptions,
 ) DeinterleaveWriteError!?PairCommandFailure {
@@ -4131,12 +4153,13 @@ fn processSources(
     var validator1 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
     var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
     var pairs: ProcessPairs = .{
+        .allocator = allocator,
         .reader1 = &reader1,
         .reader2 = &reader2,
         .validator1 = &validator1,
         .validator2 = &validator2,
         .writers = writers,
-        .stats = stats,
+        .qc = mate_qc,
         .counts = counts,
         .max_pairs = options.max_pairs,
         .policy = options.pair_name_policy,
@@ -4191,6 +4214,7 @@ const ProcessReport = struct {
     status_ok: bool,
     counts: ProcessCounts,
     stats: *const [2]zfastq.Stats,
+    qc: *const [2]qc.MateQc,
     input_failure: ?PairCommandFailure,
     failed_output: ?[]const u8,
 };
@@ -4253,6 +4277,13 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
         try json.endObject();
     }
     try json.endArray();
+    try json.objectField("qc");
+    try json.beginObject();
+    try json.objectField("raw");
+    try json.beginArray();
+    for (report.qc) |*collector| try collector.writeJson(json);
+    try json.endArray();
+    try json.endObject();
 
     const failed_input: ?[]const u8 = if (report.input_failure) |failure| switch (failure) {
         .command => |details| report.inputs[details.input_index],
@@ -6762,14 +6793,15 @@ test "[failure] - [process]: a mate 2 write failure keeps mate 1 and counts no w
     var sink2 = DeinterleaveTestSink{ .fail_write = true };
     var writer1 = zfastq.Writer.init(sink1.byteSink());
     var writer2 = zfastq.Writer.init(sink2.byteSink());
-    var stats = [2]zfastq.Stats{ .{}, .{} };
+    var mate_qc = [2]qc.MateQc{ .{}, .{} };
+    defer for (&mate_qc) |*collector| collector.deinit(std.testing.allocator);
     var counts: ProcessCounts = .{};
 
     try std.testing.expectError(error.Output2WriteFailed, processSources(
         std.testing.allocator,
         .{ &stream1.reader.interface, &stream2.reader.interface },
         .{ &writer1, &writer2 },
-        &stats,
+        &mate_qc,
         &counts,
         .{
             .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,

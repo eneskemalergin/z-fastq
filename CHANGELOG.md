@@ -10,7 +10,7 @@ A `process` command that validates paired reads into two plain or gzip outputs w
 
 ### Added
 
-- **Commands.** `process` validates two mate files pair by pair, as `check --paired` does, and writes every accepted pair to two new files, plain or gzip (`--gzip`). `--max-pairs N` stops after the first N pairs, and `--report` writes a `z-fastq/process-v1` JSON document with per-mate statistics and any failure. The same inputs and options give byte-identical outputs and report.
+- **Commands.** `process` validates two mate files pair by pair, as `check --paired` does, and writes every accepted pair to two new files, plain or gzip (`--gzip`). `--max-pairs N` stops after the first N pairs, and `--report` writes a `z-fastq/process-v1` JSON document with per-mate statistics, FastQC's core quality modules computed as FastQC 0.13.0 computes them, terminal poly-G and poly-A counts, and any failure. The same inputs and options give byte-identical outputs and report.
 - **Library.**
   - `FileSink.initStreaming` writes at the file handle's current position, for standard output and pipes.
   - `Stats.ratios` returns each ratio of `StatsResult` as an exact numerator and denominator, so callers can round without floating point.

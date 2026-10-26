@@ -87,6 +87,14 @@ test "[cli] - [process]: pairs pass through with LF endings and the report count
     try std.testing.expectEqual(std.json.Value.null, report.get("error").?);
     try std.testing.expectEqual(std.json.Value.null, report.get("failed_input").?);
     try cli.expectJsonInteger(report.get("inputs").?.array.items[1].object.get("size"), R2.len);
+
+    const qc_mates = report.get("qc").?.object.get("raw").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), qc_mates.len);
+    const read_quality = qc_mates[0].object.get("per_sequence_quality").?.array.items;
+    try std.testing.expectEqual(@as(usize, 40), read_quality.len);
+    try cli.expectJsonInteger(read_quality[0].object.get("quality"), 1);
+    try cli.expectJsonInteger(read_quality[39].object.get("count"), 1);
+    try std.testing.expectEqual(@as(usize, 101), qc_mates[1].object.get("per_sequence_gc").?.array.items.len);
 }
 
 test "[cli] - [process]: gzip outputs decode to the same records, and empty input gives empty members" {

@@ -170,8 +170,8 @@ const RecordTotals = struct {
     q30_bases: u64,
 };
 
-const Q20_SCORE = 20;
-const Q30_SCORE = 30;
+pub const Q20_SCORE = 20;
+pub const Q30_SCORE = 30;
 
 const PayloadTotals = extern struct {
     base_counts: [6]usize = .{0} ** 6,

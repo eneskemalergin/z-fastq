@@ -32,6 +32,7 @@ z-fastq process --max-pairs 1000000 --out1 sub_R1.fastq --out2 sub_R2.fastq R1.f
 - `pairs`: pairs `read` and `written`.
 - `mates`: one statistics object per mate, with the same fields as `stats --json`.
 - `failed_input`, `failed_output`, and `error`: the failure, in the form `check --paired --json` uses, or `null`.
+- `qc`: FastQC's core modules for each mate's reads as they were read, under `raw`: `per_base_quality`, `per_base_content`, `per_base_n`, `length_distribution`, `per_sequence_quality`, `per_sequence_gc` (101 values, percent 0 to 100), and `terminal_runs` (reads ending in at least 10 `G` or 10 `A`). The values follow FastQC 0.13.0's definitions, including its groups of cycles for long reads; a value FastQC prints as `NaN` is `null`. A mate with a read longer than 1024 bases reports its per-cycle modules and length distribution as `null`, with the reason in `unavailable`.
 
 The report holds no time of the run or host name, so a rerun gives the same bytes.
 
