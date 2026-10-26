@@ -954,7 +954,8 @@ run_edges() {
                 cell="wrong: ${value:-empty}"
             fi
             printf '%s\t%s\t%s\n' "$name" "$edge" "$cell" >>"$out"
-            [[ -z "$stem" ]] || rm -f -- "$o1" "$o2"
+            # Every file under the stem, also one a tool named its own way.
+            [[ -z "$stem" ]] || rm -f -- "$o1" "$o2" "${stem:?}"*
         done < <(edge_list)
     done
     rm -f -- "$o" "$o.err" "$o.1" "$o.2"
