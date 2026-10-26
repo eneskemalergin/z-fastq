@@ -156,6 +156,7 @@ pub const Stats = struct {
     pub fn ratios(self: *const Stats) Ratios {
         return .{
             .mean_length = .{ .numerator = self.bases, .denominator = self.reads },
+            // N and other symbols are not called bases here, so they stay out of GC.
             .gc_fraction = .{
                 .numerator = @as(u128, self.g) + self.c,
                 .denominator = @as(u128, self.a) + self.c + self.g + self.t,
@@ -198,6 +199,7 @@ fn recordTotals(
 ) StatsError!RecordTotals {
     if (record.sequence.len != record.quality.len) return error.S005LengthMismatch;
 
+    // The u128 total serves quality lines over 2^64 / 93 bytes, past any real input.
     const payload_totals = if (maxQualitySum(record.quality.len) != null)
         try payloadTotals(u64, record.sequence, record.quality, quality_error)
     else

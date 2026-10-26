@@ -72,4 +72,4 @@ The current build supports `--json` only for `stats` and `check`. `count` prints
 
 ## The command returns status `4`
 
-Status `4` means z-fastq reached a configured or representable limit: a line limit, sample-selection or staging limit, or arithmetic limit. The error message identifies the relevant boundary when the command can report it.
+Status `4` means z-fastq reached a configured or representable limit: a line limit, a sample-selection limit, or an arithmetic limit. The error message identifies the relevant boundary when the command can report it.

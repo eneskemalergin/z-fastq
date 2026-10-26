@@ -3,7 +3,7 @@
 const std = @import("std");
 const cli = @import("utilities.zig");
 
-const FIXTURE_DIR = "tests/data/synthetic";
+const FIXTURE_DIR = cli.FIXTURE_DIR;
 
 const FixtureExpect = struct {
     name: []const u8,
@@ -512,7 +512,7 @@ test "[cli] - [check]: files and stdin preserve prefix detection and gzip failur
         "z-fastq/check-v1",
     );
     try std.testing.expectEqual(@as(usize, 1), damaged_results.len);
-    try expectCheckFailureWithoutLocation(
+    try cli.expectJsonFailureWithoutLocation(
         damaged_results[0],
         "-",
         "io_error",
@@ -674,9 +674,9 @@ test "[cli] - [check]: independent inputs continue and highest exit class wins" 
     const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/check-v1");
     try std.testing.expectEqual(@as(usize, 5), results.len);
     try expectCheckStatus(results[0], valid, "ok");
-    try expectCheckFailure(results[1], semantic, "S002", 0, 3, 2);
-    try expectCheckFailureWithoutLocation(results[2], missing, "io_error", "file not found");
-    try expectCheckFailureWithoutLocation(
+    try cli.expectJsonFailure(results[1], semantic, "S002", 0, 3, 2);
+    try cli.expectJsonFailureWithoutLocation(results[2], missing, "io_error", "file not found");
+    try cli.expectJsonFailureWithoutLocation(
         results[3],
         long,
         "line_limit",
@@ -722,7 +722,7 @@ test "[cli] - [check-json]: options, stdin, escaped bytes, and output failure co
     defer escaped_json.deinit();
     const escaped_results = try cli.expectJsonDocument(&escaped_json.value, "z-fastq/check-v1");
     try std.testing.expectEqual(@as(usize, 1), escaped_results.len);
-    try expectCheckFailureWithoutLocation(
+    try cli.expectJsonFailureWithoutLocation(
         escaped_results[0],
         "missing\\x0A\\\\\"\\xFF.fastq",
         "io_error",
@@ -744,7 +744,7 @@ test "[cli] - [check-json]: options, stdin, escaped bytes, and output failure co
         "z-fastq/check-v1",
     );
     try std.testing.expectEqual(@as(usize, 1), double_dash_results.len);
-    try expectCheckFailureWithoutLocation(
+    try cli.expectJsonFailureWithoutLocation(
         double_dash_results[0],
         "--json",
         "io_error",
@@ -757,7 +757,7 @@ test "[cli] - [check-json]: options, stdin, escaped bytes, and output failure co
         "@r\nA\n+\n!\n",
     );
     try std.testing.expectEqual(@as(u8, 3), closed.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), closed.stderr.len);
+    try std.testing.expectEqualStrings("error: standard output: I/O error\n", closed.stderr);
 }
 
 test "[cli] - [check-json]: output failure preserves an observed limit status in every mode" {
@@ -782,7 +782,7 @@ test "[cli] - [check-json]: output failure preserves an observed limit status in
             const captured = try cli.run(allocator, args);
             try std.testing.expectEqual(@as(u8, 4), captured.exit_code);
             try std.testing.expectEqualStrings("", captured.stderr);
-            try std.testing.expectEqual(name.len > 200, captured.stdout.len > 16 * 1024);
+            try std.testing.expectEqual(name.len > 200, captured.stdout.len > cli.JSON_OUTPUT_BUFFER_BYTES);
             var parsed = try std.json.parseFromSlice(std.json.Value, allocator, captured.stdout, .{});
             defer parsed.deinit();
             const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/check-v1");
@@ -790,7 +790,7 @@ test "[cli] - [check-json]: output failure preserves an observed limit status in
             const failed = try cli.runWithClosedStdout(allocator, args, "");
             try std.testing.expectEqual(@as(u8, 4), failed.exit_code);
             try std.testing.expectEqualStrings("", failed.stdout);
-            try std.testing.expectEqualStrings("", failed.stderr);
+            try std.testing.expectEqualStrings("error: standard output: I/O error\n", failed.stderr);
         }
     }
 }
@@ -1033,7 +1033,7 @@ test "[cli] - [paired check]: documented name forms and input transports pass" {
         &parsed_damaged.value,
         "z-fastq/check-v1",
     );
-    try expectCheckFailureWithoutLocation(
+    try cli.expectJsonFailureWithoutLocation(
         damaged_results[0],
         "-",
         "io_error",
@@ -1769,7 +1769,7 @@ fn expectCheckJsonResult(
     const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/check-v1");
     try std.testing.expectEqual(@as(usize, 1), results.len);
     if (fixture.code) |code| {
-        try expectCheckFailure(
+        try cli.expectJsonFailure(
             results[0],
             input,
             code,
@@ -1793,32 +1793,4 @@ fn expectCheckStatus(value: std.json.Value, input: []const u8, status: []const u
     try cli.expectJsonObjectKeys(object, &.{ "input", "status" });
     try cli.expectJsonString(object.get("input"), input);
     try cli.expectJsonString(object.get("status"), status);
-}
-
-fn expectCheckFailure(
-    value: std.json.Value,
-    input: []const u8,
-    code: []const u8,
-    record_index: u64,
-    byte_offset: u64,
-    line_in_record: u3,
-) !void {
-    const error_object = try cli.expectJsonError(value, input, code);
-    try cli.expectJsonErrorLocation(
-        error_object,
-        record_index,
-        byte_offset,
-        line_in_record,
-    );
-}
-
-fn expectCheckFailureWithoutLocation(
-    value: std.json.Value,
-    input: []const u8,
-    code: []const u8,
-    message: []const u8,
-) !void {
-    const error_object = try cli.expectJsonError(value, input, code);
-    try cli.expectJsonString(error_object.get("message"), message);
-    try cli.expectJsonNullErrorLocation(error_object);
 }

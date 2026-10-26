@@ -50,6 +50,8 @@ This distinction is central to the module. Borrowed records keep streaming work 
 
 The reader consumes a `ByteSource`, exposes record offsets, and enforces the configured line limit. The caller opens and closes paths and streams; the I/O adapters only borrow them, so the FASTQ record types never handle files. The gzip adapter validates gzip framing while reading through its backing source.
 
+An error ends the reader. Read its diagnostic with `takeLastError` and do not call `next` again: the position and record index may reflect a partly read record.
+
 ## Compatibility
 
 The `0.1.0` module targets Zig `0.16.0` and Linux x86-64. Pin the package version when an application depends on the exact exported names or error shapes, and check release notes before upgrading.

@@ -733,6 +733,8 @@ fn firstInvalidNarrowIupacSequence(
 ) ?usize {
     return switch (scanSequenceLineFor(.acgtn, sequence, false)) {
         .incomplete => null,
+        // Callers pass line content, so no LF arrives; one would be the
+        // first invalid byte.
         .line_end => |line_end| line_end,
         .invalid_start => |start| switch (scanSequenceLineFor(
             .iupac,
@@ -1173,6 +1175,9 @@ pub const RecordSpan = struct {
 /// `initStreamReader` over a borrowed `std.Io.Reader`; fields are
 /// implementation state. The copied source wrapper's referenced adapter must
 /// outlive the reader.
+///
+/// An error ends the reader: afterwards only `takeLastError` is meaningful, and
+/// the position, offsets, and record index may reflect a partly read record.
 pub const Reader = struct {
     allocator: std.mem.Allocator,
     transport: Transport,
@@ -2515,7 +2520,7 @@ pub const Writer = struct {
             return error.InvalidRecord;
         }
 
-        return writeRecordFields(self, record);
+        return writeRecordUnchecked(self, record);
     }
 
     /// Flushes the underlying sink when it provides a flush callback.
@@ -2531,11 +2536,11 @@ pub fn recordHasTerminalCr(record: Record) bool {
     return false;
 }
 
+/// Writes a record span that is already canonical (validated, LF-only) as is.
 pub fn writeCanonicalRecordSpan(writer: *Writer, span: []const u8) WriteError!void {
     return writer.sink.write(span);
 }
 
-// CLI callers check both mates, including terminal CR, before writing either record.
 /// Canonical framing adds '@', '+', and four LFs to the four fields.
 pub const RECORD_FRAMING_BYTES = 6;
 
@@ -2574,7 +2579,10 @@ pub fn copyCanonicalRecord(dest: []u8, record: Record) Record {
     return copied;
 }
 
-pub fn writeRecordFields(writer: *Writer, record: Record) WriteError!void {
+/// Writes `record` in canonical framing without the checks `Writer.writeRecord`
+/// runs; the caller has proved them (equal lengths, an identifier, and no
+/// field that LF output cannot hold).
+pub fn writeRecordUnchecked(writer: *Writer, record: Record) WriteError!void {
     const fields = [_][]const u8{
         "@",
         record.header,
@@ -4828,7 +4836,7 @@ test "[property] - [record delivery]: omits identifiers and preserves buffered c
             try writeCanonicalRecordSpan(&writer, span);
         } else {
             try std.testing.expect(!recordHasTerminalCr(record));
-            try writeRecordFields(&writer, record);
+            try writeRecordUnchecked(&writer, record);
         }
         try std.testing.expectEqualStrings(case.expected_output, sink.written());
         try std.testing.expect((try nextWithSpan(&reader, &canonical_span)) == null);
@@ -5082,7 +5090,7 @@ test "[integration] - [writer]: prechecked Reader records match checked serializ
         if (case.expected) |expected| {
             try checked_writer.writeRecord(record);
             try std.testing.expect(!recordHasTerminalCr(record));
-            try writeRecordFields(&trusted_writer, record);
+            try writeRecordUnchecked(&trusted_writer, record);
             try std.testing.expectEqualStrings(expected, checked_sink.written());
         } else {
             try std.testing.expectError(error.InvalidRecord, checked_writer.writeRecord(record));
@@ -5102,7 +5110,7 @@ test "[property] - [writer]: the canonical copy matches written records" {
         var output: [64]u8 = undefined;
         var sink = io_layer.SliceSink.init(&output);
         var writer = Writer.init(sink.byteSink());
-        try writeRecordFields(&writer, record);
+        try writeRecordUnchecked(&writer, record);
 
         var copy: [64]u8 = undefined;
         const len = canonicalRecordLen(record).?;

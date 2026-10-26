@@ -86,14 +86,32 @@ fn printUsageAndExit(io: std.Io) noreturn {
 }
 
 fn printHelpAndExit(io: std.Io) noreturn {
-    std.Io.File.writeStreamingAll(.stdout(), io, USAGE) catch std.process.exit(3);
+    std.Io.File.writeStreamingAll(.stdout(), io, USAGE) catch std.process.exit(stdoutFailed(io, 0));
     std.process.exit(0);
+}
+
+/// Value options seen so far: each may be given once, so a later value never
+/// silently replaces an earlier one.
+const GivenOptions = struct {
+    max_line_bytes: bool = false,
+    alphabet: bool = false,
+    fraction: bool = false,
+    count: bool = false,
+    seed: bool = false,
+    pair_names: bool = false,
+    out1: bool = false,
+    out2: bool = false,
+};
+
+fn onlyOnce(io: std.Io, given: *bool, comptime option: []const u8) void {
+    if (given.*) argumentError(io, "error: " ++ option ++ " may appear only once\n", 2);
+    given.* = true;
 }
 
 fn printVersionAndExit(io: std.Io) noreturn {
     var buf: [64]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "z-fastq {s}\n", .{zfastq.VERSION}) catch "z-fastq\n";
-    std.Io.File.writeStreamingAll(.stdout(), io, line) catch std.process.exit(3);
+    std.Io.File.writeStreamingAll(.stdout(), io, line) catch std.process.exit(stdoutFailed(io, 0));
     std.process.exit(0);
 }
 
@@ -109,20 +127,20 @@ fn validateRecordCommandInputs(
         return 2;
     }
 
-    if (stdinRepeats(inputs)) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: standard input may appear at most once\n",
-        ) catch {};
-        return 2;
-    }
-    return null;
+    const output_identity = checkedStdoutIdentity(io) catch return 3;
+    return inputAliasFailure(io, inputs, output_identity);
 }
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
+    // A write to a closed pipe then fails with EPIPE, which ends the command
+    // with the documented I/O status instead of a signal.
+    std.posix.sigaction(.PIPE, &.{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    }, null);
 
     var args = std.process.Args.Iterator.initAllocator(init.minimal.args, gpa) catch {
         argumentError(io, OUT_OF_MEMORY_LINE, 3);
@@ -171,6 +189,7 @@ pub fn main(init: std.process.Init) !void {
     var sample_seed: u64 = 11;
     var output1: ?[]const u8 = null;
     var output2: ?[]const u8 = null;
+    var given: GivenOptions = .{};
     var positional = std.ArrayList([]const u8).empty;
     defer positional.deinit(gpa);
 
@@ -190,6 +209,7 @@ pub fn main(init: std.process.Init) !void {
             const value = args.next() orelse {
                 argumentError(io, "error: --max-line-bytes requires a value\n", 2);
             };
+            onlyOnce(io, &given.max_line_bytes, "--max-line-bytes");
             max_line_bytes = sampling.parseDecimal(usize, value) catch |err| switch (err) {
                 error.Overflow => {
                     argumentError(io, "error: --max-line-bytes exceeds supported limit\n", 4);
@@ -211,6 +231,7 @@ pub fn main(init: std.process.Init) !void {
             const value = args.next() orelse {
                 argumentError(io, "error: --alphabet requires a value\n", 2);
             };
+            onlyOnce(io, &given.alphabet, "--alphabet");
             alphabet = if (std.mem.eql(u8, value, "iupac"))
                 .iupac
             else if (std.mem.eql(u8, value, "acgtn"))
@@ -224,6 +245,7 @@ pub fn main(init: std.process.Init) !void {
             const value = args.next() orelse {
                 argumentError(io, "error: --fraction requires a value\n", 2);
             };
+            onlyOnce(io, &given.fraction, "--fraction");
             fraction = sampling.Fraction.parse(value) catch {
                 argumentError(io, "error: invalid --fraction value\n", 2);
             };
@@ -233,6 +255,7 @@ pub fn main(init: std.process.Init) !void {
             const value = args.next() orelse {
                 argumentError(io, "error: --count requires a value\n", 2);
             };
+            onlyOnce(io, &given.count, "--count");
             sample_count = sampling.parseCount(value) catch |err| switch (err) {
                 error.InvalidCount => {
                     argumentError(io, "error: invalid --count value\n", 2);
@@ -247,6 +270,7 @@ pub fn main(init: std.process.Init) !void {
             const value = args.next() orelse {
                 argumentError(io, "error: --seed requires a value\n", 2);
             };
+            onlyOnce(io, &given.seed, "--seed");
             sample_seed = sampling.parseSeed(value) catch |err| switch (err) {
                 error.InvalidSeed => {
                     argumentError(io, "error: invalid --seed value\n", 2);
@@ -282,6 +306,7 @@ pub fn main(init: std.process.Init) !void {
             const value = args.next() orelse {
                 argumentError(io, "error: --pair-names requires a value\n", 2);
             };
+            onlyOnce(io, &given.pair_names, "--pair-names");
             pair_name_policy = if (std.mem.eql(u8, value, "illumina"))
                 .illumina
             else if (std.mem.eql(u8, value, "exact"))
@@ -302,15 +327,13 @@ pub fn main(init: std.process.Init) !void {
                     "error: --out2 requires a value\n";
                 argumentError(io, message, 2);
             };
-            const destination = if (std.mem.eql(u8, arg, "--out1")) &output1 else &output2;
-            if (destination.* != null) {
-                const message = if (std.mem.eql(u8, arg, "--out1"))
-                    "error: --out1 may appear only once\n"
-                else
-                    "error: --out2 may appear only once\n";
-                argumentError(io, message, 2);
+            if (std.mem.eql(u8, arg, "--out1")) {
+                onlyOnce(io, &given.out1, "--out1");
+                output1 = value;
+            } else {
+                onlyOnce(io, &given.out2, "--out2");
+                output2 = value;
             }
-            destination.* = value;
             continue;
         }
         if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
@@ -415,6 +438,11 @@ const RECORD_LOCATION_UNAVAILABLE = CommandFailure.plain("io_error", "record loc
 
 /// For failures reported before a command's input labels exist.
 const OUT_OF_MEMORY_LINE = "error: " ++ OUT_OF_MEMORY.message ++ "\n";
+
+/// Output buffers: a JSON document is flushed when it outgrows its buffer;
+/// FASTQ output is written in whole pages from its buffer.
+const JSON_OUTPUT_BUFFER_BYTES = 16 * 1024;
+const RECORD_OUTPUT_BUFFER_BYTES = 64 * 1024;
 
 const PAIR_DIAGNOSTIC_PREFIX_BYTES = 128;
 
@@ -767,6 +795,12 @@ fn printOutputFailure(io: std.Io) void {
     ) catch {};
 }
 
+/// Reports a failed write to stdout and raises the exit status to the I/O class.
+fn stdoutFailed(io: std.Io, exit_code: u8) u8 {
+    printOutputFailure(io);
+    return @max(exit_code, 3);
+}
+
 const HEX = "0123456789ABCDEF";
 
 fn writeEscaped(file: std.Io.File, io: std.Io, bytes: []const u8) void {
@@ -893,10 +927,20 @@ fn initRecordInput(
     const owns_file = !namesStdin(label);
     var transferred = false;
     defer if (!transferred and owns_file) file.close(io);
+    if (inputTypeFailure(io, file)) |failure| return failure;
     if (outputFileFailure(io, file, output_identity)) |failure| return failure;
     input.init(io, file, owns_file) catch
         return IO_FAILURE;
     transferred = true;
+    return null;
+}
+
+/// A directory opens like a file but fails on its first read; name it instead.
+fn inputTypeFailure(io: std.Io, file: std.Io.File) ?CommandFailure {
+    const stat = statRecordFile(io, file) catch return null;
+    if (stat.mode & std.os.linux.S.IFMT == std.os.linux.S.IFDIR) {
+        return CommandFailure.plain("io_error", "input is a directory", 3);
+    }
     return null;
 }
 
@@ -953,6 +997,8 @@ fn initPairedRecordInputs(
         return pairCommandFailure(1, inputOpenFailure(err));
     defer if (!transferred and owns2) file2.close(io);
 
+    if (inputTypeFailure(io, file1)) |failure| return pairCommandFailure(0, failure);
+    if (inputTypeFailure(io, file2)) |failure| return pairCommandFailure(1, failure);
     if (pairedFilesFailure(io, file1, file2, output_identity)) |failure| return failure;
     input1.init(io, file1, owns1) catch return pairCommandFailure(0, IO_FAILURE);
     if (owns2) {
@@ -1024,6 +1070,63 @@ fn stdoutFileIdentity(io: std.Io) (std.Io.Cancelable || error{Io})!?FileIdentity
     return .of(stat);
 }
 
+/// `stdoutFileIdentity`, with a failure to inspect stdout already reported (exit 3).
+fn checkedStdoutIdentity(io: std.Io) error{Reported}!?FileIdentity {
+    return stdoutFileIdentity(io) catch {
+        if (canReportInputFailure(io, null)) printOutputFailure(io);
+        return error.Reported;
+    };
+}
+
+/// The identity of the file named `path`, without opening it; null when it
+/// cannot be inspected, which the command reports when it reaches the input.
+fn pathIdentity(io: std.Io, path: []const u8) ?FileIdentity {
+    const linux = std.os.linux;
+    const path_z = std.posix.toPosixPath(path) catch return null;
+    var stat: linux.Statx = undefined;
+    while (true) switch (linux.errno(linux.statx(linux.AT.FDCWD, &path_z, 0, .{ .INO = true, .TYPE = true }, &stat))) {
+        .SUCCESS => break,
+        .INTR => io.checkCancel() catch return null,
+        else => return null,
+    };
+    if (!stat.mask.INO or !stat.mask.TYPE) return null;
+    return .of(stat);
+}
+
+/// Rejects, before any input is read or output written, an input that is
+/// stdout's file, and standard input named more than once under any name
+/// while it is a pipe or FIFO, which can be read only once. A regular file on
+/// standard input may also be named by path: each name reads it from the
+/// start.
+fn inputAliasFailure(io: std.Io, inputs: []const []const u8, output_identity: ?FileIdentity) ?u8 {
+    const stdin_stat = statRecordFile(io, .stdin()) catch null;
+    const stdin_identity: ?FileIdentity = if (stdin_stat) |stat| .of(stat) else null;
+    const stdin_is_stream = if (stdin_stat) |stat| stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG else false;
+    var stdin_uses: usize = 0;
+    for (inputs) |label| {
+        const identity = if (namesStdin(label)) stdin_identity else pathIdentity(io, label);
+        const reads_stdin = namesStdin(label) or
+            (stdin_is_stream and identity != null and std.meta.eql(identity.?, stdin_identity.?));
+        if (reads_stdin) {
+            stdin_uses += 1;
+            if (stdin_uses > 1) {
+                std.Io.File.writeStreamingAll(
+                    .stderr(),
+                    io,
+                    "error: standard input may appear at most once\n",
+                ) catch {};
+                return 2;
+            }
+        }
+        const output = output_identity orelse continue;
+        if (identity) |input| if (std.meta.eql(input, output)) {
+            printCommandFailure(io, label, outputAliasFailure(io, &.{input}));
+            return 2;
+        };
+    }
+    return null;
+}
+
 fn outputFileFailure(io: std.Io, file: std.Io.File, output_identity: ?FileIdentity) ?CommandFailure {
     const output = output_identity orelse return null;
     const input = fileIdentity(io, file) catch return inputInspectionFailure(io, output_identity);
@@ -1088,18 +1191,13 @@ fn recordHasUnwritableEnding(record: zfastq.Record, canonical_span: ?[]const u8)
 
 fn writeCheckedRecord(
     writer: *zfastq.Writer,
-    direct_writer: ?*std.Io.Writer,
     record: zfastq.Record,
     canonical_span: ?[]const u8,
 ) error{WriteFailed}!void {
     if (canonical_span) |span| {
-        if (direct_writer) |output| {
-            try output.writeAll(span);
-        } else {
-            try fastq.writeCanonicalRecordSpan(writer, span);
-        }
+        try fastq.writeCanonicalRecordSpan(writer, span);
     } else {
-        try fastq.writeRecordFields(writer, record);
+        try fastq.writeRecordUnchecked(writer, record);
     }
 }
 
@@ -1111,7 +1209,7 @@ fn spanIsWritable(span: fastq.RecordSpan) bool {
 
 fn writeRecordSpan(writer: *zfastq.Writer, span: fastq.RecordSpan) error{WriteFailed}!void {
     if (span.canonical) return fastq.writeCanonicalRecordSpan(writer, span.bytes);
-    return fastq.writeRecordFields(writer, span.record());
+    return fastq.writeRecordUnchecked(writer, span.record());
 }
 
 fn headerNameMismatch(
@@ -1131,10 +1229,12 @@ fn headerNameMismatch(
     } } };
 }
 
-/// Four lines at the line limit, each with its LF: the largest canonical record.
-fn recordStagingLimit(max_line_bytes: usize) error{ArithmeticLimit}!usize {
-    const line = std.math.add(usize, max_line_bytes, 1) catch return error.ArithmeticLimit;
-    return std.math.mul(usize, line, 4) catch error.ArithmeticLimit;
+/// Four lines at the line limit, each with its LF: the largest canonical
+/// record. It saturates, so every command accepts the same line limits; no
+/// record reaches the size of the address space.
+fn recordStagingLimit(max_line_bytes: usize) usize {
+    const line = std.math.add(usize, max_line_bytes, 1) catch return std.math.maxInt(usize);
+    return std.math.mul(usize, line, 4) catch std.math.maxInt(usize);
 }
 
 fn canonicalRecordSize(
@@ -1285,11 +1385,7 @@ fn nextAfterPreservingInterleavedMate1(
         };
         // Reader's four line limits cover CLI staging limits, including markers.
         // Internal callers can supply a smaller limit and still need its error.
-        const covers_line_limit = if (recordStagingLimit(reader.options.max_line_bytes)) |limit|
-            staging_limit >= limit
-        else |_|
-            false;
-        if (!covers_line_limit) {
+        if (staging_limit < recordStagingLimit(reader.options.max_line_bytes)) {
             if (try canonicalRecordSize(record1, canonical_span1) > staging_limit) {
                 return error.RecordStagingLimit;
             }
@@ -1323,7 +1419,7 @@ fn writePreservedInterleavedMate1(
     storage: InterleavedFirstRecordStorage,
 ) error{WriteFailed}!void {
     switch (storage) {
-        .reader, .retained => try writeCheckedRecord(writer, null, record, canonical_span),
+        .reader, .retained => try writeCheckedRecord(writer, record, canonical_span),
         .staged => try fastq.writeCanonicalRecordSpan(writer, staged),
     }
     if (storage == .retained) {
@@ -1350,16 +1446,12 @@ fn runCount(
         const count = switch (countInput(io, input, options)) {
             .success => |count| count,
             .failure => |failure| {
-                if (std.mem.eql(u8, failure.code, "out_of_memory")) {
-                    std.Io.File.writeStreamingAll(.stderr(), io, OUT_OF_MEMORY_LINE) catch {};
-                    return 3;
-                }
                 printCommandFailure(io, input, failure);
                 exit_code = @max(exit_code, failure.exit_code);
                 continue;
             },
         };
-        printCount(io, count) catch return @max(exit_code, 3);
+        printCount(io, count) catch return stdoutFailed(io, exit_code);
     }
     return exit_code;
 }
@@ -1429,7 +1521,7 @@ fn runStats(
         };
 
         printStats(io, input, &stats, printed_block) catch
-            return @max(exit_code, 3);
+            return stdoutFailed(io, exit_code);
         printed_block = true;
     }
     return exit_code;
@@ -1441,11 +1533,11 @@ fn runStatsJson(
     inputs: []const []const u8,
     options: InputOptions,
 ) u8 {
-    var stdout_buffer: [16 * 1024]u8 = undefined;
+    var stdout_buffer: [JSON_OUTPUT_BUFFER_BYTES]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     var json: std.json.Stringify = .{ .writer = &stdout_writer.interface };
 
-    beginJsonDocument(&json, "z-fastq/stats-v1") catch return 3;
+    beginJsonDocument(&json, "z-fastq/stats-v1") catch return stdoutFailed(io, 0);
     var exit_code: u8 = 0;
     for (inputs) |input| {
         const outcome = statsInput(io, allocator, input, options);
@@ -1453,10 +1545,10 @@ fn runStatsJson(
             .success => {},
             .failure => |failure| exit_code = @max(exit_code, failure.exit_code),
         }
-        writeStatsJsonResult(&json, input, outcome) catch return @max(exit_code, 3);
+        writeStatsJsonResult(&json, input, outcome) catch return stdoutFailed(io, exit_code);
     }
-    finishJsonDocument(&json) catch return @max(exit_code, 3);
-    stdout_writer.interface.flush() catch return @max(exit_code, 3);
+    finishJsonDocument(&json) catch return stdoutFailed(io, exit_code);
+    stdout_writer.interface.flush() catch return stdoutFailed(io, exit_code);
     return exit_code;
 }
 
@@ -1565,6 +1657,8 @@ const PairedCheckOptions = struct {
     alphabet: zfastq.Alphabet = .iupac,
     pair_mode: PairMode = .none,
     pair_name_policy: pairing.NamePolicy = .illumina,
+    /// Stdout's file, which no input may be (JSON output would land in it).
+    output_identity: ?FileIdentity = null,
 };
 
 fn runSingleCheckCommand(
@@ -1615,9 +1709,11 @@ fn runPairedCheckCommand(
     if (validatePairedCheckInputs(io, inputs, options.pair_mode)) |exit_code| {
         return exit_code;
     }
-    if (json_output) return runPairedCheckJson(io, allocator, inputs, options);
+    var checked_options = options;
+    checked_options.output_identity = checkedStdoutIdentity(io) catch return 3;
+    if (json_output) return runPairedCheckJson(io, allocator, inputs, checked_options);
 
-    const failure = checkPairMode(io, allocator, inputs, options);
+    const failure = checkPairMode(io, allocator, inputs, checked_options);
     if (failure) |details| printPairCommandFailure(io, inputs, options.pair_mode, details);
     return if (failure) |details| details.exitCode() else 0;
 }
@@ -1652,19 +1748,19 @@ fn runCheckJson(
     inputs: []const []const u8,
     options: CheckOptions,
 ) u8 {
-    var stdout_buffer: [16 * 1024]u8 = undefined;
+    var stdout_buffer: [JSON_OUTPUT_BUFFER_BYTES]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     var json: std.json.Stringify = .{ .writer = &stdout_writer.interface };
 
-    beginJsonDocument(&json, "z-fastq/check-v1") catch return 3;
+    beginJsonDocument(&json, "z-fastq/check-v1") catch return stdoutFailed(io, 0);
     var exit_code: u8 = 0;
     for (inputs) |input| {
         const failure = checkInput(io, input, options);
         if (failure) |details| exit_code = @max(exit_code, details.exit_code);
-        writeCheckJsonResult(&json, input, failure) catch return @max(exit_code, 3);
+        writeCheckJsonResult(&json, input, failure) catch return stdoutFailed(io, exit_code);
     }
-    finishJsonDocument(&json) catch return @max(exit_code, 3);
-    stdout_writer.interface.flush() catch return @max(exit_code, 3);
+    finishJsonDocument(&json) catch return stdoutFailed(io, exit_code);
+    stdout_writer.interface.flush() catch return stdoutFailed(io, exit_code);
     return exit_code;
 }
 
@@ -1681,16 +1777,16 @@ fn runPairedCheckJson(
             return 2;
         }
     }
-    var stdout_buffer: [16 * 1024]u8 = undefined;
+    var stdout_buffer: [JSON_OUTPUT_BUFFER_BYTES]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     var json: std.json.Stringify = .{ .writer = &stdout_writer.interface };
 
-    beginJsonDocument(&json, "z-fastq/check-v1") catch return 3;
+    beginJsonDocument(&json, "z-fastq/check-v1") catch return stdoutFailed(io, 0);
     const exit_code = if (failure) |details| details.exitCode() else 0;
     writePairedCheckJsonResult(&json, inputs, options.pair_mode, failure) catch
-        return @max(exit_code, 3);
-    finishJsonDocument(&json) catch return @max(exit_code, 3);
-    stdout_writer.interface.flush() catch return @max(exit_code, 3);
+        return stdoutFailed(io, exit_code);
+    finishJsonDocument(&json) catch return stdoutFailed(io, exit_code);
+    stdout_writer.interface.flush() catch return stdoutFailed(io, exit_code);
     return exit_code;
 }
 
@@ -1715,7 +1811,7 @@ fn checkPaired(
 ) ?PairCommandFailure {
     var input1: RecordInput = undefined;
     var input2: RecordInput = undefined;
-    if (initPairedRecordInputs(&input1, &input2, io, inputs, null)) |failure| return failure;
+    if (initPairedRecordInputs(&input1, &input2, io, inputs, options.output_identity)) |failure| return failure;
     defer input1.deinit(io);
     defer input2.deinit(io);
 
@@ -1828,7 +1924,7 @@ fn checkInterleaved(
     options: PairedCheckOptions,
 ) ?PairCommandFailure {
     var input: RecordInput = undefined;
-    if (initRecordInput(&input, io, input_label, null)) |failure| {
+    if (initRecordInput(&input, io, input_label, options.output_identity)) |failure| {
         return pairCommandFailure(0, failure);
     }
     defer input.deinit(io);
@@ -2154,11 +2250,8 @@ fn runSample(
         return 2;
     }
 
-    options.output_identity = stdoutFileIdentity(io) catch {
-        if (canReportInputFailure(io, null)) printOutputFailure(io);
-        return 3;
-    };
-    var stdout_buffer: [64 * 1024]u8 = undefined;
+    options.output_identity = checkedStdoutIdentity(io) catch return 3;
+    var stdout_buffer: [RECORD_OUTPUT_BUFFER_BYTES]u8 = undefined;
     var stdout_sink = io_layer.FileSink.initStreaming(io, .stdout(), &stdout_buffer);
     var writer = zfastq.Writer.init(stdout_sink.byteSink());
     const failure = (switch (mode) {
@@ -2183,18 +2276,14 @@ fn runSample(
         ),
     }) catch {
         writer.flush() catch {};
-        return 3;
+        return stdoutFailed(io, 0);
     };
 
-    var output_exit: u8 = 0;
-    writer.flush() catch {
-        output_exit = 3;
-    };
-    if (failure) |details| {
-        printCommandFailure(io, input, details);
-        return @max(output_exit, details.exit_code);
-    }
-    return output_exit;
+    // Messages follow detection order: a record's failure before the final flush's.
+    const flushed = if (writer.flush()) true else |_| false;
+    if (failure) |details| printCommandFailure(io, input, details);
+    const output_exit: u8 = if (flushed) 0 else stdoutFailed(io, 0);
+    return if (failure) |details| @max(output_exit, details.exit_code) else output_exit;
 }
 
 fn runPairSampleCommand(
@@ -2240,24 +2329,9 @@ fn runPairSampleCommand(
         .fraction => |fraction| fraction != .none,
         .count => |count| count != 0,
     };
-    const staging_limit = if (needs_staging)
-        recordStagingLimit(options.max_line_bytes) catch {
-            if (canReportInputFailure(io, null)) {
-                std.Io.File.writeStreamingAll(
-                    .stderr(),
-                    io,
-                    "error: sample " ++ RECORD_STAGING_LIMIT.message ++ "\n",
-                ) catch {};
-            }
-            return 4;
-        }
-    else
-        0;
-    options.output_identity = stdoutFileIdentity(io) catch {
-        if (canReportInputFailure(io, null)) printOutputFailure(io);
-        return 3;
-    };
-    var stdout_buffer: [64 * 1024]u8 = undefined;
+    const staging_limit = if (needs_staging) recordStagingLimit(options.max_line_bytes) else 0;
+    options.output_identity = checkedStdoutIdentity(io) catch return 3;
+    var stdout_buffer: [RECORD_OUTPUT_BUFFER_BYTES]u8 = undefined;
     var stdout_sink = io_layer.FileSink.initStreaming(io, .stdout(), &stdout_buffer);
     var writer = zfastq.Writer.init(stdout_sink.byteSink());
     const failure = (switch (mode) {
@@ -2266,7 +2340,7 @@ fn runPairSampleCommand(
             var output_selector: PairOutputSelector = .{ .fraction = &selector };
             break :blk switch (options.pair_mode) {
                 .none => unreachable,
-                .paired => interleaveInputs(io, allocator, inputs, &writer, null, .{
+                .paired => interleaveInputs(io, allocator, inputs, &writer, .{
                     .max_line_bytes = options.max_line_bytes,
                     .alphabet = options.alphabet,
                     .pair_name_policy = options.pair_name_policy,
@@ -2295,18 +2369,14 @@ fn runPairSampleCommand(
         ),
     }) catch {
         writer.flush() catch {};
-        return 3;
+        return stdoutFailed(io, 0);
     };
 
-    var output_exit: u8 = 0;
-    writer.flush() catch {
-        output_exit = 3;
-    };
-    if (failure) |details| {
-        printPairCommandFailure(io, inputs, options.pair_mode, details);
-        return @max(output_exit, details.exitCode());
-    }
-    return output_exit;
+    // Messages follow detection order: a pair's failure before the final flush's.
+    const flushed = if (writer.flush()) true else |_| false;
+    if (failure) |details| printPairCommandFailure(io, inputs, options.pair_mode, details);
+    const output_exit: u8 = if (flushed) 0 else stdoutFailed(io, 0);
+    return if (failure) |details| @max(output_exit, details.exitCode()) else output_exit;
 }
 
 fn sampleInterleavedFractionInput(
@@ -2387,7 +2457,7 @@ fn sampleInterleavedSource(
             .pair => |pair| pair,
         };
         try mate1_storage.write(writer, &reader, pair);
-        try writeCheckedRecord(writer, null, pair.record2, pair.canonical_span2);
+        try writeCheckedRecord(writer, pair.record2, pair.canonical_span2);
     }
 }
 
@@ -2458,7 +2528,7 @@ fn sampleFractionSource(
         if (recordHasUnwritableEnding(validated.record, validated.canonical_span)) {
             return unwritableRecordFailure();
         }
-        try writeCheckedRecord(writer, null, validated.record, validated.canonical_span);
+        try writeCheckedRecord(writer, validated.record, validated.canonical_span);
     }
 }
 
@@ -2634,7 +2704,7 @@ fn sampleExactSecondPass(
             if (recordHasUnwritableEnding(validated.record, validated.canonical_span)) {
                 return self.fail(unwritableRecordFailure());
             }
-            try writeCheckedRecord(self.writer, null, validated.record, validated.canonical_span);
+            try writeCheckedRecord(self.writer, validated.record, validated.canonical_span);
             return .done;
         }
 
@@ -2997,8 +3067,8 @@ fn sampleExactPairedSecondPass(
             if (recordHasUnwritableEnding(mate2.record, mate2.canonical_span)) {
                 return self.fail(pairCommandFailure(1, unwritableRecordFailure()));
             }
-            try writeCheckedRecord(self.writer, null, mate1.record, mate1.canonical_span);
-            try writeCheckedRecord(self.writer, null, mate2.record, mate2.canonical_span);
+            try writeCheckedRecord(self.writer, mate1.record, mate1.canonical_span);
+            try writeCheckedRecord(self.writer, mate2.record, mate2.canonical_span);
             return .done;
         }
 
@@ -3149,7 +3219,7 @@ fn sampleExactInterleavedSecondPass(
                 .record2 = record2,
                 .canonical_span2 = canonical_span2,
             });
-            try writeCheckedRecord(self.writer, null, record2, canonical_span2);
+            try writeCheckedRecord(self.writer, record2, canonical_span2);
             return .done;
         }
 
@@ -3249,16 +3319,19 @@ fn openExactInput(io: std.Io, path: []const u8, expected_snapshot: ?FileSnapshot
     const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = true } };
     const snapshot = fileSnapshot(file, io) catch |err| {
         file.close(io);
-        return .{ .failure = if (expected_snapshot != null and err == error.NotRegularFile)
-            inputChangedFailure()
-        else if (err == error.NotRegularFile)
-            CommandFailure.plain(
-                "io_error",
-                "exact-count sampling requires a regular file",
-                3,
-            )
-        else
-            INSPECT_FAILURE };
+        return .{
+            .failure = if (expected_snapshot != null and err == error.NotRegularFile)
+                inputChangedFailure()
+            else if (err == error.NotRegularFile)
+                // An invalid request, as `-` is: exact-count sampling reads its input twice.
+                CommandFailure.plain(
+                    "usage",
+                    "exact-count sampling requires a regular file",
+                    2,
+                )
+            else
+                INSPECT_FAILURE,
+        };
     };
     if (expected_snapshot) |expected| {
         if (!sameFileSnapshot(expected, snapshot)) {
@@ -3355,11 +3428,8 @@ fn runInterleave(
     if (validateInterleaveInputs(io, inputs)) |exit_code| return exit_code;
 
     var options = parsed_options;
-    options.output_identity = stdoutFileIdentity(io) catch {
-        if (canReportInputFailure(io, null)) printOutputFailure(io);
-        return 3;
-    };
-    var stdout_buffer: [64 * 1024]u8 = undefined;
+    options.output_identity = checkedStdoutIdentity(io) catch return 3;
+    var stdout_buffer: [RECORD_OUTPUT_BUFFER_BYTES]u8 = undefined;
     var stdout_sink = io_layer.FileSink.initStreaming(io, .stdout(), &stdout_buffer);
     var writer = zfastq.Writer.init(stdout_sink.byteSink());
 
@@ -3368,7 +3438,6 @@ fn runInterleave(
         allocator,
         inputs,
         &writer,
-        &stdout_sink.writer,
         options,
     ) catch {
         writer.flush() catch {};
@@ -3450,7 +3519,6 @@ fn interleaveInputs(
     allocator: std.mem.Allocator,
     inputs: []const []const u8,
     writer: *zfastq.Writer,
-    direct_writer: ?*std.Io.Writer,
     options: InterleaveOptions,
 ) error{WriteFailed}!?PairCommandFailure {
     var input1: RecordInput = undefined;
@@ -3465,7 +3533,6 @@ fn interleaveInputs(
         input1.stream(),
         input2.stream(),
         writer,
-        direct_writer,
         &selection,
         options,
     );
@@ -3476,7 +3543,6 @@ fn interleaveSources(
     source1: *std.Io.Reader,
     source2: *std.Io.Reader,
     writer: *zfastq.Writer,
-    direct_writer: ?*std.Io.Writer,
     selection: *PairOutputSelector,
     options: InterleaveOptions,
 ) error{WriteFailed}!?PairCommandFailure {
@@ -3546,8 +3612,8 @@ fn interleaveSources(
             return pairCommandFailure(1, unwritableRecordFailure());
         }
 
-        try writeCheckedRecord(writer, direct_writer, record1.*, canonical_span1);
-        try writeCheckedRecord(writer, direct_writer, record2.*, canonical_span2);
+        try writeCheckedRecord(writer, record1.*, canonical_span1);
+        try writeCheckedRecord(writer, record2.*, canonical_span2);
     }
 }
 
@@ -3567,7 +3633,7 @@ const DeinterleaveWriteError = error{
 const DeinterleaveOutput = struct {
     path: []const u8,
     file: ?std.Io.File = null,
-    write_buffer: [64 * 1024]u8 = undefined,
+    write_buffer: [RECORD_OUTPUT_BUFFER_BYTES]u8 = undefined,
     sink: io_layer.FileSink = undefined,
     writer: zfastq.Writer = undefined,
 
@@ -3604,14 +3670,7 @@ fn runDeinterleave(
 ) u8 {
     const paths = validateDeinterleaveArguments(io, inputs, output1_path, output2_path) orelse
         return 2;
-    const staging_limit = recordStagingLimit(options.max_line_bytes) catch {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: deinterleave record staging size exceeds supported limit\n",
-        ) catch {};
-        return 4;
-    };
+    const staging_limit = recordStagingLimit(options.max_line_bytes);
 
     const input_label = inputs[0];
     const owns_input = !namesStdin(input_label);
@@ -3621,6 +3680,11 @@ fn runDeinterleave(
         return failure.exit_code;
     };
     defer if (owns_input) input_file.close(io);
+    // Checked before any output exists, so a failure here creates nothing.
+    if (inputTypeFailure(io, input_file)) |failure| {
+        printCommandFailure(io, input_label, failure);
+        return failure.exit_code;
+    }
 
     var output1 = DeinterleaveOutput.init(paths[0]);
     defer output1.close(io);
@@ -3631,6 +3695,9 @@ fn runDeinterleave(
         return failure.exit_code;
     }
     if (output2.create(io)) |failure| {
+        // Output 1 was created empty a moment ago; leaving it would block a rerun.
+        output1.close(io);
+        std.Io.Dir.cwd().deleteFile(io, output1.path) catch {};
         printCommandFailure(io, output2.path, failure);
         return failure.exit_code;
     }
@@ -3753,7 +3820,7 @@ fn deinterleaveSource(
             .pair => |pair| pair,
         };
         mate1_storage.write(writer1, &reader, pair) catch return error.Output1WriteFailed;
-        writeCheckedRecord(writer2, null, pair.record2, pair.canonical_span2) catch
+        writeCheckedRecord(writer2, pair.record2, pair.canonical_span2) catch
             return error.Output2WriteFailed;
     }
 }
@@ -4205,6 +4272,14 @@ const TestStream = struct {
     }
 };
 
+/// A `std.testing.tmpDir` and a file in it, relative to the repository root.
+const TEST_TEMP_DIR = ".zig-cache/tmp/{s}";
+const TEST_TEMP_PATH = TEST_TEMP_DIR ++ "/{s}";
+
+fn testTempPath(allocator: std.mem.Allocator, sub_path: []const u8, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, TEST_TEMP_PATH, .{ sub_path, name });
+}
+
 test "[unit] - [interleaved staging]: releases oversized slack before a smaller mate" {
     var staging: std.ArrayList(u8) = .empty;
     defer staging.deinit(std.testing.allocator);
@@ -4568,7 +4643,8 @@ test "[integration] - [stats command]: handled failures preserve input order and
         .{
             .inputs = &.{ "small.fastq", "limit.fastq", "small.fastq", "small.fastq" },
             .stdout = partial,
-            .stderr = "error: limit.fastq: line length limit exceeded\n",
+            .stderr = "error: limit.fastq: line length limit exceeded\n" ++
+                "error: standard output: I/O error\n",
             .status = 4,
             .opened = 3,
             .stdout_capacity = partial.len,
@@ -4642,11 +4718,7 @@ test "[failure] - [exact sample]: selection allocation failure precedes later bl
             "@bad\nG\nx\n$\n",
     });
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(
-        &path_buffer,
-        ".zig-cache/tmp/{s}/records.fastq",
-        .{tmp.sub_path},
-    );
+    const path = try std.fmt.bufPrint(&path_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, "records.fastq" });
     var selector = sampling.ExactSelector.init(1, 11);
     defer selector.deinit(std.testing.allocator);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
@@ -4689,11 +4761,7 @@ test "[failure] - [exact sample]: final record-count change keeps a valid prefix
         try std.Io.File.writeStreamingAll(file, io, "@one\nA\n+\n!\n");
     }
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(
-        &path_buffer,
-        ".zig-cache/tmp/{s}/{s}",
-        .{ tmp.sub_path, name },
-    );
+    const path = try std.fmt.bufPrint(&path_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, name });
     const snapshot = try snapshotTestFile(io, path);
 
     var output: [64]u8 = undefined;
@@ -4786,11 +4854,7 @@ test "[failure] - [exact sample]: a FIFO replacement reports input changed on re
     };
     defer keeper.close(io);
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(
-        &path_buffer,
-        ".zig-cache/tmp/{s}/{s}",
-        .{ tmp.sub_path, name },
-    );
+    const path = try std.fmt.bufPrint(&path_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, name });
     var input: RecordInput = undefined;
     const failure = switch (initExactInput(&input, io, path, snapshot, null)) {
         .failure => |failure| failure,
@@ -4840,7 +4904,7 @@ test "[integration] - [exact sample]: selected records are revalidated after met
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/input", .{tmp.sub_path});
+    const path = try testTempPath(allocator, &tmp.sub_path, "input");
     defer allocator.free(path);
     const prefix = "@a\nC\n+\n#\n";
     const cases = [_]struct {
@@ -4933,9 +4997,9 @@ test "[integration] - [paired exact sample]: selected pairs are revalidated afte
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path1 = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/r1", .{tmp.sub_path});
+    const path1 = try testTempPath(allocator, &tmp.sub_path, "r1");
     defer allocator.free(path1);
-    const path2 = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/r2", .{tmp.sub_path});
+    const path2 = try testTempPath(allocator, &tmp.sub_path, "r2");
     defer allocator.free(path2);
     const prefix1 = "@a\nC\n+\n#\n";
     const prefix2 = "@a\nG\n+\n$\n";
@@ -5056,7 +5120,7 @@ test "[integration] - [paired exact sample]: selected pairs are revalidated afte
                         },
                         snapshots,
                         selector.record_count,
-                        try recordStagingLimit(options.max_line_bytes),
+                        recordStagingLimit(options.max_line_bytes),
                         options,
                     );
                     const reject = case.failed_input != null and
@@ -5090,7 +5154,7 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pairs", .{tmp.sub_path});
+    const path = try testTempPath(allocator, &tmp.sub_path, "pairs");
     defer allocator.free(path);
     const small_prefix = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n";
     const options = SampleOptions{
@@ -5101,7 +5165,7 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
         .seed = 11,
         .pair_mode = .interleaved,
     };
-    const staging_limit = try recordStagingLimit(options.max_line_bytes);
+    const staging_limit = recordStagingLimit(options.max_line_bytes);
     const Change = enum { valid, alphabet1, quality1, alphabet2, quality2, name, structure, write };
     for ([_]InterleavedFirstRecordStorage{ .reader, .staged, .retained }) |storage| {
         var input: std.ArrayList(u8) = .empty;
@@ -5274,7 +5338,7 @@ test "[integration] - [interleaved exact sample]: preserves the first mate parse
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pairs", .{tmp.sub_path});
+    const path = try testTempPath(allocator, &tmp.sub_path, "pairs");
     defer allocator.free(path);
     const original = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n@b/1\nA\n+\n!\n@b/2\nT\n+\n#\n";
     const changed = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n@b/1\nA\n+\n!\n@b/2\nT\nx\n#\n";
@@ -5353,23 +5417,11 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
     });
 
     var path1_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path1 = try std.fmt.bufPrint(
-        &path1_buffer,
-        ".zig-cache/tmp/{s}/r1.fastq",
-        .{tmp.sub_path},
-    );
+    const path1 = try std.fmt.bufPrint(&path1_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, "r1.fastq" });
     var path2_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path2 = try std.fmt.bufPrint(
-        &path2_buffer,
-        ".zig-cache/tmp/{s}/r2.fastq",
-        .{tmp.sub_path},
-    );
+    const path2 = try std.fmt.bufPrint(&path2_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, "r2.fastq" });
     var pairs_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const pairs_path = try std.fmt.bufPrint(
-        &pairs_path_buffer,
-        ".zig-cache/tmp/{s}/pairs.fastq",
-        .{tmp.sub_path},
-    );
+    const pairs_path = try std.fmt.bufPrint(&pairs_path_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, "pairs.fastq" });
     const inputs = [_][]const u8{ path1, path2 };
 
     const snapshot1 = try snapshotTestFile(io, path1);
@@ -5426,7 +5478,7 @@ test "[failure] - [paired exact sample]: each input snapshot is checked independ
         .empty,
         changed_pair_snapshot,
         1,
-        try recordStagingLimit(zfastq.limits.DEFAULT_MAX_LINE_BYTES),
+        recordStagingLimit(zfastq.limits.DEFAULT_MAX_LINE_BYTES),
         .{
             .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
             .alphabet = .iupac,
@@ -5450,23 +5502,11 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path1_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path1 = try std.fmt.bufPrint(
-        &path1_buffer,
-        ".zig-cache/tmp/{s}/r1.fastq",
-        .{tmp.sub_path},
-    );
+    const path1 = try std.fmt.bufPrint(&path1_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, "r1.fastq" });
     var path2_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path2 = try std.fmt.bufPrint(
-        &path2_buffer,
-        ".zig-cache/tmp/{s}/r2.fastq",
-        .{tmp.sub_path},
-    );
+    const path2 = try std.fmt.bufPrint(&path2_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, "r2.fastq" });
     var pairs_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const pairs_path = try std.fmt.bufPrint(
-        &pairs_path_buffer,
-        ".zig-cache/tmp/{s}/pairs.fastq",
-        .{tmp.sub_path},
-    );
+    const pairs_path = try std.fmt.bufPrint(&pairs_path_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, "pairs.fastq" });
     const inputs = [_][]const u8{ path1, path2 };
     const first_pair = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n";
     const paired_options = SampleOptions{
@@ -5523,7 +5563,7 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
         .empty,
         pair_snapshot,
         1,
-        try recordStagingLimit(zfastq.limits.DEFAULT_MAX_LINE_BYTES),
+        recordStagingLimit(zfastq.limits.DEFAULT_MAX_LINE_BYTES),
         .{
             .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
             .alphabet = .iupac,
@@ -5613,7 +5653,7 @@ fn exerciseExactAllocations(allocator: std.mem.Allocator) !void {
     defer for (paths[0..path_count]) |path| std.testing.allocator.free(path);
     for (names, [_][]const u8{ r1, r2, interleaved }, 0..) |name, bytes, index| {
         try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
-        paths[index] = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+        paths[index] = try testTempPath(std.testing.allocator, &tmp.sub_path, name);
         path_count += 1;
     }
 
@@ -5638,7 +5678,7 @@ fn exerciseExactAllocations(allocator: std.mem.Allocator) !void {
                 }
             } else {
                 const inputs = if (mode == .paired) paths[0..2] else paths[2..3];
-                if (try sampleExactPairs(io, allocator, inputs, &writer, count, try recordStagingLimit(options.max_line_bytes), options)) |failure| {
+                if (try sampleExactPairs(io, allocator, inputs, &writer, count, recordStagingLimit(options.max_line_bytes), options)) |failure| {
                     try std.testing.expectEqual(descriptors, try openDescriptorCount());
                     return pairAllocationFailure(failure);
                 }
@@ -5719,9 +5759,9 @@ test "[integration] - [paired inputs]: identity follows open descriptors after p
         var sink = io_layer.SliceSink.init(&output);
         var writer = zfastq.Writer.init(sink.byteSink());
         const descriptors = try openDescriptorCount();
-        const r1_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/r1", .{tmp.sub_path});
+        const r1_path = try testTempPath(std.testing.allocator, &tmp.sub_path, "r1");
         defer std.testing.allocator.free(r1_path);
-        const r2_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/r2", .{tmp.sub_path});
+        const r2_path = try testTempPath(std.testing.allocator, &tmp.sub_path, "r2");
         defer std.testing.allocator.free(r2_path);
 
         const failure = try interleaveInputs(
@@ -5729,7 +5769,6 @@ test "[integration] - [paired inputs]: identity follows open descriptors after p
             std.testing.allocator,
             &.{ r1_path, r2_path },
             &writer,
-            null,
             .{ .max_line_bytes = 8192, .alphabet = .iupac, .pair_name_policy = .illumina },
         );
         try writer.flush();
@@ -5762,7 +5801,7 @@ test "[integration] - [output aliases]: rejection closes inputs on both exact pa
     var identities: [2]FileIdentity = undefined;
     for (names, 0..) |name, index| {
         try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "@same\nAC\n+\nII\n" });
-        paths[index] = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+        paths[index] = try testTempPath(allocator, &tmp.sub_path, name);
         const file = try tmp.dir.openFile(io, name, .{});
         defer file.close(io);
         snapshots[index] = try fileSnapshot(file, io);
@@ -5816,7 +5855,7 @@ test "[integration] - [output aliases]: rejection closes inputs on both exact pa
             .empty,
             snapshots[0],
             1,
-            try recordStagingLimit(options.max_line_bytes),
+            recordStagingLimit(options.max_line_bytes),
             options,
         )).?;
         try std.testing.expectEqualStrings("input_changed", interleaved_failure.command.details.code);
@@ -5873,7 +5912,7 @@ test "[integration] - [input resources]: repeated failures close owned files and
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "r1", .data = "@a/1\nA\n+\n!\n" });
     try tmp.dir.createDir(io, "directory", .default_dir);
-    const base = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.fmt.allocPrint(std.testing.allocator, TEST_TEMP_DIR, .{tmp.sub_path});
     defer std.testing.allocator.free(base);
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/r1", .{base});
     defer std.testing.allocator.free(path);
@@ -5892,7 +5931,7 @@ test "[integration] - [input resources]: repeated failures close owned files and
         try std.testing.expect(initRecordInput(&input, io, path, null) == null);
         input.deinit(io);
         try std.testing.expectEqualStrings("io_error", initRecordInput(&input, io, directory, null).?.code);
-        try std.testing.expectEqualStrings("io_error", initExactInput(&input, io, directory, null, null).failure.code);
+        try std.testing.expectEqualStrings("usage", initExactInput(&input, io, directory, null, null).failure.code);
         try std.testing.expectEqualStrings("input_changed", initExactInput(&input, io, path, changed, null).failure.code);
         try std.testing.expectEqualStrings("input_changed", initExactInput(&input, io, missing, changed, null).failure.code);
         try std.testing.expectEqual(descriptors, try openDescriptorCount());
@@ -5911,8 +5950,10 @@ test "[integration] - [input resources]: repeated failures close owned files and
             const stream_failure = initPairedRecordInputs(&input1, &input2, io, &paths, null).?;
             try std.testing.expectEqualStrings(expected, stream_failure.command.details.code);
             try std.testing.expectEqual(descriptors, try openDescriptorCount());
+            // Exact-count sampling rejects a directory as an invalid request.
+            const exact_expected = if (index >= 3) "usage" else expected;
             const exact_failure = initExactPairedInputs(&input1, &input2, io, &paths, null, null).failure;
-            try std.testing.expectEqualStrings(expected, exact_failure.command.details.code);
+            try std.testing.expectEqualStrings(exact_expected, exact_failure.command.details.code);
             try std.testing.expectEqual(descriptors, try openDescriptorCount());
         }
 
@@ -5934,7 +5975,7 @@ test "[integration] - [input resources]: repeated failures close owned files and
         var sink = io_layer.SliceSink.init(&output);
         var writer = zfastq.Writer.init(sink.byteSink());
         const inputs = [_][]const u8{ path, missing };
-        const failure = (try interleaveInputs(io, std.testing.allocator, &inputs, &writer, null, .{
+        const failure = (try interleaveInputs(io, std.testing.allocator, &inputs, &writer, .{
             .max_line_bytes = 8192,
             .alphabet = .iupac,
             .pair_name_policy = .illumina,
@@ -5948,8 +5989,8 @@ test "[integration] - [input resources]: repeated failures close owned files and
             .pair_name_policy = .illumina,
         }));
         try std.testing.expectEqual(descriptors, try openDescriptorCount());
-        try std.testing.expectEqual(@as(u64, 0), (try snapshotTestFile(io, output_path)).size);
-        try tmp.dir.deleteFile(io, "out1");
+        // Output 2 already existed, so the output 1 it created is gone again.
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "out1", .{}));
     }
 }
 
@@ -5959,11 +6000,7 @@ test "[regression] - [input resources]: plain input leaves the gzip decoder fiel
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "plain.fastq", .data = "@r\nA\n+\n!\n" });
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(
-        &path_buffer,
-        ".zig-cache/tmp/{s}/plain.fastq",
-        .{tmp.sub_path},
-    );
+    const path = try std.fmt.bufPrint(&path_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, "plain.fastq" });
     var input: RecordInput = undefined;
     const gzip_bytes = std.mem.asBytes(&input.gzip);
     @memset(gzip_bytes, 0x5a);
@@ -6095,7 +6132,7 @@ test "[property] - [interleaved fraction sample]: source chunks preserve selecte
     const data = "@a/1 left\r\nAC\r\n+left\r\n!#\r\n@a/2 right\nGT\n+right\n$%\n" ++
         "@b/1\nG\n+\n&\n@b/2\nC\n+\n'\n" ++
         "@c/1\nTTA\n+one\n()*\n@c/2\nAAT\n+two\n+,-";
-    // Seed 11 at one half selects pair indexes 0 and 2 in the frozen CLI vectors.
+    // Seed 11 at one half selects pair indexes 0 and 2.
     const expected = "@a/1 left\nAC\n+left\n!#\n@a/2 right\nGT\n+right\n$%\n" ++
         "@c/1\nTTA\n+one\n()*\n@c/2\nAAT\n+two\n+,-\n";
     for (1..data.len + 1) |chunk_len| {
@@ -6144,11 +6181,7 @@ test "[edge] - [single fraction sample]: fraction zero reads without a record re
     try input.appendNTimes(std.testing.allocator, 'x', io_layer.DEFAULT_READER_BUFFER_BYTES + 1);
     const header_len = input.items.len;
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(
-        &path_buffer,
-        ".zig-cache/tmp/{s}/input.fastq",
-        .{tmp.sub_path},
-    );
+    const path = try std.fmt.bufPrint(&path_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, "input.fastq" });
 
     for ([_][]const u8{ "\nA\n+\n!\n", "\nA\n+\n!!\n" }, 0..) |suffix, case_index| {
         input.shrinkRetainingCapacity(header_len);
@@ -6202,11 +6235,7 @@ test "[edge] - [paired fraction sample]: fraction zero keeps buffered mate one b
         .data = input_bytes.items,
     });
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(
-        &path_buffer,
-        ".zig-cache/tmp/{s}/pairs.fastq",
-        .{tmp.sub_path},
-    );
+    const path = try std.fmt.bufPrint(&path_buffer, TEST_TEMP_PATH, .{ tmp.sub_path, "pairs.fastq" });
     var output: [1]u8 = undefined;
     var sink = io_layer.SliceSink.init(&output);
     var writer = zfastq.Writer.init(sink.byteSink());
@@ -6388,7 +6417,7 @@ test "[failure] - [deinterleave]: identifies both output write positions" {
         .alphabet = .iupac,
         .pair_name_policy = .illumina,
     };
-    const staging_limit = try recordStagingLimit(options.max_line_bytes);
+    const staging_limit = recordStagingLimit(options.max_line_bytes);
 
     {
         var source = io_layer.SliceSource.init(input);
@@ -6638,7 +6667,7 @@ test "[failure] - [deinterleave]: staging allocation failure emits no output" {
         &stream.reader.interface,
         &writer1,
         &writer2,
-        try recordStagingLimit(options.max_line_bytes),
+        recordStagingLimit(options.max_line_bytes),
         options,
     )).?;
 
@@ -6692,7 +6721,7 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
             &staging,
             record1,
             null,
-            try recordStagingLimit(reader.options.max_line_bytes),
+            recordStagingLimit(reader.options.max_line_bytes),
             &validator,
         );
         try std.testing.expect(next.first_storage == .retained);
@@ -6730,7 +6759,7 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
             &stream.reader.interface,
             &writer1,
             &writer2,
-            if (failure_mode == 2) 1 else try recordStagingLimit(options.max_line_bytes),
+            if (failure_mode == 2) 1 else recordStagingLimit(options.max_line_bytes),
             options,
         );
         if (failure_mode < 2) {
@@ -6772,7 +6801,7 @@ test "[failure] - [deinterleave]: both fallback owners survive allocation and ou
             &stream.reader.interface,
             &writer1,
             &writer2,
-            try recordStagingLimit(options.max_line_bytes),
+            recordStagingLimit(options.max_line_bytes),
             options,
         )).?;
         switch (failure_mode) {

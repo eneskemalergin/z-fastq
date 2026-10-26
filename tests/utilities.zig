@@ -2,8 +2,14 @@
 
 const std = @import("std");
 
+/// The CLI's JSON output buffer: a longer document is flushed before it ends.
+pub const JSON_OUTPUT_BUFFER_BYTES = 16 * 1024;
+
+/// Tracked synthetic fixtures, relative to the repository root.
+pub const FIXTURE_DIR = "tests/data/synthetic";
+
 pub const EXPECTED_VERSION = @import("test_options").package_version;
-const ZFASTQ_BIN = "zig-out/bin/z-fastq";
+pub const ZFASTQ_BIN = "zig-out/bin/z-fastq";
 const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
 pub const PROCESS_TIMEOUT = std.Io.Duration.fromSeconds(30);
 
@@ -236,6 +242,31 @@ pub fn expectJsonErrorLocation(
     try expectJsonInteger(object.get("record_index"), record_index);
     try expectJsonInteger(object.get("byte_offset"), byte_offset);
     try expectJsonInteger(object.get("line_in_record"), line_in_record);
+}
+
+/// A failed result with the given code and record location.
+pub fn expectJsonFailure(
+    value: std.json.Value,
+    input: []const u8,
+    code: []const u8,
+    record_index: u64,
+    byte_offset: u64,
+    line_in_record: u64,
+) !void {
+    const error_object = try expectJsonError(value, input, code);
+    try expectJsonErrorLocation(error_object, record_index, byte_offset, line_in_record);
+}
+
+/// A failed result with the given code and message and no record location.
+pub fn expectJsonFailureWithoutLocation(
+    value: std.json.Value,
+    input: []const u8,
+    code: []const u8,
+    message: []const u8,
+) !void {
+    const error_object = try expectJsonError(value, input, code);
+    try expectJsonString(error_object.get("message"), message);
+    try expectJsonNullErrorLocation(error_object);
 }
 
 pub fn expectJsonNullErrorLocation(object: std.json.ObjectMap) !void {

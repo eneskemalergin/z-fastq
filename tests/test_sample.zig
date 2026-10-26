@@ -667,7 +667,7 @@ test "[cli] - [exact sample]: rejects FIFOs without waiting for a writer" {
                 &.{ "sample", "--paired", "--count", count, BASIC_PATH, path },
             };
             for (cases) |args| {
-                try cli.expectResult(try cli.run(allocator, args), 3, "", diagnostic);
+                try cli.expectResult(try cli.run(allocator, args), 2, "", diagnostic);
             }
         }
     }
@@ -721,11 +721,7 @@ test "[cli] - [exact sample]: count boundaries preserve records in input order" 
     defer tmp.cleanup();
     const empty_file = try tmp.dir.createFile(std.testing.io, "empty.fastq", .{});
     empty_file.close(std.testing.io);
-    const empty_path = try std.fmt.allocPrint(
-        allocator,
-        ".zig-cache/tmp/{s}/empty.fastq",
-        .{tmp.sub_path},
-    );
+    const empty_path = try cli.tempPath(allocator, &tmp.sub_path, "empty.fastq");
 
     const cases = [_]struct {
         count: []const u8,
@@ -807,11 +803,7 @@ test "[integration] - [sample]: plain and gzip file and stdin select identical r
         defer file.close(std.testing.io);
         try std.Io.File.writeStreamingAll(file, std.testing.io, gzip.items);
     }
-    const gzip_path = try std.fmt.allocPrint(
-        allocator,
-        ".zig-cache/tmp/{s}/{s}",
-        .{ tmp.sub_path, gzip_name },
-    );
+    const gzip_path = try cli.tempPath(allocator, &tmp.sub_path, gzip_name);
 
     const file_plain = try cli.run(
         allocator,
@@ -1733,7 +1725,7 @@ test "[cli] - [paired sample]: failing pairs leave only earlier complete pairs" 
         ),
         3,
         "",
-        "",
+        "error: standard output: I/O error\n",
     );
     try cli.expectResult(
         try cli.runWithClosedStdout(
@@ -1743,7 +1735,7 @@ test "[cli] - [paired sample]: failing pairs leave only earlier complete pairs" 
         ),
         3,
         "",
-        "",
+        "error: standard output: I/O error\n",
     );
     try tmp.dir.writeFile(io, .{
         .sub_path = "pairs.fastq",
@@ -1757,7 +1749,7 @@ test "[cli] - [paired sample]: failing pairs leave only earlier complete pairs" 
         ),
         3,
         "",
-        "",
+        "error: standard output: I/O error\n",
     );
 }
 
@@ -1992,7 +1984,7 @@ test "[cli] - [paired sample]: arguments and output failures retain their classe
         ),
         3,
         "",
-        "",
+        "error: standard output: I/O error\n",
     );
     try cli.expectResult(
         try cli.runWithClosedStdin(
@@ -2339,7 +2331,7 @@ test "[cli] - [sample]: invocation shape is validated before input" {
     );
 }
 
-test "[cli] - [interleaved sample]: staging bounds agree in fraction and count modes" {
+test "[cli] - [interleaved sample]: every line limit is accepted in fraction and count modes" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2350,7 +2342,6 @@ test "[cli] - [interleaved sample]: staging bounds agree in fraction and count m
     const valid = "@p/1\nA\n+\n!\n@p/2\nT\n+\n!\n";
     const invalid = "@p/1\nA\n+\n!\n@p/2\nX\n+\n!\n";
     const lint_error = try std.fmt.allocPrint(allocator, "error: {s}: S002: sequence byte is outside the selected alphabet (record 1, line 2, offset 16)\n", .{path});
-    const staging_error = "error: sample record staging size exceeds supported limit\n";
 
     for ([_][]const u8{ valid, invalid, "" }) |payload| {
         var gzip: std.ArrayList(u8) = .empty;
@@ -2359,90 +2350,18 @@ test "[cli] - [interleaved sample]: staging bounds agree in fraction and count m
             try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = bytes });
             for ([_][]const u8{ "--count", "--fraction" }) |mode| {
                 for ([_][]const u8{ "0", "1" }) |amount| {
-                    for ([_][]const u8{ "4611686018427387902", "4611686018427387903", "18446744073709551615" }, 0..) |limit, limit_index| {
-                        const rejects_staging = limit_index != 0 and !std.mem.eql(u8, amount, "0");
+                    // Up to the usize maximum, where four lines no longer fit the address space.
+                    for ([_][]const u8{ "4611686018427387902", "4611686018427387903", "18446744073709551615" }) |limit| {
                         const rejects_input = std.mem.eql(u8, payload, invalid);
                         try cli.expectResult(
                             try cli.run(allocator, &.{ "sample", "--interleaved", mode, amount, "--max-line-bytes", limit, path }),
-                            if (rejects_staging) 4 else if (rejects_input) 1 else 0,
-                            if (rejects_staging or rejects_input or std.mem.eql(u8, amount, "0")) "" else payload,
-                            if (rejects_staging) staging_error else if (rejects_input) lint_error else "",
+                            if (rejects_input) 1 else 0,
+                            if (rejects_input or std.mem.eql(u8, amount, "0")) "" else payload,
+                            if (rejects_input) lint_error else "",
                         );
                         try std.testing.expectEqualStrings(bytes, try tmp.dir.readFileAlloc(io, "input.fastq", allocator, .limited(1024)));
                     }
                 }
-            }
-        }
-    }
-}
-
-test "[cli] - [interleaved sample]: staging overflow precedes input access" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const diagnostic = "error: sample record staging size exceeds supported limit\n";
-    try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.mknodat(
-        tmp.dir.handle,
-        "input.fifo",
-        std.os.linux.S.IFIFO | 0o600,
-        0,
-    )));
-    for ([_][]const u8{ "missing.fastq", "input.fifo" }) |name| {
-        const path = try cli.tempPath(allocator, &tmp.sub_path, name);
-        for ([_][]const u8{ "--count", "--fraction" }) |mode| {
-            try cli.expectResult(
-                try cli.run(allocator, &.{ "sample", "--interleaved", mode, "1", "--max-line-bytes", "4611686018427387903", path }),
-                4,
-                "",
-                diagnostic,
-            );
-        }
-    }
-    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = "@p/1\nA\n+\n!\n@p/2\nT\n+\n!\n" });
-    const input = try tmp.dir.openFile(io, "input.fastq", .{});
-    defer input.close(io);
-    try cli.expectResult(
-        try cli.runWithStdinFile(allocator, &.{ "sample", "--interleaved", "--fraction", "1", "--max-line-bytes", "4611686018427387903", "-" }, input),
-        4,
-        "",
-        diagnostic,
-    );
-    var first: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try input.readStreaming(io, &.{&first}));
-    try std.testing.expectEqual(@as(u8, '@'), first[0]);
-}
-
-test "[cli] - [interleaved sample]: staging overflow cannot write diagnostics into input" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
-    const payload = "@p/1\nA\n+\n!\n@p/2\nT\n+\n!\n";
-    for ([_][]const u8{ "--count", "--fraction" }) |mode| {
-        for ([_][]const u8{ "input.fastq", "output.fastq" }) |output_name| {
-            for ([_][]const u8{ "input.fastq", "error.log" }) |stderr_name| {
-                for ([_][]const u8{ "input.fastq", "output.fastq", "error.log" }) |name| {
-                    try tmp.dir.writeFile(io, .{ .sub_path = name, .data = if (std.mem.eql(u8, name, "input.fastq")) payload else "" });
-                }
-                const output = try tmp.dir.openFile(io, output_name, .{ .mode = .write_only });
-                defer output.close(io);
-                const stderr_file = try tmp.dir.openFile(io, stderr_name, .{ .mode = .write_only });
-                defer stderr_file.close(io);
-                try std.testing.expectEqual(@as(u8, 4), try cli.runWithOutputFiles(
-                    allocator,
-                    &.{ "sample", "--interleaved", mode, "1", "--max-line-bytes", "4611686018427387903", path },
-                    output,
-                    stderr_file,
-                ));
-                try std.testing.expectEqualStrings(payload, try tmp.dir.readFileAlloc(io, "input.fastq", allocator, .limited(1024)));
-                try std.testing.expectEqualStrings("", try tmp.dir.readFileAlloc(io, "output.fastq", allocator, .limited(1024)));
-                try std.testing.expectEqualStrings("", try tmp.dir.readFileAlloc(io, "error.log", allocator, .limited(1024)));
             }
         }
     }
@@ -2480,7 +2399,7 @@ test "[cli] - [sample]: line, input, and output failures retain their classes" {
         ),
         3,
         "",
-        "",
+        "error: standard output: I/O error\n",
     );
     try cli.expectResult(
         try cli.runWithClosedStdout(
@@ -2491,7 +2410,8 @@ test "[cli] - [sample]: line, input, and output failures retain their classes" {
         3,
         "",
         "error: -: S001: plus line must start with '+' " ++
-            "(record 1, line 3, offset 17)\n",
+            "(record 1, line 3, offset 17)\n" ++
+            "error: standard output: I/O error\n",
     );
     try cli.expectResult(
         try cli.runWithClosedStdin(
@@ -2519,6 +2439,6 @@ test "[cli] - [sample]: line, input, and output failures retain their classes" {
         ),
         3,
         "",
-        "",
+        "error: standard output: I/O error\n",
     );
 }

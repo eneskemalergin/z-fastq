@@ -18,6 +18,18 @@ All notable changes to z-fastq will be documented in this file.
 - Paired and interleaved fraction sampling draw each pair before reading it and validate unselected pairs without keeping them, and `check --interleaved` and `deinterleave` read a mate whose partner already failed only far enough to report it: on 300 kb read pairs, peak memory for `sample --paired` falls from 2.3 MiB to 0.8 MiB when few pairs are selected.
 - `-Dkernel-backend=portable` builds no AVX2 object and selects no kernel at run time; z-fastq's own kernels then use only the instructions of the build target, as Zipir's do.
 
+### Fixed
+
+- `count`, `stats`, and `check` reject standard output appended to one of their inputs (`count a.fastq b.fastq >> b.fastq`) with status `2` before reading anything, as `sample` and `interleave` already did; the input is no longer changed.
+- Standard input named twice, as `- /dev/stdin` or `/dev/stdin /dev/stdin`, is rejected when it is a pipe or FIFO instead of reading it once and reporting zero records for the second name.
+- A pipe closed by its reader ends every command with status `3` and `error: standard output: I/O error`, as documented, instead of a SIGPIPE status of 141; `sample`, `stats`, `count`, and the JSON forms now print that message on any standard-output failure.
+- `sample --interleaved` and `deinterleave` accept every `--max-line-bytes` value the other commands accept, instead of exiting with status `4` before reading for values of 2^62 − 1 and above, sometimes with no message.
+- `stats` reports an input location past the supported limit as `input location exceeds supported limit`, as the other commands do.
+- A directory given as an input is reported as `input is a directory` before anything is read, instead of `I/O error`; `deinterleave` then creates no output files.
+- `deinterleave` removes the empty `--out1` it created when `--out2` cannot be created, so a rerun is not blocked by it.
+- Exact-count sampling of a FIFO or directory exits with status `2`, as for standard input, instead of `3`.
+- A value option given twice (`--count 1 --count 2`) fails with status `2` and `may appear only once`, as `--out1` and `--out2` already did, instead of keeping the last value.
+
 ### Added
 
 - `FileSink.initStreaming` writes at the file handle's current position, for standard output and pipes.

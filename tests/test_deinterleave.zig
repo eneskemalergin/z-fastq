@@ -758,7 +758,7 @@ test "[cli] - [deinterleave]: line limit failures leave empty outputs" {
     }
 }
 
-test "[cli] - [deinterleave]: output creation is exclusive and preserves created paths" {
+test "[cli] - [deinterleave]: output creation is exclusive and leaves no output of its own on failure" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -801,10 +801,9 @@ test "[cli] - [deinterleave]: output creation is exclusive and preserves created
         "",
         second_error,
     );
-    try expectEmptyFile(out1_path);
+    try expectAbsent(out1_path);
     try expectFile(allocator, out2_path, "keep-two");
 
-    try tmp.dir.deleteFile(io, "out1.fastq");
     try tmp.dir.deleteFile(io, "out2.fastq");
     const alias_path = try cli.tempPath(allocator, &tmp.sub_path, "./out1.fastq");
     const alias_error = try std.fmt.allocPrint(
@@ -818,8 +817,7 @@ test "[cli] - [deinterleave]: output creation is exclusive and preserves created
         "",
         alias_error,
     );
-    try expectEmptyFile(out1_path);
-    try tmp.dir.deleteFile(io, "out1.fastq");
+    try expectAbsent(out1_path);
 
     const input_alias_error = try std.fmt.allocPrint(
         allocator,
@@ -845,13 +843,12 @@ test "[cli] - [deinterleave]: output creation is exclusive and preserves created
         "",
         input_alias_error,
     );
-    try expectEmptyFile(out1_path);
+    try expectAbsent(out1_path);
     try expectFile(
         allocator,
         input_path,
         "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n",
     );
-    try tmp.dir.deleteFile(io, "out1.fastq");
 
     try tmp.dir.writeFile(io, .{ .sub_path = "sentinel", .data = "keep-target" });
     try tmp.dir.symLink(io, "sentinel", "out1.fastq", .{});
@@ -885,7 +882,7 @@ test "[cli] - [deinterleave]: failure does not delete replaced or created output
     const child_io = threaded.io();
     var process = try std.process.spawn(child_io, .{
         .argv = &.{
-            "zig-out/bin/z-fastq",
+            cli.ZFASTQ_BIN,
             "deinterleave",
             "--out1",
             out1_path,
@@ -1021,26 +1018,29 @@ test "[cli] - [deinterleave]: invalid arguments fail before output creation" {
     }
 }
 
-test "[cli] - [deinterleave]: staging overflow fails before input or output access" {
+test "[cli] - [deinterleave]: the largest line limit is accepted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-
+    const mates = [_][]const u8{ "@p/1\nA\n+\n!\n", "@p/2\nT\n+\n#\n" };
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = mates[0] ++ mates[1] });
+    const input = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const outputs = [_][]const u8{
+        try cli.tempPath(allocator, &tmp.sub_path, "one.fastq"),
+        try cli.tempPath(allocator, &tmp.sub_path, "two.fastq"),
+    };
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "deinterleave",
-            "--max-line-bytes",
-            "18446744073709551615",
-            "--out1",
-            "one",
-            "--out2",
-            "two",
-            "missing",
-        }),
-        4,
+        try cli.run(allocator, &.{ "deinterleave", "--max-line-bytes", "18446744073709551615", "--out1", outputs[0], "--out2", outputs[1], input }),
+        0,
         "",
-        "error: deinterleave record staging size exceeds supported limit\n",
+        "",
     );
+    for ([_][]const u8{ "one.fastq", "two.fastq" }, mates) |name, mate| {
+        try std.testing.expectEqualStrings(mate, try tmp.dir.readFileAlloc(io, name, allocator, .limited(64)));
+    }
 }
 
 test "[cli] - [deinterleave]: missing input cannot be created as an output" {
@@ -1161,14 +1161,8 @@ fn outputPaths(
     prefix: []const u8,
 ) ![2][]const u8 {
     return .{
-        try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}-r1.fastq", .{
-            sub_path,
-            prefix,
-        }),
-        try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}-r2.fastq", .{
-            sub_path,
-            prefix,
-        }),
+        try cli.tempPath(allocator, sub_path, try std.fmt.allocPrint(allocator, "{s}-r1.fastq", .{prefix})),
+        try cli.tempPath(allocator, sub_path, try std.fmt.allocPrint(allocator, "{s}-r2.fastq", .{prefix})),
     };
 }
 

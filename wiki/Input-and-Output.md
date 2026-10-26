@@ -23,7 +23,7 @@ Use `-` explicitly:
 gzip -dc reads.fastq.gz | z-fastq stats -
 ```
 
-An omitted path does not mean stdin. A command accepts stdin at most once. Exact-count sampling needs a regular file because it reads the input twice.
+An omitted path does not mean stdin. A command accepts stdin at most once. When stdin is a pipe or FIFO, that includes other names for it, such as `/dev/stdin`, because a stream can be read only once; a regular file on stdin may also be named by its path. Exact-count sampling needs a regular file because it reads the input twice.
 
 ## Standard output
 
@@ -36,6 +36,10 @@ z-fastq sample --fraction 0.1 reads.fastq | gzip > sample.fastq.gz
 ```
 
 `deinterleave` is the exception: it writes two requested output files.
+
+Standard output may not be one of the inputs: `z-fastq count a.fastq b.fastq >> b.fastq` exits with status `2` and `input file is output file` before reading anything, so the input is never changed. Every command that writes to standard output applies this check, including when stdin is redirected from the output file.
+
+If standard output fails, including a pipe whose reader has exited, the command reports `error: standard output: I/O error` and exits with status `3`.
 
 ## Multiple inputs
 

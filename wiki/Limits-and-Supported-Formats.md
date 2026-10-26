@@ -31,6 +31,21 @@ z-fastq check --max-line-bytes 33554432 reads.fastq
 
 The limit applies to the line content, not the LF terminator. Raising it allows longer single-line fields; it does not enable wrapped FASTQ.
 
+## Memory and the line limit
+
+Memory follows what a command keeps, and the line limit bounds that:
+
+- `count`, `check`, `stats`, and sampling that selects nothing keep no record bytes: they stream lines of any length, so memory stays at a few MiB.
+- `check --paired` and `check --interleaved` keep each mate's header line while they compare names.
+- Commands that write records (`sample`, `interleave`, `deinterleave`) keep a record that does not fit the read buffer until it is written: up to four lines per input, plus mate 1 for interleaved input.
+
+With 15 MiB header, sequence, and quality lines, `stats` peaks near 5 MiB, `sample` near 50 MiB, and the pair commands near 100 MiB. Raise `--max-line-bytes` only as far as the data needs, because the worst case grows with it.
+
+## gzip limits
+
+- An optional gzip header field (file name, comment, or extra field) may be at most 64 KiB; a longer one fails with an I/O error. `gzip -dc` accepts it.
+- Bytes after the last gzip member fail, including zero padding that `gzip -dc` accepts.
+
 ## Location semantics
 
 Validation locations use:

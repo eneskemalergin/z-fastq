@@ -47,6 +47,8 @@ These headers also match:
 
 Multiple recognized markers in one header must agree. A marker present on only one side is rejected. If neither header has a recognized marker, equal normalized identifiers are accepted. Fields after the recognized mate token are opaque.
 
+Only `/1` and `/2` are mate markers. Other suffixes are part of the name: `@read42/3` and `@read42/4` do not match, while `@read42 1:N:0/3` and `@read42 2:N:0/4` match because their first tokens agree and the second tokens carry `1:` and `2:`. An empty identifier never matches, so `@/1` and `@/2` fail with `P001`; the diagnostic shows `normalized_id` with length 0.
+
 ## Exact name policy
 
 Use `exact` when the complete first token must match byte for byte:

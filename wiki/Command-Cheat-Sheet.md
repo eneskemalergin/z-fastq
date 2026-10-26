@@ -70,7 +70,7 @@ deinterleave --out1 R1 --out2 R2 interleaved.fastq
 z-fastq --version
 ```
 
-The default maximum logical line length is 16 MiB. Use `--` before a path that begins with a hyphen:
+The default maximum logical line length is 16 MiB. An option that takes a value may be given once; repeating it fails with status `2` instead of letting the last value win. Use `--` before a path that begins with a hyphen:
 
 ```bash
 z-fastq count -- ./-named.fastq

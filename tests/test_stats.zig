@@ -590,7 +590,7 @@ test "[cli] - [stats]: embedded quality endings preserve structural error preced
             defer parsed.deinit();
             const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
             try std.testing.expectEqual(@as(usize, 1), results.len);
-            try expectJsonFailure(results[0], "-", case.code, record_index, offset, 4);
+            try cli.expectJsonFailure(results[0], "-", case.code, record_index, offset, 4);
         }
     }
 }
@@ -787,7 +787,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
         "z-fastq/stats-v1",
     );
     try std.testing.expectEqual(@as(usize, 1), corrupt_results.len);
-    try expectJsonFailureWithoutLocation(
+    try cli.expectJsonFailureWithoutLocation(
         corrupt_results[0],
         "-",
         "io_error",
@@ -800,7 +800,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
         SAMPLE_FASTQ,
     );
     try std.testing.expectEqual(@as(u8, 3), closed.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), closed.stderr.len);
+    try std.testing.expectEqualStrings("error: standard output: I/O error\n", closed.stderr);
 
     const json_closed = try runCliWithClosedStdout(
         allocator,
@@ -808,7 +808,7 @@ test "[cli] - [stats]: arguments, line limits, damaged gzip, and output I/O are 
         SAMPLE_FASTQ,
     );
     try std.testing.expectEqual(@as(u8, 3), json_closed.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), json_closed.stderr.len);
+    try std.testing.expectEqualStrings("error: standard output: I/O error\n", json_closed.stderr);
 
     const closed_stdin = try runCliWithClosedStdin(allocator, &.{ "stats", "-" });
     try cli.expectResult(closed_stdin, 3, "", "error: -: I/O error\n");
@@ -833,18 +833,18 @@ test "[cli] - [stats]: output failure preserves an observed limit status" {
         const captured = try cli.run(allocator, args);
         try std.testing.expectEqual(@as(u8, 4), captured.exit_code);
         try std.testing.expectEqualStrings("", captured.stderr);
-        try std.testing.expectEqual(name.len > 200, captured.stdout.len > 16 * 1024);
+        try std.testing.expectEqual(name.len > 200, captured.stdout.len > cli.JSON_OUTPUT_BUFFER_BYTES);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, captured.stdout, .{});
         defer parsed.deinit();
         const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
         try std.testing.expectEqual(@as(usize, 2), results.len);
         try cli.expectJsonString(results[0].object.get("error").?.object.get("code"), "line_limit");
         try cli.expectJsonString(results[1].object.get("status"), "ok");
-        try cli.expectResult(try runCliWithClosedStdout(allocator, args, ""), 4, "", "");
+        try cli.expectResult(try runCliWithClosedStdout(allocator, args, ""), 4, "", "error: standard output: I/O error\n");
     }
 
     const path = try cli.tempPath(allocator, &tmp.sub_path, "limit.fastq");
-    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: line length limit exceeded\n", .{path});
+    const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: line length limit exceeded\nerror: standard output: I/O error\n", .{path});
     try cli.expectResult(
         try runCliWithClosedStdout(allocator, &.{ "stats", "--max-line-bytes", "4", path, valid }, ""),
         4,
@@ -892,9 +892,9 @@ test "[cli] - [stats-json]: mixed results preserve order, variants, and stream s
     const results = try cli.expectJsonDocument(&parsed.value, "z-fastq/stats-v1");
     try std.testing.expectEqual(@as(usize, 5), results.len);
     try expectSampleJsonStats(results[0], valid);
-    try expectJsonFailure(results[1], invalid, "S006", 0, 9, 4);
-    try expectJsonFailureWithoutLocation(results[2], missing, "io_error", "file not found");
-    try expectJsonFailureWithoutLocation(
+    try cli.expectJsonFailure(results[1], invalid, "S006", 0, 9, 4);
+    try cli.expectJsonFailureWithoutLocation(results[2], missing, "io_error", "file not found");
+    try cli.expectJsonFailureWithoutLocation(
         results[3],
         long,
         "line_limit",
@@ -1015,34 +1015,6 @@ fn expectEmptyJsonStats(value: std.json.Value, input: []const u8) !void {
         const field_value = object.get(field) orelse return error.UnexpectedJsonShape;
         try std.testing.expect(field_value == .null);
     }
-}
-
-fn expectJsonFailure(
-    value: std.json.Value,
-    input: []const u8,
-    code: []const u8,
-    record_index: u64,
-    byte_offset: u64,
-    line_in_record: u64,
-) !void {
-    const error_object = try cli.expectJsonError(value, input, code);
-    try cli.expectJsonErrorLocation(
-        error_object,
-        record_index,
-        byte_offset,
-        line_in_record,
-    );
-}
-
-fn expectJsonFailureWithoutLocation(
-    value: std.json.Value,
-    input: []const u8,
-    code: []const u8,
-    message: []const u8,
-) !void {
-    const error_object = try cli.expectJsonError(value, input, code);
-    try cli.expectJsonString(error_object.get("message"), message);
-    try cli.expectJsonNullErrorLocation(error_object);
 }
 
 fn expectJsonNumber(value: ?std.json.Value, expected: f64) !void {
