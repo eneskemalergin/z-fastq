@@ -1232,7 +1232,6 @@ const PairOutputSelector = union(enum) {
 };
 
 const InterleavedFirstRecordStorage = enum {
-    unused,
     reader,
     retained,
     staged,
@@ -1302,7 +1301,6 @@ fn writePreservedInterleavedMate1(
     storage: InterleavedFirstRecordStorage,
 ) error{WriteFailed}!void {
     switch (storage) {
-        .unused => unreachable,
         .reader, .retained => try writeCheckedRecord(writer, null, record, canonical_span),
         .staged => try fastq.writeCanonicalRecordSpan(writer, staged),
     }
@@ -1721,6 +1719,63 @@ fn checkPaired(
     );
 }
 
+const PairStep = union(enum) {
+    /// Both inputs ended together.
+    end,
+    pair,
+    failure: PairCommandFailure,
+};
+
+/// The verdict on the mates just read from two files (null at the end of an
+/// input): count mismatch, then mate 1's and mate 2's semantic failures, then
+/// their names.
+inline fn verifyPair(
+    reader1: *const fastq.Reader,
+    reader2: *const fastq.Reader,
+    mate1: ?fastq.ValidatedHeader,
+    mate2: ?fastq.ValidatedHeader,
+    policy: pairing.NamePolicy,
+) PairStep {
+    if (mate1 == null and mate2 == null) return .end;
+    if (mate1 == null or mate2 == null) {
+        const remaining_side: u1 = if (mate1 != null) 0 else 1;
+        const pair_index = if (mate1 != null)
+            reader1.recordIndex() - 1
+        else
+            reader2.recordIndex() - 1;
+        return .{ .failure = .{ .pair = .{ .count_mismatch = .{
+            .pair_index = pair_index,
+            .remaining_side = remaining_side,
+            .record_indexes = .{
+                lastRecordIndex(reader1),
+                lastRecordIndex(reader2),
+            },
+        } } } };
+    }
+
+    const record_index1 = reader1.recordIndex() - 1;
+    const record_index2 = reader2.recordIndex() - 1;
+    const offsets1 = reader1.currentRecordOffsets().?;
+    const offsets2 = reader2.currentRecordOffsets().?;
+    if (mapSemanticFailure(mate1.?.semantic_error, offsets1, record_index1)) |failure| {
+        return .{ .failure = pairCommandFailure(0, failure) };
+    }
+    if (mapSemanticFailure(mate2.?.semantic_error, offsets2, record_index2)) |failure| {
+        return .{ .failure = pairCommandFailure(1, failure) };
+    }
+    if (!pairing.headersMatch(mate1.?.header, mate2.?.header, policy)) {
+        return .{ .failure = headerNameMismatch(
+            mate1.?.header,
+            mate2.?.header,
+            policy,
+            record_index1,
+            .{ record_index1, record_index2 },
+            .{ offsets1.header, offsets2.header },
+        ) };
+    }
+    return .pair;
+}
+
 fn checkPairedSources(
     allocator: std.mem.Allocator,
     source1: *std.Io.Reader,
@@ -1743,56 +1798,10 @@ fn checkPairedSources(
         const record2 = fastq.nextValidatedHeader(&reader2, &validator2) catch |err| {
             return pairCommandFailure(1, mapReaderFailure(&reader2, err));
         };
-
-        if (record1 == null and record2 == null) return null;
-        if (record1 == null or record2 == null) {
-            const remaining_side: u1 = if (record1 != null) 0 else 1;
-            const pair_index = if (record1 != null)
-                reader1.recordIndex() - 1
-            else
-                reader2.recordIndex() - 1;
-            return .{ .pair = .{ .count_mismatch = .{
-                .pair_index = pair_index,
-                .remaining_side = remaining_side,
-                .record_indexes = .{
-                    lastRecordIndex(&reader1),
-                    lastRecordIndex(&reader2),
-                },
-            } } };
-        }
-
-        const record_index1 = reader1.recordIndex() - 1;
-        const record_index2 = reader2.recordIndex() - 1;
-        const offsets1 = reader1.currentRecordOffsets().?;
-        const offsets2 = reader2.currentRecordOffsets().?;
-        if (mapSemanticFailure(
-            record1.?.semantic_error,
-            offsets1,
-            record_index1,
-        )) |failure| {
-            return pairCommandFailure(0, failure);
-        }
-        if (mapSemanticFailure(
-            record2.?.semantic_error,
-            offsets2,
-            record_index2,
-        )) |failure| {
-            return pairCommandFailure(1, failure);
-        }
-
-        if (!pairing.headersMatch(
-            record1.?.header,
-            record2.?.header,
-            options.pair_name_policy,
-        )) {
-            return headerNameMismatch(
-                record1.?.header,
-                record2.?.header,
-                options.pair_name_policy,
-                record_index1,
-                .{ record_index1, record_index2 },
-                .{ offsets1.header, offsets2.header },
-            );
+        switch (verifyPair(&reader1, &reader2, record1, record2, options.pair_name_policy)) {
+            .end => return null,
+            .failure => |failure| return failure,
+            .pair => {},
         }
 
         if (exact_selector) |selector| {
@@ -1838,92 +1847,110 @@ fn checkInterleavedSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        var record1 = fastq.nextValidatedHeader(&reader, &validator) catch |err| {
-            return pairCommandFailure(0, mapReaderFailure(&reader, err));
-        } orelse return null;
-        const record_index1 = reader.recordIndex() - 1;
-        const offsets1 = reader.currentRecordOffsets().?;
-        const semantic1 = mapSemanticFailure(
-            record1.semantic_error,
-            offsets1,
-            record_index1,
-        );
-
-        const paired_record2 = (if (semantic1 == null)
-            fastq.nextValidatedMatePreservingHeader(&reader, &record1.header, &validator)
-        else
-            fastq.nextBufferedValidatedRecord(&reader, &validator)) catch |err| {
-            return pairCommandFailure(0, mapReaderFailure(&reader, err));
-        };
-        const both_headers_borrowed = paired_record2 != null;
-        var semantic2: ?zfastq.SemanticError = null;
-        const header2 = if (paired_record2) |validated2| header: {
-            if (semantic1 == null) semantic2 = validated2.semantic_error;
-            break :header validated2.record.header;
-        } else header: {
-            if (semantic1 == null) {
-                const name1 = pairing.parseName(record1.header, options.pair_name_policy);
-                stored_name.store(allocator, name1) catch return pairCommandFailure(0, OUT_OF_MEMORY);
-            }
-            if (semantic1) |failure| {
-                const record2 = fastq.nextRecordFields(&reader) catch |err| {
-                    return pairCommandFailure(0, mapReaderFailure(&reader, err));
-                } orelse return missingInterleavedMateFailure(record_index1);
-                _ = record2;
-                return pairCommandFailure(0, failure);
-            }
-            const record2 = fastq.nextValidatedHeader(&reader, &validator) catch |err| {
-                return pairCommandFailure(0, mapReaderFailure(&reader, err));
-            } orelse return missingInterleavedMateFailure(record_index1);
-            semantic2 = record2.semantic_error;
-            break :header record2.header;
-        };
-
-        if (semantic1) |failure| {
-            return pairCommandFailure(0, failure);
+        switch (verifyInterleavedPair(allocator, &reader, &validator, &stored_name, options.pair_name_policy, null)) {
+            .end => return null,
+            .failure => |failure| return failure,
+            .pair => {},
         }
-
-        const record_index2 = reader.recordIndex() - 1;
-        const offsets2 = reader.currentRecordOffsets().?;
-        if (mapSemanticFailure(
-            semantic2,
-            offsets2,
-            record_index2,
-        )) |failure| {
-            return pairCommandFailure(0, failure);
-        }
-
-        const names_match = if (both_headers_borrowed)
-            pairing.headersMatch(record1.header, header2, options.pair_name_policy)
-        else blk: {
-            const name1 = stored_name.name();
-            const name2 = pairing.parseName(header2, options.pair_name_policy);
-            break :blk pairing.namesMatch(name1, name2);
-        };
-        if (!names_match) {
-            const name2 = pairing.parseName(header2, options.pair_name_policy);
-            return .{ .pair = .{ .name_mismatch = .{
-                .pair_index = record_index1 / 2,
-                .records = .{
-                    if (both_headers_borrowed)
-                        .init(
-                            pairing.parseName(record1.header, options.pair_name_policy),
-                            record_index1,
-                            offsets1.header,
-                        )
-                    else
-                        stored_name.diagnostic(record_index1, offsets1.header),
-                    .init(name2, record_index2, offsets2.header),
-                },
-            } } };
-        }
-
         if (exact_selector) |selector| {
             selector.considerRecord(allocator, reader.recordIndex() / 2) catch |err| {
                 return exactPairSelectionFailure(err);
             };
         }
     }
+}
+
+/// Reads and verifies one interleaved pair without keeping either record:
+/// mate 1's semantic failure (after mate 2 proves it exists), mate 2's, then
+/// their names. `first` is mate 1 when the caller has already read it.
+inline fn verifyInterleavedPair(
+    allocator: std.mem.Allocator,
+    reader: *fastq.Reader,
+    validator: *fastq.AdaptiveRecordValidator,
+    stored_name: *StoredPairName,
+    policy: pairing.NamePolicy,
+    first: ?fastq.ValidatedHeader,
+) PairStep {
+    var record1 = first orelse (fastq.nextValidatedHeader(reader, validator) catch |err| {
+        return .{ .failure = pairCommandFailure(0, mapReaderFailure(reader, err)) };
+    }) orelse return .end;
+    const record_index1 = reader.recordIndex() - 1;
+    const offsets1 = reader.currentRecordOffsets().?;
+    const semantic1 = mapSemanticFailure(
+        record1.semantic_error,
+        offsets1,
+        record_index1,
+    );
+
+    const paired_record2 = (if (semantic1 == null)
+        fastq.nextValidatedMatePreservingHeader(reader, &record1.header, validator)
+    else
+        fastq.nextBufferedValidatedRecord(reader, validator)) catch |err| {
+        return .{ .failure = pairCommandFailure(0, mapReaderFailure(reader, err)) };
+    };
+    const both_headers_borrowed = paired_record2 != null;
+    var semantic2: ?zfastq.SemanticError = null;
+    const header2 = if (paired_record2) |validated2| header: {
+        if (semantic1 == null) semantic2 = validated2.semantic_error;
+        break :header validated2.record.header;
+    } else header: {
+        if (semantic1) |failure| {
+            // Mate 2 must exist, and its structural error comes first. The
+            // call stays out of line: this path ends the command.
+            const exists = @call(.never_inline, fastq.Reader.advance, .{reader}) catch |err| {
+                return .{ .failure = pairCommandFailure(0, mapReaderFailure(reader, err)) };
+            };
+            if (!exists) return .{ .failure = missingInterleavedMateFailure(record_index1) };
+            return .{ .failure = pairCommandFailure(0, failure) };
+        }
+        const name1 = pairing.parseName(record1.header, policy);
+        stored_name.store(allocator, name1) catch return .{ .failure = pairCommandFailure(0, OUT_OF_MEMORY) };
+        const record2 = fastq.nextValidatedHeader(reader, validator) catch |err| {
+            return .{ .failure = pairCommandFailure(0, mapReaderFailure(reader, err)) };
+        } orelse return .{ .failure = missingInterleavedMateFailure(record_index1) };
+        semantic2 = record2.semantic_error;
+        break :header record2.header;
+    };
+
+    if (semantic1) |failure| {
+        return .{ .failure = pairCommandFailure(0, failure) };
+    }
+
+    const record_index2 = reader.recordIndex() - 1;
+    const offsets2 = reader.currentRecordOffsets().?;
+    if (mapSemanticFailure(
+        semantic2,
+        offsets2,
+        record_index2,
+    )) |failure| {
+        return .{ .failure = pairCommandFailure(0, failure) };
+    }
+
+    const names_match = if (both_headers_borrowed)
+        pairing.headersMatch(record1.header, header2, policy)
+    else blk: {
+        const name1 = stored_name.name();
+        const name2 = pairing.parseName(header2, policy);
+        break :blk pairing.namesMatch(name1, name2);
+    };
+    if (!names_match) {
+        const name2 = pairing.parseName(header2, policy);
+        return .{ .failure = .{ .pair = .{ .name_mismatch = .{
+            .pair_index = record_index1 / 2,
+            .records = .{
+                if (both_headers_borrowed)
+                    .init(
+                        pairing.parseName(record1.header, policy),
+                        record_index1,
+                        offsets1.header,
+                    )
+                else
+                    stored_name.diagnostic(record_index1, offsets1.header),
+                .init(name2, record_index2, offsets2.header),
+            },
+        } } } };
+    }
+    return .pair;
 }
 
 fn checkInput(
@@ -2286,10 +2313,8 @@ fn sampleInterleavedSource(
     defer reader.deinit();
     var stored_name: StoredPairName = .{};
     defer stored_name.deinit(allocator);
-    var staged_record: std.ArrayList(u8) = .empty;
-    defer staged_record.deinit(allocator);
-    var retained_record_storage: fastq.RetainedRecordStorage = .{};
-    defer retained_record_storage.deinit(allocator);
+    var mate1_storage: PreservedMate1 = .{};
+    defer mate1_storage.deinit(allocator);
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
@@ -2302,120 +2327,32 @@ fn sampleInterleavedSource(
             .{ writer, writer },
             &span1,
         ) catch return error.WriteFailed) |failure| return failure;
-        var validated1 = if (span1) |mate1| fastq.validatedSpan(mate1) else fastq.nextValidatedRecord(&reader, &validator) catch |err| {
-            return pairCommandFailure(0, mapReaderFailure(&reader, err));
-        } orelse return null;
-        const record_index1 = reader.recordIndex() - 1;
-        const offsets1 = reader.currentRecordOffsets().?;
-        const semantic1 = mapSemanticFailure(
-            validated1.semantic_error,
-            offsets1,
-            record_index1,
-        );
-
-        const selected = semantic1 == null and selection.selectPair();
-        const unwritable1 = selected and recordHasUnwritableEnding(validated1.record, validated1.canonical_span);
-
-        var record1_storage: InterleavedFirstRecordStorage = .unused;
-        const paired_record2 = (if (selected)
-            fastq.nextValidatedMatePreservingRecord(&reader, &validated1, &validator)
-        else if (semantic1 == null)
-            fastq.nextValidatedMatePreservingHeader(&reader, &validated1.record.header, &validator)
-        else
-            fastq.nextBufferedValidatedRecord(&reader, &validator)) catch |err| {
-            return pairCommandFailure(0, mapReaderFailure(&reader, err));
-        };
-        const record1 = validated1.record;
-        const canonical_span1 = validated1.canonical_span;
-        const both_headers_borrowed = paired_record2 != null;
-        const validated2 = (if (paired_record2) |complete_record2| buffered: {
-            if (selected) record1_storage = .reader;
-            break :buffered complete_record2;
-        } else record: {
-            if (semantic1 == null) {
-                const name1 = pairing.parseName(record1.header, options.pair_name_policy);
-                stored_name.store(allocator, name1) catch return pairCommandFailure(0, OUT_OF_MEMORY);
-            }
-            if (!selected) break :record fastq.nextValidatedRecord(
-                &reader,
-                &validator,
-            ) catch |err| {
-                return pairCommandFailure(0, mapReaderFailure(&reader, err));
-            };
-
-            const preserved = nextAfterPreservingInterleavedMate1(
-                allocator,
-                &reader,
-                &retained_record_storage,
-                &staged_record,
-                record1,
-                canonical_span1,
-                staging_limit,
-                &validator,
-            ) catch |err| return mapPreservedMateFailure(&reader, err);
-            record1_storage = preserved.first_storage;
-            break :record preserved.record;
-        }) orelse return missingInterleavedMateFailure(record_index1);
-
-        const record2 = validated2.record;
-        const canonical_span2 = validated2.canonical_span;
-        if (semantic1) |failure| {
-            return pairCommandFailure(0, failure);
-        }
-
-        const record_index2 = reader.recordIndex() - 1;
-        const offsets2 = reader.currentRecordOffsets().?;
-        if (mapSemanticFailure(
-            validated2.semantic_error,
-            offsets2,
-            record_index2,
-        )) |failure| {
-            return pairCommandFailure(0, failure);
-        }
-
-        if (both_headers_borrowed) {
-            if (!pairing.headersMatch(
-                record1.header,
-                record2.header,
-                options.pair_name_policy,
-            )) {
-                return headerNameMismatch(
-                    record1.header,
-                    record2.header,
-                    options.pair_name_policy,
-                    record_index1 / 2,
-                    .{ record_index1, record_index2 },
-                    .{ offsets1.header, offsets2.header },
-                );
-            }
-        } else {
-            const name1 = stored_name.name();
-            const name2 = pairing.parseName(record2.header, options.pair_name_policy);
-            if (!pairing.namesMatch(name1, name2)) {
-                return .{ .pair = .{ .name_mismatch = .{
-                    .pair_index = record_index1 / 2,
-                    .records = .{
-                        stored_name.diagnostic(record_index1, offsets1.header),
-                        .init(name2, record_index2, offsets2.header),
-                    },
-                } } };
+        // Drawn before the pair is read: an unselected pair is validated
+        // without being kept.
+        if (!selection.selectPair()) {
+            const first: ?fastq.ValidatedHeader = if (span1) |mate1| .{ .header = mate1.header(), .semantic_error = null } else null;
+            switch (verifyInterleavedPair(allocator, &reader, &validator, &stored_name, options.pair_name_policy, first)) {
+                .end => return null,
+                .failure => |failure| return failure,
+                .pair => continue,
             }
         }
-        if (!selected) continue;
-        if (unwritable1 or recordHasUnwritableEnding(record2, canonical_span2)) {
-            return pairCommandFailure(0, unwritableRecordFailure());
-        }
-
-        try writePreservedInterleavedMate1(
-            writer,
+        const pair = switch (readInterleavedPair(
+            allocator,
             &reader,
-            &retained_record_storage,
-            staged_record.items,
-            record1,
-            canonical_span1,
-            record1_storage,
-        );
-        try writeCheckedRecord(writer, null, record2, canonical_span2);
+            &validator,
+            &stored_name,
+            &mate1_storage,
+            staging_limit,
+            options.pair_name_policy,
+            span1,
+        )) {
+            .end => return null,
+            .failure => |failure| return failure,
+            .pair => |pair| pair,
+        };
+        try mate1_storage.write(writer, &reader, pair);
+        try writeCheckedRecord(writer, null, pair.record2, pair.canonical_span2);
     }
 }
 
@@ -3141,23 +3078,14 @@ fn sampleExactInterleavedSecondPass(
         const header1_len = validated1.record.header.len;
         const unwritable1 = recordHasUnwritableEnding(validated1.record, validated1.canonical_span);
         var record1_storage: InterleavedFirstRecordStorage = .reader;
-        var paired_record2 = fastq.nextBufferedValidatedRecord(
+        const paired_record2 = fastq.nextValidatedMatePreservingRecord(
             &reader,
+            &validated1,
             &validator,
         ) catch |err| {
             failure = pairCommandFailure(0, mapReaderFailure(&reader, err));
             break;
         };
-        if (paired_record2 == null) {
-            paired_record2 = fastq.nextValidatedMatePreservingRecord(
-                &reader,
-                &validated1,
-                &validator,
-            ) catch |err| {
-                failure = pairCommandFailure(0, mapReaderFailure(&reader, err));
-                break;
-            };
-        }
         const record1 = validated1.record;
         const canonical_span1 = validated1.canonical_span;
         const validated2 = paired_record2 orelse record: {
@@ -3186,7 +3114,6 @@ fn sampleExactInterleavedSecondPass(
             break;
         }
         const header1 = switch (record1_storage) {
-            .unused => unreachable,
             .reader, .retained => record1.header,
             .staged => staged_record.items[1 .. 1 + header1_len],
         };
@@ -3535,6 +3462,21 @@ fn interleaveSources(
             options.pair_name_policy,
             &span1,
         )) |failure| return failure;
+        // Drawn before the pair is read: an unselected pair is validated
+        // without being kept.
+        if (!selection.selectPair()) {
+            const header1 = if (span1) |mate1| fastq.ValidatedHeader{ .header = mate1.header(), .semantic_error = null } else fastq.nextValidatedHeader(&reader1, &validator1) catch |err| {
+                return pairCommandFailure(0, mapReaderFailure(&reader1, err));
+            };
+            const header2 = fastq.nextValidatedHeader(&reader2, &validator2) catch |err| {
+                return pairCommandFailure(1, mapReaderFailure(&reader2, err));
+            };
+            switch (verifyPair(&reader1, &reader2, header1, header2, options.pair_name_policy)) {
+                .end => return null,
+                .failure => |failure| return failure,
+                .pair => continue,
+            }
+        }
         var next1 = if (span1) |mate1| fastq.validatedSpan(mate1) else fastq.nextValidatedRecord(&reader1, &validator1) catch |err| {
             return pairCommandFailure(0, mapReaderFailure(&reader1, err));
         };
@@ -3544,65 +3486,21 @@ fn interleaveSources(
         // Pointer captures read both records where the readers built them.
         const maybe1: ?*const fastq.ValidatedRecord = if (next1) |*value| value else null;
         const maybe2: ?*const fastq.ValidatedRecord = if (next2) |*value| value else null;
-
-        if (maybe1 == null and maybe2 == null) return null;
-        if (maybe1 == null or maybe2 == null) {
-            const remaining_side: u1 = if (maybe1 != null) 0 else 1;
-            const pair_index = if (maybe1 != null)
-                reader1.recordIndex() - 1
-            else
-                reader2.recordIndex() - 1;
-            return .{ .pair = .{ .count_mismatch = .{
-                .pair_index = pair_index,
-                .remaining_side = remaining_side,
-                .record_indexes = .{
-                    lastRecordIndex(&reader1),
-                    lastRecordIndex(&reader2),
-                },
-            } } };
-        }
-
-        const validated1 = maybe1.?;
-        const validated2 = maybe2.?;
-        const record1 = &validated1.record;
-        const record2 = &validated2.record;
-        const canonical_span1 = validated1.canonical_span;
-        const canonical_span2 = validated2.canonical_span;
-        const record_index1 = reader1.recordIndex() - 1;
-        const record_index2 = reader2.recordIndex() - 1;
-        const offsets1 = reader1.currentRecordOffsets().?;
-        const offsets2 = reader2.currentRecordOffsets().?;
-        if (mapSemanticFailure(
-            validated1.semantic_error,
-            offsets1,
-            record_index1,
-        )) |failure| {
-            return pairCommandFailure(0, failure);
-        }
-        if (mapSemanticFailure(
-            validated2.semantic_error,
-            offsets2,
-            record_index2,
-        )) |failure| {
-            return pairCommandFailure(1, failure);
-        }
-
-        if (!pairing.headersMatch(
-            record1.header,
-            record2.header,
+        switch (verifyPair(
+            &reader1,
+            &reader2,
+            if (maybe1) |mate1| mate1.validatedHeader() else null,
+            if (maybe2) |mate2| mate2.validatedHeader() else null,
             options.pair_name_policy,
         )) {
-            return headerNameMismatch(
-                record1.header,
-                record2.header,
-                options.pair_name_policy,
-                record_index1,
-                .{ record_index1, record_index2 },
-                .{ offsets1.header, offsets2.header },
-            );
+            .end => return null,
+            .failure => |failure| return failure,
+            .pair => {},
         }
-
-        if (!selection.selectPair()) continue;
+        const record1 = &maybe1.?.record;
+        const record2 = &maybe2.?.record;
+        const canonical_span1 = maybe1.?.canonical_span;
+        const canonical_span2 = maybe2.?.canonical_span;
         if (recordHasUnwritableEnding(record1.*, canonical_span1)) {
             return pairCommandFailure(0, unwritableRecordFailure());
         }
@@ -3785,10 +3683,10 @@ fn deinterleaveSource(
         .max_line_bytes = options.max_line_bytes,
     });
     defer reader.deinit();
-    var staged_record: std.ArrayList(u8) = .empty;
-    defer staged_record.deinit(allocator);
-    var retained_record_storage: fastq.RetainedRecordStorage = .{};
-    defer retained_record_storage.deinit(allocator);
+    var stored_name: StoredPairName = .{};
+    defer stored_name.deinit(allocator);
+    var mate1_storage: PreservedMate1 = .{};
+    defer mate1_storage.deinit(allocator);
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
@@ -3801,104 +3699,152 @@ fn deinterleaveSource(
             .{ writer1, writer2 },
             &span1,
         )) |failure| return failure;
-        var validated1 = if (span1) |mate1| fastq.validatedSpan(mate1) else fastq.nextValidatedRecord(&reader, &validator) catch |err| {
-            return pairCommandFailure(0, mapReaderFailure(&reader, err));
-        } orelse return null;
-        const record_index1 = reader.recordIndex() - 1;
-        const offsets1 = reader.currentRecordOffsets().?;
-        const header1_len = validated1.record.header.len;
-        const semantic1 = mapSemanticFailure(
-            validated1.semantic_error,
-            offsets1,
-            record_index1,
-        );
-
-        const unwritable1 = recordHasUnwritableEnding(validated1.record, validated1.canonical_span);
-        var record1_storage: InterleavedFirstRecordStorage = .reader;
-        var paired_record2 = (if (semantic1 == null)
-            fastq.nextValidatedMatePreservingRecord(&reader, &validated1, &validator)
-        else
-            fastq.nextBufferedValidatedRecord(&reader, &validator)) catch |err| {
-            return pairCommandFailure(0, mapReaderFailure(&reader, err));
-        };
-        // Pointers read both records where the reader built them.
-        const record1 = &validated1.record;
-        const canonical_span1 = validated1.canonical_span;
-        var later_record2: fastq.ValidatedRecord = undefined;
-        const validated2 = if (paired_record2) |*paired| paired else record: {
-            @branchHint(.cold);
-            if (semantic1 != null) {
-                later_record2 = fastq.nextValidatedRecord(
-                    &reader,
-                    &validator,
-                ) catch |err| {
-                    return pairCommandFailure(0, mapReaderFailure(&reader, err));
-                } orelse return missingInterleavedMateFailure(record_index1);
-                break :record &later_record2;
-            }
-
-            const preserved = nextAfterPreservingInterleavedMate1(
-                allocator,
-                &reader,
-                &retained_record_storage,
-                &staged_record,
-                record1.*,
-                canonical_span1,
-                staging_limit,
-                &validator,
-            ) catch |err| return mapPreservedMateFailure(&reader, err);
-            record1_storage = preserved.first_storage;
-            later_record2 = preserved.record orelse return missingInterleavedMateFailure(record_index1);
-            break :record &later_record2;
-        };
-
-        const record2 = &validated2.record;
-        const canonical_span2 = validated2.canonical_span;
-        if (semantic1) |details| {
-            return pairCommandFailure(0, details);
-        }
-
-        const record_index2 = reader.recordIndex() - 1;
-        const offsets2 = reader.currentRecordOffsets().?;
-        if (mapSemanticFailure(
-            validated2.semantic_error,
-            offsets2,
-            record_index2,
-        )) |details| {
-            return pairCommandFailure(0, details);
-        }
-
-        const header1 = switch (record1_storage) {
-            .unused => unreachable,
-            .reader, .retained => record1.header,
-            .staged => staged_record.items[1 .. 1 + header1_len],
-        };
-        if (!pairing.headersMatch(header1, record2.header, options.pair_name_policy)) {
-            return headerNameMismatch(
-                header1,
-                record2.header,
-                options.pair_name_policy,
-                record_index1 / 2,
-                .{ record_index1, record_index2 },
-                .{ offsets1.header, offsets2.header },
-            );
-        }
-
-        if (unwritable1 or recordHasUnwritableEnding(record2.*, canonical_span2)) {
-            return pairCommandFailure(0, unwritableRecordFailure());
-        }
-        writePreservedInterleavedMate1(
-            writer1,
+        const pair = switch (readInterleavedPair(
+            allocator,
             &reader,
-            &retained_record_storage,
-            staged_record.items,
-            record1.*,
-            canonical_span1,
-            record1_storage,
-        ) catch return error.Output1WriteFailed;
-        writeCheckedRecord(writer2, null, record2.*, canonical_span2) catch
+            &validator,
+            &stored_name,
+            &mate1_storage,
+            staging_limit,
+            options.pair_name_policy,
+            span1,
+        )) {
+            .end => return null,
+            .failure => |failure| return failure,
+            .pair => |pair| pair,
+        };
+        mate1_storage.write(writer1, &reader, pair) catch return error.Output1WriteFailed;
+        writeCheckedRecord(writer2, null, pair.record2, pair.canonical_span2) catch
             return error.Output2WriteFailed;
     }
+}
+
+/// Where mate 1 of an interleaved pair lives while mate 2 is read, when the
+/// reader's buffer cannot keep it.
+const PreservedMate1 = struct {
+    staged_record: std.ArrayList(u8) = .empty,
+    retained: fastq.RetainedRecordStorage = .{},
+
+    fn deinit(self: *PreservedMate1, allocator: std.mem.Allocator) void {
+        self.staged_record.deinit(allocator);
+        self.retained.deinit(allocator);
+    }
+
+    fn write(self: *PreservedMate1, writer: *zfastq.Writer, reader: *fastq.Reader, pair: InterleavedPair) error{WriteFailed}!void {
+        return writePreservedInterleavedMate1(
+            writer,
+            reader,
+            &self.retained,
+            self.staged_record.items,
+            pair.record1,
+            pair.canonical_span1,
+            pair.record1_storage,
+        );
+    }
+};
+
+const InterleavedPair = struct {
+    record1: fastq.Record,
+    canonical_span1: ?[]const u8,
+    record1_storage: InterleavedFirstRecordStorage,
+    record2: fastq.Record,
+    canonical_span2: ?[]const u8,
+};
+
+const InterleavedPairStep = union(enum) {
+    end,
+    pair: InterleavedPair,
+    failure: PairCommandFailure,
+};
+
+/// Reads one interleaved pair for writing. Mate 1 stays alive through mate
+/// 2's read in the reader or in `mate1_storage`; both mates are validated,
+/// their names compared, and their endings checked writable. A pair whose
+/// mate 1 fails is reported as `verifyInterleavedPair` reports it. `span1`
+/// is mate 1 when the span loop has already taken it.
+fn readInterleavedPair(
+    allocator: std.mem.Allocator,
+    reader: *fastq.Reader,
+    validator: *fastq.AdaptiveRecordValidator,
+    stored_name: *StoredPairName,
+    mate1_storage: *PreservedMate1,
+    staging_limit: usize,
+    policy: pairing.NamePolicy,
+    span1: ?fastq.RecordSpan,
+) InterleavedPairStep {
+    var validated1 = if (span1) |mate1| fastq.validatedSpan(mate1) else fastq.nextValidatedRecord(reader, validator) catch |err| {
+        return .{ .failure = pairCommandFailure(0, mapReaderFailure(reader, err)) };
+    } orelse return .end;
+    if (validated1.semantic_error != null) {
+        return switch (verifyInterleavedPair(allocator, reader, validator, stored_name, policy, validated1.validatedHeader())) {
+            .failure => |failure| .{ .failure = failure },
+            // A mate 1 that fails semantic validation fails its pair.
+            .end, .pair => unreachable,
+        };
+    }
+    const record_index1 = reader.recordIndex() - 1;
+    const offsets1 = reader.currentRecordOffsets().?;
+    const header1_len = validated1.record.header.len;
+
+    var record1_storage: InterleavedFirstRecordStorage = .reader;
+    const paired_record2 = fastq.nextValidatedMatePreservingRecord(reader, &validated1, validator) catch |err| {
+        return .{ .failure = pairCommandFailure(0, mapReaderFailure(reader, err)) };
+    };
+    const record1 = validated1.record;
+    const canonical_span1 = validated1.canonical_span;
+    const validated2 = paired_record2 orelse record: {
+        @branchHint(.cold);
+        const preserved = nextAfterPreservingInterleavedMate1(
+            allocator,
+            reader,
+            &mate1_storage.retained,
+            &mate1_storage.staged_record,
+            record1,
+            canonical_span1,
+            staging_limit,
+            validator,
+        ) catch |err| return .{ .failure = mapPreservedMateFailure(reader, err) };
+        record1_storage = preserved.first_storage;
+        break :record preserved.record orelse return .{ .failure = missingInterleavedMateFailure(record_index1) };
+    };
+
+    const record_index2 = reader.recordIndex() - 1;
+    const offsets2 = reader.currentRecordOffsets().?;
+    if (mapSemanticFailure(
+        validated2.semantic_error,
+        offsets2,
+        record_index2,
+    )) |details| {
+        return .{ .failure = pairCommandFailure(0, details) };
+    }
+
+    const header1 = switch (record1_storage) {
+        .reader, .retained => record1.header,
+        .staged => mate1_storage.staged_record.items[1 .. 1 + header1_len],
+    };
+    if (!pairing.headersMatch(header1, validated2.record.header, policy)) {
+        return .{ .failure = headerNameMismatch(
+            header1,
+            validated2.record.header,
+            policy,
+            record_index1 / 2,
+            .{ record_index1, record_index2 },
+            .{ offsets1.header, offsets2.header },
+        ) };
+    }
+
+    if (recordHasUnwritableEnding(record1, canonical_span1) or
+        recordHasUnwritableEnding(validated2.record, validated2.canonical_span))
+    {
+        return .{ .failure = pairCommandFailure(0, unwritableRecordFailure()) };
+    }
+    return .{ .pair = .{
+        .record1 = record1,
+        .canonical_span1 = canonical_span1,
+        .record1_storage = record1_storage,
+        .record2 = validated2.record,
+        .canonical_span2 = validated2.canonical_span,
+    } };
 }
 
 /// Takes interleaved pairs straight from the reader's buffer until a mate

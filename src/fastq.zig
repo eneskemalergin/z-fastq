@@ -2104,6 +2104,8 @@ pub const Reader = struct {
         const storage_limit = fieldStorageLimit(self.options.max_line_bytes);
         if (needed > storage_limit) return error.LineTooLong;
         const doubled = std.math.add(usize, field.storage.len, field.storage.len) catch needed;
+        // A line still open at a chunk edge starts at one read buffer and
+        // doubles, so lines of whole-buffer lengths fit without slack.
         var grown_len = if (complete)
             needed
         else
@@ -2183,6 +2185,10 @@ pub const ValidatedRecord = struct {
     record: Record,
     canonical_span: ?[]const u8,
     semantic_error: ?SemanticError,
+
+    pub fn validatedHeader(self: *const ValidatedRecord) ValidatedHeader {
+        return .{ .header = self.record.header, .semantic_error = self.semantic_error };
+    }
 };
 
 pub const RetainedRecordStorage = struct {
@@ -2255,7 +2261,7 @@ pub fn nextPayloadOrStreamed(reader: *Reader, comptime Hook: type, hook: *Hook) 
     }
 }
 
-pub fn nextValidatedHeader(
+pub inline fn nextValidatedHeader(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
 ) ReaderError!?ValidatedHeader {
