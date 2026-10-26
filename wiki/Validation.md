@@ -17,6 +17,8 @@ Each record has four logical lines:
 3. A plus line beginning with `+`.
 4. A quality line with the same byte length as the sequence.
 
+Lines may end in LF or CRLF, mixed within one file. A CR is removed only when an LF follows it, so a final quality line that ends in CR without a final LF keeps the CR as content and fails with `S005`, one byte longer than its sequence. Without the CR, a missing final LF is accepted.
+
 Quality bytes use Phred+33 and must be in the inclusive ASCII range 33 to 126. Empty sequence and quality lines are valid when both are empty. z-fastq expects sequence and quality on one logical line; it does not join wrapped lines into one record.
 
 ## Choose a sequence alphabet

@@ -60,7 +60,7 @@ The reader consumes a `ByteSource`, exposes record offsets, and enforces the con
 
 `ByteSource` and `ByteSink` are copied by value and point at their adapter, so the adapter must stay at a stable address and outlive every copy. A read fills a prefix of the destination and returns its length; zero for a nonempty destination means EOF, and a length beyond the destination is rejected. A write consumes the whole slice; a sink without a flush callback treats `flush` as a no-op. `FileSink` writes whole pages and keeps a partial last page buffered until the next write or `flush`.
 
-An error ends the reader. Read its diagnostic with `takeLastError` and do not call `next` again: the position and record index may reflect a partly read record.
+An error ends the reader. Read its diagnostic with `takeLastError` and do not call `next` again: the position and record index may reflect a partly read record. The same holds for `count_scan.Scanner`: after an error from `feed` or `finishEof`, read `takeLastError` and stop; `record_index` and `byte_offset` are not defined after an error.
 
 ## Compatibility
 

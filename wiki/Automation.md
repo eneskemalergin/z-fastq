@@ -26,7 +26,7 @@ else
 fi
 ```
 
-FASTQ-producing commands can write earlier records before a later failure. Check the exit status before treating redirected output as complete.
+FASTQ-producing commands can write earlier records before a later failure. Check the exit status before treating redirected output as complete. An interrupted run (SIGINT or SIGTERM, status `130` or `143`) leaves the same partial output: z-fastq does not remove what it already wrote, and `deinterleave` keeps both output files.
 
 ## Machine-readable output
 

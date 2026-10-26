@@ -16,6 +16,8 @@ z-fastq count lane1.fastq.gz lane2.fastq.gz
 
 This command uses a specialized count path. It does not need to retain the header, sequence, or quality fields after it recognizes the record boundaries.
 
+`count` checks record structure only (S001 to S005): it does not check quality bytes or the sequence alphabet. `stats` also rejects quality bytes outside Phred+33 (S006) and counts unexpected sequence symbols in `other_bases`. Use [`check`](Validation) to validate the alphabet as well.
+
 ## Report aggregate statistics
 
 ```bash

@@ -21,6 +21,14 @@ const FixtureExpect = struct {
 const FIXTURES = [_]FixtureExpect{
     .{ .name = "crlf.fastq" },
     .{
+        .name = "crlf_missing_final_newline.fastq",
+        .code = "S005",
+        .message = "sequence and quality lengths differ",
+        .record_index = 1,
+        .line = 4,
+        .offset = 50,
+    },
+    .{
         .name = "bad_header.fastq",
         .code = "S003",
         .message = "header line must start with '@' and contain a nonempty identifier",

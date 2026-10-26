@@ -12,6 +12,8 @@ The selector makes one deterministic decision per record. The output count is th
 
 Accepted fraction forms are `0`, `1`, decimals beginning with `0.`, and decimals beginning with `1.` whose remaining digits are zero. Percentages and scientific notation are not accepted.
 
+`--fraction 0` and `--count 0` only validate the input: they write nothing, so a record that could not be written (a field ending in CR) does not fail them, and a closed standard output still exits `0`, as with `check`.
+
 The default seed is `11`. Set it explicitly when you need the current selection to repeat:
 
 ```bash
@@ -28,7 +30,9 @@ The same seed, input record stream, and sampling options repeat the selection in
 z-fastq sample --count 1000 --seed 42 reads.fastq > sample.fastq
 ```
 
-The command selects `min(1000, record_count)` records. It uses two passes over a regular file, so exact-count mode rejects stdin. The selection state grows with the requested count, not with the size of the FASTQ file.
+The command selects `min(1000, record_count)` records: when the input has no more records than the count, every record is written and no note is printed. It uses two passes over a regular file, so exact-count mode rejects stdin. The file must not change between the passes; z-fastq compares its inode, size, and modification time before and after each pass and fails with `input changed during exact sampling` when they differ, but a rewrite that keeps all three is not detected.
+
+The selection state grows with the requested count, not with the size of the FASTQ file: once the input has more records than the count, z-fastq reserves about 4 bytes per requested record (8 bytes above 2^32 records), so `--count 10000000` holds about 40 MB.
 
 ## Sample pairs
 
