@@ -97,10 +97,7 @@ pub const Scanner = struct {
     last_header_line_bytes: usize = 0,
     current_record_minimal_plus: bool = false,
     current_record_dense_eligible: bool = false,
-    line_raw_len: usize = 0,
-    line_first_byte: u8 = 0,
-    line_second_byte: u8 = 0,
-    line_last_byte: u8 = 0,
+    line: fastq.LineBytes = .{},
     line_start_offset: u64 = 0,
     record_index: u64 = 0,
     byte_offset: u64 = 0,
@@ -126,7 +123,7 @@ pub const Scanner = struct {
         while (pos < data.len) {
             if (self.fast_path_enabled and
                 self.machine.expected == .header and
-                self.line_raw_len == 0)
+                self.line.raw_len == 0)
             {
                 const progress = try self.feedFast(data[pos..]);
                 if (progress.bytes > 0) {
@@ -152,7 +149,7 @@ pub const Scanner = struct {
 
     /// Finalizes an unterminated last line and rejects an incomplete record.
     pub fn finishEof(self: *Scanner) fastq.ReaderError!void {
-        if (self.line_raw_len > 0) try self.finishLine(false);
+        if (self.line.raw_len > 0) try self.finishLine(false);
         const missing_line = self.machine.missingLine() orelse return;
         self.storeError(
             .s004_truncated_record,
@@ -340,32 +337,18 @@ pub const Scanner = struct {
     }
 
     fn consumeLineBytes(self: *Scanner, bytes: []const u8) fastq.ReaderError!void {
-        if (bytes.len == 0) return;
-        const previous_len = self.line_raw_len;
-        if (previous_len == 0) self.line_first_byte = bytes[0];
-        self.line_raw_len = std.math.add(usize, self.line_raw_len, bytes.len) catch
-            return error.LineTooLong;
-        if (previous_len < 2 and self.line_raw_len >= 2) {
-            self.line_second_byte = bytes[1 - previous_len];
-        }
-        self.line_last_byte = bytes[bytes.len - 1];
-        if (self.line_raw_len > self.options.max_line_bytes) {
-            const excess = self.line_raw_len - self.options.max_line_bytes;
-            if (excess > 1 or self.line_last_byte != '\r') return error.LineTooLong;
-        }
+        try self.line.add(bytes, self.options.max_line_bytes);
     }
 
     fn finishLine(self: *Scanner, terminated_by_lf: bool) fastq.ReaderError!void {
-        const had_cr = terminated_by_lf and
-            self.line_raw_len > 0 and
-            self.line_last_byte == '\r';
-        const content_len = self.line_raw_len - @intFromBool(had_cr);
+        const had_cr = terminated_by_lf and self.line.holdsCr();
+        const content_len = self.line.contentLen(terminated_by_lf);
         if (content_len > self.options.max_line_bytes) return error.LineTooLong;
 
         const line_kind = self.machine.expected;
         switch (line_kind) {
             .header => {
-                self.last_header_line_bytes = std.math.add(usize, self.line_raw_len, 1) catch
+                self.last_header_line_bytes = std.math.add(usize, self.line.raw_len, 1) catch
                     return error.LineTooLong;
                 self.current_record_dense_eligible = !had_cr;
             },
@@ -379,8 +362,8 @@ pub const Scanner = struct {
             .quality => {},
         }
 
-        const first_byte = if (content_len == 0) null else self.line_first_byte;
-        const second_byte = if (content_len < 2) null else self.line_second_byte;
+        const first_byte = self.line.firstByte(content_len);
+        const second_byte = self.line.secondByte(content_len);
         var machine = self.machine;
         const record_ready = machine.push(content_len, first_byte, second_byte) catch |err| {
             return self.structuralError(err, self.line_start_offset);
@@ -403,10 +386,7 @@ pub const Scanner = struct {
                 self.observeDenseLayout(null);
             }
         }
-        self.line_raw_len = 0;
-        self.line_first_byte = 0;
-        self.line_second_byte = 0;
-        self.line_last_byte = 0;
+        self.line = .{};
         self.line_start_offset = self.byte_offset;
     }
 

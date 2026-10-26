@@ -1109,26 +1109,18 @@ fn headerNameMismatch(
     } } };
 }
 
+/// Four lines at the line limit, each with its LF: the largest canonical record.
 fn recordStagingLimit(max_line_bytes: usize) error{ArithmeticLimit}!usize {
-    const fields = std.math.mul(usize, max_line_bytes, 4) catch
-        return error.ArithmeticLimit;
-    return std.math.add(usize, fields, 4) catch error.ArithmeticLimit;
+    const line = std.math.add(usize, max_line_bytes, 1) catch return error.ArithmeticLimit;
+    return std.math.mul(usize, line, 4) catch error.ArithmeticLimit;
 }
 
 fn canonicalRecordSize(
     record: zfastq.Record,
     canonical_span: ?[]const u8,
 ) error{RecordStagingLimit}!usize {
-    return if (canonical_span) |span|
-        span.len
-    else blk: {
-        var total: usize = 6;
-        inline for (&.{ record.header, record.sequence, record.plus, record.quality }) |field| {
-            total = std.math.add(usize, total, field.len) catch
-                return error.RecordStagingLimit;
-        }
-        break :blk total;
-    };
+    if (canonical_span) |span| return span.len;
+    return fastq.canonicalRecordLen(record) orelse error.RecordStagingLimit;
 }
 
 fn stageCanonicalRecord(
@@ -1153,15 +1145,7 @@ fn stageCanonicalRecord(
         staging.appendSliceAssumeCapacity(span);
         return;
     }
-    staging.appendAssumeCapacity('@');
-    staging.appendSliceAssumeCapacity(record.header);
-    staging.appendAssumeCapacity('\n');
-    staging.appendSliceAssumeCapacity(record.sequence);
-    staging.appendSliceAssumeCapacity("\n+");
-    staging.appendSliceAssumeCapacity(record.plus);
-    staging.appendAssumeCapacity('\n');
-    staging.appendSliceAssumeCapacity(record.quality);
-    staging.appendAssumeCapacity('\n');
+    _ = fastq.copyCanonicalRecord(staging.addManyAsSliceAssumeCapacity(required), record);
 }
 
 // --- Pair names and retained mates ---
@@ -1280,7 +1264,11 @@ fn nextAfterPreservingInterleavedMate1(
         };
         // Reader's four line limits cover CLI staging limits, including markers.
         // Internal callers can supply a smaller limit and still need its error.
-        if (staging_limit < 4 or (staging_limit - 4) / 4 < reader.options.max_line_bytes) {
+        const covers_line_limit = if (recordStagingLimit(reader.options.max_line_bytes)) |limit|
+            staging_limit >= limit
+        else |_|
+            false;
+        if (!covers_line_limit) {
             if (try canonicalRecordSize(record1, canonical_span1) > staging_limit) {
                 return error.RecordStagingLimit;
             }

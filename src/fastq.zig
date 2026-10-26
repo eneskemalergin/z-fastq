@@ -202,6 +202,52 @@ pub const Machine = struct {
     }
 };
 
+/// One logical line that arrives in chunks without its LF. Content excludes
+/// one CR before the LF, so a CR that ends the bytes seen so far is held: it
+/// is content only if more bytes follow or the line ends without LF. The
+/// content limit allows for that CR. The first two content bytes feed the
+/// structural checks.
+pub const LineBytes = struct {
+    raw_len: usize = 0,
+    first_byte: u8 = 0,
+    second_byte: u8 = 0,
+    last_byte: u8 = 0,
+
+    /// Adds `chunk` (no LF). A held CR still counts toward `raw_len`.
+    pub inline fn add(self: *LineBytes, chunk: []const u8, max_line_bytes: usize) error{LineTooLong}!void {
+        if (chunk.len == 0) return;
+        const previous_len = self.raw_len;
+        self.raw_len = std.math.add(usize, previous_len, chunk.len) catch return error.LineTooLong;
+        if (previous_len == 0) self.first_byte = chunk[0];
+        if (previous_len < 2 and self.raw_len >= 2) self.second_byte = chunk[1 - previous_len];
+        self.last_byte = chunk[chunk.len - 1];
+        if (self.raw_len - @intFromBool(self.last_byte == '\r') > max_line_bytes) return error.LineTooLong;
+    }
+
+    /// True when the bytes so far end in a CR that LF may still claim.
+    pub inline fn holdsCr(self: *const LineBytes) bool {
+        return self.raw_len != 0 and self.last_byte == '\r';
+    }
+
+    /// The bytes of a chunk just added that are content now: all but a held CR.
+    pub inline fn contentOf(chunk: []const u8) []const u8 {
+        return chunk[0 .. chunk.len - @intFromBool(chunk.len != 0 and chunk[chunk.len - 1] == '\r')];
+    }
+
+    /// Content length when the line ends; LF claims a held CR.
+    pub inline fn contentLen(self: *const LineBytes, terminated_by_lf: bool) usize {
+        return self.raw_len - @intFromBool(terminated_by_lf and self.holdsCr());
+    }
+
+    pub inline fn firstByte(self: *const LineBytes, content_len: usize) ?u8 {
+        return if (content_len == 0) null else self.first_byte;
+    }
+
+    pub inline fn secondByte(self: *const LineBytes, content_len: usize) ?u8 {
+        return if (content_len < 2) null else self.second_byte;
+    }
+};
+
 /// Excludes one trailing CR; callers check LF termination and handle EOF separately.
 pub fn lineContentLen(line: []const u8) usize {
     if (line.len > 0 and line[line.len - 1] == '\r') return line.len - 1;
@@ -458,7 +504,7 @@ fn semanticSequenceError(byte_index: usize) SemanticError {
 pub fn semanticQualityError(byte_index: usize) SemanticError {
     return .{
         .code = .s006_invalid_quality_range,
-        .message = "quality byte must be ASCII 33 through 126",
+        .message = std.fmt.comptimePrint("quality byte must be ASCII {d} through {d}", .{ PHRED_OFFSET, PHRED_MAX_BYTE }),
         .field = .quality,
         .byte_index = byte_index,
     };
@@ -481,10 +527,15 @@ pub fn semanticParseError(
     };
 }
 
+/// Phred+33: a quality byte is its score plus 33, from '!' (33) to '~' (126).
+pub const PHRED_OFFSET = 33;
+pub const PHRED_MAX_BYTE = 126;
+pub const PHRED_MAX_SCORE = PHRED_MAX_BYTE - PHRED_OFFSET;
+
 /// Decodes one Phred+33 byte and rejects values outside ASCII 33 through 126.
 pub fn decodePhred33(quality_byte: u8) error{InvalidQuality}!u8 {
-    if (quality_byte < 33 or quality_byte > 126) return error.InvalidQuality;
-    return quality_byte - 33;
+    if (quality_byte < PHRED_OFFSET or quality_byte > PHRED_MAX_BYTE) return error.InvalidQuality;
+    return quality_byte - PHRED_OFFSET;
 }
 
 fn firstInvalidSequence(sequence: []const u8, alphabet: Alphabet) ?usize {
@@ -601,7 +652,7 @@ fn invalidQualityVector(
     quality: @Vector(vector_len, u8),
 ) @Vector(vector_len, bool) {
     const Bytes = @Vector(vector_len, u8);
-    return (quality < @as(Bytes, @splat(33))) | (quality > @as(Bytes, @splat(126)));
+    return (quality < @as(Bytes, @splat(PHRED_OFFSET))) | (quality > @as(Bytes, @splat(PHRED_MAX_BYTE)));
 }
 
 fn firstInvalidQualityScalar(quality: []const u8, start_index: usize) ?usize {
@@ -977,7 +1028,6 @@ const FallbackValidation = struct {
     use_full_iupac: bool,
     sequence_failure: ?usize = null,
     quality_failure: ?usize = null,
-    pending_cr: bool = false,
 
     fn init(validator: *const AdaptiveRecordValidator) FallbackValidation {
         return .{
@@ -1006,64 +1056,14 @@ const FallbackValidation = struct {
         start_index: usize,
     ) ReaderError!void {
         if (bytes.len == 0) return;
-        if (self.pending_cr) {
-            std.debug.assert(start_index > 0);
-            classifySemanticByte(
-                field,
-                self.alphabet,
-                &self.use_full_iupac,
-                self.failure(field),
-                '\r',
-                start_index - 1,
-            );
-            self.pending_cr = false;
-        }
-
-        const semantic_end = if (bytes[bytes.len - 1] == '\r') bytes.len - 1 else bytes.len;
-        self.pending_cr = semantic_end != bytes.len;
-        const semantic_bytes = bytes[0..semantic_end];
-        if (semantic_bytes.len == 0) return;
         classifySemanticBytes(
             field,
             self.alphabet,
             &self.use_full_iupac,
             self.failure(field),
-            semantic_bytes,
+            bytes,
             start_index,
         ) catch return error.ArithmeticLimit;
-    }
-
-    fn finishLine(
-        self: *FallbackValidation,
-        line_kind: ExpectedLine,
-        terminated: bool,
-        content_len: usize,
-    ) void {
-        switch (line_kind) {
-            .sequence => self.finishField(.sequence, terminated, content_len),
-            .quality => self.finishField(.quality, terminated, content_len),
-            .header, .plus => {},
-        }
-    }
-
-    fn finishField(
-        self: *FallbackValidation,
-        comptime field: SemanticField,
-        terminated: bool,
-        content_len: usize,
-    ) void {
-        if (self.pending_cr and !terminated) {
-            std.debug.assert(content_len > 0);
-            classifySemanticByte(
-                field,
-                self.alphabet,
-                &self.use_full_iupac,
-                self.failure(field),
-                '\r',
-                content_len - 1,
-            );
-        }
-        self.pending_cr = false;
     }
 
     fn failure(
@@ -1961,8 +1961,9 @@ pub const Reader = struct {
         };
     }
 
-    /// `hook` (validation or streamed totals) sees every byte of a line that
-    /// is not retained, with its offset in the line, then the line's end.
+    /// `hook` (validation or streamed totals) sees the content bytes of a line
+    /// that is not retained, with their offsets in the line; a held CR reaches
+    /// it once it is known to be content.
     fn readLine(
         self: *Reader,
         comptime retain: bool,
@@ -1974,30 +1975,13 @@ pub const Reader = struct {
         const field = &self.fallback_fields[field_index];
         const content_start = if (retain) field.len else 0;
         const line_start_offset = self.byte_offset;
-        var discarded_len: usize = 0;
-        var first_byte: ?u8 = null;
-        var second_byte: ?u8 = null;
-        var last_byte: ?u8 = null;
+        var line: LineBytes = .{};
 
         while (true) {
             if (self.cursor < self.fill_end) {
                 const haystack = self.buf[self.cursor..self.fill_end];
                 if (simd.findNewline(haystack)) |rel| {
-                    if (retain) {
-                        try self.appendLineBytes(field_index, content_start, haystack[0..rel], true);
-                    } else {
-                        const chunk_start = discarded_len;
-                        try self.discardLineBytes(
-                            &discarded_len,
-                            &first_byte,
-                            &second_byte,
-                            &last_byte,
-                            haystack[0..rel],
-                        );
-                        if (hook) |state| {
-                            try state.consume(self.machine.expected, haystack[0..rel], chunk_start);
-                        }
-                    }
+                    try self.takeLineBytes(retain, Hook, hook, field_index, content_start, &line, haystack[0..rel], true);
                     const next_offset = try self.offsetAfter(rel + 1);
                     self.cursor += rel + 1;
                     self.byte_offset = next_offset;
@@ -2011,33 +1995,16 @@ pub const Reader = struct {
                             .start_offset = line_start_offset,
                         };
                     }
-                    if (hook) |state| {
-                        state.finishLine(self.machine.expected, true, discarded_len);
-                    }
-                    if (last_byte == '\r') discarded_len -= 1;
+                    const content_len = line.contentLen(true);
                     return .{
-                        .content_len = discarded_len,
-                        .first_byte = if (discarded_len == 0) null else first_byte,
-                        .second_byte = if (discarded_len < 2) null else second_byte,
+                        .content_len = content_len,
+                        .first_byte = line.firstByte(content_len),
+                        .second_byte = line.secondByte(content_len),
                         .start_offset = line_start_offset,
                     };
                 }
 
-                if (retain) {
-                    try self.appendLineBytes(field_index, content_start, haystack, false);
-                } else {
-                    const chunk_start = discarded_len;
-                    try self.discardLineBytes(
-                        &discarded_len,
-                        &first_byte,
-                        &second_byte,
-                        &last_byte,
-                        haystack,
-                    );
-                    if (hook) |state| {
-                        try state.consume(self.machine.expected, haystack, chunk_start);
-                    }
-                }
+                try self.takeLineBytes(retain, Hook, hook, field_index, content_start, &line, haystack, false);
                 const next_offset = try self.offsetAfter(haystack.len);
                 self.cursor = self.fill_end;
                 self.byte_offset = next_offset;
@@ -2057,30 +2024,52 @@ pub const Reader = struct {
 
             const got_data = try self.refill();
             if (!got_data) {
-                const content_len = if (retain) field.len - content_start else discarded_len;
-                if (content_len > 0) {
-                    if (content_len > self.options.max_line_bytes) {
-                        return error.LineTooLong;
-                    }
-                    if (hook) |state| {
-                        state.finishLine(self.machine.expected, false, content_len);
-                    }
-                    if (!retain) return .{
-                        .content_len = content_len,
-                        .first_byte = first_byte,
-                        .second_byte = second_byte,
-                        .start_offset = line_start_offset,
-                    };
-                    const content = field.storage[0..field.len];
-                    return .{
-                        .content_len = content.len,
-                        .first_byte = content[0],
-                        .second_byte = if (content.len < 2) null else content[1],
-                        .start_offset = line_start_offset,
-                    };
+                // Without LF a held CR is content.
+                const content_len = line.raw_len;
+                if (content_len == 0) return null;
+                if (content_len > self.options.max_line_bytes) return error.LineTooLong;
+                if (!retain and line.holdsCr()) {
+                    if (hook) |state| try state.consume(self.machine.expected, "\r", content_len - 1);
                 }
-                return null;
+                if (!retain) return .{
+                    .content_len = content_len,
+                    .first_byte = line.firstByte(content_len),
+                    .second_byte = line.secondByte(content_len),
+                    .start_offset = line_start_offset,
+                };
+                const content = field.storage[0..field.len];
+                return .{
+                    .content_len = content.len,
+                    .first_byte = content[0],
+                    .second_byte = if (content.len < 2) null else content[1],
+                    .start_offset = line_start_offset,
+                };
             }
+        }
+    }
+
+    /// Adds one chunk of the current line (no LF): retained bytes are copied
+    /// into the line's field, discarded content goes to `hook`.
+    fn takeLineBytes(
+        self: *Reader,
+        comptime retain: bool,
+        comptime Hook: type,
+        hook: ?*Hook,
+        field_index: usize,
+        content_start: usize,
+        line: *LineBytes,
+        chunk: []const u8,
+        complete: bool,
+    ) ReaderError!void {
+        if (chunk.len == 0) return;
+        const chunk_start = line.raw_len;
+        const held_cr = line.holdsCr();
+        try line.add(chunk, self.options.max_line_bytes);
+        if (retain) return self.appendLineBytes(field_index, content_start + line.raw_len, chunk, complete);
+        if (hook) |state| {
+            // More bytes follow a held CR, so it is content.
+            if (held_cr) try state.consume(self.machine.expected, "\r", chunk_start - 1);
+            try state.consume(self.machine.expected, LineBytes.contentOf(chunk), chunk_start);
         }
     }
 
@@ -2091,55 +2080,17 @@ pub const Reader = struct {
     fn appendLineBytes(
         self: *Reader,
         field_index: usize,
-        content_start: usize,
+        new_len: usize,
         chunk: []const u8,
         complete: bool,
     ) ReaderError!void {
-        if (chunk.len == 0) return;
         const field = &self.fallback_fields[field_index];
-        const line_len = try self.lineLengthAfter(field.len - content_start, chunk);
-        const new_len = std.math.add(usize, content_start, line_len) catch
-            return error.LineTooLong;
         try self.ensureFieldCapacity(field_index, new_len, complete);
         if (self.buf.ptr == field.storage.ptr) {
             // A replayed record prefix shares the sequence fallback allocation.
             @memmove(field.storage[field.len..new_len], chunk);
         } else @memcpy(field.storage[field.len..new_len], chunk);
         field.len = new_len;
-    }
-
-    fn discardLineBytes(
-        self: *const Reader,
-        line_len: *usize,
-        first_byte: *?u8,
-        second_byte: *?u8,
-        last_byte: *?u8,
-        chunk: []const u8,
-    ) ReaderError!void {
-        if (chunk.len == 0) return;
-        const old_len = line_len.*;
-        line_len.* = try self.lineLengthAfter(old_len, chunk);
-        if (old_len == 0) {
-            first_byte.* = chunk[0];
-            if (chunk.len > 1) second_byte.* = chunk[1];
-        } else if (old_len == 1) {
-            second_byte.* = chunk[0];
-        }
-        last_byte.* = chunk[chunk.len - 1];
-    }
-
-    fn lineLengthAfter(
-        self: *const Reader,
-        current_len: usize,
-        chunk: []const u8,
-    ) ReaderError!usize {
-        const new_len = std.math.add(usize, current_len, chunk.len) catch
-            return error.LineTooLong;
-        if (new_len > self.options.max_line_bytes) {
-            const excess = new_len - self.options.max_line_bytes;
-            if (excess > 1 or chunk[chunk.len - 1] != '\r') return error.LineTooLong;
-        }
-        return new_len;
     }
 
     fn ensureFieldCapacity(
@@ -2430,40 +2381,19 @@ fn readMatePreservingRecord(
     if (!reader.canBufferIncompleteRecord()) return null;
     // Separate fallback fields can overlap the destination before they are copied.
     if (first.record.sequence.ptr == reader.fallback_fields[1].storage.ptr) return null;
-    const capacity = io_layer.DEFAULT_READER_BUFFER_BYTES;
     const span = first.canonical_span;
-    var size: usize = 6;
-    if (span) |bytes| {
-        size = bytes.len;
-    } else {
-        inline for (.{ "header", "sequence", "plus", "quality" }) |field| {
-            const len = @field(first.record, field).len;
-            if (len > capacity - size) return null;
-            size += len;
-        }
-    }
-    if (size >= capacity) return null;
+    const size = if (span) |bytes| bytes.len else canonicalRecordLen(first.record) orelse return null;
+    if (size >= io_layer.DEFAULT_READER_BUFFER_BYTES) return null;
     try reader.ensureRefillCapacity();
     const saved = reader.fallback_fields[1].storage[0..size];
-    if (span) |bytes| @memmove(saved, bytes) else saved[0] = '@';
-    var offset: usize = 1;
-    inline for (.{ "header", "sequence", "plus", "quality" }, 0..) |field, index| {
-        const bytes = &@field(first.record, field);
-        const start = if (span) |raw| @intFromPtr(bytes.ptr) - @intFromPtr(raw.ptr) else offset;
-        const dest = saved[start..][0..bytes.len];
-        if (span == null) {
-            @memmove(dest, bytes.*);
-            offset += bytes.len;
-            saved[offset] = '\n';
-            offset += 1;
-            if (index == 1) {
-                saved[offset] = '+';
-                offset += 1;
-            }
+    if (span) |raw| {
+        @memmove(saved, raw);
+        inline for (.{ "header", "sequence", "plus", "quality" }) |field| {
+            const bytes = &@field(first.record, field);
+            bytes.* = saved[@intFromPtr(bytes.ptr) - @intFromPtr(raw.ptr) ..][0..bytes.len];
         }
-        bytes.* = dest;
-    }
-    first.record.id = first.record.header[0..first.record.id.len];
+        first.record.id = first.record.header[0..first.record.id.len];
+    } else first.record = copyCanonicalRecord(saved, first.record);
     // Staging writes one canonical span, including when the input uses CRLF.
     first.canonical_span = if (recordHasTerminalCr(first.record)) null else saved;
     return nextSavedPairMate(reader, size, validator);
@@ -2595,6 +2525,44 @@ pub fn writeCanonicalRecordSpan(writer: *Writer, span: []const u8) WriteError!vo
 }
 
 // CLI callers check both mates, including terminal CR, before writing either record.
+/// Canonical framing adds '@', '+', and four LFs to the four fields.
+pub const RECORD_FRAMING_BYTES = 6;
+
+/// Bytes `record` takes in canonical framing, or null when that overflows.
+pub fn canonicalRecordLen(record: Record) ?usize {
+    var total: usize = RECORD_FRAMING_BYTES;
+    inline for (.{ record.header, record.sequence, record.plus, record.quality }) |field| {
+        total = std.math.add(usize, total, field.len) catch return null;
+    }
+    return total;
+}
+
+/// Copies `record` in canonical framing, field by field in order, to `dest`
+/// of exactly `canonicalRecordLen(record)` bytes, and returns the record with
+/// its fields in `dest`. A field may overlap `dest` only where the copies of
+/// earlier fields cannot reach it.
+pub fn copyCanonicalRecord(dest: []u8, record: Record) Record {
+    var copied = record;
+    dest[0] = '@';
+    var offset: usize = 1;
+    inline for (.{ "header", "sequence", "plus", "quality" }, 0..) |field, index| {
+        const bytes = @field(record, field);
+        const target = dest[offset..][0..bytes.len];
+        @memmove(target, bytes);
+        @field(copied, field) = target;
+        offset += bytes.len;
+        dest[offset] = '\n';
+        offset += 1;
+        if (index == 1) {
+            dest[offset] = '+';
+            offset += 1;
+        }
+    }
+    std.debug.assert(offset == dest.len);
+    copied.id = copied.header[0..record.id.len];
+    return copied;
+}
+
 pub fn writeRecordFields(writer: *Writer, record: Record) WriteError!void {
     const fields = [_][]const u8{
         "@",
@@ -2628,10 +2596,7 @@ pub const CheckScanner = struct {
     alphabet: Alphabet,
     use_full_iupac: bool = false,
     machine: Machine = .{},
-    line_len: usize = 0,
-    first_byte: ?u8 = null,
-    second_byte: ?u8 = null,
-    pending_cr: bool = false,
+    line: LineBytes = .{},
     line_start_offset: u64 = 0,
     sequence_start_offset: u64 = 0,
     quality_start_offset: u64 = 0,
@@ -2695,10 +2660,7 @@ pub const CheckScanner = struct {
 
     fn atRecordBoundary(self: *const CheckScanner) bool {
         return self.machine.expected == .header and
-            self.line_len == 0 and
-            self.first_byte == null and
-            self.second_byte == null and
-            !self.pending_cr and
+            self.line.raw_len == 0 and
             self.sequence_failure == null and
             self.quality_failure == null and
             self.line_start_offset == self.byte_offset;
@@ -2727,11 +2689,11 @@ pub const CheckScanner = struct {
     }
 
     pub fn finishEof(self: *CheckScanner) CheckScannerError!void {
-        if (self.line_len != 0) {
-            if (self.pending_cr) {
-                self.pending_cr = false;
-                if (self.line_len > self.max_line_bytes) return error.LineTooLong;
-                self.classifyByte('\r', self.line_len - 1);
+        if (self.line.raw_len != 0) {
+            // Without LF a held CR is content.
+            if (self.line.holdsCr()) {
+                if (self.line.raw_len > self.max_line_bytes) return error.LineTooLong;
+                self.classifyByte('\r', self.line.raw_len - 1);
             }
             try self.finishLine(false);
         }
@@ -2753,25 +2715,11 @@ pub const CheckScanner = struct {
 
     fn consumeLineBytes(self: *CheckScanner, bytes: []const u8) CheckScannerError!void {
         if (bytes.len == 0) return;
-
-        if (self.pending_cr) {
-            self.pending_cr = false;
-            self.classifyByte('\r', self.line_len - 1);
-        }
-
-        const previous_len = self.line_len;
-        self.line_len = std.math.add(usize, self.line_len, bytes.len) catch
-            return error.LineTooLong;
-        if (self.first_byte == null) self.first_byte = bytes[0];
-        if (self.second_byte == null and previous_len < 2 and self.line_len >= 2) {
-            self.second_byte = bytes[1 - previous_len];
-        }
-
-        const semantic_end = if (bytes[bytes.len - 1] == '\r') bytes.len - 1 else bytes.len;
-        self.pending_cr = semantic_end != bytes.len;
-        const content_len = self.line_len - @intFromBool(self.pending_cr);
-        if (content_len > self.max_line_bytes) return error.LineTooLong;
-        try self.classifyBytes(bytes[0..semantic_end], previous_len);
+        const previous_len = self.line.raw_len;
+        // More bytes follow a held CR, so it is content.
+        if (self.line.holdsCr()) self.classifyByte('\r', previous_len - 1);
+        try self.line.add(bytes, self.max_line_bytes);
+        try self.classifyBytes(LineBytes.contentOf(bytes), previous_len);
     }
 
     fn classifyBytes(
@@ -2823,9 +2771,9 @@ pub const CheckScanner = struct {
     }
 
     fn finishLine(self: *CheckScanner, terminated: bool) CheckScannerError!void {
-        const content_len = self.line_len - @intFromBool(terminated and self.pending_cr);
-        const content_first = if (content_len == 0) null else self.first_byte;
-        const content_second = if (content_len < 2) null else self.second_byte;
+        const content_len = self.line.contentLen(terminated);
+        const content_first = self.line.firstByte(content_len);
+        const content_second = self.line.secondByte(content_len);
         const line_kind = self.machine.expected;
         const record_ready = self.machine.push(
             content_len,
@@ -2849,10 +2797,7 @@ pub const CheckScanner = struct {
         }
         if (record_ready) try self.finishRecord();
 
-        self.line_len = 0;
-        self.first_byte = null;
-        self.second_byte = null;
-        self.pending_cr = false;
+        self.line = .{};
         self.line_start_offset = self.byte_offset;
     }
 
@@ -5137,8 +5082,30 @@ test "[integration] - [writer]: prechecked Reader records match checked serializ
     }
 }
 
-test "[unit] - [check scanner]: state remains fixed-size" {
-    try std.testing.expect(@sizeOf(CheckScanner) <= 160);
+test "[property] - [writer]: the canonical copy matches written records" {
+    const records = [_]Record{
+        .{ .header = "r", .id = "r", .sequence = "", .plus = "", .quality = "" },
+        .{ .header = "read/1 extra", .id = "read/1", .sequence = "ACGTN", .plus = "read/1 extra", .quality = "IIII#" },
+    };
+    for (records) |record| {
+        var output: [64]u8 = undefined;
+        var sink = io_layer.SliceSink.init(&output);
+        var writer = Writer.init(sink.byteSink());
+        try writeRecordFields(&writer, record);
+
+        var copy: [64]u8 = undefined;
+        const len = canonicalRecordLen(record).?;
+        const copied = copyCanonicalRecord(copy[0..len], record);
+        try std.testing.expectEqualStrings(sink.written(), copy[0..len]);
+        inline for (.{ "header", "id", "sequence", "plus", "quality" }) |field| {
+            try std.testing.expectEqualStrings(@field(record, field), @field(copied, field));
+        }
+    }
+}
+
+test "[unit] - [check scanner]: state fits in three cache lines" {
+    // No input-sized buffer: validation state is a line, a record, and one diagnostic.
+    try std.testing.expect(@sizeOf(CheckScanner) <= 3 * 64);
 }
 
 fn firstValidSequenceLineEnd(bytes: []const u8, alphabet: Alphabet) ?usize {

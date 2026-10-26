@@ -146,6 +146,10 @@ const RecordTotals = struct {
     q30_bases: u64,
 };
 
+/// Bases at or above these scores count toward the Q20 and Q30 totals.
+const Q20_SCORE = 20;
+const Q30_SCORE = 30;
+
 // Extern layout: the AVX2 copy of `payloadTotals` returns it across the object boundary.
 const PayloadTotals = extern struct {
     base_counts: [6]usize = .{0} ** 6,
@@ -183,16 +187,14 @@ fn totalsFromPayload(payload_totals: PayloadTotals, length: usize) StatsError!Re
     };
 }
 
-/// Totals of one record whose sequence and quality arrive as chunks, for a
-/// record larger than what the reader has buffered; nothing is copied. A CR
-/// at the end of a chunk waits for the next one: before LF it ends the line,
-/// anywhere else it is a sequence or quality byte.
+/// Totals of one record whose sequence and quality arrive as chunks of
+/// content, for a record larger than what the reader has buffered; nothing is
+/// copied.
 pub const StreamedTotals = struct {
     totals: PayloadTotals = .{},
     sequence_len: usize = 0,
     quality_error: ?QualityError = null,
     overflow: bool = false,
-    pending_cr: bool = false,
 
     pub fn consume(
         self: *StreamedTotals,
@@ -207,27 +209,8 @@ pub const StreamedTotals = struct {
         }
     }
 
-    pub fn finishLine(self: *StreamedTotals, line_kind: fastq.ExpectedLine, terminated: bool, content_len: usize) void {
-        switch (line_kind) {
-            .sequence, .quality => {
-                if (self.pending_cr and !terminated) {
-                    self.add(line_kind == .quality, "\r", content_len - 1);
-                }
-                self.pending_cr = false;
-            },
-            .header, .plus => {},
-        }
-    }
-
     fn consumeField(self: *StreamedTotals, comptime field: fastq.SemanticField, bytes: []const u8, start_index: usize) void {
-        if (bytes.len == 0) return;
-        if (self.pending_cr) {
-            self.add(field == .quality, "\r", start_index - 1);
-            self.pending_cr = false;
-        }
-        const end = if (bytes[bytes.len - 1] == '\r') bytes.len - 1 else bytes.len;
-        self.pending_cr = end != bytes.len;
-        self.add(field == .quality, bytes[0..end], start_index);
+        self.add(field == .quality, bytes, start_index);
     }
 
     fn add(self: *StreamedTotals, is_quality: bool, bytes: []const u8, start_index: usize) void {
@@ -262,7 +245,7 @@ pub const StreamedTotals = struct {
 
 fn maxQualitySum(length: usize) ?u64 {
     const length_u64 = std.math.cast(u64, length) orelse return null;
-    return std.math.mul(u64, length_u64, 93) catch null;
+    return std.math.mul(u64, length_u64, fastq.PHRED_MAX_SCORE) catch null;
 }
 
 fn payloadTotals(
@@ -365,8 +348,8 @@ fn payloadTotalsScalar(
                 return error.S006InvalidQuality;
             };
             quality_sum += score;
-            if (score >= 20) q20_bases += 1;
-            if (score >= 30) q30_bases += 1;
+            if (score >= Q20_SCORE) q20_bases += 1;
+            if (score >= Q30_SCORE) q30_bases += 1;
         }
     }
     if (parts != .quality) {
@@ -408,10 +391,10 @@ fn payloadTotalsVector(
     const Mask = @Vector(vector_len, bool);
     const Lanes = @Vector(half_len, u16);
     const ReductionLanes = @Vector(half_len, u32);
-    const phred_offset: Bytes = @splat(33);
-    const maximum_score: Bytes = @splat(93);
-    const q20_score: Bytes = @splat(20);
-    const q30_score: Bytes = @splat(30);
+    const phred_offset: Bytes = @splat(fastq.PHRED_OFFSET);
+    const maximum_score: Bytes = @splat(fastq.PHRED_MAX_SCORE);
+    const q20_score: Bytes = @splat(Q20_SCORE);
+    const q30_score: Bytes = @splat(Q30_SCORE);
     const case_mask: Bytes = @splat(0xdf);
     const a_base: Bytes = @splat('A');
     const c_base: Bytes = @splat('C');
