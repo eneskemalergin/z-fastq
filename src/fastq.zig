@@ -1169,8 +1169,10 @@ pub const RecordSpan = struct {
     }
 };
 
-/// Streaming parser constructed with `init`; fields are implementation state.
-/// The copied source wrapper's referenced adapter must outlive the reader.
+/// Streaming parser constructed with `init` over a byte source, or with
+/// `initStreamReader` over a borrowed `std.Io.Reader`; fields are
+/// implementation state. The copied source wrapper's referenced adapter must
+/// outlive the reader.
 pub const Reader = struct {
     allocator: std.mem.Allocator,
     transport: Transport,
@@ -1395,21 +1397,33 @@ pub const Reader = struct {
         self: *Reader,
         validator: *AdaptiveRecordValidator,
     ) ReaderError!?ValidatedHeader {
-        self.beginFallbackRecord();
         var validation = FallbackValidation.init(validator);
+        if (!try self.ingestFallbackRecord(true, &validation, readValidatedFallbackLine)) return null;
+        validation.commit(validator);
+        const header = self.fallback_fields[0];
+        return .{
+            .header = header.storage[1..header.len],
+            .semantic_error = validation.result(),
+        };
+    }
+
+    /// Reads one record line by line through `readLine` (given `context`);
+    /// false at EOF before a record starts. `publish` makes its offsets the
+    /// current record's.
+    fn ingestFallbackRecord(
+        self: *Reader,
+        comptime publish: bool,
+        context: anytype,
+        comptime readLineWith: fn (*Reader, @TypeOf(context)) ReaderError!?Line,
+    ) ReaderError!bool {
+        self.beginFallbackRecord();
         while (true) {
-            const line = try self.readValidatedFallbackLine(&validation);
-            switch (try self.ingestLine(line)) {
-                .eof => return null,
+            switch (try self.ingestLine(try readLineWith(self, context))) {
+                .eof => return false,
                 .continue_ => {},
                 .record_ready => {
-                    self.current_record_offsets = self.record_offsets;
-                    validation.commit(validator);
-                    const header = self.fallback_fields[0];
-                    return .{
-                        .header = header.storage[1..header.len],
-                        .semantic_error = validation.result(),
-                    };
+                    if (publish) self.current_record_offsets = self.record_offsets;
+                    return true;
                 },
             }
         }
@@ -1418,33 +1432,23 @@ pub const Reader = struct {
     /// Reads one record line by line without retaining any field; `hook`
     /// receives its sequence and quality bytes.
     fn readStreamedRecord(self: *Reader, comptime Hook: type, hook: *Hook) ReaderError!bool {
-        self.beginFallbackRecord();
-        while (true) {
-            const line = try self.readLine(false, Hook, hook, null);
-            switch (try self.ingestLine(line)) {
-                .eof => return false,
-                .continue_ => {},
-                .record_ready => {
-                    self.current_record_offsets = self.record_offsets;
-                    return true;
-                },
+        return self.ingestFallbackRecord(true, hook, struct {
+            fn read(reader: *Reader, state: *Hook) ReaderError!?Line {
+                return reader.readLine(false, Hook, state, null);
             }
-        }
+        }.read);
     }
 
     fn readFallbackRecord(self: *Reader, comptime retained_fields: u4) ReaderError!bool {
-        self.beginFallbackRecord();
-        while (true) {
-            const line = try self.readFallbackLine(retained_fields);
-            switch (try self.ingestLine(line)) {
-                .eof => return false,
-                .continue_ => {},
-                .record_ready => {
-                    self.current_record_offsets = self.record_offsets;
-                    return true;
-                },
+        return self.ingestFallbackRecord(true, {}, retainingLines(retained_fields));
+    }
+
+    fn retainingLines(comptime retained_fields: u4) fn (*Reader, void) ReaderError!?Line {
+        return struct {
+            fn read(reader: *Reader, _: void) ReaderError!?Line {
+                return reader.readFallbackLine(retained_fields);
             }
-        }
+        }.read;
     }
 
     /// Consumes one record without returning its fields, or returns false at clean EOF.
@@ -1459,15 +1463,7 @@ pub const Reader = struct {
     }
 
     fn advanceFallback(self: *Reader) ReaderError!bool {
-        self.beginFallbackRecord();
-        while (true) {
-            const line = try self.readFallbackLine(0);
-            switch (try self.ingestLine(line)) {
-                .eof => return false,
-                .continue_ => {},
-                .record_ready => return true,
-            }
-        }
+        return self.ingestFallbackRecord(false, {}, retainingLines(0));
     }
 
     const IngestResult = enum {
@@ -1596,10 +1592,41 @@ pub const Reader = struct {
             .{ .record = payload };
     }
 
+    /// Moves past a complete record at `start` (the cursor) whose LFs are at
+    /// `ends` (relative): its line offsets, cursor, byte offset, index, and
+    /// sequence length. The caller has checked `end_offset` and `next_index`.
+    /// `current` says what the current record's offsets become.
+    inline fn commitRecord(
+        self: *Reader,
+        comptime current: enum { none, unchanged },
+        start: usize,
+        ends: [4]usize,
+        end_offset: u64,
+        next_index: u64,
+        sequence_len: usize,
+    ) void {
+        const offsets: RecordOffsets = .{
+            .header = self.byte_offset,
+            .sequence = self.byte_offset + ends[0] + 1,
+            .plus = self.byte_offset + ends[1] + 1,
+            .quality = self.byte_offset + ends[2] + 1,
+        };
+        self.record_offsets = offsets;
+        switch (current) {
+            .none => self.current_record_offsets = null,
+            .unchanged => {},
+        }
+        self.cursor = start + ends[3] + 1;
+        self.byte_offset = end_offset;
+        self.record_index = next_index;
+        self.machine.sequence_len = sequence_len;
+    }
+
     /// Takes a complete, valid record straight from the buffered bytes, with
     /// the same state changes as the general buffered path. Never refills;
-    /// null leaves the reader unchanged for the general path, which owns
-    /// refills, saved records, and error reporting.
+    /// null leaves the general path to refills, saved records, and error
+    /// reporting, and a failed scan sets `span_missed` so that path does not
+    /// repeat it.
     inline fn readRecordSpan(self: *Reader, validator: *AdaptiveRecordValidator) ?RecordSpan {
         if (self.span_missed or self.machine.expected != .header) return null;
         const buf = self.buf[0..self.fill_end];
@@ -1624,6 +1651,8 @@ pub const Reader = struct {
         for (ends) |end| canonical = canonical and buf[start + end - 1] != '\r';
         const span: RecordSpan = .{ .bytes = buf[start..][0..len], .line_ends = ends, .canonical = canonical };
 
+        // The commit is written out here rather than through `commitRecord`:
+        // this is the hottest record path, and the shared form costs it cycles.
         const offsets: RecordOffsets = .{
             .header = self.byte_offset,
             .sequence = self.byte_offset + ends[0] + 1,
@@ -1680,20 +1709,9 @@ pub const Reader = struct {
             plus[0..lineContentLen(plus)],
             lineContentLen(quality),
         )) return false;
-        const len = ends[3] + 1;
-        const end_offset = progressAfter(self.byte_offset, len) catch return false;
+        const end_offset = progressAfter(self.byte_offset, ends[3] + 1) catch return false;
         const next_index = std.math.add(u64, self.record_index, 1) catch return false;
-        self.record_offsets = .{
-            .header = self.byte_offset,
-            .sequence = self.byte_offset + ends[0] + 1,
-            .plus = self.byte_offset + ends[1] + 1,
-            .quality = self.byte_offset + ends[2] + 1,
-        };
-        self.current_record_offsets = null;
-        self.cursor = start + len;
-        self.byte_offset = end_offset;
-        self.record_index = next_index;
-        self.machine.sequence_len = sequence_len;
+        self.commitRecord(.none, start, ends, end_offset, next_index, sequence_len);
         self.span_missed = false;
         return true;
     }
@@ -1715,16 +1733,10 @@ pub const Reader = struct {
         );
         const next_offset = if (valid) self.offsetAfter(record_len) catch null else null;
         if (next_offset) |end_offset| {
-            // The checked end also bounds every intermediate line offset.
-            self.record_offsets = .{
-                .header = self.byte_offset,
-                .sequence = self.byte_offset + relative_ends[0] + 1,
-                .plus = self.byte_offset + relative_ends[1] + 1,
-                .quality = self.byte_offset + relative_ends[2] + 1,
-            };
-            self.cursor = record_start + record_len;
-            self.byte_offset = end_offset;
-            self.machine.sequence_len = sequence_len;
+            // The checked end also bounds every intermediate line offset. As on
+            // the line-by-line path, the record's bytes are consumed before
+            // its index can overflow.
+            self.commitRecord(.unchanged, record_start, relative_ends, end_offset, self.record_index, sequence_len);
             self.record_index = std.math.add(u64, self.record_index, 1) catch
                 return error.ArithmeticLimit;
             return;
@@ -2224,16 +2236,6 @@ pub fn nextRecordFields(reader: *Reader) ReaderError!?Record {
     return reader.nextRecord(&unused_canonical_span, false, false);
 }
 
-pub fn nextPayload(reader: *Reader) ReaderError!?RecordPayload {
-    return reader.readPayload();
-}
-
-/// Validate predicted quality as Phred+33 before advancing the reader again.
-/// On rejection, reread from the checkpoint to recover structural errors first.
-pub fn nextPredictedPayload(reader: *Reader) ReaderError!?PredictedPayload {
-    return reader.readPredictedPayload();
-}
-
 pub const PayloadOrStreamed = union(enum) {
     payload: PredictedPayload,
     /// The record was larger than what is buffered: its sequence and quality
@@ -2241,8 +2243,11 @@ pub const PayloadOrStreamed = union(enum) {
     streamed,
 };
 
-/// Like `nextPredictedPayload`, but a record that is not complete in the
-/// buffer streams through `hook` (see `readLine`) instead of being copied.
+/// The next record's sequence and quality, borrowed when the record is
+/// buffered; quality is predicted from the sequence length, so the caller
+/// validates it as Phred+33 and rereads from the checkpoint on rejection. A
+/// record that is not complete in the buffer streams through `hook` (see
+/// `readLine`) instead of being copied.
 pub fn nextPayloadOrStreamed(reader: *Reader, comptime Hook: type, hook: *Hook) ReaderError!?PayloadOrStreamed {
     reader.beginRecord();
     switch (try reader.readBufferedRecord(.predicted_payload, false, null, false)) {
@@ -3013,7 +3018,7 @@ fn expectPayloadProjection(
 
     while (true) {
         const full_result = full_reader.next();
-        const payload_result = nextPayload(&payload_reader);
+        const payload_result = payload_reader.readPayload();
         const record_result = nextRecordFields(&record_reader);
         const advance_result = advance_reader.advance();
         const validated_result = nextValidatedHeader(&validated_reader, &projected_validator);
@@ -3265,7 +3270,7 @@ test "[property] - [reader]: complete buffered records preserve per-line results
 }
 
 fn readPredictedPayloadForTest(reader: *Reader) ReaderError!?RecordPayload {
-    const predicted = try nextPredictedPayload(reader) orelse return null;
+    const predicted = try reader.readPredictedPayload() orelse return null;
     for (predicted.payload.quality) |byte| {
         if (byte < 33 or byte > 126) {
             if (predicted.checkpoint) |checkpoint| return try checkpoint.reread(reader);
@@ -3305,7 +3310,7 @@ fn expectPredictedPayloads(
     }
 
     while (true) {
-        const expected_result = nextPayload(&reference);
+        const expected_result = reference.readPayload();
         const actual_result = readPredictedPayloadForTest(&reader);
         var finished = false;
         if (expected_result) |expected| {
@@ -3399,7 +3404,7 @@ test "[unit] - [reader]: prediction and retry use the current buffer without all
             var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
             var reader = try Reader.init(failing.allocator(), source.byteSource(), .{});
             defer reader.deinit();
-            const predicted = (try nextPredictedPayload(&reader)).?;
+            const predicted = (try reader.readPredictedPayload()).?;
             try std.testing.expect(predicted.checkpoint != null);
             try std.testing.expectEqual(len, predicted.payload.sequence.len);
             try std.testing.expectEqual(len, predicted.payload.quality.len);
@@ -3419,7 +3424,7 @@ test "[unit] - [reader]: prediction and retry use the current buffer without all
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
     var reader = try Reader.init(failing.allocator(), source.byteSource(), .{});
     defer reader.deinit();
-    const predicted = (try nextPredictedPayload(&reader)).?;
+    const predicted = (try reader.readPredictedPayload()).?;
     try std.testing.expectEqualStrings("!\n!", predicted.payload.quality);
     try std.testing.expectError(error.S005LengthMismatch, predicted.checkpoint.?.reread(&reader));
     try std.testing.expectEqual(@as(u64, 9), reader.takeLastError().?.byte_offset);

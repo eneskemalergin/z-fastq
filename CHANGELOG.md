@@ -15,6 +15,8 @@ All notable changes to z-fastq will be documented in this file.
 - Fraction sampling validates records it does not select without copying them, and the streaming validator for sequence and quality lines longer than the read buffer uses AVX2 when the CPU has it: 5 to 25% less time for `sample` and single-file `check` on long reads, with no change in memory.
 - `stats` counts bases and quality scores of reads of 1 KiB or more with AVX2 when the CPU has it: about a quarter less time on long reads.
 - `stats` streams a record larger than the read buffer instead of copying it, so its peak memory no longer grows with read length (772 KiB on every input shape, from up to 1.8 MiB on 300 kb reads) and long reads take 5 to 25% less time; `stats` now allocates nothing per record.
+- Paired and interleaved fraction sampling draw each pair before reading it and validate unselected pairs without keeping them, and `check --interleaved` and `deinterleave` read a mate whose partner already failed only far enough to report it: on 300 kb read pairs, peak memory for `sample --paired` falls from 2.3 MiB to 0.8 MiB when few pairs are selected.
+- `-Dkernel-backend=portable` builds no AVX2 object and selects no kernel at run time; z-fastq's own kernels then use only the instructions of the build target, as Zipir's do.
 
 ### Added
 

@@ -38,12 +38,18 @@ pub const Fraction = union(enum) {
     }
 };
 
-pub fn parseSeed(text: []const u8) SeedError!u64 {
-    if (text.len == 0) return error.InvalidSeed;
+/// Parses a CLI decimal option: one or more ASCII digits, nothing else (no
+/// sign, prefix, separator, or space).
+pub fn parseDecimal(comptime T: type, text: []const u8) std.fmt.ParseIntError!T {
+    if (text.len == 0) return error.InvalidCharacter;
     for (text) |byte| {
-        if (byte < '0' or byte > '9') return error.InvalidSeed;
+        if (byte < '0' or byte > '9') return error.InvalidCharacter;
     }
-    return std.fmt.parseInt(u64, text, 10) catch |err| switch (err) {
+    return std.fmt.parseInt(T, text, 10);
+}
+
+pub fn parseSeed(text: []const u8) SeedError!u64 {
+    return parseDecimal(u64, text) catch |err| switch (err) {
         error.Overflow => error.Overflow,
         error.InvalidCharacter => error.InvalidSeed,
     };

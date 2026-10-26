@@ -16,6 +16,26 @@ pub const QualityError = struct {
 };
 
 /// Materialized counters and ratios; optional values are null for an empty population.
+/// A derived value kept as exact counts, so text output can round it without
+/// floating point; undefined when the denominator is zero.
+pub const Ratio = struct {
+    numerator: u128,
+    denominator: u128,
+
+    pub fn value(self: Ratio) ?f64 {
+        if (self.denominator == 0) return null;
+        return @as(f64, @floatFromInt(self.numerator)) / @as(f64, @floatFromInt(self.denominator));
+    }
+};
+
+pub const Ratios = struct {
+    mean_length: Ratio,
+    gc_fraction: Ratio,
+    mean_quality: Ratio,
+    q20_fraction: Ratio,
+    q30_fraction: Ratio,
+};
+
 pub const StatsResult = struct {
     reads: u64,
     bases: u64,
@@ -109,26 +129,40 @@ pub const Stats = struct {
 
     /// Materializes ratios without changing the accumulator.
     pub fn result(self: *const Stats) StatsResult {
-        const gc_bases = @as(u128, self.a) + self.c + self.g + self.t;
+        const exact = self.ratios();
         return .{
             .reads = self.reads,
             .bases = self.bases,
             .min_length = if (self.reads == 0) null else self.min_length,
             .max_length = if (self.reads == 0) null else self.max_length,
-            .mean_length = ratio(self.bases, self.reads),
+            .mean_length = exact.mean_length.value(),
             .a = self.a,
             .c = self.c,
             .g = self.g,
             .t = self.t,
             .n = self.n,
             .other_bases = self.other_bases,
-            .gc_fraction = ratioWide(@as(u128, self.g) + self.c, gc_bases),
+            .gc_fraction = exact.gc_fraction.value(),
             .quality_sum = self.quality_sum,
-            .mean_quality = ratio(self.quality_sum, self.bases),
+            .mean_quality = exact.mean_quality.value(),
             .q20_bases = self.q20_bases,
-            .q20_fraction = ratio(self.q20_bases, self.bases),
+            .q20_fraction = exact.q20_fraction.value(),
             .q30_bases = self.q30_bases,
-            .q30_fraction = ratio(self.q30_bases, self.bases),
+            .q30_fraction = exact.q30_fraction.value(),
+        };
+    }
+
+    /// Every ratio in `StatsResult` as exact counts, under the same names.
+    pub fn ratios(self: *const Stats) Ratios {
+        return .{
+            .mean_length = .{ .numerator = self.bases, .denominator = self.reads },
+            .gc_fraction = .{
+                .numerator = @as(u128, self.g) + self.c,
+                .denominator = @as(u128, self.a) + self.c + self.g + self.t,
+            },
+            .mean_quality = .{ .numerator = self.quality_sum, .denominator = self.bases },
+            .q20_fraction = .{ .numerator = self.q20_bases, .denominator = self.bases },
+            .q30_fraction = .{ .numerator = self.q30_bases, .denominator = self.bases },
         };
     }
 };
@@ -582,16 +616,6 @@ fn sumBaseLanes(
 
 fn add(left: u64, right: u64) error{Overflow}!u64 {
     return std.math.add(u64, left, right);
-}
-
-fn ratio(numerator: u64, denominator: u64) ?f64 {
-    if (denominator == 0) return null;
-    return @as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(denominator));
-}
-
-fn ratioWide(numerator: u128, denominator: u128) ?f64 {
-    if (denominator == 0) return null;
-    return @as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(denominator));
 }
 
 test "[unit] - [statistics]: quality accumulator width uses the checked bound" {

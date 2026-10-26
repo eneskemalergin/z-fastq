@@ -76,14 +76,6 @@ const USAGE =
     \\
 ;
 
-fn parseMaxLineBytes(value: []const u8) std.fmt.ParseIntError!usize {
-    if (value.len == 0) return error.InvalidCharacter;
-    for (value) |byte| {
-        if (byte < '0' or byte > '9') return error.InvalidCharacter;
-    }
-    return std.fmt.parseInt(usize, value, 10);
-}
-
 fn argumentError(io: std.Io, message: []const u8, exit_code: u8) noreturn {
     std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
     std.process.exit(exit_code);
@@ -117,18 +109,13 @@ fn validateRecordCommandInputs(
         return 2;
     }
 
-    var has_stdin = false;
-    for (inputs) |input| {
-        if (!std.mem.eql(u8, input, "-")) continue;
-        if (has_stdin) {
-            std.Io.File.writeStreamingAll(
-                .stderr(),
-                io,
-                "error: standard input may appear at most once\n",
-            ) catch {};
-            return 2;
-        }
-        has_stdin = true;
+    if (stdinRepeats(inputs)) {
+        std.Io.File.writeStreamingAll(
+            .stderr(),
+            io,
+            "error: standard input may appear at most once\n",
+        ) catch {};
+        return 2;
     }
     return null;
 }
@@ -138,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     var args = std.process.Args.Iterator.initAllocator(init.minimal.args, gpa) catch {
-        argumentError(io, "error: out of memory\n", 3);
+        argumentError(io, OUT_OF_MEMORY_LINE, 3);
     };
     defer args.deinit();
     _ = args.skip();
@@ -191,7 +178,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--")) {
             while (args.next()) |path| {
                 positional.append(gpa, path) catch {
-                    argumentError(io, "error: out of memory\n", 3);
+                    argumentError(io, OUT_OF_MEMORY_LINE, 3);
                 };
             }
             break;
@@ -203,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
             const value = args.next() orelse {
                 argumentError(io, "error: --max-line-bytes requires a value\n", 2);
             };
-            max_line_bytes = parseMaxLineBytes(value) catch |err| switch (err) {
+            max_line_bytes = sampling.parseDecimal(usize, value) catch |err| switch (err) {
                 error.Overflow => {
                     argumentError(io, "error: --max-line-bytes exceeds supported limit\n", 4);
                 },
@@ -334,7 +321,7 @@ pub fn main(init: std.process.Init) !void {
             argumentError(io, "\n", 2);
         }
         positional.append(gpa, arg) catch {
-            argumentError(io, "error: out of memory\n", 3);
+            argumentError(io, OUT_OF_MEMORY_LINE, 3);
         };
     }
 
@@ -420,6 +407,15 @@ const IO_FAILURE = CommandFailure.plain("io_error", "I/O error", 3);
 
 const LINE_LIMIT = CommandFailure.plain("line_limit", "line length limit exceeded", 4);
 
+const STATISTICS_LIMIT = CommandFailure.plain("arithmetic_limit", "statistics arithmetic limit exceeded", 4);
+
+const INSPECT_FAILURE = CommandFailure.plain("io_error", "failed to inspect file", 3);
+
+const RECORD_LOCATION_UNAVAILABLE = CommandFailure.plain("io_error", "record location is unavailable", 3);
+
+/// For failures reported before a command's input labels exist.
+const OUT_OF_MEMORY_LINE = "error: " ++ OUT_OF_MEMORY.message ++ "\n";
+
 const PAIR_DIAGNOSTIC_PREFIX_BYTES = 128;
 
 const BoundedBytes = struct {
@@ -478,6 +474,21 @@ const PairCountFailure = struct {
 const PairFailure = union(enum) {
     name_mismatch: PairNameFailure,
     count_mismatch: PairCountFailure,
+
+    /// Stable validation code, shared by text and JSON output.
+    fn code(self: PairFailure) []const u8 {
+        return switch (self) {
+            .name_mismatch => "P001",
+            .count_mismatch => "P002",
+        };
+    }
+
+    fn message(self: PairFailure) []const u8 {
+        return switch (self) {
+            .name_mismatch => "paired identifiers or mate markers do not match",
+            .count_mismatch => "paired input is missing a mate",
+        };
+    }
 };
 
 const PairCommandFailure = union(enum) {
@@ -528,11 +539,7 @@ fn mapCurrentSemanticFailure(
     record_index: u64,
 ) ?CommandFailure {
     const semantic_error = maybe_error orelse return null;
-    const offsets = reader.currentRecordOffsets() orelse return CommandFailure.plain(
-        "io_error",
-        "record location is unavailable",
-        3,
-    );
+    const offsets = reader.currentRecordOffsets() orelse return RECORD_LOCATION_UNAVAILABLE;
     return mapSemanticFailure(semantic_error, offsets, record_index);
 }
 
@@ -564,9 +571,14 @@ fn unwritableRecordFailure() CommandFailure {
     );
 }
 
+/// In interleaved input, mate 1 of pair `p` is record `2p`.
+fn interleavedPairIndex(mate1_record_index: u64) u64 {
+    return mate1_record_index / 2;
+}
+
 fn missingInterleavedMateFailure(record_index1: u64) PairCommandFailure {
     return .{ .pair = .{ .count_mismatch = .{
-        .pair_index = record_index1 / 2,
+        .pair_index = interleavedPairIndex(record_index1),
         .remaining_side = 0,
         .record_indexes = .{ record_index1, if (record_index1 == 0) null else record_index1 - 1 },
     } } };
@@ -647,13 +659,12 @@ fn printPairFailure(
         std.Io.File.writeStreamingAll(.stderr(), io, " + ") catch {};
         writeEscaped(.stderr(), io, inputs[1]);
     }
+    std.Io.File.writeStreamingAll(.stderr(), io, ": ") catch {};
+    std.Io.File.writeStreamingAll(.stderr(), io, failure.code()) catch {};
+    std.Io.File.writeStreamingAll(.stderr(), io, ": ") catch {};
+    std.Io.File.writeStreamingAll(.stderr(), io, failure.message()) catch {};
     switch (failure) {
         .name_mismatch => |details| {
-            std.Io.File.writeStreamingAll(
-                .stderr(),
-                io,
-                ": P001: paired identifiers or mate markers do not match",
-            ) catch {};
             var buf: [64]u8 = undefined;
             const pair = std.fmt.bufPrint(&buf, " (pair {d})\n", .{details.pair_index}) catch
                 return;
@@ -668,11 +679,6 @@ fn printPairFailure(
             }
         },
         .count_mismatch => |details| {
-            std.Io.File.writeStreamingAll(
-                .stderr(),
-                io,
-                ": P002: paired input is missing a mate",
-            ) catch {};
             var buf: [96]u8 = undefined;
             const prefix = std.fmt.bufPrint(
                 &buf,
@@ -757,7 +763,7 @@ fn printOutputFailure(io: std.Io) void {
     std.Io.File.writeStreamingAll(
         .stderr(),
         io,
-        "error: standard output: I/O error\n",
+        "error: standard output: " ++ IO_FAILURE.message ++ "\n",
     ) catch {};
 }
 
@@ -808,6 +814,11 @@ const FileIdentity = struct {
     device_major: u32,
     device_minor: u32,
     inode: u64,
+
+    // std.Io.File.Stat does not retain the device containing the inode, so identities come from statx.
+    fn of(stat: std.os.linux.Statx) FileIdentity {
+        return .{ .device_major = stat.dev_major, .device_minor = stat.dev_minor, .inode = stat.ino };
+    }
 };
 
 const GZIP_INPUT_BUFFER_BYTES = 64 * 1024;
@@ -879,7 +890,7 @@ fn initRecordInput(
     output_identity: ?FileIdentity,
 ) ?CommandFailure {
     const file = openRecordFile(io, label) catch |err| return inputOpenFailure(err);
-    const owns_file = !std.mem.eql(u8, label, "-");
+    const owns_file = !namesStdin(label);
     var transferred = false;
     defer if (!transferred and owns_file) file.close(io);
     if (outputFileFailure(io, file, output_identity)) |failure| return failure;
@@ -889,8 +900,24 @@ fn initRecordInput(
     return null;
 }
 
+/// The CLI names standard input `-`.
+fn namesStdin(label: []const u8) bool {
+    return std.mem.eql(u8, label, "-");
+}
+
+/// Standard input can be read only once, so it may be named only once.
+fn stdinRepeats(inputs: []const []const u8) bool {
+    var seen = false;
+    for (inputs) |label| {
+        if (!namesStdin(label)) continue;
+        if (seen) return true;
+        seen = true;
+    }
+    return false;
+}
+
 fn openRecordFile(io: std.Io, label: []const u8) std.Io.File.OpenError!std.Io.File {
-    if (std.mem.eql(u8, label, "-")) return .stdin();
+    if (namesStdin(label)) return .stdin();
     return std.Io.Dir.cwd().openFile(io, label, .{});
 }
 
@@ -909,19 +936,19 @@ fn initPairedRecordInputs(
     output_identity: ?FileIdentity,
 ) ?PairCommandFailure {
     for (inputs, 0..) |label, index| {
-        if (std.mem.eql(u8, label, "-")) {
+        if (namesStdin(label)) {
             // Opening a path could reuse descriptor 0 if stdin is closed.
             _ = fileIdentity(io, .stdin()) catch
                 return pairCommandFailure(@intCast(index), IO_FAILURE);
         }
     }
     var transferred = false;
-    const owns1 = !std.mem.eql(u8, inputs[0], "-");
+    const owns1 = !namesStdin(inputs[0]);
     const file1 = openRecordFile(io, inputs[0]) catch |err|
         return pairCommandFailure(0, inputOpenFailure(err));
     defer if (!transferred and owns1) file1.close(io);
 
-    const owns2 = !std.mem.eql(u8, inputs[1], "-");
+    const owns2 = !namesStdin(inputs[1]);
     var file2 = openNonblockingRecordFile(inputs[1]) catch |err|
         return pairCommandFailure(1, inputOpenFailure(err));
     defer if (!transferred and owns2) file2.close(io);
@@ -937,7 +964,7 @@ fn initPairedRecordInputs(
 }
 
 fn openNonblockingRecordFile(label: []const u8) std.posix.OpenError!std.Io.File {
-    if (std.mem.eql(u8, label, "-")) return .stdin();
+    if (namesStdin(label)) return .stdin();
     // R2's FIFO writer may wait for R1 to drain before opening R2.
     const handle = try std.posix.openat(std.Io.Dir.cwd().handle, label, .{
         .ACCMODE = .RDONLY,
@@ -970,9 +997,8 @@ fn prepareRecordFile(io: std.Io, file: *std.Io.File) (std.Io.Cancelable || error
 }
 
 fn fileIdentity(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!FileIdentity {
-    // std.Io.File.Stat does not retain the device containing the inode.
     const stat = try statRecordFile(io, file);
-    return .{ .device_major = stat.dev_major, .device_minor = stat.dev_minor, .inode = stat.ino };
+    return .of(stat);
 }
 
 fn statRecordFile(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!std.os.linux.Statx {
@@ -995,7 +1021,7 @@ fn stdoutFileIdentity(io: std.Io) (std.Io.Cancelable || error{Io})!?FileIdentity
         else => |other| return other,
     };
     if (stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG) return null;
-    return .{ .device_major = stat.dev_major, .device_minor = stat.dev_minor, .inode = stat.ino };
+    return .of(stat);
 }
 
 fn outputFileFailure(io: std.Io, file: std.Io.File, output_identity: ?FileIdentity) ?CommandFailure {
@@ -1011,11 +1037,7 @@ fn canReportInputFailure(io: std.Io, known_inputs: ?[]const FileIdentity) bool {
     const stat = statRecordFile(io, .stderr()) catch return false;
     // Without input identities, a regular stderr file could be an input.
     const inputs = known_inputs orelse return stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG;
-    const stderr_identity: FileIdentity = .{
-        .device_major = stat.dev_major,
-        .device_minor = stat.dev_minor,
-        .inode = stat.ino,
-    };
+    const stderr_identity: FileIdentity = .of(stat);
     for (inputs) |input| {
         if (std.meta.eql(input, stderr_identity)) return false;
     }
@@ -1029,7 +1051,7 @@ fn outputAliasFailure(io: std.Io, inputs: []const FileIdentity) CommandFailure {
 }
 
 fn inputInspectionFailure(io: std.Io, output_identity: ?FileIdentity) CommandFailure {
-    var failure = CommandFailure.plain("io_error", "failed to inspect file", 3);
+    var failure = INSPECT_FAILURE;
     if (output_identity != null) failure.suppress_diagnostic = !canReportInputFailure(io, null);
     return failure;
 }
@@ -1329,7 +1351,7 @@ fn runCount(
             .success => |count| count,
             .failure => |failure| {
                 if (std.mem.eql(u8, failure.code, "out_of_memory")) {
-                    std.Io.File.writeStreamingAll(.stderr(), io, "error: out of memory\n") catch {};
+                    std.Io.File.writeStreamingAll(.stderr(), io, OUT_OF_MEMORY_LINE) catch {};
                     return 3;
                 }
                 printCommandFailure(io, input, failure);
@@ -1406,7 +1428,7 @@ fn runStats(
             },
         };
 
-        printStats(io, input, stats.result(), printed_block) catch
+        printStats(io, input, &stats, printed_block) catch
             return @max(exit_code, 3);
         printed_block = true;
     }
@@ -1515,29 +1537,19 @@ fn statsFailure(stats: *zfastq.Stats, reader: *zfastq.Reader, err: statistics.St
                 );
             };
             const offsets = reader.currentRecordOffsets() orelse {
-                return CommandFailure.plain(
-                    "io_error",
-                    "record location is unavailable",
-                    3,
-                );
+                return RECORD_LOCATION_UNAVAILABLE;
             };
             const details = fastq.semanticParseError(
                 fastq.semanticQualityError(quality_error.byte_index),
                 reader.recordIndex() - 1,
                 offsets.quality,
-            ) catch return CommandFailure.plain(
-                "arithmetic_limit",
-                "statistics arithmetic limit exceeded",
-                4,
-            );
+            ) catch return INPUT_LOCATION_LIMIT;
             return CommandFailure.lint(details);
         },
+        // The Reader rejects unequal lengths as S005 before a record reaches
+        // the statistics; a panic keeps a broken invariant a defined crash.
         error.S005LengthMismatch => @panic("Reader returned unequal sequence and quality lengths"),
-        error.Overflow => return CommandFailure.plain(
-            "arithmetic_limit",
-            "statistics arithmetic limit exceeded",
-            4,
-        ),
+        error.Overflow => return STATISTICS_LIMIT,
     }
 }
 
@@ -1624,10 +1636,7 @@ fn validatePairedCheckInputs(
         std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
         return 2;
     }
-    if (pair_mode == .paired and
-        std.mem.eql(u8, inputs[0], "-") and
-        std.mem.eql(u8, inputs[1], "-"))
-    {
+    if (pair_mode == .paired and stdinRepeats(inputs)) {
         std.Io.File.writeStreamingAll(
             .stderr(),
             io,
@@ -1936,7 +1945,7 @@ inline fn verifyInterleavedPair(
     if (!names_match) {
         const name2 = pairing.parseName(header2, policy);
         return .{ .failure = .{ .pair = .{ .name_mismatch = .{
-            .pair_index = record_index1 / 2,
+            .pair_index = interleavedPairIndex(record_index1),
             .records = .{
                 if (both_headers_borrowed)
                     .init(
@@ -2045,6 +2054,35 @@ const ExactOutputCursor = struct {
     }
 };
 
+/// One unit (a record or a pair) of an exact-count second pass; a failed
+/// unit leaves its failure in the pass.
+const ExactUnit = enum { done, end, failed };
+
+/// The second pass of exact-count sampling: units in input order, selected
+/// ones written and the rest skipped; then no unit may follow and the inputs
+/// must be unchanged. `pass` reads its units with `write` and `skip`, checks
+/// for one more with `extra`, compares snapshots with `changed`, and names
+/// the failure for a changed input with `inputChanged`; failures go to
+/// `pass.failure`.
+inline fn runExactSecondPass(
+    comptime Failure: type,
+    cursor: *ExactOutputCursor,
+    expected_count: u64,
+    pass: anytype,
+) error{WriteFailed}!?Failure {
+    var next_selected = cursor.nextSelected();
+    while (cursor.unit_count < expected_count) {
+        const unit = if (cursor.selectNextCached(&next_selected)) try pass.write() else pass.skip();
+        if (unit != .done) break;
+        cursor.completeUnit();
+    }
+    if (pass.failure.* == null and cursor.unit_count == expected_count) pass.extra();
+    if (pass.changed()) |changed| return changed;
+    if (pass.failure.*) |details| return details;
+    if (cursor.unit_count != expected_count or !cursor.selectionComplete()) return pass.inputChanged();
+    return null;
+}
+
 fn exactSelectionFailure(err: sampling.ReservoirError) CommandFailure {
     return switch (err) {
         error.OutOfMemory => OUT_OF_MEMORY,
@@ -2107,7 +2145,7 @@ fn runSample(
         return 2;
     }
     const input = inputs[0];
-    if (mode == .count and std.mem.eql(u8, input, "-")) {
+    if (mode == .count and namesStdin(input)) {
         std.Io.File.writeStreamingAll(
             .stderr(),
             io,
@@ -2179,7 +2217,7 @@ fn runPairSampleCommand(
     switch (mode) {
         .count => {
             for (inputs) |input| {
-                if (!std.mem.eql(u8, input, "-")) continue;
+                if (!namesStdin(input)) continue;
                 std.Io.File.writeStreamingAll(
                     .stderr(),
                     io,
@@ -2188,10 +2226,7 @@ fn runPairSampleCommand(
                 return 2;
             }
         },
-        .fraction => if (options.pair_mode == .paired and
-            std.mem.eql(u8, inputs[0], "-") and
-            std.mem.eql(u8, inputs[1], "-"))
-        {
+        .fraction => if (options.pair_mode == .paired and stdinRepeats(inputs)) {
             std.Io.File.writeStreamingAll(
                 .stderr(),
                 io,
@@ -2211,7 +2246,7 @@ fn runPairSampleCommand(
                 std.Io.File.writeStreamingAll(
                     .stderr(),
                     io,
-                    "error: sample record staging size exceeds supported limit\n",
+                    "error: sample " ++ RECORD_STAGING_LIMIT.message ++ "\n",
                 ) catch {};
             }
             return 4;
@@ -2319,7 +2354,7 @@ fn sampleInterleavedSource(
 
     while (true) {
         var span1: ?fastq.RecordSpan = null;
-        if (interleavedSpanPairs(
+        if (splitSpanPairs(
             &reader,
             &validator,
             options.pair_name_policy,
@@ -2576,50 +2611,63 @@ fn sampleExactSecondPass(
         .select_all = select_all,
         .indexes = selected,
     };
-    var next_selected = cursor.nextSelected();
     var failure: ?CommandFailure = null;
-    while (cursor.unit_count < expected_count) {
-        if (cursor.selectNextCached(&next_selected)) {
-            const validated = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
-                failure = mapReaderFailure(&reader, err);
-                break;
-            } orelse break;
-            if (validated.semantic_error != null) {
-                failure = inputChangedFailure();
-                break;
-            }
-            const record = validated.record;
-            if (recordHasUnwritableEnding(record, validated.canonical_span)) {
-                failure = unwritableRecordFailure();
-                break;
-            }
-            try writeCheckedRecord(writer, null, record, validated.canonical_span);
-        } else {
-            const advanced = reader.advance() catch |err| {
-                failure = mapReaderFailure(&reader, err);
-                break;
-            };
-            if (!advanced) break;
-        }
-        cursor.completeUnit();
-    }
-    if (failure == null and cursor.unit_count == expected_count) {
-        if (reader.advance() catch |err| extra: {
-            failure = mapReaderFailure(&reader, err);
-            break :extra false;
-        }) {
-            failure = inputChangedFailure();
-        }
-    }
+    const Pass = struct {
+        reader: *zfastq.Reader,
+        validator: *fastq.AdaptiveRecordValidator,
+        writer: *zfastq.Writer,
+        input: *RecordInput,
+        io: std.Io,
+        snapshot: FileSnapshot,
+        failure: *?CommandFailure,
 
-    if (exactInputSnapshotFailure(input, io, expected_snapshot)) |snapshot_failure| {
-        return snapshot_failure;
-    }
-    if (failure) |details| return details;
-    if (cursor.unit_count != expected_count or !cursor.selectionComplete()) {
-        return inputChangedFailure();
-    }
-    return null;
+        fn fail(self: @This(), details: CommandFailure) ExactUnit {
+            self.failure.* = details;
+            return .failed;
+        }
+
+        inline fn write(self: @This()) error{WriteFailed}!ExactUnit {
+            const validated = fastq.nextValidatedRecord(self.reader, self.validator) catch |err| {
+                return self.fail(mapReaderFailure(self.reader, err));
+            } orelse return .end;
+            if (validated.semantic_error != null) return self.fail(inputChangedFailure());
+            if (recordHasUnwritableEnding(validated.record, validated.canonical_span)) {
+                return self.fail(unwritableRecordFailure());
+            }
+            try writeCheckedRecord(self.writer, null, validated.record, validated.canonical_span);
+            return .done;
+        }
+
+        inline fn skip(self: @This()) ExactUnit {
+            const advanced = self.reader.advance() catch |err| return self.fail(mapReaderFailure(self.reader, err));
+            return if (advanced) .done else .end;
+        }
+
+        fn extra(self: @This()) void {
+            const advanced = self.reader.advance() catch |err| {
+                _ = self.fail(mapReaderFailure(self.reader, err));
+                return;
+            };
+            if (advanced) _ = self.fail(inputChangedFailure());
+        }
+
+        fn changed(self: @This()) ?CommandFailure {
+            return exactInputSnapshotFailure(self.input, self.io, self.snapshot);
+        }
+
+        fn inputChanged(_: @This()) CommandFailure {
+            return inputChangedFailure();
+        }
+    };
+    return runExactSecondPass(CommandFailure, &cursor, expected_count, Pass{
+        .reader = &reader,
+        .validator = &validator,
+        .writer = writer,
+        .input = input,
+        .io = io,
+        .snapshot = expected_snapshot,
+        .failure = &failure,
+    });
 }
 
 fn fileSnapshot(
@@ -2912,109 +2960,98 @@ fn sampleExactPairedSecondPass(
         .select_all = select_all,
         .indexes = indexes,
     };
-    var next_selected = cursor.nextSelected();
     var failure: ?PairCommandFailure = null;
-    while (cursor.unit_count < expected_count) {
-        const selected = cursor.selectNextCached(&next_selected);
-        var canonical_span1: ?[]const u8 = null;
-        var record1: ?zfastq.Record = null;
-        var semantic1: ?zfastq.SemanticError = null;
-        const got1 = if (selected) selected_record: {
-            const validated = fastq.nextValidatedRecord(&reader1, &validator1) catch |err| failed: {
-                failure = pairCommandFailure(0, mapReaderFailure(&reader1, err));
-                break :failed null;
-            };
-            if (validated) |value| {
-                record1 = value.record;
-                canonical_span1 = value.canonical_span;
-                semantic1 = value.semantic_error;
-            }
-            break :selected_record record1 != null;
-        } else reader1.advance() catch |err| failed: {
-            failure = pairCommandFailure(0, mapReaderFailure(&reader1, err));
-            break :failed false;
-        };
-        if (failure != null) break;
+    const Pass = struct {
+        readers: [2]*zfastq.Reader,
+        validators: [2]*fastq.AdaptiveRecordValidator,
+        writer: *zfastq.Writer,
+        inputs: [2]*RecordInput,
+        io: std.Io,
+        snapshots: [2]FileSnapshot,
+        policy: pairing.NamePolicy,
+        failure: *?PairCommandFailure,
 
-        var canonical_span2: ?[]const u8 = null;
-        var record2: ?zfastq.Record = null;
-        var semantic2: ?zfastq.SemanticError = null;
-        const got2 = if (selected) selected_record: {
-            const validated = fastq.nextValidatedRecord(&reader2, &validator2) catch |err| failed: {
-                failure = pairCommandFailure(1, mapReaderFailure(&reader2, err));
-                break :failed null;
-            };
-            if (validated) |value| {
-                record2 = value.record;
-                canonical_span2 = value.canonical_span;
-                semantic2 = value.semantic_error;
-            }
-            break :selected_record record2 != null;
-        } else reader2.advance() catch |err| failed: {
-            failure = pairCommandFailure(1, mapReaderFailure(&reader2, err));
-            break :failed false;
-        };
-        if (failure != null) break;
-
-        if (!got1 or !got2) {
-            failure = if (got1 or got2)
-                inputChangedPairFailure(if (got1) 0 else 1)
-            else
-                inputChangedPairFailure(0);
-            break;
+        fn fail(self: @This(), details: PairCommandFailure) ExactUnit {
+            self.failure.* = details;
+            return .failed;
         }
-        if (selected) {
-            if (semantic1 != null) {
-                failure = inputChangedPairFailure(0);
-                break;
-            }
-            if (semantic2 != null) {
-                failure = inputChangedPairFailure(1);
-                break;
-            }
-            if (!pairing.headersMatch(record1.?.header, record2.?.header, options.pair_name_policy)) {
-                failure = inputChangedPairFailure(0);
-                break;
-            }
-            if (recordHasUnwritableEnding(record1.?, canonical_span1)) {
-                failure = pairCommandFailure(0, unwritableRecordFailure());
-                break;
-            }
-            if (recordHasUnwritableEnding(record2.?, canonical_span2)) {
-                failure = pairCommandFailure(1, unwritableRecordFailure());
-                break;
-            }
-            try writeCheckedRecord(writer, null, record1.?, canonical_span1);
-            try writeCheckedRecord(writer, null, record2.?, canonical_span2);
-        }
-        cursor.completeUnit();
-    }
 
-    if (failure == null and cursor.unit_count == expected_count) {
-        const extra1 = reader1.advance() catch |err| failed: {
-            failure = pairCommandFailure(0, mapReaderFailure(&reader1, err));
-            break :failed false;
-        };
-        if (failure == null) {
-            const extra2 = reader2.advance() catch |err| failed: {
-                failure = pairCommandFailure(1, mapReaderFailure(&reader2, err));
-                break :failed false;
-            };
-            if (failure == null and (extra1 or extra2)) {
-                failure = inputChangedPairFailure(if (extra1 != extra2)
-                    (if (extra1) 0 else 1)
-                else
-                    0);
+        fn write(self: @This()) error{WriteFailed}!ExactUnit {
+            var mates: [2]?fastq.ValidatedRecord = undefined;
+            for (&mates, 0..) |*mate, side| {
+                mate.* = fastq.nextValidatedRecord(self.readers[side], self.validators[side]) catch |err| {
+                    return self.fail(pairCommandFailure(@intCast(side), mapReaderFailure(self.readers[side], err)));
+                };
+            }
+            if (mates[0] == null or mates[1] == null) return self.fail(missingMate(mates[0] != null, mates[1] != null));
+            const mate1 = mates[0].?;
+            const mate2 = mates[1].?;
+            if (mate1.semantic_error != null) return self.fail(inputChangedPairFailure(0));
+            if (mate2.semantic_error != null) return self.fail(inputChangedPairFailure(1));
+            if (!pairing.headersMatch(mate1.record.header, mate2.record.header, self.policy)) {
+                return self.fail(inputChangedPairFailure(0));
+            }
+            if (recordHasUnwritableEnding(mate1.record, mate1.canonical_span)) {
+                return self.fail(pairCommandFailure(0, unwritableRecordFailure()));
+            }
+            if (recordHasUnwritableEnding(mate2.record, mate2.canonical_span)) {
+                return self.fail(pairCommandFailure(1, unwritableRecordFailure()));
+            }
+            try writeCheckedRecord(self.writer, null, mate1.record, mate1.canonical_span);
+            try writeCheckedRecord(self.writer, null, mate2.record, mate2.canonical_span);
+            return .done;
+        }
+
+        fn skip(self: @This()) ExactUnit {
+            var got: [2]bool = undefined;
+            for (&got, 0..) |*mate, side| {
+                mate.* = self.readers[side].advance() catch |err| {
+                    return self.fail(pairCommandFailure(@intCast(side), mapReaderFailure(self.readers[side], err)));
+                };
+            }
+            if (!got[0] or !got[1]) return self.fail(missingMate(got[0], got[1]));
+            return .done;
+        }
+
+        /// Blames the input that still has a record, or R1 when neither has.
+        fn missingMate(got1: bool, got2: bool) PairCommandFailure {
+            return inputChangedPairFailure(if (got1 != got2 and got2) 1 else 0);
+        }
+
+        fn extra(self: @This()) void {
+            var extra_mates: [2]bool = undefined;
+            for (&extra_mates, 0..) |*mate, side| {
+                mate.* = self.readers[side].advance() catch |err| {
+                    _ = self.fail(pairCommandFailure(@intCast(side), mapReaderFailure(self.readers[side], err)));
+                    return;
+                };
+            }
+            if (extra_mates[0] or extra_mates[1]) {
+                _ = self.fail(inputChangedPairFailure(if (extra_mates[0] != extra_mates[1] and extra_mates[1]) 1 else 0));
             }
         }
-    }
-    if (exactPairSnapshotFailure(input1, io, snapshots[0], 0)) |changed| return changed;
-    if (exactPairSnapshotFailure(input2, io, snapshots[1], 1)) |changed| return changed;
-    if (failure) |details| return details;
-    if (cursor.unit_count != expected_count or !cursor.selectionComplete()) {
-        return inputChangedPairFailure(0);
-    }
-    return null;
+
+        fn changed(self: @This()) ?PairCommandFailure {
+            for (self.inputs, self.snapshots, 0..) |input, snapshot, side| {
+                if (exactPairSnapshotFailure(input, self.io, snapshot, @intCast(side))) |changed_input| return changed_input;
+            }
+            return null;
+        }
+
+        fn inputChanged(_: @This()) PairCommandFailure {
+            return inputChangedPairFailure(0);
+        }
+    };
+    return runExactSecondPass(PairCommandFailure, &cursor, expected_count, Pass{
+        .readers = .{ &reader1, &reader2 },
+        .validators = .{ &validator1, &validator2 },
+        .writer = writer,
+        .inputs = .{ input1, input2 },
+        .io = io,
+        .snapshots = snapshots,
+        .policy = options.pair_name_policy,
+        .failure = &failure,
+    });
 }
 
 fn sampleExactInterleavedSecondPass(
@@ -3041,122 +3078,125 @@ fn sampleExactInterleavedSecondPass(
     });
     defer reader.deinit();
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
-    var staged_record: std.ArrayList(u8) = .empty;
-    defer staged_record.deinit(allocator);
-    var retained_record_storage: fastq.RetainedRecordStorage = .{};
-    defer retained_record_storage.deinit(allocator);
+    var mate1_storage: PreservedMate1 = .{};
+    defer mate1_storage.deinit(allocator);
 
     var cursor = ExactOutputCursor{
         .select_all = select_all,
         .indexes = indexes,
     };
-    var next_selected = cursor.nextSelected();
     var failure: ?PairCommandFailure = null;
-    while (cursor.unit_count < expected_count) {
-        const selected = cursor.selectNextCached(&next_selected);
-        if (!selected) {
-            const mate1 = reader.advance() catch |err| failed: {
-                failure = pairCommandFailure(0, mapReaderFailure(&reader, err));
-                break :failed false;
-            };
-            if (failure != null or !mate1) break;
-            const mate2 = reader.advance() catch |err| failed: {
-                failure = pairCommandFailure(0, mapReaderFailure(&reader, err));
-                break :failed false;
-            };
-            if (failure != null or !mate2) break;
-            cursor.completeUnit();
-            continue;
+    const Pass = struct {
+        allocator: std.mem.Allocator,
+        reader: *zfastq.Reader,
+        validator: *fastq.AdaptiveRecordValidator,
+        mate1_storage: *PreservedMate1,
+        staging_limit: usize,
+        writer: *zfastq.Writer,
+        input: *RecordInput,
+        io: std.Io,
+        snapshot: FileSnapshot,
+        policy: pairing.NamePolicy,
+        failure: *?PairCommandFailure,
+
+        fn fail(self: @This(), details: PairCommandFailure) ExactUnit {
+            self.failure.* = details;
+            return .failed;
         }
 
-        var validated1 = fastq.nextValidatedRecord(&reader, &validator) catch |err| failed: {
-            failure = pairCommandFailure(0, mapReaderFailure(&reader, err));
-            break :failed null;
-        } orelse break;
-
-        const invalid1 = validated1.semantic_error != null;
-        const header1_len = validated1.record.header.len;
-        const unwritable1 = recordHasUnwritableEnding(validated1.record, validated1.canonical_span);
-        var record1_storage: InterleavedFirstRecordStorage = .reader;
-        const paired_record2 = fastq.nextValidatedMatePreservingRecord(
-            &reader,
-            &validated1,
-            &validator,
-        ) catch |err| {
-            failure = pairCommandFailure(0, mapReaderFailure(&reader, err));
-            break;
-        };
-        const record1 = validated1.record;
-        const canonical_span1 = validated1.canonical_span;
-        const validated2 = paired_record2 orelse record: {
-            const preserved = nextAfterPreservingInterleavedMate1(
-                allocator,
-                &reader,
-                &retained_record_storage,
-                &staged_record,
-                record1,
-                canonical_span1,
-                staging_limit,
-                &validator,
-            ) catch |err| failed: {
-                failure = mapPreservedMateFailure(&reader, err);
-                break :failed null;
+        fn write(self: @This()) error{WriteFailed}!ExactUnit {
+            var validated1 = fastq.nextValidatedRecord(self.reader, self.validator) catch |err| {
+                return self.fail(pairCommandFailure(0, mapReaderFailure(self.reader, err)));
+            } orelse return .end;
+            const invalid1 = validated1.semantic_error != null;
+            const header1_len = validated1.record.header.len;
+            const unwritable1 = recordHasUnwritableEnding(validated1.record, validated1.canonical_span);
+            var record1_storage: InterleavedFirstRecordStorage = .reader;
+            const paired_record2 = fastq.nextValidatedMatePreservingRecord(self.reader, &validated1, self.validator) catch |err| {
+                return self.fail(pairCommandFailure(0, mapReaderFailure(self.reader, err)));
             };
-            if (failure != null) break :record null;
-            record1_storage = preserved.?.first_storage;
-            break :record preserved.?.record;
-        } orelse break;
-
-        const record2 = validated2.record;
-        const canonical_span2 = validated2.canonical_span;
-        if (invalid1 or validated2.semantic_error != null) {
-            failure = inputChangedPairFailure(0);
-            break;
-        }
-        const header1 = switch (record1_storage) {
-            .reader, .retained => record1.header,
-            .staged => staged_record.items[1 .. 1 + header1_len],
-        };
-        if (!pairing.headersMatch(header1, record2.header, options.pair_name_policy)) {
-            failure = inputChangedPairFailure(0);
-            break;
-        }
-        if (unwritable1 or recordHasUnwritableEnding(record2, canonical_span2)) {
-            failure = pairCommandFailure(0, unwritableRecordFailure());
-            break;
-        }
-        try writePreservedInterleavedMate1(
-            writer,
-            &reader,
-            &retained_record_storage,
-            staged_record.items,
-            record1,
-            canonical_span1,
-            record1_storage,
-        );
-        try writeCheckedRecord(writer, null, record2, canonical_span2);
-        cursor.completeUnit();
-    }
-
-    if (failure == null and cursor.unit_count == expected_count) {
-        const extra_mate1 = reader.advance() catch |err| failed: {
-            failure = pairCommandFailure(0, mapReaderFailure(&reader, err));
-            break :failed false;
-        };
-        if (failure == null and extra_mate1) {
-            _ = reader.advance() catch |err| failed: {
-                failure = pairCommandFailure(0, mapReaderFailure(&reader, err));
-                break :failed false;
+            const record1 = validated1.record;
+            const canonical_span1 = validated1.canonical_span;
+            const validated2 = paired_record2 orelse record: {
+                const preserved = nextAfterPreservingInterleavedMate1(
+                    self.allocator,
+                    self.reader,
+                    &self.mate1_storage.retained,
+                    &self.mate1_storage.staged_record,
+                    record1,
+                    canonical_span1,
+                    self.staging_limit,
+                    self.validator,
+                ) catch |err| return self.fail(mapPreservedMateFailure(self.reader, err));
+                record1_storage = preserved.first_storage;
+                break :record preserved.record orelse return .end;
             };
-            if (failure == null) failure = inputChangedPairFailure(0);
+            const record2 = validated2.record;
+            const canonical_span2 = validated2.canonical_span;
+            if (invalid1 or validated2.semantic_error != null) return self.fail(inputChangedPairFailure(0));
+            const header1 = switch (record1_storage) {
+                .reader, .retained => record1.header,
+                .staged => self.mate1_storage.staged_record.items[1 .. 1 + header1_len],
+            };
+            if (!pairing.headersMatch(header1, record2.header, self.policy)) return self.fail(inputChangedPairFailure(0));
+            if (unwritable1 or recordHasUnwritableEnding(record2, canonical_span2)) {
+                return self.fail(pairCommandFailure(0, unwritableRecordFailure()));
+            }
+            try self.mate1_storage.write(self.writer, self.reader, .{
+                .record1 = record1,
+                .canonical_span1 = canonical_span1,
+                .record1_storage = record1_storage,
+                .record2 = record2,
+                .canonical_span2 = canonical_span2,
+            });
+            try writeCheckedRecord(self.writer, null, record2, canonical_span2);
+            return .done;
         }
-    }
-    if (exactPairSnapshotFailure(input, io, snapshot, 0)) |changed| return changed;
-    if (failure) |details| return details;
-    if (cursor.unit_count != expected_count or !cursor.selectionComplete()) {
-        return inputChangedPairFailure(0);
-    }
-    return null;
+
+        fn skip(self: @This()) ExactUnit {
+            for (0..2) |_| {
+                const advanced = self.reader.advance() catch |err| {
+                    return self.fail(pairCommandFailure(0, mapReaderFailure(self.reader, err)));
+                };
+                if (!advanced) return .end;
+            }
+            return .done;
+        }
+
+        fn extra(self: @This()) void {
+            const extra_mate1 = self.reader.advance() catch |err| {
+                _ = self.fail(pairCommandFailure(0, mapReaderFailure(self.reader, err)));
+                return;
+            };
+            if (!extra_mate1) return;
+            _ = self.reader.advance() catch |err| {
+                _ = self.fail(pairCommandFailure(0, mapReaderFailure(self.reader, err)));
+                return;
+            };
+            _ = self.fail(inputChangedPairFailure(0));
+        }
+
+        fn changed(self: @This()) ?PairCommandFailure {
+            return exactPairSnapshotFailure(self.input, self.io, self.snapshot, 0);
+        }
+
+        fn inputChanged(_: @This()) PairCommandFailure {
+            return inputChangedPairFailure(0);
+        }
+    };
+    return runExactSecondPass(PairCommandFailure, &cursor, expected_count, Pass{
+        .allocator = allocator,
+        .reader = &reader,
+        .validator = &validator,
+        .mate1_storage = &mate1_storage,
+        .staging_limit = staging_limit,
+        .writer = writer,
+        .input = input,
+        .io = io,
+        .snapshot = snapshot,
+        .policy = options.pair_name_policy,
+        .failure = &failure,
+    });
 }
 
 fn initExactInput(
@@ -3203,10 +3243,8 @@ fn openExactInput(io: std.Io, path: []const u8, expected_snapshot: ?FileSnapshot
             inputChangedFailure()
         else if (expected_snapshot != null)
             CommandFailure.plain("io_error", "failed to reopen file", 3)
-        else if (err == error.FileNotFound)
-            CommandFailure.plain("io_error", "file not found", 3)
         else
-            CommandFailure.plain("io_error", "failed to open file", 3) };
+            inputOpenFailure(err) };
     };
     const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = true } };
     const snapshot = fileSnapshot(file, io) catch |err| {
@@ -3220,7 +3258,7 @@ fn openExactInput(io: std.Io, path: []const u8, expected_snapshot: ?FileSnapshot
                 3,
             )
         else
-            CommandFailure.plain("io_error", "failed to inspect file", 3) };
+            INSPECT_FAILURE };
     };
     if (expected_snapshot) |expected| {
         if (!sameFileSnapshot(expected, snapshot)) {
@@ -3288,7 +3326,7 @@ fn exactInputSnapshotFailure(
     expected: FileSnapshot,
 ) ?CommandFailure {
     const final = fileSnapshot(input.file, io) catch {
-        return CommandFailure.plain("io_error", "failed to inspect file", 3);
+        return INSPECT_FAILURE;
     };
     if (!sameFileSnapshot(expected, final)) return inputChangedFailure();
     return null;
@@ -3352,7 +3390,7 @@ fn runInterleave(
 /// Writes pairs straight from both readers' buffers until a mate needs the
 /// general path; `pending1` returns mate 1 when only it was taken. Kept out
 /// of line so the per-pair loop has its own small frame.
-noinline fn interleaveSpanPairs(
+noinline fn joinSpanPairs(
     writer: *zfastq.Writer,
     reader1: *zfastq.Reader,
     reader2: *zfastq.Reader,
@@ -3396,7 +3434,7 @@ fn validateInterleaveInputs(io: std.Io, inputs: []const []const u8) ?u8 {
         ) catch {};
         return 2;
     }
-    if (std.mem.eql(u8, inputs[0], "-") and std.mem.eql(u8, inputs[1], "-")) {
+    if (stdinRepeats(inputs)) {
         std.Io.File.writeStreamingAll(
             .stderr(),
             io,
@@ -3452,7 +3490,7 @@ fn interleaveSources(
 
     while (true) {
         var span1: ?fastq.RecordSpan = null;
-        if (try interleaveSpanPairs(
+        if (try joinSpanPairs(
             writer,
             &reader1,
             &reader2,
@@ -3576,7 +3614,7 @@ fn runDeinterleave(
     };
 
     const input_label = inputs[0];
-    const owns_input = !std.mem.eql(u8, input_label, "-");
+    const owns_input = !namesStdin(input_label);
     const input_file = openRecordFile(io, input_label) catch |err| {
         const failure = inputOpenFailure(err);
         printCommandFailure(io, input_label, failure);
@@ -3652,7 +3690,7 @@ fn validateDeinterleaveArguments(
         std.Io.File.writeStreamingAll(.stderr(), io, "error: deinterleave requires --out2\n") catch {};
         return null;
     };
-    if (std.mem.eql(u8, path1, "-") or std.mem.eql(u8, path2, "-")) {
+    if (namesStdin(path1) or namesStdin(path2)) {
         std.Io.File.writeStreamingAll(
             .stderr(),
             io,
@@ -3688,14 +3726,15 @@ fn deinterleaveSource(
     var mate1_storage: PreservedMate1 = .{};
     defer mate1_storage.deinit(allocator);
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
+    var every_pair: PairOutputSelector = .all;
 
     while (true) {
         var span1: ?fastq.RecordSpan = null;
-        if (try interleavedSpanPairs(
+        if (try splitSpanPairs(
             &reader,
             &validator,
             options.pair_name_policy,
-            null,
+            &every_pair,
             .{ writer1, writer2 },
             &span1,
         )) |failure| return failure;
@@ -3827,7 +3866,7 @@ fn readInterleavedPair(
             header1,
             validated2.record.header,
             policy,
-            record_index1 / 2,
+            interleavedPairIndex(record_index1),
             .{ record_index1, record_index2 },
             .{ offsets1.header, offsets2.header },
         ) };
@@ -3849,15 +3888,15 @@ fn readInterleavedPair(
 
 /// Takes interleaved pairs straight from the reader's buffer until a mate
 /// needs the general path; `pending1` returns mate 1 when only it was taken.
-/// Mate 1 goes to `writers[0]` and mate 2 to `writers[1]`; without a selection
-/// every pair is written. The selection draws once per pair, after both mates
-/// are taken, so a pair handed to the general path is drawn there. Kept out of
-/// line so the per-pair loop has its own small frame.
-noinline fn interleavedSpanPairs(
+/// Mate 1 goes to `writers[0]` and mate 2 to `writers[1]`. The selection
+/// draws once per pair, after both mates are taken and their names match, so
+/// a pair handed to the general path is drawn there. Kept out of line so the
+/// per-pair loop has its own small frame.
+noinline fn splitSpanPairs(
     reader: *zfastq.Reader,
     validator: *fastq.AdaptiveRecordValidator,
     policy: pairing.NamePolicy,
-    selection: ?*PairOutputSelector,
+    selection: *PairOutputSelector,
     writers: [2]*zfastq.Writer,
     pending1: *?fastq.RecordSpan,
 ) DeinterleaveWriteError!?PairCommandFailure {
@@ -3867,19 +3906,18 @@ noinline fn interleavedSpanPairs(
             pending1.* = mate1;
             return null;
         };
-        const selected = if (selection) |pairs| pairs.selectPair() else true;
         if (!pairing.headersMatch(mate1.header(), mate2.header(), policy)) {
             const record_index2 = reader.recordIndex() - 1;
             return headerNameMismatch(
                 mate1.header(),
                 mate2.header(),
                 policy,
-                (record_index2 - 1) / 2,
+                interleavedPairIndex(record_index2 - 1),
                 .{ record_index2 - 1, record_index2 },
                 .{ offset1, reader.currentRecordOffsets().?.header },
             );
         }
-        if (!selected) continue;
+        if (!selection.selectPair()) continue;
         if (!spanIsWritable(mate1) or !spanIsWritable(mate2)) {
             return pairCommandFailure(0, unwritableRecordFailure());
         }
@@ -3970,12 +4008,12 @@ fn writePairedCheckJsonResult(
 fn writePairJsonFailure(json: *std.json.Stringify, failure: PairFailure) !void {
     try json.objectField("error");
     try json.beginObject();
+    try json.objectField("code");
+    try json.write(failure.code());
+    try json.objectField("message");
+    try json.write(failure.message());
     switch (failure) {
         .name_mismatch => |details| {
-            try json.objectField("code");
-            try json.write("P001");
-            try json.objectField("message");
-            try json.write("paired identifiers or mate markers do not match");
             try json.objectField("pair_index");
             try json.write(details.pair_index);
             try json.objectField("record_indexes");
@@ -4000,10 +4038,6 @@ fn writePairJsonFailure(json: *std.json.Stringify, failure: PairFailure) !void {
             try json.endArray();
         },
         .count_mismatch => |details| {
-            try json.objectField("code");
-            try json.write("P002");
-            try json.objectField("message");
-            try json.write("paired input is missing a mate");
             try json.objectField("pair_index");
             try json.write(details.pair_index);
             try json.objectField("remaining_side");
@@ -4053,42 +4087,10 @@ fn writeStatsJsonResult(
             const result = stats.result();
             try json.objectField("status");
             try json.write("ok");
-            try json.objectField("reads");
-            try json.write(result.reads);
-            try json.objectField("bases");
-            try json.write(result.bases);
-            try json.objectField("min_length");
-            try json.write(result.min_length);
-            try json.objectField("max_length");
-            try json.write(result.max_length);
-            try json.objectField("mean_length");
-            try json.write(result.mean_length);
-            try json.objectField("a");
-            try json.write(result.a);
-            try json.objectField("c");
-            try json.write(result.c);
-            try json.objectField("g");
-            try json.write(result.g);
-            try json.objectField("t");
-            try json.write(result.t);
-            try json.objectField("n");
-            try json.write(result.n);
-            try json.objectField("other_bases");
-            try json.write(result.other_bases);
-            try json.objectField("gc_fraction");
-            try json.write(result.gc_fraction);
-            try json.objectField("quality_sum");
-            try json.write(result.quality_sum);
-            try json.objectField("mean_quality");
-            try json.write(result.mean_quality);
-            try json.objectField("q20_bases");
-            try json.write(result.q20_bases);
-            try json.objectField("q20_fraction");
-            try json.write(result.q20_fraction);
-            try json.objectField("q30_bases");
-            try json.write(result.q30_bases);
-            try json.objectField("q30_fraction");
-            try json.write(result.q30_fraction);
+            inline for (@typeInfo(zfastq.StatsResult).@"struct".fields) |field| {
+                try json.objectField(field.name);
+                try json.write(@field(result, field.name));
+            }
         },
     }
     try json.endObject();
@@ -4129,7 +4131,7 @@ fn printCount(io: std.Io, n: u64) !void {
 fn printStats(
     io: std.Io,
     label: []const u8,
-    result: zfastq.StatsResult,
+    stats: *const zfastq.Stats,
     separator: bool,
 ) !void {
     if (separator) try std.Io.File.writeStreamingAll(.stdout(), io, "\n");
@@ -4139,29 +4141,18 @@ fn printStats(
     var buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &buffer);
     const output = &stdout_writer.interface;
-    try writeUnsignedField(output, "reads", result.reads);
-    try writeUnsignedField(output, "bases", result.bases);
-    try writeOptionalUnsignedField(output, "min_length", result.min_length);
-    try writeOptionalUnsignedField(output, "max_length", result.max_length);
-    try writeRatioField(output, "mean_length", result.bases, result.reads);
-    try writeUnsignedField(output, "a", result.a);
-    try writeUnsignedField(output, "c", result.c);
-    try writeUnsignedField(output, "g", result.g);
-    try writeUnsignedField(output, "t", result.t);
-    try writeUnsignedField(output, "n", result.n);
-    try writeUnsignedField(output, "other_bases", result.other_bases);
-    try writeRatioField(
-        output,
-        "gc_fraction",
-        @as(u128, result.g) + result.c,
-        @as(u128, result.a) + result.c + result.g + result.t,
-    );
-    try writeUnsignedField(output, "quality_sum", result.quality_sum);
-    try writeRatioField(output, "mean_quality", result.quality_sum, result.bases);
-    try writeUnsignedField(output, "q20_bases", result.q20_bases);
-    try writeRatioField(output, "q20_fraction", result.q20_bases, result.bases);
-    try writeUnsignedField(output, "q30_bases", result.q30_bases);
-    try writeRatioField(output, "q30_fraction", result.q30_bases, result.bases);
+    const result = stats.result();
+    const ratios = stats.ratios();
+    // The fields and their order are the JSON document's.
+    inline for (@typeInfo(zfastq.StatsResult).@"struct".fields) |field| {
+        const value = @field(result, field.name);
+        switch (field.type) {
+            u64 => try writeUnsignedField(output, field.name, value),
+            ?u64 => try writeOptionalUnsignedField(output, field.name, value),
+            ?f64 => try writeRatioField(output, field.name, @field(ratios, field.name)),
+            else => @compileError("no text form for " ++ field.name),
+        }
+    }
     try output.flush();
 }
 
@@ -4174,12 +4165,14 @@ fn writeOptionalUnsignedField(output: *std.Io.Writer, name: []const u8, value: ?
     try output.print("{s}: -\n", .{name});
 }
 
+/// Rounds the exact ratio to six decimals, so text output never depends on floating point.
 fn writeRatioField(
     output: *std.Io.Writer,
     name: []const u8,
-    numerator: u128,
-    denominator: u128,
+    ratio: statistics.Ratio,
 ) !void {
+    const numerator = ratio.numerator;
+    const denominator = ratio.denominator;
     var buf: [96]u8 = undefined;
     if (denominator == 0) {
         const line = try std.fmt.bufPrint(&buf, "{s}: -\n", .{name});
