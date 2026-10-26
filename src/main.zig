@@ -10,7 +10,7 @@ const statistics = @import("stats.zig");
 
 pub const std_options: std.Options = .{ .networking = false };
 
-const Command = enum { count, stats, check, sample, interleave, deinterleave };
+const Command = enum { count, stats, check, sample, interleave, deinterleave, process };
 
 const USAGE =
     \\usage: z-fastq <command> [options] [args...]
@@ -22,6 +22,7 @@ const USAGE =
     \\  sample        Select records by deterministic probability or exact count
     \\  interleave    Validate and interleave paired FASTQ inputs
     \\  deinterleave  Validate and separate interleaved paired FASTQ input
+    \\  process       Validate paired FASTQ inputs into two plain or gzip outputs
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -45,6 +46,11 @@ const USAGE =
     \\  --fraction P         Use 0, 1, 0.DIGITS, or 1.ZEROES
     \\  --count K            Select exactly min(K, records or pairs) from paths
     \\  --seed S             Use an unsigned decimal u64 seed (default 11)
+    \\
+    \\Process options:
+    \\  --gzip               Write both outputs as gzip
+    \\  --max-pairs N        Stop after the first N pairs
+    \\  --report PATH        Write a z-fastq/process-v1 JSON report (- for stdout)
     \\
     \\Count usage:
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
@@ -70,6 +76,9 @@ const USAGE =
     \\
     \\Deinterleave usage:
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
+    \\
+    \\Process usage:
+    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 
@@ -105,6 +114,8 @@ const GivenOptions = struct {
     pair_names: bool = false,
     out1: bool = false,
     out2: bool = false,
+    report: bool = false,
+    max_pairs: bool = false,
 };
 
 fn optionValue(
@@ -181,6 +192,8 @@ pub fn main(init: std.process.Init) !void {
         .interleave
     else if (std.mem.eql(u8, cmd, "deinterleave"))
         .deinterleave
+    else if (std.mem.eql(u8, cmd, "process"))
+        .process
     else {
         std.Io.File.writeStreamingAll(.stderr(), io, "error: unknown command: ") catch {};
         writeEscaped(.stderr(), io, cmd);
@@ -199,6 +212,9 @@ pub fn main(init: std.process.Init) !void {
     var sample_seed: u64 = 11;
     var output1: ?[]const u8 = null;
     var output2: ?[]const u8 = null;
+    var report_path: ?[]const u8 = null;
+    var gzip_output = false;
+    var max_pairs: ?u64 = null;
     var given: GivenOptions = .{};
     var positional = std.ArrayList([]const u8).empty;
     defer positional.deinit(gpa);
@@ -232,7 +248,7 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
         if ((command == .check or command == .sample or command == .interleave or
-            command == .deinterleave) and
+            command == .deinterleave or command == .process) and
             std.mem.eql(u8, arg, "--alphabet"))
         {
             const value = optionValue(io, &args, &given.alphabet, "--alphabet");
@@ -295,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
         if ((command == .check or command == .sample or command == .interleave or
-            command == .deinterleave) and
+            command == .deinterleave or command == .process) and
             std.mem.eql(u8, arg, "--pair-names"))
         {
             const value = optionValue(io, &args, &given.pair_names, "--pair-names");
@@ -309,7 +325,7 @@ pub fn main(init: std.process.Init) !void {
             pair_names_set = true;
             continue;
         }
-        if (command == .deinterleave and
+        if ((command == .deinterleave or command == .process) and
             (std.mem.eql(u8, arg, "--out1") or std.mem.eql(u8, arg, "--out2")))
         {
             if (std.mem.eql(u8, arg, "--out1")) {
@@ -317,6 +333,26 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 output2 = optionValue(io, &args, &given.out2, "--out2");
             }
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--gzip")) {
+            gzip_output = true;
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--report")) {
+            report_path = optionValue(io, &args, &given.report, "--report");
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--max-pairs")) {
+            const value = optionValue(io, &args, &given.max_pairs, "--max-pairs");
+            max_pairs = sampling.parseDecimal(u64, value) catch |err| switch (err) {
+                error.Overflow => {
+                    argumentError(io, "error: --max-pairs exceeds supported limit\n", 4);
+                },
+                error.InvalidCharacter => {
+                    argumentError(io, "error: invalid --max-pairs value\n", 2);
+                },
+            };
             continue;
         }
         if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
@@ -371,6 +407,16 @@ pub fn main(init: std.process.Init) !void {
             .max_line_bytes = max_line_bytes,
             .alphabet = alphabet,
             .pair_name_policy = pair_name_policy,
+        }),
+        .process => runProcess(io, gpa, positional.items, .{
+            .max_line_bytes = max_line_bytes,
+            .alphabet = alphabet,
+            .pair_name_policy = pair_name_policy,
+            .output1 = output1,
+            .output2 = output2,
+            .report = report_path,
+            .gzip = gzip_output,
+            .max_pairs = max_pairs,
         }),
     };
     std.process.exit(code);
@@ -3457,31 +3503,37 @@ const DeinterleaveWriteError = error{
     Output2WriteFailed,
 };
 
-const DeinterleaveOutput = struct {
+const RecordOutput = struct {
     path: []const u8,
     file: ?std.Io.File = null,
     write_buffer: [RECORD_OUTPUT_BUFFER_BYTES]u8 = undefined,
     sink: io_layer.FileSink = undefined,
+    gzip: ?*io_layer.GzipSink = null,
     writer: zfastq.Writer = undefined,
 
-    fn init(path: []const u8) DeinterleaveOutput {
+    fn init(path: []const u8) RecordOutput {
         return .{ .path = path };
     }
 
-    fn create(self: *DeinterleaveOutput, io: std.Io) ?CommandFailure {
-        const file = std.Io.Dir.cwd().createFile(io, self.path, .{ .exclusive = true }) catch |err| {
-            return if (err == error.PathAlreadyExists)
-                CommandFailure.plain("io_error", "output path already exists", 3)
-            else
-                CommandFailure.plain("io_error", "failed to create output", 3);
-        };
-        self.file = file;
+    fn create(self: *RecordOutput, io: std.Io) ?CommandFailure {
+        if (createExclusiveOutput(io, self.path, &self.file)) |failure| return failure;
+        const file = self.file.?;
         self.sink = io_layer.FileSink.init(io, file, &self.write_buffer);
-        self.writer = zfastq.Writer.init(self.sink.byteSink());
+        if (self.gzip) |gzip| {
+            gzip.init(&self.sink.writer) catch return IO_FAILURE;
+            self.writer = zfastq.Writer.init(gzip.byteSink());
+        } else {
+            self.writer = zfastq.Writer.init(self.sink.byteSink());
+        }
         return null;
     }
 
-    fn close(self: *DeinterleaveOutput, io: std.Io) void {
+    fn finish(self: *RecordOutput) error{WriteFailed}!void {
+        if (self.gzip) |gzip| try gzip.finish();
+        self.sink.writer.flush() catch return error.WriteFailed;
+    }
+
+    fn close(self: *RecordOutput, io: std.Io) void {
         if (self.file) |file| file.close(io);
         self.file = null;
     }
@@ -3512,9 +3564,9 @@ fn runDeinterleave(
         return failure.exit_code;
     }
 
-    var output1 = DeinterleaveOutput.init(paths[0]);
+    var output1 = RecordOutput.init(paths[0]);
     defer output1.close(io);
-    var output2 = DeinterleaveOutput.init(paths[1]);
+    var output2 = RecordOutput.init(paths[1]);
     defer output2.close(io);
     if (output1.create(io)) |failure| {
         printCommandFailure(io, output1.path, failure);
@@ -3801,7 +3853,429 @@ fn flushDeinterleaveWriters(
     writer2.flush() catch return error.Output2WriteFailed;
 }
 
-fn beginJsonDocument(json: *std.json.Stringify, schema: []const u8) !void {
+const ProcessOptions = struct {
+    max_line_bytes: usize,
+    alphabet: zfastq.Alphabet,
+    pair_name_policy: pairing.NamePolicy,
+    output1: ?[]const u8,
+    output2: ?[]const u8,
+    report: ?[]const u8,
+    gzip: bool,
+    max_pairs: ?u64,
+};
+
+const ProcessCounts = struct {
+    read: u64 = 0,
+    written: u64 = 0,
+    input_complete: bool = false,
+};
+
+fn runProcess(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inputs: []const []const u8,
+    options: ProcessOptions,
+) u8 {
+    const paths = validateProcessArguments(io, inputs, options) orelse return 2;
+    const report_to_stdout = if (options.report) |path| namesStdin(path) else false;
+    const output_identity: ?FileIdentity = if (report_to_stdout)
+        checkedStdoutIdentity(io) catch return 3
+    else
+        null;
+
+    var input1: RecordInput = undefined;
+    var input2: RecordInput = undefined;
+    if (initPairedRecordInputs(&input1, &input2, io, inputs, output_identity)) |failure| {
+        printPairCommandFailure(io, inputs, .paired, failure);
+        return failure.exitCode();
+    }
+    defer input1.deinit(io);
+    defer input2.deinit(io);
+    const snapshots = [2]?FileSnapshot{
+        fileSnapshot(input1.file, io) catch null,
+        fileSnapshot(input2.file, io) catch null,
+    };
+
+    var gzip_sinks: [2]?*io_layer.GzipSink = .{ null, null };
+    defer for (gzip_sinks) |slot| if (slot) |sink| allocator.destroy(sink);
+    if (options.gzip) for (&gzip_sinks) |*slot| {
+        slot.* = allocator.create(io_layer.GzipSink) catch {
+            writeStderr(io, OUT_OF_MEMORY_LINE);
+            return OUT_OF_MEMORY.exit_code;
+        };
+    };
+
+    var outputs = [2]RecordOutput{ .init(paths[0]), .init(paths[1]) };
+    defer for (&outputs) |*output| output.close(io);
+    for (&outputs, gzip_sinks, 0..) |*output, gzip_sink, index| {
+        output.gzip = gzip_sink;
+        if (output.create(io)) |failure| {
+            removeCreatedOutputs(io, outputs[0..index]);
+            printCommandFailure(io, output.path, failure);
+            return failure.exit_code;
+        }
+    }
+    var report_file: ?std.Io.File = null;
+    defer if (report_file) |file| file.close(io);
+    if (options.report) |path| if (!report_to_stdout) {
+        if (createExclusiveOutput(io, path, &report_file)) |failure| {
+            removeCreatedOutputs(io, &outputs);
+            printCommandFailure(io, path, failure);
+            return failure.exit_code;
+        }
+    };
+
+    var stats = [2]zfastq.Stats{ .{}, .{} };
+    var counts: ProcessCounts = .{};
+    var failed_output: ?u1 = null;
+    const input_failure = processSources(
+        allocator,
+        .{ input1.stream(), input2.stream() },
+        .{ &outputs[0].writer, &outputs[1].writer },
+        &stats,
+        &counts,
+        options,
+    ) catch |err| failure: {
+        failed_output = if (err == error.Output1WriteFailed) 0 else 1;
+        break :failure null;
+    };
+
+    var exit_code: u8 = 0;
+    if (input_failure) |failure| {
+        printPairCommandFailure(io, inputs, .paired, failure);
+        exit_code = failure.exitCode();
+    }
+    if (failed_output) |index| {
+        printPathError(io, outputs[index].path, IO_FAILURE.message);
+        exit_code = @max(exit_code, IO_FAILURE.exit_code);
+    }
+    for (&outputs, 0..) |*output, index| {
+        if (failed_output != null and failed_output.? == index) continue;
+        output.finish() catch {
+            printPathError(io, output.path, IO_FAILURE.message);
+            exit_code = @max(exit_code, IO_FAILURE.exit_code);
+            if (failed_output == null) failed_output = @intCast(index);
+        };
+    }
+
+    const report_path = options.report orelse return exit_code;
+    const report: ProcessReport = .{
+        .inputs = inputs,
+        .snapshots = snapshots,
+        .outputs = paths,
+        .options = options,
+        .status_ok = exit_code == 0,
+        .counts = counts,
+        .stats = &stats,
+        .input_failure = input_failure,
+        .failed_output = if (failed_output) |index| paths[index] else null,
+    };
+    var report_buffer: [JSON_OUTPUT_BUFFER_BYTES]u8 = undefined;
+    var report_writer = if (report_file) |file|
+        file.writerStreaming(io, &report_buffer)
+    else
+        std.Io.File.stdout().writerStreaming(io, &report_buffer);
+    var json: std.json.Stringify = .{ .writer = &report_writer.interface };
+    writeProcessReport(&json, report) catch return reportFailed(io, report_path, report_to_stdout, exit_code);
+    report_writer.interface.flush() catch return reportFailed(io, report_path, report_to_stdout, exit_code);
+    return exit_code;
+}
+
+fn reportFailed(io: std.Io, path: []const u8, to_stdout: bool, exit_code: u8) u8 {
+    if (to_stdout) return stdoutFailed(io, exit_code);
+    printPathError(io, path, IO_FAILURE.message);
+    return @max(exit_code, IO_FAILURE.exit_code);
+}
+
+fn validateProcessArguments(
+    io: std.Io,
+    inputs: []const []const u8,
+    options: ProcessOptions,
+) ?[2][]const u8 {
+    if (inputs.len != 2) {
+        writeStderr(io, "error: process requires exactly two inputs\n");
+        return null;
+    }
+    if (stdinRepeats(inputs)) {
+        writeStderr(io, "error: process inputs may contain standard input at most once\n");
+        return null;
+    }
+    const path1 = options.output1 orelse {
+        writeStderr(io, "error: process requires --out1\n");
+        return null;
+    };
+    const path2 = options.output2 orelse {
+        writeStderr(io, "error: process requires --out2\n");
+        return null;
+    };
+    if (namesStdin(path1) or namesStdin(path2)) {
+        writeStderr(io, "error: process output paths cannot be standard output\n");
+        return null;
+    }
+    if (!options.gzip) {
+        if (std.mem.endsWith(u8, path1, ".gz")) {
+            writeStderr(io, "error: --out1 names a .gz file but --gzip is not given\n");
+            return null;
+        }
+        if (std.mem.endsWith(u8, path2, ".gz")) {
+            writeStderr(io, "error: --out2 names a .gz file but --gzip is not given\n");
+            return null;
+        }
+    }
+    const report = options.report orelse "-";
+    if (std.mem.eql(u8, path1, path2) or
+        std.mem.eql(u8, report, path1) or
+        std.mem.eql(u8, report, path2))
+    {
+        writeStderr(io, "error: process output paths must differ\n");
+        return null;
+    }
+    return .{ path1, path2 };
+}
+
+fn createExclusiveOutput(io: std.Io, path: []const u8, created: *?std.Io.File) ?CommandFailure {
+    created.* = std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true }) catch |err| {
+        return if (err == error.PathAlreadyExists)
+            CommandFailure.plain("io_error", "output path already exists", 3)
+        else
+            CommandFailure.plain("io_error", "failed to create output", 3);
+    };
+    return null;
+}
+
+fn removeCreatedOutputs(io: std.Io, outputs: []RecordOutput) void {
+    for (outputs) |*output| {
+        output.close(io);
+        std.Io.Dir.cwd().deleteFile(io, output.path) catch {};
+    }
+}
+
+const ProcessPairs = struct {
+    reader1: *zfastq.Reader,
+    reader2: *zfastq.Reader,
+    validator1: *fastq.AdaptiveRecordValidator,
+    validator2: *fastq.AdaptiveRecordValidator,
+    writers: [2]*zfastq.Writer,
+    stats: *[2]zfastq.Stats,
+    counts: *ProcessCounts,
+    max_pairs: ?u64,
+    policy: pairing.NamePolicy,
+
+    fn atCap(self: *const ProcessPairs) bool {
+        const cap = self.max_pairs orelse return false;
+        return self.counts.read == cap;
+    }
+
+    fn emit(
+        self: *ProcessPairs,
+        records: [2]zfastq.Record,
+        spans: [2]?[]const u8,
+    ) DeinterleaveWriteError!?PairCommandFailure {
+        self.counts.read += 1;
+        for (self.stats, records, [_]*zfastq.Reader{ self.reader1, self.reader2 }, 0..) |*mate_stats, record, reader, index| {
+            mate_stats.addRecord(record) catch |err| {
+                return pairCommandFailure(@intCast(index), statsFailure(mate_stats, reader, err));
+            };
+        }
+        writeCheckedRecord(self.writers[0], records[0], spans[0]) catch return error.Output1WriteFailed;
+        writeCheckedRecord(self.writers[1], records[1], spans[1]) catch return error.Output2WriteFailed;
+        self.counts.written += 1;
+        return null;
+    }
+};
+
+noinline fn processSpanPairs(
+    pairs: *ProcessPairs,
+    pending1: *?fastq.RecordSpan,
+) DeinterleaveWriteError!?PairCommandFailure {
+    while (!pairs.atCap()) {
+        const mate1 = fastq.nextRecordSpan(pairs.reader1, pairs.validator1) orelse return null;
+        const mate2 = fastq.nextRecordSpan(pairs.reader2, pairs.validator2) orelse {
+            pending1.* = mate1;
+            return null;
+        };
+        if (!pairing.headersMatch(mate1.header(), mate2.header(), pairs.policy)) {
+            const record_index1 = pairs.reader1.recordIndex() - 1;
+            return headerNameMismatch(
+                mate1.header(),
+                mate2.header(),
+                pairs.policy,
+                record_index1,
+                .{ record_index1, pairs.reader2.recordIndex() - 1 },
+                .{ pairs.reader1.currentRecordOffsets().?.header, pairs.reader2.currentRecordOffsets().?.header },
+            );
+        }
+        if (!spanIsWritable(mate1)) return pairCommandFailure(0, unwritableRecordFailure());
+        if (!spanIsWritable(mate2)) return pairCommandFailure(1, unwritableRecordFailure());
+        if (try pairs.emit(
+            .{ mate1.record(), mate2.record() },
+            .{ if (mate1.canonical) mate1.bytes else null, if (mate2.canonical) mate2.bytes else null },
+        )) |failure| return failure;
+    }
+    return null;
+}
+
+fn processSources(
+    allocator: std.mem.Allocator,
+    sources: [2]*std.Io.Reader,
+    writers: [2]*zfastq.Writer,
+    stats: *[2]zfastq.Stats,
+    counts: *ProcessCounts,
+    options: ProcessOptions,
+) DeinterleaveWriteError!?PairCommandFailure {
+    const reader_options: fastq.ReaderOptions = .{ .max_line_bytes = options.max_line_bytes };
+    var reader1 = fastq.initStreamReader(allocator, sources[0], reader_options);
+    defer reader1.deinit();
+    var reader2 = fastq.initStreamReader(allocator, sources[1], reader_options);
+    defer reader2.deinit();
+    var validator1 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
+    var validator2 = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
+    var pairs: ProcessPairs = .{
+        .reader1 = &reader1,
+        .reader2 = &reader2,
+        .validator1 = &validator1,
+        .validator2 = &validator2,
+        .writers = writers,
+        .stats = stats,
+        .counts = counts,
+        .max_pairs = options.max_pairs,
+        .policy = options.pair_name_policy,
+    };
+
+    while (true) {
+        var span1: ?fastq.RecordSpan = null;
+        if (try processSpanPairs(&pairs, &span1)) |failure| return failure;
+        if (pairs.atCap()) return null;
+        var next1 = if (span1) |mate1| fastq.validatedSpan(mate1) else fastq.nextValidatedRecord(&reader1, &validator1) catch |err| {
+            return pairCommandFailure(0, mapReaderFailure(&reader1, err));
+        };
+        var next2 = fastq.nextValidatedRecord(&reader2, &validator2) catch |err| {
+            return pairCommandFailure(1, mapReaderFailure(&reader2, err));
+        };
+        const maybe1: ?*const fastq.ValidatedRecord = if (next1) |*value| value else null;
+        const maybe2: ?*const fastq.ValidatedRecord = if (next2) |*value| value else null;
+        switch (verifyPair(
+            &reader1,
+            &reader2,
+            if (maybe1) |mate1| mate1.validatedHeader() else null,
+            if (maybe2) |mate2| mate2.validatedHeader() else null,
+            options.pair_name_policy,
+        )) {
+            .end => {
+                counts.input_complete = true;
+                return null;
+            },
+            .failure => |failure| return failure,
+            .pair => {},
+        }
+        const mate1 = maybe1.?;
+        const mate2 = maybe2.?;
+        if (recordHasUnwritableEnding(mate1.record, mate1.canonical_span)) {
+            return pairCommandFailure(0, unwritableRecordFailure());
+        }
+        if (recordHasUnwritableEnding(mate2.record, mate2.canonical_span)) {
+            return pairCommandFailure(1, unwritableRecordFailure());
+        }
+        if (try pairs.emit(
+            .{ mate1.record, mate2.record },
+            .{ mate1.canonical_span, mate2.canonical_span },
+        )) |failure| return failure;
+    }
+}
+
+const ProcessReport = struct {
+    inputs: []const []const u8,
+    snapshots: [2]?FileSnapshot,
+    outputs: [2][]const u8,
+    options: ProcessOptions,
+    status_ok: bool,
+    counts: ProcessCounts,
+    stats: *const [2]zfastq.Stats,
+    input_failure: ?PairCommandFailure,
+    failed_output: ?[]const u8,
+};
+
+fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
+    try writeJsonHeader(json, "z-fastq/process-v1");
+    try json.objectField("options");
+    try json.beginObject();
+    try json.objectField("gzip");
+    try json.write(report.options.gzip);
+    try json.objectField("max_pairs");
+    try json.write(report.options.max_pairs);
+    try json.objectField("pair_names");
+    try json.write(@tagName(report.options.pair_name_policy));
+    try json.objectField("alphabet");
+    try json.write(@tagName(report.options.alphabet));
+    try json.objectField("max_line_bytes");
+    try json.write(report.options.max_line_bytes);
+    try json.endObject();
+
+    try json.objectField("inputs");
+    try json.beginArray();
+    for (report.inputs, report.snapshots) |path, snapshot| {
+        try json.beginObject();
+        try json.objectField("path");
+        try writeEscapedJsonString(json, path);
+        try json.objectField("size");
+        try json.write(if (snapshot) |known| known.size else null);
+        try json.objectField("mtime_ns");
+        try json.write(if (snapshot) |known| known.mtime_nanoseconds else null);
+        try json.endObject();
+    }
+    try json.endArray();
+    try json.objectField("outputs");
+    try json.beginArray();
+    for (report.outputs) |path| {
+        try json.beginObject();
+        try json.objectField("path");
+        try writeEscapedJsonString(json, path);
+        try json.endObject();
+    }
+    try json.endArray();
+
+    try json.objectField("status");
+    try json.write(if (report.status_ok) "ok" else "error");
+    try json.objectField("input_complete");
+    try json.write(report.counts.input_complete);
+    try json.objectField("pairs");
+    try json.beginObject();
+    try json.objectField("read");
+    try json.write(report.counts.read);
+    try json.objectField("written");
+    try json.write(report.counts.written);
+    try json.endObject();
+    try json.objectField("mates");
+    try json.beginArray();
+    for (report.stats) |*mate_stats| {
+        try json.beginObject();
+        try writeStatsResultFields(json, mate_stats);
+        try json.endObject();
+    }
+    try json.endArray();
+
+    const failed_input: ?[]const u8 = if (report.input_failure) |failure| switch (failure) {
+        .command => |details| report.inputs[details.input_index],
+        .pair => null,
+    } else null;
+    try json.objectField("failed_input");
+    if (failed_input) |path| try writeEscapedJsonString(json, path) else try json.write(null);
+    try json.objectField("failed_output");
+    if (report.failed_output) |path| try writeEscapedJsonString(json, path) else try json.write(null);
+    if (report.input_failure) |failure| switch (failure) {
+        .command => |details| try writeJsonFailure(json, details.details),
+        .pair => |details| try writePairJsonFailure(json, details),
+    } else if (report.failed_output != null) {
+        try writeJsonFailure(json, IO_FAILURE);
+    } else {
+        try json.objectField("error");
+        try json.write(null);
+    }
+    try json.endObject();
+    try json.writer.writeByte('\n');
+}
+
+fn writeJsonHeader(json: *std.json.Stringify, schema: []const u8) !void {
     try json.beginObject();
     try json.objectField("schema");
     try json.write(schema);
@@ -3814,6 +4288,10 @@ fn beginJsonDocument(json: *std.json.Stringify, schema: []const u8) !void {
     try json.endObject();
     try json.objectField("byte_strings");
     try json.write("escaped-bytes-v1");
+}
+
+fn beginJsonDocument(json: *std.json.Stringify, schema: []const u8) !void {
+    try writeJsonHeader(json, schema);
     try json.objectField("results");
     try json.beginArray();
 }
@@ -3948,16 +4426,20 @@ fn writeStatsJsonResult(
             try writeJsonFailure(json, failure);
         },
         .success => |stats| {
-            const result = stats.result();
             try json.objectField("status");
             try json.write("ok");
-            inline for (@typeInfo(zfastq.StatsResult).@"struct".fields) |field| {
-                try json.objectField(field.name);
-                try json.write(@field(result, field.name));
-            }
+            try writeStatsResultFields(json, &stats);
         },
     }
     try json.endObject();
+}
+
+fn writeStatsResultFields(json: *std.json.Stringify, stats: *const zfastq.Stats) !void {
+    const result = stats.result();
+    inline for (@typeInfo(zfastq.StatsResult).@"struct".fields) |field| {
+        try json.objectField(field.name);
+        try json.write(@field(result, field.name));
+    }
 }
 
 fn writeJsonFailure(json: *std.json.Stringify, failure: CommandFailure) !void {
@@ -6265,6 +6747,45 @@ test "[failure] - [interleave]: a write failure after the first mate keeps only 
         },
     ));
     try std.testing.expectEqualStrings(mate1, sink.buffer[0..sink.length]);
+}
+
+test "[failure] - [process]: a mate 2 write failure keeps mate 1 and counts no written pair" {
+    const mate1 = "@pair/1\nA\n+left\n!\n";
+    const mate2 = "@pair/2\nT\n+right\n#\n";
+    var source1 = io_layer.SliceSource.init(mate1);
+    var source2 = io_layer.SliceSource.init(mate2);
+    var stream1 = try TestStream.init(source1.byteSource());
+    defer stream1.deinit();
+    var stream2 = try TestStream.init(source2.byteSource());
+    defer stream2.deinit();
+    var sink1 = DeinterleaveTestSink{};
+    var sink2 = DeinterleaveTestSink{ .fail_write = true };
+    var writer1 = zfastq.Writer.init(sink1.byteSink());
+    var writer2 = zfastq.Writer.init(sink2.byteSink());
+    var stats = [2]zfastq.Stats{ .{}, .{} };
+    var counts: ProcessCounts = .{};
+
+    try std.testing.expectError(error.Output2WriteFailed, processSources(
+        std.testing.allocator,
+        .{ &stream1.reader.interface, &stream2.reader.interface },
+        .{ &writer1, &writer2 },
+        &stats,
+        &counts,
+        .{
+            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+            .alphabet = .iupac,
+            .pair_name_policy = .illumina,
+            .output1 = null,
+            .output2 = null,
+            .report = null,
+            .gzip = false,
+            .max_pairs = null,
+        },
+    ));
+    try std.testing.expectEqualStrings(mate1, sink1.buffer[0..sink1.length]);
+    try std.testing.expectEqual(@as(u64, 1), counts.read);
+    try std.testing.expectEqual(@as(u64, 0), counts.written);
+    try std.testing.expect(!counts.input_complete);
 }
 
 test "[failure] - [deinterleave]: names the output whose write failed and writes nothing partial" {

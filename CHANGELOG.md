@@ -4,35 +4,47 @@
 
 All notable changes to z-fastq will be documented in this file.
 
-## Unreleased
+## [0.2.0]
 
-### Changed
-
-- `sample`, `interleave`, and `deinterleave` take complete records straight from the read buffer and write output in whole pages, which roughly halves their time on plain input without raising peak memory beyond a few KiB.
-- `FileSink` writes whole pages and keeps a partial last page buffered until the next write or flush.
-- Interleaved fraction sampling, exact-count sampling in every mode, and `check --paired` / `--interleaved` also take complete records straight from the read buffer, and the exact-count output pass skips unselected records with less work: 5 to 20% less time on plain input.
-- On CPUs with AVX2, records with sequences of 1 KiB or more are validated with 32-byte vectors, selected at run time: about a third less time for `check` on PacBio reads and 15 to 20% for `check` and `sample` on ONT reads. Validation of every record also skips a redundant tail mask, about 5% fewer instructions on short reads.
-- Fraction sampling validates records it does not select without copying them, and the streaming validator for sequence and quality lines longer than the read buffer uses AVX2 when the CPU has it: 5 to 25% less time for `sample` and single-file `check` on long reads, with no change in memory.
-- `stats` counts bases and quality scores of reads of 1 KiB or more with AVX2 when the CPU has it: about a quarter less time on long reads.
-- `stats` streams a record larger than the read buffer instead of copying it, so its peak memory no longer grows with read length (772 KiB on every input shape, from up to 1.8 MiB on 300 kb reads) and long reads take 5 to 25% less time; `stats` now allocates nothing per record.
-- Paired and interleaved fraction sampling draw each pair before reading it and validate unselected pairs without keeping them, and `check --interleaved` and `deinterleave` read a mate whose partner already failed only far enough to report it: on 300 kb read pairs, peak memory for `sample --paired` falls from 2.3 MiB to 0.8 MiB when few pairs are selected.
-- `-Dkernel-backend=portable` builds no AVX2 object and selects no kernel at run time; z-fastq's own kernels then use only the instructions of the build target, as Zipir's do.
-
-### Fixed
-
-- `count`, `stats`, and `check` reject standard output appended to one of their inputs (`count a.fastq b.fastq >> b.fastq`) with status `2` before reading anything, as `sample` and `interleave` already did; the input is no longer changed.
-- Standard input named twice, as `- /dev/stdin` or `/dev/stdin /dev/stdin`, is rejected when it is a pipe or FIFO instead of reading it once and reporting zero records for the second name.
-- A pipe closed by its reader ends every command with status `3` and `error: standard output: I/O error`, as documented, instead of a SIGPIPE status of 141; `sample`, `stats`, `count`, and the JSON forms now print that message on any standard-output failure.
-- `sample --interleaved` and `deinterleave` accept every `--max-line-bytes` value the other commands accept, instead of exiting with status `4` before reading for values of 2^62 − 1 and above, sometimes with no message.
-- `stats` reports an input location past the supported limit as `input location exceeds supported limit`, as the other commands do.
-- A directory given as an input is reported as `input is a directory` before anything is read, instead of `I/O error`; `deinterleave` then creates no output files.
-- `deinterleave` removes the empty `--out1` it created when `--out2` cannot be created, so a rerun is not blocked by it.
-- Exact-count sampling of a FIFO or directory exits with status `2`, as for standard input, instead of `3`.
-- A value option given twice (`--count 1 --count 2`) fails with status `2` and `may appear only once`, as `--out1` and `--out2` already did, instead of keeping the last value.
+A `process` command that validates paired reads into two plain or gzip outputs with a JSON report, faster record handling in every command, AVX2 kernels selected at run time on CPUs that have them, bounded memory for `stats` and paired sampling on long reads, and stricter handling of standard input and output. Output bytes, JSON documents, and exit classes are unchanged except where a fix below says so.
 
 ### Added
 
-- `FileSink.initStreaming` writes at the file handle's current position, for standard output and pipes.
+- **Commands.** `process` validates two mate files pair by pair, as `check --paired` does, and writes every accepted pair to two new files, plain or gzip (`--gzip`). `--max-pairs N` stops after the first N pairs, and `--report` writes a `z-fastq/process-v1` JSON document with per-mate statistics and any failure. The same inputs and options give byte-identical outputs and report.
+- **Library.**
+  - `FileSink.initStreaming` writes at the file handle's current position, for standard output and pipes.
+  - `Stats.ratios` returns each ratio of `StatsResult` as an exact numerator and denominator, so callers can round without floating point.
+- **Build.**
+  - `-Dstrip` sets whether debug information is stripped; it defaults to on for ReleaseFast, so a profiling build can keep its symbols.
+  - `zig build test-<suite>` runs a single test binary, such as `test-reader`, or `test-src` for the in-file tests; `zig build -l` lists them.
+
+### Changed
+
+- **Speed.**
+  - `sample`, `interleave`, and `deinterleave` take complete records straight from the read buffer and write output in whole pages, which roughly halves their time on plain input without raising peak memory beyond a few KiB.
+  - Interleaved fraction sampling, exact-count sampling in every mode, and `check --paired` and `--interleaved` take records the same way, and the exact-count output pass skips unselected records with less work: 5 to 20% less time on plain input.
+  - On CPUs with AVX2, builds whose target lacks AVX2 select 32-byte kernels at run time for newline search past the first 1 KiB of a line, validation of sequences of 1 KiB or more (about a third less time for `check` on PacBio reads, 15 to 20% for `check` and `sample` on ONT reads), validation of lines longer than the read buffer, and `stats` counting on reads of 1 KiB or more (about a quarter less time on long reads).
+  - Fraction sampling validates the records it does not select without copying them: 5 to 25% less time for `sample` and single-file `check` on long reads, with no change in memory.
+- **Memory.**
+  - `stats` streams a record larger than the read buffer instead of copying it, so its peak memory no longer grows with read length (772 KiB on every input shape, from up to 1.8 MiB on 300 kb reads), long reads take 5 to 25% less time, and `stats` allocates nothing per record.
+  - Paired and interleaved fraction sampling draw each pair before reading it and validate unselected pairs without keeping them: on 300 kb read pairs, peak memory for `sample --paired` falls from 2.3 MiB to 0.8 MiB when few pairs are selected. `check --interleaved` and `deinterleave` read a mate whose partner already failed only far enough to report it.
+- **Library.** `FileSink` writes whole pages and keeps a partial last page buffered until the next write or `flush`.
+- **Build.** `-Dkernel-backend=portable` builds no AVX2 object and selects no kernel at run time; z-fastq's own kernels then use only the instructions of the build target, as Zipir's do.
+
+### Fixed
+
+- **Standard input and output.**
+  - `count`, `stats`, and `check` reject standard output appended to one of their inputs (`count a.fastq b.fastq >> b.fastq`) with status `2` before reading anything, as `sample` and `interleave` already did; the input is no longer changed.
+  - Standard input named twice, as `- /dev/stdin` or `/dev/stdin /dev/stdin`, is rejected when it is a pipe or FIFO instead of being read once and reported as zero records for the second name.
+  - A pipe closed by its reader ends every command with status `3` and `error: standard output: I/O error`, as documented, instead of a SIGPIPE status of 141; `sample`, `stats`, `count`, and the JSON forms print that message on any standard-output failure.
+- **Inputs and outputs.**
+  - A directory given as an input is reported as `input is a directory` before anything is read, instead of `I/O error`; `deinterleave` then creates no output files.
+  - `deinterleave` removes the empty `--out1` it created when `--out2` cannot be created, so a rerun is not blocked by it.
+  - Exact-count sampling of a FIFO or directory exits with status `2`, as for standard input, instead of `3`.
+- **Options and limits.**
+  - A value option given twice (`--count 1 --count 2`) fails with status `2` and `may appear only once`, as `--out1` and `--out2` already did, instead of keeping the last value.
+  - `sample --interleaved` and `deinterleave` accept every `--max-line-bytes` value the other commands accept, instead of exiting with status `4` before reading for values of 2^62 - 1 and above, sometimes with no message.
+  - `stats` reports an input location past the supported limit as `input location exceeds supported limit`, as the other commands do.
 
 ## [0.1.0]
 

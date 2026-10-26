@@ -142,6 +142,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "tests/test_sample.zig", .imports = &.{.{ .name = "sample_internal", .module = sample_internal_module }} },
         .{ .path = "tests/test_interleave.zig" },
         .{ .path = "tests/test_deinterleave.zig" },
+        .{ .path = "tests/test_process.zig" },
     };
 
     const test_step = b.step("test", "Run unit tests");

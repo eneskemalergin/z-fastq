@@ -15,6 +15,7 @@
 - [Paired reads](Paired-Reads)
 - [Sampling](Sampling)
 - [Interleaving](Interleaving)
+- [Processing paired reads](Processing)
 
 **Understand behavior**
 

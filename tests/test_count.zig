@@ -24,6 +24,7 @@ const EXPECTED_USAGE =
     \\  sample        Select records by deterministic probability or exact count
     \\  interleave    Validate and interleave paired FASTQ inputs
     \\  deinterleave  Validate and separate interleaved paired FASTQ input
+    \\  process       Validate paired FASTQ inputs into two plain or gzip outputs
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -47,6 +48,11 @@ const EXPECTED_USAGE =
     \\  --fraction P         Use 0, 1, 0.DIGITS, or 1.ZEROES
     \\  --count K            Select exactly min(K, records or pairs) from paths
     \\  --seed S             Use an unsigned decimal u64 seed (default 11)
+    \\
+    \\Process options:
+    \\  --gzip               Write both outputs as gzip
+    \\  --max-pairs N        Stop after the first N pairs
+    \\  --report PATH        Write a z-fastq/process-v1 JSON report (- for stdout)
     \\
     \\Count usage:
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
@@ -72,6 +78,9 @@ const EXPECTED_USAGE =
     \\
     \\Deinterleave usage:
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
+    \\
+    \\Process usage:
+    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 

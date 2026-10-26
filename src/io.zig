@@ -192,6 +192,40 @@ fn fileSourceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return readShort(&self.file_reader.interface, dest);
 }
 
+pub const GzipSink = struct {
+    compressor: zipir.gzip.Compressor,
+
+    pub fn init(self: *GzipSink, output: *std.Io.Writer) WriteError!void {
+        self.compressor.init(output, .{}) catch return error.WriteFailed;
+    }
+
+    pub fn byteSink(self: *GzipSink) ByteSink {
+        return .{
+            .vtable = &GZIP_SINK_VTABLE,
+            .ctx = self,
+        };
+    }
+
+    pub fn finish(self: *GzipSink) WriteError!void {
+        _ = self.compressor.finish() catch return error.WriteFailed;
+    }
+};
+
+const GZIP_SINK_VTABLE = ByteSink.VTable{
+    .write = gzipSinkWrite,
+    .writeVec = gzipSinkWriteVec,
+};
+
+fn gzipSinkWrite(ctx: *anyopaque, data: []const u8) WriteError!void {
+    const self: *GzipSink = @ptrCast(@alignCast(ctx));
+    self.compressor.writer.writeAll(data) catch return error.WriteFailed;
+}
+
+fn gzipSinkWriteVec(ctx: *anyopaque, data: []const []const u8) WriteError!void {
+    const self: *GzipSink = @ptrCast(@alignCast(ctx));
+    writeVecToWriter(&self.compressor.writer, data) catch return error.WriteFailed;
+}
+
 pub const GzipSource = struct {
     input: *std.Io.Reader,
     decoder: zipir.gzip.Decompressor = undefined,
@@ -405,4 +439,40 @@ fn fileSinkWriteVec(ctx: *anyopaque, data: []const []const u8) WriteError!void {
 fn fileSinkFlush(ctx: *anyopaque) WriteError!void {
     const self: *FileSink = @ptrCast(@alignCast(ctx));
     self.writer.flush() catch return error.WriteFailed;
+}
+
+test "[unit] - [gzip sink]: records decode unchanged and a sink flush leaves the member open" {
+    var compressed: [256]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&compressed);
+    const sink = try std.testing.allocator.create(GzipSink);
+    defer std.testing.allocator.destroy(sink);
+    try sink.init(&output);
+    const byte_sink = sink.byteSink();
+    try byte_sink.write("@r\nACGT\n");
+    try byte_sink.flush();
+    const gzip_header_bytes = 10;
+    try std.testing.expectEqual(gzip_header_bytes, output.end);
+    try byte_sink.writeVec(&.{ "+\n", "IIII\n" });
+    try sink.finish();
+
+    var input: std.Io.Reader = .fixed(output.buffered());
+    var decoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer decoded.deinit();
+    var decompress: std.compress.flate.Decompress = .init(&input, .gzip, &.{});
+    _ = try decompress.reader.streamRemaining(&decoded.writer);
+    try std.testing.expectEqualStrings("@r\nACGT\n+\nIIII\n", decoded.written());
+}
+
+test "[failure] - [gzip sink]: a full output fails the header or the finish" {
+    const sink = try std.testing.allocator.create(GzipSink);
+    defer std.testing.allocator.destroy(sink);
+    var header_space: [4]u8 = undefined;
+    var too_small: std.Io.Writer = .fixed(&header_space);
+    try std.testing.expectError(error.WriteFailed, sink.init(&too_small));
+
+    var trailer_space: [12]u8 = undefined;
+    var no_trailer: std.Io.Writer = .fixed(&trailer_space);
+    try sink.init(&no_trailer);
+    try sink.byteSink().write("@r\nACGT\n+\nIIII\n");
+    try std.testing.expectError(error.WriteFailed, sink.finish());
 }

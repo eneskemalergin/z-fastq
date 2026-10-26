@@ -40,6 +40,12 @@ z-fastq interleave R1.fastq.gz R2.fastq.gz > interleaved.fastq
 z-fastq deinterleave --out1 R1.fastq --out2 R2.fastq interleaved.fastq
 ```
 
+`process` validates two mates into two new files, plain or with `--gzip`, and can write a JSON report:
+
+```bash
+z-fastq process --gzip --out1 clean_R1.fastq.gz --out2 clean_R2.fastq.gz --report sample.json R1.fastq.gz R2.fastq.gz
+```
+
 ## Input shapes
 
 ```text
@@ -53,6 +59,7 @@ sample --paired R1 R2
 sample --interleaved interleaved.fastq
 interleave    R1 R2
 deinterleave --out1 R1 --out2 R2 interleaved.fastq
+process --out1 R1 --out2 R2 R1-input R2-input
 ```
 
 `sample` requires exactly one ordinary input, two inputs for `--paired`, and one input for `--interleaved`. Exact-count forms require regular file paths because they use two passes.
