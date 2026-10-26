@@ -3,7 +3,6 @@
 const std = @import("std");
 
 const KernelBackend = enum { dispatch, portable };
-const Avx2Mode = enum { direct, object };
 
 pub fn build(b: *std.Build) void {
     const requested_target = b.standardTargetOptions(.{});
@@ -59,11 +58,13 @@ pub fn build(b: *std.Build) void {
     const package_version = @import("build.zig.zon").version;
     const build_options = b.addOptions();
     build_options.addOption([:0]const u8, "version", package_version);
-    build_options.addOption(KernelBackend, "kernel_backend", kernel_backend);
-    const avx2_mode: Avx2Mode = if (std.Target.x86.featureSetHas(target.result.cpu.features, .avx2)) .direct else .object;
-    build_options.addOption(Avx2Mode, "simd_avx2", avx2_mode);
+    // Run-time selection needs the AVX2 object only when the target lacks AVX2;
+    // a target that has it uses AVX2 inline, and portable builds select nothing.
+    const link_avx2_object = kernel_backend == .dispatch and
+        !std.Target.x86.featureSetHas(target.result.cpu.features, .avx2);
+    build_options.addOption(bool, "avx2_object", link_avx2_object);
     build_options.addOption(bool, "simd_object", false);
-    const avx2_object: ?*std.Build.Step.Compile = if (avx2_mode == .direct) null else blk: {
+    const avx2_object: ?*std.Build.Step.Compile = if (!link_avx2_object) null else blk: {
         var query = target.query;
         query.cpu_model = .baseline;
         query.cpu_features_add = .empty;
@@ -71,12 +72,13 @@ pub fn build(b: *std.Build) void {
         query.cpu_features_add.addFeature(@intFromEnum(std.Target.x86.Feature.avx2));
         const object_options = b.addOptions();
         object_options.addOption(bool, "simd_object", true);
-        object_options.addOption(KernelBackend, "kernel_backend", kernel_backend);
-        object_options.addOption(Avx2Mode, "simd_avx2", .direct);
+        object_options.addOption(bool, "avx2_object", false);
+        // The root reaches only the kernel files; no exported kernel reaches I/O, so the object needs no Zipir import.
         const module = b.createModule(.{
             .root_source_file = b.path("src/simd.zig"),
             .target = b.resolveTargetQuery(query),
             .optimize = optimize,
+            .single_threaded = true,
             .strip = strip,
         });
         module.addOptions("build_options", object_options);
@@ -129,116 +131,47 @@ pub fn build(b: *std.Build) void {
         if (avx2_object) |object| module.addObject(object);
     }
 
-    const reader_test_module = b.createModule(.{
-        .root_source_file = b.path("tests/test_reader.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &import_lib,
-    });
     const test_options = b.addOptions();
     test_options.addOption([]const u8, "package_version", package_version);
-
-    const writer_test_module = b.createModule(.{
-        .root_source_file = b.path("tests/test_writer.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &import_lib,
-    });
-
-    const count_test_module = b.createModule(.{
-        .root_source_file = b.path("tests/test_count.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    count_test_module.link_libc = true;
-
-    const stats_test_module = b.createModule(.{
-        .root_source_file = b.path("tests/test_stats.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &import_lib,
-    });
-    stats_test_module.link_libc = true;
-
-    const check_test_module = b.createModule(.{
-        .root_source_file = b.path("tests/test_check.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    check_test_module.link_libc = true;
-
     const sample_internal_module = b.createModule(.{
         .root_source_file = b.path("src/sample.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const sample_test_module = b.createModule(.{
-        .root_source_file = b.path("tests/test_sample.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "sample_internal", .module = sample_internal_module },
-        },
-    });
-    sample_test_module.link_libc = true;
-
-    const interleave_test_module = b.createModule(.{
-        .root_source_file = b.path("tests/test_interleave.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    interleave_test_module.link_libc = true;
-
-    const deinterleave_test_module = b.createModule(.{
-        .root_source_file = b.path("tests/test_deinterleave.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    deinterleave_test_module.link_libc = true;
-
-    for ([_]*std.Build.Module{
-        reader_test_module,
-        count_test_module,
-        stats_test_module,
-        check_test_module,
-        sample_test_module,
-        interleave_test_module,
-        deinterleave_test_module,
-    }) |module| {
-        module.addOptions("test_options", test_options);
-    }
-
-    const run_fastq_test = b.addRunArtifact(b.addTest(.{ .root_module = fastq_test_module }));
-    const run_main_test = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
-    const run_reader_test = b.addRunArtifact(b.addTest(.{ .root_module = reader_test_module }));
-    const run_writer_test = b.addRunArtifact(b.addTest(.{ .root_module = writer_test_module }));
-
-    const run_count_test = b.addRunArtifact(b.addTest(.{ .root_module = count_test_module }));
-    run_count_test.step.dependOn(b.getInstallStep());
-    const run_stats_test = b.addRunArtifact(b.addTest(.{ .root_module = stats_test_module }));
-    run_stats_test.step.dependOn(b.getInstallStep());
-    const run_check_test = b.addRunArtifact(b.addTest(.{ .root_module = check_test_module }));
-    run_check_test.step.dependOn(b.getInstallStep());
-    const run_sample_test = b.addRunArtifact(b.addTest(.{ .root_module = sample_test_module }));
-    run_sample_test.step.dependOn(b.getInstallStep());
-    const run_interleave_test = b.addRunArtifact(b.addTest(.{
-        .root_module = interleave_test_module,
-    }));
-    run_interleave_test.step.dependOn(b.getInstallStep());
-    const run_deinterleave_test = b.addRunArtifact(b.addTest(.{
-        .root_module = deinterleave_test_module,
-    }));
-    run_deinterleave_test.step.dependOn(b.getInstallStep());
+    const Suite = struct {
+        path: []const u8,
+        imports: []const std.Build.Module.Import = &.{},
+        // Suites that run the installed binary link libc and wait for the install step.
+        runs_binary: bool = true,
+    };
+    const suites = [_]Suite{
+        .{ .path = "tests/test_reader.zig", .imports = &import_lib, .runs_binary = false },
+        .{ .path = "tests/test_writer.zig", .imports = &import_lib, .runs_binary = false },
+        .{ .path = "tests/test_count.zig" },
+        .{ .path = "tests/test_stats.zig", .imports = &import_lib },
+        .{ .path = "tests/test_check.zig" },
+        .{ .path = "tests/test_sample.zig", .imports = &.{.{ .name = "sample_internal", .module = sample_internal_module }} },
+        .{ .path = "tests/test_interleave.zig" },
+        .{ .path = "tests/test_deinterleave.zig" },
+    };
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_fastq_test.step);
-    test_step.dependOn(&run_main_test.step);
-    test_step.dependOn(&run_reader_test.step);
-    test_step.dependOn(&run_writer_test.step);
-    test_step.dependOn(&run_count_test.step);
-    test_step.dependOn(&run_stats_test.step);
-    test_step.dependOn(&run_check_test.step);
-    test_step.dependOn(&run_sample_test.step);
-    test_step.dependOn(&run_interleave_test.step);
-    test_step.dependOn(&run_deinterleave_test.step);
+    for ([_]*std.Build.Module{ fastq_test_module, exe.root_module }) |module| {
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+    }
+    for (suites) |suite| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(suite.path),
+            .target = target,
+            .optimize = optimize,
+            .imports = suite.imports,
+        });
+        module.addOptions("test_options", test_options);
+        const run = b.addRunArtifact(b.addTest(.{ .root_module = module }));
+        if (suite.runs_binary) {
+            module.link_libc = true;
+            run.step.dependOn(b.getInstallStep());
+        }
+        test_step.dependOn(&run.step);
+    }
 }

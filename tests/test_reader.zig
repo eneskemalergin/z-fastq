@@ -657,14 +657,20 @@ test "[property] - [reader]: complete and refill-spanning records are identical"
             .offsets = .{ .header = 55, .sequence = 62, .plus = 65, .quality = 67 },
         },
     };
-    const vector_len = @max(std.simd.suggestVectorLength(u8) orelse 16, 2);
+    // Splits around every vector tier width (16, 32, 64 bytes).
     const chunk_sizes = [_]usize{
         1,
         2,
         3,
-        vector_len - 1,
-        vector_len,
-        vector_len + 1,
+        15,
+        16,
+        17,
+        31,
+        32,
+        33,
+        63,
+        64,
+        65,
         4 * 1024,
         zfastq.limits.DEFAULT_READER_BUFFER_BYTES,
     };

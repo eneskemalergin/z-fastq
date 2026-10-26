@@ -1,80 +1,125 @@
-//! Newline search over 64-byte blocks, with 32-byte AVX2 vectors when the running CPU has them and 16-byte vectors otherwise.
+//! Byte-kernel tiers, their run-time selection, and the newline search kernels.
+//!
+//! Every byte kernel has a scalar reference and one generic vector body over a
+//! comptime lane count. Inline code uses the widest tier the compile target
+//! guarantees. When the target lacks AVX2, the same bodies are also compiled
+//! into a separate AVX2 object, and long spans call it on CPUs that have AVX2.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
-const BLOCK_BYTES = 64;
-const SSE_LANES = 16;
-const AVX2_LANES = 32;
-// A call into the separate AVX2 object cannot be inlined, so shorter spans stay on inline 16-byte code.
+pub const Tier = enum { baseline, avx2, avx512 };
+
+/// Vector width of each tier in bytes. AVX-512 is not selected yet: it needs
+/// CPU detection and its own object, tested on a host that has it. Kernels are
+/// tested at its width already.
+pub fn tierWidth(comptime tier: Tier) comptime_int {
+    return switch (tier) {
+        .baseline => 16,
+        .avx2 => 32,
+        .avx512 => 64,
+    };
+}
+
+/// The widest tier the compile target guarantees.
+pub const INLINE_TIER: Tier = if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) .avx2 else .baseline;
+pub const INLINE_LANES = tierWidth(INLINE_TIER);
+const BASELINE_LANES = tierWidth(.baseline);
+
+/// Structural block: one 64-bit mask holds the LF positions of 64 bytes.
+pub const BLOCK_BYTES = 64;
+
+// A call into the separate AVX2 object cannot be inlined, so shorter spans stay inline.
 const AVX2_MIN_BYTES = 1024;
 
-const SELECT_AT_RUN_TIME = build_options.kernel_backend == .dispatch and build_options.simd_avx2 == .object;
-const INLINE_LANES = if (build_options.kernel_backend == .dispatch and build_options.simd_avx2 == .direct) AVX2_LANES else SSE_LANES;
+const SELECT_AT_RUN_TIME = build_options.avx2_object;
 
+/// True when a call that will process `len` bytes should take the AVX2 object:
+/// the build links it, the span repays the call, and the running CPU has AVX2.
+/// A search that cannot know its length first (`findNewline`, the complete
+/// record scanner) applies this to a bound or a hint instead.
+pub inline fn useAvx2(len: usize) bool {
+    return SELECT_AT_RUN_TIME and len >= AVX2_MIN_BYTES and cpuHasAvx2();
+}
+
+// --- Kernel table ---
+
+// Each kernel's object entry point is declared once, as the exported function;
+// the caller's declaration takes its type from it.
+
+/// Exports `function` from the object under the kernel name `name`. Call from a
+/// `comptime` block; outside the object it does nothing.
+pub fn exportKernel(comptime name: []const u8, comptime function: anytype) void {
+    if (build_options.simd_object) @export(function, .{ .name = symbol(INLINE_TIER, name) });
+}
+
+/// The AVX2 object's copy of the kernel exported as `name` from `function`.
+/// Reach it only behind `useAvx2`, which is false in builds without the object.
+pub fn avx2Kernel(comptime name: []const u8, comptime function: anytype) *const @TypeOf(function.*) {
+    return @extern(*const @TypeOf(function.*), .{ .name = symbol(.avx2, name) });
+}
+
+fn symbol(comptime tier: Tier, comptime name: []const u8) []const u8 {
+    return "zfq_" ++ @tagName(tier) ++ "_" ++ name;
+}
+
+comptime {
+    if (build_options.simd_object) {
+        // The object's root: the record scanner's and statistics' kernels are exported from their files.
+        _ = @import("fastq.zig");
+        _ = @import("stats.zig");
+    }
+    exportKernel("find_newline", &findNewlineExport);
+    exportKernel("collect_newlines", &collectNewlinesExport);
+    exportKernel("contains_newline", &containsNewlineExport);
+}
+
+// --- Newline search ---
+
+/// Searches start inline; the bytes after the first `AVX2_MIN_BYTES` go to the
+/// object, so a short line never pays for the call.
 pub inline fn findNewline(bytes: []const u8) ?usize {
     if (!SELECT_AT_RUN_TIME) return @call(.always_inline, findNewlineFor, .{ INLINE_LANES, bytes });
     const head = @min(bytes.len, AVX2_MIN_BYTES);
-    if (@call(.always_inline, findNewlineFor, .{ SSE_LANES, bytes[0..head] })) |index| return index;
+    if (@call(.always_inline, findNewlineFor, .{ BASELINE_LANES, bytes[0..head] })) |index| return index;
     if (head == bytes.len) return null;
-    if (!cpuHasAvx2()) return if (findNewlineFor(SSE_LANES, bytes[head..])) |index| head + index else null;
-    const rest = zfq_avx2_find_newline(bytes.ptr + head, bytes.len - head);
+    if (!useAvx2(bytes.len)) return if (findNewlineFor(BASELINE_LANES, bytes[head..])) |index| head + index else null;
+    const rest = avx2Kernel("find_newline", &findNewlineExport)(bytes.ptr + head, bytes.len - head);
     return if (rest == bytes.len - head) null else head + rest;
 }
 
 pub inline fn findNewlines(bytes: []const u8, ends: *[4]usize) bool {
     if (!SELECT_AT_RUN_TIME) return @call(.always_inline, collectNewlines, .{ INLINE_LANES, bytes, 0, ends, 0 }) == ends.len;
     const head = @min(bytes.len, AVX2_MIN_BYTES);
-    const count = @call(.always_inline, collectNewlines, .{ SSE_LANES, bytes[0..head], 0, ends, 0 });
+    const count = @call(.always_inline, collectNewlines, .{ BASELINE_LANES, bytes[0..head], 0, ends, 0 });
     if (count == ends.len or head == bytes.len) return count == ends.len;
-    if (!cpuHasAvx2()) return collectNewlines(SSE_LANES, bytes[head..], head, ends, count) == ends.len;
-    return zfq_avx2_collect_newlines(bytes.ptr + head, bytes.len - head, head, ends, count) == ends.len;
+    if (!useAvx2(bytes.len)) return collectNewlines(BASELINE_LANES, bytes[head..], head, ends, count) == ends.len;
+    return avx2Kernel("collect_newlines", &collectNewlinesExport)(bytes.ptr + head, bytes.len - head, head, ends, count) == ends.len;
 }
 
 pub inline fn containsNewline(first: []const u8, second: ?[]const u8) bool {
     std.debug.assert(second == null or second.?.len == first.len);
     const second_ptr: ?[*]const u8 = if (second) |s| s.ptr else null;
-    if (SELECT_AT_RUN_TIME and first.len >= AVX2_MIN_BYTES and cpuHasAvx2()) {
-        return zfq_avx2_contains_newline(first.ptr, second_ptr, first.len);
+    if (useAvx2(first.len)) {
+        return avx2Kernel("contains_newline", &containsNewlineExport)(first.ptr, second_ptr, first.len);
     }
     return @call(.always_inline, containsNewlineFor, .{ INLINE_LANES, first.ptr, second_ptr, first.len });
 }
 
-// --- Run-time selection ---
-
-extern fn zfq_avx2_find_newline(bytes: [*]const u8, len: usize) callconv(.c) usize;
-extern fn zfq_avx2_collect_newlines(bytes: [*]const u8, len: usize, base: usize, ends: *[4]usize, count: usize) callconv(.c) usize;
-extern fn zfq_avx2_contains_newline(first: [*]const u8, second: ?[*]const u8, len: usize) callconv(.c) bool;
-
-/// True when a span of `len` bytes should take the separate AVX2 object: the
-/// running CPU has AVX2 and the span is long enough to repay the call.
-pub inline fn useAvx2(len: usize) bool {
-    return SELECT_AT_RUN_TIME and len >= AVX2_MIN_BYTES and cpuHasAvx2();
+fn findNewlineExport(bytes: [*]const u8, len: usize) callconv(.c) usize {
+    return findNewlineFor(INLINE_LANES, bytes[0..len]) orelse len;
 }
 
-comptime {
-    if (build_options.simd_object) {
-        // The record scanner's and statistics' AVX2 copies are compiled into the same object.
-        _ = @import("fastq.zig");
-        _ = @import("stats.zig");
-        @export(&avx2FindNewline, .{ .name = "zfq_avx2_find_newline" });
-        @export(&avx2CollectNewlines, .{ .name = "zfq_avx2_collect_newlines" });
-        @export(&avx2ContainsNewline, .{ .name = "zfq_avx2_contains_newline" });
-    }
+fn collectNewlinesExport(bytes: [*]const u8, len: usize, base: usize, ends: *[4]usize, count: usize) callconv(.c) usize {
+    return collectNewlines(INLINE_LANES, bytes[0..len], base, ends, count);
 }
 
-fn avx2FindNewline(bytes: [*]const u8, len: usize) callconv(.c) usize {
-    return findNewlineFor(AVX2_LANES, bytes[0..len]) orelse len;
+fn containsNewlineExport(first: [*]const u8, second: ?[*]const u8, len: usize) callconv(.c) bool {
+    return containsNewlineFor(INLINE_LANES, first, second, len);
 }
 
-fn avx2CollectNewlines(bytes: [*]const u8, len: usize, base: usize, ends: *[4]usize, count: usize) callconv(.c) usize {
-    return collectNewlines(AVX2_LANES, bytes[0..len], base, ends, count);
-}
-
-fn avx2ContainsNewline(first: [*]const u8, second: ?[*]const u8, len: usize) callconv(.c) bool {
-    return containsNewlineFor(AVX2_LANES, first, second, len);
-}
+// --- CPU detection ---
 
 var avx2_state: std.atomic.Value(u8) = .init(0);
 
@@ -126,27 +171,25 @@ fn xgetbv0() u32 {
 
 // --- Kernels ---
 
-inline fn blockMask(comptime lanes: usize, block: *const [BLOCK_BYTES]u8) u64 {
-    const Bytes = @Vector(lanes, u8);
+/// Bit `i` is set when `block[i]` is LF.
+pub inline fn newlineMask(comptime width: usize, block: *const [width]u8) @Int(.unsigned, width) {
+    const Bytes = @Vector(width, u8);
+    const bytes: Bytes = block.*;
+    return @bitCast(bytes == @as(Bytes, @splat('\n')));
+}
+
+inline fn blockMask(comptime width: usize, block: *const [BLOCK_BYTES]u8) u64 {
     var mask: u64 = 0;
-    inline for (0..BLOCK_BYTES / lanes) |i| {
-        const bytes: Bytes = block[i * lanes ..][0..lanes].*;
-        const lane_mask: @Int(.unsigned, lanes) = @bitCast(bytes == @as(Bytes, @splat('\n')));
-        mask |= @as(u64, lane_mask) << @intCast(i * lanes);
+    inline for (0..BLOCK_BYTES / width) |i| {
+        mask |= @as(u64, newlineMask(width, block[i * width ..][0..width])) << @intCast(i * width);
     }
     return mask;
 }
 
-inline fn chunkMask(chunk: *const [SSE_LANES]u8) u16 {
-    const Bytes = @Vector(SSE_LANES, u8);
-    const bytes: Bytes = chunk.*;
-    return @bitCast(bytes == @as(Bytes, @splat('\n')));
-}
-
 // The last 16 bytes are re-read, so the bits of bytes before `pos` are shifted out.
 inline fn tailMask(bytes: []const u8, pos: usize) u16 {
-    const start = bytes.len - SSE_LANES;
-    return chunkMask(bytes[start..][0..SSE_LANES]) >> @intCast(pos - start);
+    const start = bytes.len - BASELINE_LANES;
+    return newlineMask(BASELINE_LANES, bytes[start..][0..BASELINE_LANES]) >> @intCast(pos - start);
 }
 
 inline fn anyNewline(comptime lanes: usize, comptime len: usize, first: [*]const u8, second: ?[*]const u8) bool {
@@ -184,12 +227,12 @@ pub fn findNewlineFor(comptime lanes: usize, bytes: []const u8) ?usize {
         empty_bytes += BLOCK_BYTES;
         if (empty_bytes >= SKIP_AFTER_EMPTY_BYTES) pos = skipLineBody(lanes, bytes, pos);
     }
-    while (bytes.len - pos >= SSE_LANES) : (pos += SSE_LANES) {
-        const mask = chunkMask(bytes[pos..][0..SSE_LANES]);
+    while (bytes.len - pos >= BASELINE_LANES) : (pos += BASELINE_LANES) {
+        const mask = newlineMask(BASELINE_LANES, bytes[pos..][0..BASELINE_LANES]);
         if (mask != 0) return pos + @ctz(mask);
     }
     if (pos == bytes.len) return null;
-    if (bytes.len >= SSE_LANES) {
+    if (bytes.len >= BASELINE_LANES) {
         const mask = tailMask(bytes, pos);
         return if (mask != 0) pos + @ctz(mask) else null;
     }
@@ -219,15 +262,15 @@ pub fn collectNewlines(comptime lanes: usize, bytes: []const u8, base: usize, en
         }
         pos += BLOCK_BYTES;
     }
-    while (bytes.len - pos >= SSE_LANES) : (pos += SSE_LANES) {
-        var mask = chunkMask(bytes[pos..][0..SSE_LANES]);
+    while (bytes.len - pos >= BASELINE_LANES) : (pos += BASELINE_LANES) {
+        var mask = newlineMask(BASELINE_LANES, bytes[pos..][0..BASELINE_LANES]);
         while (mask != 0) : (mask &= mask - 1) {
             ends[n] = base + pos + @ctz(mask);
             n += 1;
             if (n == ends.len) return n;
         }
     }
-    if (pos < bytes.len and bytes.len >= SSE_LANES) {
+    if (pos < bytes.len and bytes.len >= BASELINE_LANES) {
         var mask = tailMask(bytes, pos);
         while (mask != 0) : (mask &= mask - 1) {
             ends[n] = base + pos + @ctz(mask);
@@ -254,13 +297,13 @@ pub fn containsNewlineFor(comptime lanes: usize, first: [*]const u8, second: ?[*
     while (len - pos >= BLOCK_BYTES) : (pos += BLOCK_BYTES) {
         if (anyNewline(lanes, BLOCK_BYTES, first + pos, if (second) |s| s + pos else null)) return true;
     }
-    while (len - pos >= SSE_LANES) : (pos += SSE_LANES) {
-        if (anyNewline(SSE_LANES, SSE_LANES, first + pos, if (second) |s| s + pos else null)) return true;
+    while (len - pos >= BASELINE_LANES) : (pos += BASELINE_LANES) {
+        if (anyNewline(BASELINE_LANES, BASELINE_LANES, first + pos, if (second) |s| s + pos else null)) return true;
     }
     if (pos == len) return false;
-    if (len >= SSE_LANES) {
-        const start = len - SSE_LANES;
-        return anyNewline(SSE_LANES, SSE_LANES, first + start, if (second) |s| s + start else null);
+    if (len >= BASELINE_LANES) {
+        const start = len - BASELINE_LANES;
+        return anyNewline(BASELINE_LANES, BASELINE_LANES, first + start, if (second) |s| s + start else null);
     }
     for (pos..len) |index| {
         if (first[index] == '\n') return true;
@@ -289,7 +332,7 @@ test "[property] - [newline kernels]: every width and the selected path match a 
             }
         }
         const want_first: ?usize = if (want_count > 0) want_ends[0] else null;
-        inline for (.{ SSE_LANES, AVX2_LANES, 0 }) |lanes| {
+        inline for (.{ BASELINE_LANES, tierWidth(.avx2), tierWidth(.avx512), 0 }) |lanes| {
             try std.testing.expectEqual(want_first, if (lanes == 0) findNewline(bytes) else findNewlineFor(lanes, bytes));
             var ends: [4]usize = undefined;
             const four = if (lanes == 0) findNewlines(bytes, &ends) else findNewlinesFor(lanes, bytes, &ends);
@@ -299,10 +342,31 @@ test "[property] - [newline kernels]: every width and the selected path match a 
     }
 }
 
+test "[property] - [newline kernels]: masks preserve newline positions at every width" {
+    inline for (.{ 1, BASELINE_LANES, tierWidth(.avx2), BLOCK_BYTES }) |lanes| {
+        const Mask = @Int(.unsigned, lanes);
+        var block: [lanes]u8 = @splat('A');
+        try std.testing.expectEqual(@as(Mask, 0), newlineMask(lanes, &block));
+        for (0..lanes) |lane| {
+            block[lane] = '\n';
+            try std.testing.expectEqual(@as(Mask, 1) << @intCast(lane), newlineMask(lanes, &block));
+            block[lane] = 'A';
+        }
+
+        var expected: Mask = 0;
+        for ([_]usize{ 0, 1, 15, 16, 31, 32, 47, 48, 62, 63 }) |lane| {
+            if (lane >= lanes) continue;
+            block[lane] = '\n';
+            expected |= @as(Mask, 1) << @intCast(lane);
+        }
+        try std.testing.expectEqual(expected, newlineMask(lanes, &block));
+    }
+}
+
 test "[property] - [newline kernels]: two-slice search is exact at every length and alignment" {
-    var first_storage: [5 * BLOCK_BYTES + 2]u8 = undefined;
-    var second_storage: [5 * BLOCK_BYTES + 2]u8 = undefined;
-    for ([_]usize{ 0, 1, SSE_LANES - 1, AVX2_LANES - 1 }) |alignment| {
+    var first_storage: [5 * BLOCK_BYTES + tierWidth(.avx512)]u8 = undefined;
+    var second_storage: [5 * BLOCK_BYTES + tierWidth(.avx512)]u8 = undefined;
+    for ([_]usize{ 0, 1, BASELINE_LANES - 1, tierWidth(.avx2) - 1, tierWidth(.avx512) - 1 }) |alignment| {
         for (0..4 * BLOCK_BYTES + 3) |len| {
             // LF bytes just outside the slices must never be reported.
             @memset(&first_storage, '\n');
@@ -316,7 +380,7 @@ test "[property] - [newline kernels]: two-slice search is exact at every length 
                     if (pos < len) slice[pos] = '\n';
                     const first_has_lf = std.mem.findScalar(u8, first, '\n') != null;
                     const second_has_lf = std.mem.findScalar(u8, second, '\n') != null;
-                    inline for (.{ SSE_LANES, AVX2_LANES }) |lanes| {
+                    inline for (.{ BASELINE_LANES, tierWidth(.avx2), tierWidth(.avx512) }) |lanes| {
                         try std.testing.expectEqual(first_has_lf, containsNewlineFor(lanes, first.ptr, null, len));
                         try std.testing.expectEqual(first_has_lf or second_has_lf, containsNewlineFor(lanes, first.ptr, second.ptr, len));
                     }
@@ -344,7 +408,7 @@ test "[edge] - [newline kernels]: four-LF search is exact at vector and block bo
         for (expected) |index| data[index] = '\n';
         data[510] = '\n';
         var actual: [4]usize = undefined;
-        inline for (.{ SSE_LANES, AVX2_LANES }) |lanes| {
+        inline for (.{ BASELINE_LANES, tierWidth(.avx2), tierWidth(.avx512) }) |lanes| {
             try std.testing.expect(findNewlinesFor(lanes, &data, &actual));
             try std.testing.expectEqual(expected, actual);
             try std.testing.expect(!findNewlinesFor(lanes, data[0..expected[3]], &actual));
@@ -352,6 +416,42 @@ test "[edge] - [newline kernels]: four-LF search is exact at vector and block bo
         try std.testing.expect(findNewlines(&data, &actual));
         try std.testing.expectEqual(expected, actual);
         try std.testing.expect(!findNewlines(data[0..expected[3]], &actual));
+    }
+}
+
+test "[property] - [newline kernels]: the run-time selected path is exact around its length gate" {
+    // The span, one sentinel LF, and an LF-free span of the same length.
+    var storage: [7 * AVX2_MIN_BYTES]u8 = undefined;
+    const lengths = [_]usize{ AVX2_MIN_BYTES - 1, AVX2_MIN_BYTES, AVX2_MIN_BYTES + 1, AVX2_MIN_BYTES + 77, 2 * AVX2_MIN_BYTES, 3 * AVX2_MIN_BYTES + 5 };
+    const positions = [_]usize{ 0, 63, AVX2_MIN_BYTES - 1, AVX2_MIN_BYTES, AVX2_MIN_BYTES + 1, AVX2_MIN_BYTES + 31, 2 * AVX2_MIN_BYTES - 1, 3 * AVX2_MIN_BYTES };
+    for ([_]usize{ 0, 1, tierWidth(.avx2) - 1 }) |alignment| {
+        for (lengths) |len| {
+            const bytes = storage[alignment..][0..len];
+            for (positions) |first_lf| {
+                @memset(&storage, 'A');
+                // LF bytes just past the span must never be reported.
+                storage[alignment + len] = '\n';
+                var want_ends: [4]usize = undefined;
+                var want_count: usize = 0;
+                for ([_]usize{ first_lf, first_lf + 1, first_lf + 100, first_lf + 700 }) |index| {
+                    if (index >= len) break;
+                    bytes[index] = '\n';
+                    want_ends[want_count] = index;
+                    want_count += 1;
+                }
+                try std.testing.expectEqual(if (want_count > 0) want_ends[0] else null, findNewline(bytes));
+                var ends: [4]usize = undefined;
+                try std.testing.expectEqual(want_count == 4, findNewlines(bytes, &ends));
+                if (want_count == 4) try std.testing.expectEqualSlices(usize, &want_ends, &ends);
+
+                const quiet = storage[alignment + len + 1 ..][0..len];
+                @memset(quiet, 'C');
+                try std.testing.expectEqual(want_count > 0, containsNewline(bytes, null));
+                try std.testing.expectEqual(want_count > 0, containsNewline(quiet, bytes));
+                try std.testing.expectEqual(want_count > 0, containsNewline(bytes, quiet));
+                try std.testing.expect(!containsNewline(quiet, null));
+            }
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 //! CLI-private paired-read name parsing and matching.
 
 const std = @import("std");
+const simd = @import("simd.zig");
 
 pub const NamePolicy = enum {
     illumina,
@@ -64,8 +65,11 @@ pub fn namesMatch(name1: Name, name2: Name) bool {
     return name1.mate_markers == 0b01 and name2.mate_markers == 0b10;
 }
 
-const TOKEN_LANES = 16;
+// Read names are short, so the token kernels have only the scalar and
+// baseline tiers: no name would repay a call into the AVX2 object.
+const TOKEN_LANES = simd.tierWidth(.baseline);
 const TokenVector = @Vector(TOKEN_LANES, u8);
+const TokenMask = @Int(.unsigned, TOKEN_LANES);
 
 fn exactHeadersMatch(header1: []const u8, header2: []const u8) bool {
     return matchingTokenEnd(header1, header2) != null;
@@ -80,13 +84,13 @@ fn matchingTokenEnd(header1: []const u8, header2: []const u8) ?usize {
     while (common_len - offset >= TOKEN_LANES) : (offset += TOKEN_LANES) {
         const bytes1: TokenVector = header1[offset..][0..TOKEN_LANES].*;
         const bytes2: TokenVector = header2[offset..][0..TOKEN_LANES].*;
-        const stop1: u16 = @bitCast((bytes1 == spaces) | (bytes1 == tabs));
-        const stop2: u16 = @bitCast((bytes2 == spaces) | (bytes2 == tabs));
-        const mismatch: u16 = @bitCast(bytes1 != bytes2);
+        const stop1: TokenMask = @bitCast((bytes1 == spaces) | (bytes1 == tabs));
+        const stop2: TokenMask = @bitCast((bytes2 == spaces) | (bytes2 == tabs));
+        const mismatch: TokenMask = @bitCast(bytes1 != bytes2);
         const event = stop1 | stop2 | mismatch;
         if (event != 0) {
             const lane = @as(usize, @intCast(@ctz(event)));
-            const bit = @as(u16, 1) << @intCast(lane);
+            const bit = @as(TokenMask, 1) << @intCast(lane);
             const token_end1 = stop1 & bit != 0;
             const token_end2 = stop2 & bit != 0;
             return if (offset + lane != 0 and token_end1 and token_end2) offset + lane else null;
@@ -118,7 +122,7 @@ fn tokenEnd(header: []const u8, start: usize) usize {
     var end = start;
     while (header.len - end >= TOKEN_LANES) : (end += TOKEN_LANES) {
         const bytes: TokenVector = header[end..][0..TOKEN_LANES].*;
-        const mask: u16 = @bitCast((bytes == spaces) | (bytes == tabs));
+        const mask: TokenMask = @bitCast((bytes == spaces) | (bytes == tabs));
         if (mask != 0) return end + @as(usize, @intCast(@ctz(mask)));
     }
     while (end < header.len and header[end] != ' ' and header[end] != '\t') {
@@ -166,7 +170,7 @@ fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
         const tabs: TokenVector = @splat('\t');
         if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return false;
 
-        const space_mask: u16 = @bitCast(bytes1 == spaces);
+        const space_mask: TokenMask = @bitCast(bytes1 == spaces);
         if (space_mask != 0) {
             if (separator_plus_one != 0 or space_mask & (space_mask - 1) != 0) return false;
             separator_plus_one = offset + @as(usize, @intCast(@ctz(space_mask))) + 1;

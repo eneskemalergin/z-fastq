@@ -3,7 +3,6 @@
 const std = @import("std");
 const fastq = @import("fastq.zig");
 const simd = @import("simd.zig");
-const build_options = @import("build_options");
 
 pub const StatsError = error{
     S005LengthMismatch,
@@ -290,7 +289,7 @@ fn avx2Totals(parts: Parts, sequence: []const u8, quality: []const u8, quality_e
     var totals: PayloadTotals = undefined;
     var error_index: usize = undefined;
     var error_byte: u8 = undefined;
-    switch (zfq_avx2_payload_totals(@intFromEnum(parts), sequence.ptr, sequence.len, quality.ptr, quality.len, &totals, &error_index, &error_byte)) {
+    switch (simd.avx2Kernel("payload_totals", &payloadTotalsExport)(@intFromEnum(parts), sequence.ptr, sequence.len, quality.ptr, quality.len, &totals, &error_index, &error_byte)) {
         0 => return totals,
         1 => {
             quality_error.* = .{ .byte_index = error_index, .byte = error_byte };
@@ -300,24 +299,13 @@ fn avx2Totals(parts: Parts, sequence: []const u8, quality: []const u8, quality_e
     }
 }
 
-extern fn zfq_avx2_payload_totals(
-    parts: u8,
-    sequence: [*]const u8,
-    sequence_len: usize,
-    quality: [*]const u8,
-    quality_len: usize,
-    totals: *PayloadTotals,
-    error_index: *usize,
-    error_byte: *u8,
-) callconv(.c) u8;
-
 comptime {
-    if (build_options.simd_object) @export(&avx2PayloadTotals, .{ .name = "zfq_avx2_payload_totals" });
+    simd.exportKernel("payload_totals", &payloadTotalsExport);
 }
 
 /// 0 on success, 1 for an invalid quality byte (reported through the out
 /// parameters), 2 for counter overflow.
-fn avx2PayloadTotals(
+fn payloadTotalsExport(
     parts: u8,
     sequence: [*]const u8,
     sequence_len: usize,
@@ -353,16 +341,8 @@ fn payloadTotalsInline(
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
     const len = if (parts == .sequence) sequence.len else quality.len;
-    if (sum_type == u64) {
-        if (std.simd.suggestVectorLength(u8)) |vector_len| {
-            if (vector_len >= 2 and
-                vector_len % 2 == 0 and
-                vector_len <= std.math.maxInt(u16) / std.math.maxInt(u8) and
-                len >= vector_len)
-            {
-                return payloadTotalsVector(vector_len, parts, sequence, quality, quality_error);
-            }
-        }
+    if (sum_type == u64 and len >= simd.INLINE_LANES) {
+        return payloadTotalsVector(simd.INLINE_LANES, parts, sequence, quality, quality_error);
     }
     return payloadTotalsScalar(sum_type, parts, sequence, quality, quality_error);
 }
@@ -410,6 +390,7 @@ fn payloadTotalsScalar(
     };
 }
 
+/// The covered field holds at least `vector_len` bytes.
 fn payloadTotalsVector(
     comptime vector_len: comptime_int,
     comptime parts: Parts,
@@ -417,6 +398,9 @@ fn payloadTotalsVector(
     quality: []const u8,
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
+    // Score pairs are summed in u16 lanes, so a lane takes at most 257 vectors of u8 scores.
+    comptime std.debug.assert(vector_len >= 2 and vector_len % 2 == 0 and
+        vector_len <= std.math.maxInt(u16) / std.math.maxInt(u8));
     const half_len = vector_len / 2;
     const vectors_per_quality_block: usize = std.math.maxInt(u8) - 1;
     const vectors_per_base_block: usize = std.math.maxInt(u8) - 1;
@@ -443,7 +427,7 @@ fn payloadTotalsVector(
     var q20_bases: usize = 0;
     var q30_bases: usize = 0;
     var byte_index: usize = 0;
-    while (quality.len - byte_index >= vector_len) {
+    while (parts != .sequence and quality.len - byte_index >= vector_len) {
         const remaining_vectors = (quality.len - byte_index) / vector_len;
         const block_vectors = @min(remaining_vectors, vectors_per_quality_block);
         const block_start = byte_index;
@@ -522,7 +506,7 @@ fn payloadTotalsVector(
 
     var base_counts = [_]usize{0} ** 6;
     var base_index: usize = 0;
-    while (sequence.len - base_index >= vector_len) {
+    while (parts != .quality and sequence.len - base_index >= vector_len) {
         const remaining_vectors = (sequence.len - base_index) / vector_len;
         const block_vectors = @min(remaining_vectors, vectors_per_base_block);
         var a_lanes: Bytes = @splat(0);
@@ -600,8 +584,9 @@ fn rejectInvalidQualityBlock(
             return error.S006InvalidQuality;
         };
     }
-    std.debug.assert(false);
-    return error.S006InvalidQuality;
+    // The vector check flags a block only when one of its bytes fails the
+    // scalar decoding above; the tier test pins the two to each other.
+    unreachable;
 }
 
 fn sumBaseLanes(
@@ -651,12 +636,36 @@ test "[property] - [statistics]: wrapped quality scores preserve the valid range
     }
 }
 
-test "[property] - [statistics]: vector payload kernels match the scalar path" {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse return;
-    if (vector_len < 2 or
-        vector_len % 2 != 0 or
-        vector_len > std.math.maxInt(u16) / std.math.maxInt(u8)) return;
+test "[property] - [statistics]: vector payload kernels match the scalar path at every tier width" {
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |vector_len| {
+        try expectVectorTotalsAtWidth(vector_len);
+    }
+}
 
+/// The vector body at `vector_len` and the selected path agree, totals and
+/// first invalid byte alike; the vector result is returned.
+fn widthTotals(
+    comptime vector_len: comptime_int,
+    sequence: []const u8,
+    quality: []const u8,
+    quality_error: *?QualityError,
+) !PayloadTotals {
+    var selected_error: ?QualityError = null;
+    const selected = payloadTotals(u64, sequence, quality, &selected_error);
+    const vector = if (quality.len >= vector_len)
+        payloadTotalsVector(vector_len, .both, sequence, quality, quality_error)
+    else
+        payloadTotalsScalar(u64, .both, sequence, quality, quality_error);
+    if (vector) |totals| {
+        try std.testing.expectEqualDeep(totals, try selected);
+    } else |err| {
+        try std.testing.expectError(err, selected);
+    }
+    try std.testing.expectEqualDeep(quality_error.*, selected_error);
+    return vector;
+}
+
+fn expectVectorTotalsAtWidth(comptime vector_len: comptime_int) !void {
     const quality_vectors_per_block: usize = std.math.maxInt(u8) - 1;
     const quality_block_len: usize = vector_len * quality_vectors_per_block;
     const base_block_len: usize = vector_len * std.math.maxInt(u8);
@@ -699,8 +708,8 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
             quality[0..length],
             &scalar_error,
         );
-        const vector = try payloadTotals(
-            u64,
+        const vector = try widthTotals(
+            vector_len,
             sequence[0..length],
             quality[0..length],
             &vector_error,
@@ -719,8 +728,8 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
             quality[0..length],
             &scalar_error,
         );
-        const vector = try payloadTotals(
-            u64,
+        const vector = try widthTotals(
+            vector_len,
             sequence[0..length],
             quality[0..length],
             &vector_error,
@@ -749,8 +758,8 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
             );
             try std.testing.expectError(
                 error.S006InvalidQuality,
-                payloadTotals(
-                    u64,
+                widthTotals(
+                    vector_len,
                     sequence[0..length],
                     quality[0..length],
                     &vector_error,
@@ -771,8 +780,8 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
         quality[0..quality_block_len],
         &maximum_scalar_error,
     );
-    const maximum_vector = try payloadTotals(
-        u64,
+    const maximum_vector = try widthTotals(
+        vector_len,
         sequence[0..quality_block_len],
         quality[0..quality_block_len],
         &maximum_vector_error,
@@ -802,8 +811,8 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
     );
     try std.testing.expectError(
         error.S006InvalidQuality,
-        payloadTotals(
-            u64,
+        widthTotals(
+            vector_len,
             sequence[0..bound_len],
             quality[0..bound_len],
             &bound_vector_error,
@@ -841,7 +850,7 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
         );
         try std.testing.expectError(
             error.S006InvalidQuality,
-            payloadTotals(u64, sequence[0..invalid_len], quality[0..invalid_len], &vector_error),
+            widthTotals(vector_len, sequence[0..invalid_len], quality[0..invalid_len], &vector_error),
         );
         try std.testing.expectEqualDeep(scalar_error, vector_error);
         quality[invalid_index] = original;
@@ -865,8 +874,8 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
     );
     try std.testing.expectError(
         error.S006InvalidQuality,
-        payloadTotals(
-            u64,
+        widthTotals(
+            vector_len,
             sequence[0..invalid_len],
             quality[0..invalid_len],
             &vector_error,

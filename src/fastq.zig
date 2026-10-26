@@ -3,7 +3,6 @@
 const std = @import("std");
 const io_layer = @import("io.zig");
 const simd = @import("simd.zig");
-const build_options = @import("build_options");
 
 const ByteSource = io_layer.ByteSource;
 const ByteSink = io_layer.ByteSink;
@@ -222,27 +221,23 @@ fn identifierFirstByteIsValid(byte: ?u8) bool {
     return byte != null and byte != ' ' and byte != '\t';
 }
 
-const STRUCTURAL_BLOCK_BYTES = 64;
-
 // The validation loops start on a cache-line boundary: on cores with a
 // decoded-instruction cache their speed otherwise shifts by up to a fifth
 // with where unrelated code changes happen to place them.
 const HOT_LOOP_ALIGNMENT = 64;
-
-pub fn newlineMask(comptime lanes: usize, block: *const [lanes]u8) @Int(.unsigned, lanes) {
-    const Bytes = @Vector(lanes, u8);
-    const bytes: Bytes = block.*;
-    return @bitCast(bytes == @as(Bytes, @splat('\n')));
-}
 
 // Saved positions remain valid only while the buffer's bytes and indexes stay unchanged.
 // Extern layout: the AVX2 record scanner shares it across the object boundary.
 const LineFeedSearch = extern struct {
     block_start: usize = 0,
     block_end: usize = 0,
-    mask: @Int(.unsigned, @max(64, std.simd.suggestVectorLength(u8) orelse 1)) = 0,
+    mask: u64 = 0,
 
+    /// The complete-record scanner searches whole structural blocks, so one
+    /// mask serves a record's header and plus lines; the reader projections
+    /// search at the inline width, which costs less on short lines.
     fn find(self: *LineFeedSearch, comptime lanes: usize, bytes: []const u8, start: usize) align(HOT_LOOP_ALIGNMENT) ?usize {
+        comptime std.debug.assert(lanes <= simd.BLOCK_BYTES);
         var offset = start;
         if (start >= self.block_start and start < self.block_end and self.block_end <= bytes.len) {
             const remaining = self.mask >> @intCast(start - self.block_start);
@@ -253,7 +248,7 @@ const LineFeedSearch = extern struct {
         while (bytes.len - offset >= lanes) : (offset += lanes) {
             self.block_start = offset;
             self.block_end = offset + lanes;
-            self.mask = newlineMask(lanes, bytes[offset..][0..lanes]);
+            self.mask = simd.newlineMask(lanes, bytes[offset..][0..lanes]);
             if (self.mask != 0) return offset + @as(usize, @intCast(@ctz(self.mask)));
         }
         for (bytes[offset..], offset..) |byte, index| {
@@ -271,7 +266,7 @@ const LineFeedSearch = extern struct {
     ) bool {
         var offset = start;
         for (ends) |*end| {
-            const line_end = self.find(std.simd.suggestVectorLength(u8) orelse 1, bytes, offset) orelse
+            const line_end = self.find(simd.INLINE_LANES, bytes, offset) orelse
                 return false;
             end.* = line_end - start;
             offset = line_end + 1;
@@ -315,9 +310,7 @@ pub fn validateRecord(record: Record, options: ValidationOptions) ?SemanticError
 
 fn validateRecordFor(comptime alphabet: Alphabet, record: Record) ?SemanticError {
     if (record.sequence.len == record.quality.len) {
-        if (std.simd.suggestVectorLength(u8)) |vector_len| {
-            return validateRecordVector(vector_len, alphabet, record);
-        }
+        return validateRecordVector(simd.INLINE_LANES, alphabet, record);
     }
     if (firstInvalidSequence(record.sequence, alphabet)) |byte_index| {
         return semanticSequenceError(byte_index);
@@ -367,7 +360,7 @@ fn validateRecordVector(
     }
 
     const invalid: InvalidFields = if (simd.useAvx2(record.sequence.len))
-        @bitCast(zfq_avx2_invalid_fields(record.sequence.ptr, record.quality.ptr, record.sequence.len, @intFromEnum(alphabet)))
+        @bitCast(simd.avx2Kernel("invalid_fields", &invalidFieldsExport)(record.sequence.ptr, record.quality.ptr, record.sequence.len, @intFromEnum(alphabet)))
     else
         invalidFieldsVector(vector_len, alphabet, record.sequence, record.quality);
     if (invalid.sequence) {
@@ -447,12 +440,9 @@ fn invalidFieldsVector(
     return .{ .sequence = @reduce(.Or, sequence_invalid), .quality = @reduce(.Or, quality_invalid) };
 }
 
-extern fn zfq_avx2_invalid_fields(sequence: [*]const u8, quality: [*]const u8, len: usize, alphabet: u8) callconv(.c) u8;
-
-fn avx2InvalidFields(sequence: [*]const u8, quality: [*]const u8, len: usize, alphabet: u8) callconv(.c) u8 {
-    const vector_len = comptime std.simd.suggestVectorLength(u8).?;
+fn invalidFieldsExport(sequence: [*]const u8, quality: [*]const u8, len: usize, alphabet: u8) callconv(.c) u8 {
     return @bitCast(switch (@as(Alphabet, @enumFromInt(alphabet))) {
-        inline else => |known| invalidFieldsVector(vector_len, known, sequence[0..len], quality[0..len]),
+        inline else => |known| invalidFieldsVector(simd.INLINE_LANES, known, sequence[0..len], quality[0..len]),
     });
 }
 
@@ -498,13 +488,10 @@ pub fn decodePhred33(quality_byte: u8) error{InvalidQuality}!u8 {
 }
 
 fn firstInvalidSequence(sequence: []const u8, alphabet: Alphabet) ?usize {
-    if (std.simd.suggestVectorLength(u8)) |vector_len| {
-        return switch (alphabet) {
-            .iupac => firstInvalidSequenceVector(vector_len, .iupac, sequence),
-            .acgtn => firstInvalidSequenceVector(vector_len, .acgtn, sequence),
-        };
-    }
-    return firstInvalidSequenceScalar(sequence, alphabet, 0);
+    return switch (alphabet) {
+        .iupac => firstInvalidSequenceVector(simd.INLINE_LANES, .iupac, sequence),
+        .acgtn => firstInvalidSequenceVector(simd.INLINE_LANES, .acgtn, sequence),
+    };
 }
 
 fn firstInvalidSequenceVector(
@@ -575,10 +562,7 @@ fn firstInvalidSequenceScalar(
 }
 
 fn firstInvalidQuality(quality: []const u8) align(HOT_LOOP_ALIGNMENT) ?usize {
-    if (std.simd.suggestVectorLength(u8)) |vector_len| {
-        return firstInvalidQualityVector(vector_len, quality);
-    }
-    return firstInvalidQualityScalar(quality, 0);
+    return firstInvalidQualityVector(simd.INLINE_LANES, quality);
 }
 
 fn firstInvalidQualityVector(
@@ -768,12 +752,12 @@ fn scanSequenceLineFor(
     bytes: []const u8,
     comptime allow_crlf: bool,
 ) align(HOT_LOOP_ALIGNMENT) SequenceLineScan {
-    const Bytes = @Vector(STRUCTURAL_BLOCK_BYTES, u8);
+    const Bytes = @Vector(simd.BLOCK_BYTES, u8);
     var block_start: usize = 0;
-    while (bytes.len - block_start >= STRUCTURAL_BLOCK_BYTES) {
-        const block: Bytes = bytes[block_start..][0..STRUCTURAL_BLOCK_BYTES].*;
+    while (bytes.len - block_start >= simd.BLOCK_BYTES) {
+        const block: Bytes = bytes[block_start..][0..simd.BLOCK_BYTES].*;
         const invalid: u64 = @bitCast(invalidSequenceVector(
-            STRUCTURAL_BLOCK_BYTES,
+            simd.BLOCK_BYTES,
             alphabet,
             block,
         ));
@@ -787,7 +771,7 @@ fn scanSequenceLineFor(
             }
             return .{ .invalid_start = block_start };
         }
-        block_start += STRUCTURAL_BLOCK_BYTES;
+        block_start += simd.BLOCK_BYTES;
     }
     for (bytes[block_start..], block_start..) |byte, byte_index| {
         if (byte == '\n') return .{ .line_end = byte_index };
@@ -831,14 +815,12 @@ fn firstInvalidChunk(
 }
 
 fn avx2FirstInvalid(field: SemanticField, alphabet: Alphabet, use_full_iupac: *bool, bytes: []const u8) ?usize {
-    const index = zfq_avx2_first_invalid(@intFromEnum(field), @intFromEnum(alphabet), use_full_iupac, bytes.ptr, bytes.len);
+    const index = simd.avx2Kernel("first_invalid", &firstInvalidExport)(@intFromEnum(field), @intFromEnum(alphabet), use_full_iupac, bytes.ptr, bytes.len);
     return if (index == bytes.len) null else index;
 }
 
-extern fn zfq_avx2_first_invalid(field: u8, alphabet: u8, use_full_iupac: *bool, bytes: [*]const u8, len: usize) callconv(.c) usize;
-
 /// The first invalid byte of a sequence or quality chunk, or `len` when none.
-fn avx2FirstInvalidExport(field: u8, alphabet: u8, use_full_iupac: *bool, bytes: [*]const u8, len: usize) callconv(.c) usize {
+fn firstInvalidExport(field: u8, alphabet: u8, use_full_iupac: *bool, bytes: [*]const u8, len: usize) callconv(.c) usize {
     return firstInvalidChunk(@enumFromInt(field), @enumFromInt(alphabet), use_full_iupac, bytes[0..len]) orelse len;
 }
 
@@ -892,32 +874,19 @@ inline fn scanCompleteRecord(
 ) ?CompleteRecord {
     if (simd.useAvx2(sequence_len_hint)) {
         var checked: CompleteRecord = undefined;
-        if (!zfq_avx2_scan_complete_record(buffer.ptr, buffer.len, start, line_feeds, max_line_bytes, @intFromEnum(alphabet), initial_full_iupac, &checked)) return null;
+        if (!simd.avx2Kernel("scan_complete_record", &scanCompleteRecordExport)(buffer.ptr, buffer.len, start, line_feeds, max_line_bytes, @intFromEnum(alphabet), initial_full_iupac, &checked)) return null;
         return checked;
     }
     return scanCompleteRecordInline(buffer, start, line_feeds, max_line_bytes, alphabet, initial_full_iupac);
 }
 
-extern fn zfq_avx2_scan_complete_record(
-    buffer: [*]const u8,
-    len: usize,
-    start: usize,
-    line_feeds: *LineFeedSearch,
-    max_line_bytes: usize,
-    alphabet: u8,
-    initial_full_iupac: bool,
-    checked: *CompleteRecord,
-) callconv(.c) bool;
-
 comptime {
-    if (build_options.simd_object) {
-        @export(&avx2ScanCompleteRecord, .{ .name = "zfq_avx2_scan_complete_record" });
-        @export(&avx2InvalidFields, .{ .name = "zfq_avx2_invalid_fields" });
-        @export(&avx2FirstInvalidExport, .{ .name = "zfq_avx2_first_invalid" });
-    }
+    simd.exportKernel("scan_complete_record", &scanCompleteRecordExport);
+    simd.exportKernel("invalid_fields", &invalidFieldsExport);
+    simd.exportKernel("first_invalid", &firstInvalidExport);
 }
 
-fn avx2ScanCompleteRecord(
+fn scanCompleteRecordExport(
     buffer: [*]const u8,
     len: usize,
     start: usize,
@@ -940,7 +909,7 @@ fn scanCompleteRecordInline(
     initial_full_iupac: bool,
 ) align(HOT_LOOP_ALIGNMENT) ?CompleteRecord {
     const data = buffer[start..];
-    const header_end = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start) orelse return null) - start;
+    const header_end = (line_feeds.find(simd.BLOCK_BYTES, buffer, start) orelse return null) - start;
     const header_len = lineContentLen(data[0..header_end]);
     const header = data[0..header_len];
     if (header.len > max_line_bytes) return null;
@@ -960,7 +929,7 @@ fn scanCompleteRecordInline(
     if (sequence_len > max_line_bytes) return null;
 
     const plus_start = sequence_start + sequence_raw_len + 1;
-    const plus_raw_len = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start + plus_start) orelse
+    const plus_raw_len = (line_feeds.find(simd.BLOCK_BYTES, buffer, start + plus_start) orelse
         return null) - start - plus_start;
     const plus_len = lineContentLen(data[plus_start..][0..plus_raw_len]);
     const plus = data[plus_start..][0..plus_len];
@@ -2743,7 +2712,7 @@ pub const CheckScanner = struct {
     ) CheckScannerError!usize {
         const initial_record_index = self.record_index;
         var segment_start = start;
-        while (line_feeds.find(STRUCTURAL_BLOCK_BYTES, data, segment_start)) |line_end| {
+        while (line_feeds.find(simd.BLOCK_BYTES, data, segment_start)) |line_end| {
             try self.consumeLineBytes(data[segment_start..line_end]);
             try self.advanceOffset(line_end - segment_start + 1);
             try self.finishLine(true);
@@ -3901,7 +3870,7 @@ test "[edge] - [reader]: refill reserve grows from projected fields and retains 
 }
 
 test "[property] - [reader]: structural masks match scalar line boundaries" {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse 1;
+    const vector_len = simd.BLOCK_BYTES;
     var storage: [5 * vector_len + 8]u8 = undefined;
 
     for (0..vector_len) |alignment| {
@@ -3943,7 +3912,7 @@ test "[property] - [reader]: structural masks match scalar line boundaries" {
 
 test "[property] - [reader]: saved LF masks preserve searches after skips and rewinds" {
     var storage: [193]u8 = undefined;
-    inline for (.{ std.simd.suggestVectorLength(u8) orelse 1, STRUCTURAL_BLOCK_BYTES }) |lanes| {
+    inline for (.{ simd.tierWidth(.baseline), simd.BLOCK_BYTES }) |lanes| {
         for (0..storage.len) |newline| {
             @memset(&storage, 'x');
             storage[newline] = '\n';
@@ -4175,7 +4144,7 @@ test "[property] - [reader]: validated records match separate parsing and valida
         }
     }
 
-    const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
+    const vector_len = simd.INLINE_LANES;
     for ([_]usize{ 15, 16, 17, vector_len - 1, vector_len, vector_len + 1, 63, 64, 65 }) |len| {
         const input = try ReaderSpillFixture.init(std.testing.allocator, len, len, "\n", true);
         defer std.testing.allocator.free(input);
@@ -5172,27 +5141,6 @@ test "[unit] - [check scanner]: state remains fixed-size" {
     try std.testing.expect(@sizeOf(CheckScanner) <= 160);
 }
 
-test "[property] - [LF mask]: preserves newline positions across block widths" {
-    inline for (.{ 1, 16, STRUCTURAL_BLOCK_BYTES, std.simd.suggestVectorLength(u8) orelse 1 }) |lanes| {
-        const Mask = @Int(.unsigned, lanes);
-        var block: [lanes]u8 = @splat('A');
-        try std.testing.expectEqual(@as(Mask, 0), newlineMask(lanes, &block));
-        for (0..lanes) |lane| {
-            block[lane] = '\n';
-            try std.testing.expectEqual(@as(Mask, 1) << @intCast(lane), newlineMask(lanes, &block));
-            block[lane] = 'A';
-        }
-
-        var expected: Mask = 0;
-        for ([_]usize{ 0, 1, 15, 16, 31, 32, 47, 48, 62, 63 }) |lane| {
-            if (lane >= lanes) continue;
-            block[lane] = '\n';
-            expected |= @as(Mask, 1) << @intCast(lane);
-        }
-        try std.testing.expectEqual(expected, newlineMask(lanes, &block));
-    }
-}
-
 fn firstValidSequenceLineEnd(bytes: []const u8, alphabet: Alphabet) ?usize {
     return switch (alphabet) {
         .iupac => firstValidSequenceLineEndFor(.iupac, bytes),
@@ -5201,7 +5149,7 @@ fn firstValidSequenceLineEnd(bytes: []const u8, alphabet: Alphabet) ?usize {
 }
 
 test "[property] - [check scanner]: fused sequence scan preserves delimiter boundaries" {
-    var bytes: [2 * STRUCTURAL_BLOCK_BYTES + 2]u8 = @splat('A');
+    var bytes: [2 * simd.BLOCK_BYTES + 2]u8 = @splat('A');
     for (0..bytes.len) |line_end| {
         @memset(&bytes, 'A');
         bytes[line_end] = '\n';
@@ -5229,10 +5177,10 @@ test "[property] - [check scanner]: fused sequence scan preserves delimiter boun
     }
 
     @memset(&bytes, 'A');
-    bytes[STRUCTURAL_BLOCK_BYTES] = 'R';
-    bytes[STRUCTURAL_BLOCK_BYTES + 1] = '\n';
+    bytes[simd.BLOCK_BYTES] = 'R';
+    bytes[simd.BLOCK_BYTES + 1] = '\n';
     try std.testing.expectEqual(
-        STRUCTURAL_BLOCK_BYTES + 1,
+        simd.BLOCK_BYTES + 1,
         firstValidSequenceLineEnd(&bytes, .iupac).?,
     );
     try std.testing.expect(firstValidSequenceLineEnd(&bytes, .acgtn) == null);
@@ -5290,7 +5238,7 @@ test "[property] - [check scanner]: adaptive IUPAC validation preserves byte pol
         try std.testing.expect(!use_full_iupac);
     }
 
-    var block: [STRUCTURAL_BLOCK_BYTES]u8 = @splat('A');
+    var block: [simd.BLOCK_BYTES]u8 = @splat('A');
     block[1] = '\n';
     block[2] = 'R';
     var use_full_iupac = false;
@@ -5308,7 +5256,7 @@ test "[property] - [check scanner]: adaptive IUPAC validation preserves byte pol
     );
     try std.testing.expect(use_full_iupac);
 
-    var sequence: [2 * STRUCTURAL_BLOCK_BYTES]u8 = @splat('A');
+    var sequence: [2 * simd.BLOCK_BYTES]u8 = @splat('A');
     sequence[31] = 'R';
     sequence[70] = '.';
     use_full_iupac = false;
@@ -5789,7 +5737,7 @@ test "[property] - [check scanner]: refill-spanning records match Reader" {
 }
 
 test "[property] - [check scanner]: generated semantic mutations retain exact locations" {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
+    const vector_len = simd.INLINE_LANES;
     for (1..2 * vector_len + 2) |field_len| {
         var data: std.ArrayList(u8) = .empty;
         defer data.deinit(std.testing.allocator);
@@ -6022,7 +5970,7 @@ fn expectCheckOutcome(expected: CheckTestOutcome, actual: CheckTestOutcome) !voi
 }
 
 test "[property] - [record validation]: quality checks match scalar results" {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
+    const vector_len = simd.INLINE_LANES;
     const max_len = 4 * vector_len - 1;
     const quality = try std.testing.allocator.alloc(u8, max_len);
     defer std.testing.allocator.free(quality);
@@ -6086,7 +6034,7 @@ test "[property] - [record validation]: quality checks match scalar results" {
 }
 
 test "[property] - [record validation]: vector sequence validation matches scalar policies" {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
+    const vector_len = simd.INLINE_LANES;
     const max_len = 4 * vector_len - 1;
     const sequence = try std.testing.allocator.alloc(u8, max_len);
     defer std.testing.allocator.free(sequence);
@@ -6248,8 +6196,38 @@ test "[property] - [record validation]: adaptive IUPAC state preserves byte poli
     try std.testing.expect(!acgtn.use_full_iupac);
 }
 
+test "[property] - [record validation]: vector kernels match the scalar reference at every tier width" {
+    var prng: std.Random.DefaultPrng = .init(std.testing.random_seed);
+    const random = prng.random();
+    const symbols = "ACGTNacgtnRYSWKMBDHVUu";
+    var sequence: [5 * simd.tierWidth(.avx512) + 3]u8 = undefined;
+    var quality: [sequence.len]u8 = undefined;
+    for (0..3000) |_| {
+        const len = random.uintLessThan(usize, sequence.len + 1);
+        // Most inputs carry no invalid byte, some carry several.
+        const invalid_per_mille = random.uintLessThan(u16, 4) * 3;
+        for (sequence[0..len], quality[0..len]) |*base, *score| {
+            base.* = if (random.uintLessThan(u16, 1000) < invalid_per_mille) random.int(u8) else symbols[random.uintLessThan(usize, symbols.len)];
+            score.* = if (random.uintLessThan(u16, 1000) < invalid_per_mille) random.int(u8) else 33 + random.uintLessThan(u8, 94);
+        }
+        inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
+            inline for (.{ Alphabet.iupac, Alphabet.acgtn }) |alphabet| {
+                const want_sequence = firstInvalidSequenceScalar(sequence[0..len], alphabet, 0);
+                const want_quality = firstInvalidQualityScalar(quality[0..len], 0);
+                try std.testing.expectEqual(want_sequence, firstInvalidSequenceVector(lanes, alphabet, sequence[0..len]));
+                try std.testing.expectEqual(want_quality, firstInvalidQualityVector(lanes, quality[0..len]));
+                if (len >= lanes) {
+                    const invalid = invalidFieldsVector(lanes, alphabet, sequence[0..len], quality[0..len]);
+                    try std.testing.expectEqual(want_sequence != null, invalid.sequence);
+                    try std.testing.expectEqual(want_quality != null, invalid.quality);
+                }
+            }
+        }
+    }
+}
+
 test "[property] - [record validation]: fused vectors preserve field precedence" {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse return;
+    const vector_len = simd.INLINE_LANES;
     const length = 8 * vector_len - 1;
     const sequence = try std.testing.allocator.alloc(u8, length);
     defer std.testing.allocator.free(sequence);

@@ -37,9 +37,9 @@ Use `Debug` while changing the project:
 zig build
 ```
 
-## Portable checksum kernels
+## Run-time kernel selection
 
-The release binary is compiled for generic x86-64. By default Zipir picks its checksum kernels at run time for the CPU the binary runs on: gzip CRC-32 uses PCLMUL and SSE4.1 when available. To build only the portable kernels:
+The release binary is compiled for generic x86-64. By default some kernels are picked at run time for the CPU the binary runs on: gzip CRC-32 uses PCLMUL and SSE4.1 when available, and newline search, record validation, and base and quality counting on records of 1 KiB or more use AVX2 when available. To build without run-time selection, using only the instructions of the build target:
 
 ```bash
 zig build -Dstatic=true -Doptimize=ReleaseFast -Dkernel-backend=portable
