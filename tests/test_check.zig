@@ -1,16 +1,12 @@
-//! Installed CLI contracts for `z-fastq check`.
+//! Installed `z-fastq check` validation, diagnostics, input forms, and exit status.
 
 const std = @import("std");
 const cli = @import("utilities.zig");
 
 const FIXTURE_DIR = cli.FIXTURE_DIR;
-/// The identifier prefix kept in P001 diagnostics (`PAIR_DIAGNOSTIC_PREFIX_BYTES` in src/main.zig).
 const DIAGNOSTIC_PREFIX_BYTES = 128;
-/// An identifier longer than the diagnostic prefix, so the prefix is the only part shown.
 const LONG_IDENTIFIER_BYTES = DIAGNOSTIC_PREFIX_BYTES + 32;
-/// Upper bound on the size of a bounded P001 report.
 const BOUNDED_REPORT_BYTES = 2048;
-/// Length of each directory component in the long-path test; a path longer than the JSON buffer.
 const LONG_COMPONENT_BYTES = 200;
 
 const FixtureExpect = struct {
@@ -205,7 +201,6 @@ test "[cli] - [check]: a record reports the first rule it breaks" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // Each input breaks several rules; the reported error is the one earliest in the record.
     const cases = [_]struct {
         args: []const []const u8 = &.{ "check", "-" },
         input: []const u8,
@@ -560,44 +555,39 @@ test "[cli] - [paired check]: aliases reject before reading or writing JSON" {
     };
     const payload = "@SRR1.1 1 length=4\nACGT\n+\nIIII\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = payload });
+    try tmp.dir.writeFile(io, .{ .sub_path = "copy.fastq", .data = payload });
     try tmp.dir.hardLink("input.fastq", tmp.dir, "hard.fastq", io, .{});
     try tmp.dir.symLink(io, "input.fastq", "link.fastq", .{});
 
-    for ([_][]const u8{payload}) |bytes| {
-        try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = bytes });
-        try tmp.dir.writeFile(io, .{ .sub_path = "copy.fastq", .data = bytes });
-        for ([_][]const []const u8{ &.{ "check", "--paired" }, &.{ "check", "--paired", "--json" } }) |command| {
-            for (aliases) |alias| {
-                const args = try std.mem.concat(allocator, []const u8, &.{ command, &.{ path, alias } });
-                const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{alias});
-                try cli.expectResult(try cli.run(allocator, args), 2, "", diagnostic);
-            }
-            for (0..2) |stdin_side| {
-                const inputs: [2][]const u8 = if (stdin_side == 0) .{ "-", path } else .{ path, "-" };
-                const args = try std.mem.concat(allocator, []const u8, &.{ command, &inputs });
-                const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{inputs[1]});
-                const file = try tmp.dir.openFile(io, "input.fastq", .{});
-                defer file.close(io);
-                try cli.expectResult(try cli.runWithStdinFile(allocator, args, file), 2, "", diagnostic);
-                if (bytes.len != 0) {
-                    var first: [1]u8 = undefined;
-                    try std.testing.expectEqual(@as(usize, 1), try file.readStreaming(io, &.{&first}));
-                    try std.testing.expectEqual(bytes[0], first[0]);
-                }
-            }
-            const args = try std.mem.concat(allocator, []const u8, &.{ command, &.{ path, copy } });
-            const result = try cli.run(allocator, args);
-            try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-            try std.testing.expectEqualStrings("", result.stderr);
-            if (command.len == 2) {
-                try std.testing.expectEqualStrings("", result.stdout);
-            } else {
-                const results = try cli.parseJsonResults(allocator, result.stdout, "z-fastq/check-v1");
-                try std.testing.expectEqual(@as(usize, 1), results.len);
-                try cli.expectJsonObjectKeys(results[0].object, &.{ "inputs", "status" });
-                try expectJsonInputs(results[0].object.get("inputs"), path, copy);
-                try cli.expectJsonString(results[0].object.get("status"), "ok");
-            }
+    for ([_][]const []const u8{ &.{ "check", "--paired" }, &.{ "check", "--paired", "--json" } }) |command| {
+        for (aliases) |alias| {
+            const args = try std.mem.concat(allocator, []const u8, &.{ command, &.{ path, alias } });
+            const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{alias});
+            try cli.expectResult(try cli.run(allocator, args), 2, "", diagnostic);
+        }
+        for (0..2) |stdin_side| {
+            const inputs: [2][]const u8 = if (stdin_side == 0) .{ "-", path } else .{ path, "-" };
+            const args = try std.mem.concat(allocator, []const u8, &.{ command, &inputs });
+            const diagnostic = try std.fmt.allocPrint(allocator, "error: {s}: paired inputs refer to the same file\n", .{inputs[1]});
+            const file = try tmp.dir.openFile(io, "input.fastq", .{});
+            defer file.close(io);
+            try cli.expectResult(try cli.runWithStdinFile(allocator, args, file), 2, "", diagnostic);
+            var first: [1]u8 = undefined;
+            try std.testing.expectEqual(@as(usize, 1), try file.readStreaming(io, &.{&first}));
+            try std.testing.expectEqual(payload[0], first[0]);
+        }
+        const args = try std.mem.concat(allocator, []const u8, &.{ command, &.{ path, copy } });
+        const result = try cli.run(allocator, args);
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expectEqualStrings("", result.stderr);
+        if (command.len == 2) {
+            try std.testing.expectEqualStrings("", result.stdout);
+        } else {
+            const results = try cli.parseJsonResults(allocator, result.stdout, "z-fastq/check-v1");
+            try std.testing.expectEqual(@as(usize, 1), results.len);
+            try cli.expectJsonObjectKeys(results[0].object, &.{ "inputs", "status" });
+            try expectJsonInputs(results[0].object.get("inputs"), path, copy);
+            try cli.expectJsonString(results[0].object.get("status"), "ok");
         }
     }
 }
@@ -1043,7 +1033,6 @@ test "[cli] - [paired check]: missing mates and semantic failures report the exa
     const r1_path = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
     const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
 
-    // A structural failure in R2 is reported before a semantic failure in R1.
     const Reported = enum { pair, r1, r2 };
     const cases = [_]struct {
         r1: []const u8,

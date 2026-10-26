@@ -1,4 +1,4 @@
-//! Installed CLI contracts for `z-fastq deinterleave`.
+//! Installed `z-fastq deinterleave` behavior: pairing, two outputs, validation, and exit status.
 
 const std = @import("std");
 const cli = @import("utilities.zig");
@@ -13,18 +13,9 @@ const EXACT_R2 =
     "@same right\nT\n+two\n#\n" ++
     "@empty two\n\n+empty-two\n\n";
 
-/// The read buffer and the output buffer the CLI uses; sizes below are chosen relative to them.
 const READ_BUFFER_BYTES = 256 * 1024;
 const OUTPUT_BUFFER_BYTES = 64 * 1024;
-/// Input bytes per gzip member in the fixtures below, under the 64 KiB member payload limit.
 const GZIP_MEMBER_INPUT_BYTES = 60 * 1024;
-
-/// Checks the first line of a multi-line diagnostic. The full text of pair
-/// diagnostics belongs to the check suite.
-fn expectFirstLine(expected: []const u8, stderr: []const u8) !void {
-    const end = std.mem.indexOfScalar(u8, stderr, '\n') orelse return error.MissingDiagnosticLine;
-    try std.testing.expectEqualStrings(expected, stderr[0 .. end + 1]);
-}
 
 test "[cli] - [deinterleave]: mates are written in input order with canonical LF output" {
     const io = std.testing.io;
@@ -51,14 +42,7 @@ test "[cli] - [deinterleave]: mates are written in input order with canonical LF
     try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = input });
 
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "deinterleave",
-            "--out1",
-            out1_path,
-            "--out2",
-            out2_path,
-            input_path,
-        }),
+        try cli.run(allocator, &.{ "deinterleave", "--out1", out1_path, "--out2", out2_path, input_path }),
         0,
         "",
         "",
@@ -113,7 +97,7 @@ test "[cli] - [deinterleave]: terminal CR fields leave both outputs empty" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    for (1..2) |bad_mate| {
+    for (0..2) |bad_mate| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
@@ -176,19 +160,7 @@ test "[cli] - [deinterleave]: empty input creates two empty outputs" {
     const empty_out1 = try cli.tempPath(allocator, &tmp.sub_path, "empty-r1.fastq");
     const empty_out2 = try cli.tempPath(allocator, &tmp.sub_path, "empty-r2.fastq");
     try cli.expectResult(
-        try cli.runWithStdin(
-            allocator,
-            &.{
-                "deinterleave",
-                "--out1",
-                empty_out1,
-                "--out2",
-                empty_out2,
-                "-",
-            },
-            "",
-            1,
-        ),
+        try cli.runWithStdin(allocator, &.{ "deinterleave", "--out1", empty_out1, "--out2", empty_out2, "-" }, "", 1),
         0,
         "",
         "",
@@ -228,7 +200,7 @@ test "[cli] - [deinterleave]: exact policy compares complete first tokens" {
     });
     try std.testing.expectEqual(@as(u8, 1), result.exit_code);
     try std.testing.expectEqualStrings("", result.stdout);
-    try expectFirstLine(expected, result.stderr);
+    try cli.expectFirstLine(expected, result.stderr);
     try expectEmptyFile(paths[0]);
     try expectEmptyFile(paths[1]);
 }
@@ -298,7 +270,7 @@ test "[cli] - [deinterleave]: the earliest failure decides the diagnostic and wh
         try std.testing.expectEqual(@as(u8, 1), result.exit_code);
         try std.testing.expectEqualStrings("", result.stdout);
         if (case.first_line) {
-            try expectFirstLine(message, result.stderr);
+            try cli.expectFirstLine(message, result.stderr);
         } else {
             try std.testing.expectEqualStrings(message, result.stderr);
         }
@@ -325,12 +297,7 @@ test "[cli] - [deinterleave]: late gzip failure retains the same complete prefix
         try input.appendSlice(allocator, r2.items);
     }
     var gzip: std.ArrayList(u8) = .empty;
-    var offset: usize = 0;
-    while (offset < input.items.len) {
-        const end = @min(offset + GZIP_MEMBER_INPUT_BYTES, input.items.len);
-        try cli.appendGzipMember(allocator, &gzip, input.items[offset..end], .{});
-        offset = end;
-    }
+    try appendGzipChunks(allocator, &gzip, input.items);
     gzip.items[cli.gzipCrcOffset(gzip.items.len)] ^= 1;
     try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq.gz", .data = gzip.items });
     const paths = try outputPaths(allocator, &tmp.sub_path, "corrupt-prefix");
@@ -399,11 +366,7 @@ test "[cli] - [deinterleave]: validation failures in the first pair leave empty 
     for (cases) |case| {
         try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = case.input });
         const paths = try outputPaths(allocator, &tmp.sub_path, case.prefix);
-        const expected = try std.fmt.allocPrint(
-            allocator,
-            "error: {s}: {s}",
-            .{ input_path, case.error_tail },
-        );
+        const expected = try std.fmt.allocPrint(allocator, "error: {s}: {s}", .{ input_path, case.error_tail });
         try cli.expectResult(
             try runDeinterleave(allocator, input_path, paths),
             case.exit_code,
@@ -423,7 +386,6 @@ test "[cli] - [deinterleave]: a later failure keeps the complete pair beyond bot
     defer arena.deinit();
     const allocator = arena.allocator();
     const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
-    // Each mate is one output buffer plus 64 bytes, so the complete pair fills both buffers.
     const mate_len = OUTPUT_BUFFER_BYTES + 64;
     var r1: std.ArrayList(u8) = .empty;
     var r2: std.ArrayList(u8) = .empty;
@@ -484,23 +446,17 @@ test "[cli] - [deinterleave]: a later failure keeps the complete pair beyond bot
                 "error: {s}: {s} (record {d}, line {d}, offset {d})\n",
                 .{ input_path, case.message, case.record, case.line, prefix_len + case.offset },
             );
-        // One gzip row, for the first class.
         const transports: []const bool = if (index == 0) &.{ false, true } else &.{false};
         for (transports) |gzip_input| {
             var gzip: std.ArrayList(u8) = .empty;
-            var offset: usize = 0;
-            while (gzip_input and offset < input.items.len) {
-                const end = @min(offset + GZIP_MEMBER_INPUT_BYTES, input.items.len);
-                try cli.appendGzipMember(allocator, &gzip, input.items[offset..end], .{});
-                offset = end;
-            }
+            if (gzip_input) try appendGzipChunks(allocator, &gzip, input.items);
             try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = if (gzip_input) gzip.items else input.items });
             const paths = try outputPaths(allocator, &tmp.sub_path, "prefix");
             const result = try runDeinterleave(allocator, input_path, paths);
             try std.testing.expectEqual(@as(u8, 1), result.exit_code);
             try std.testing.expectEqualStrings("", result.stdout);
             if (case.first_line) {
-                try expectFirstLine(expected_stderr, result.stderr);
+                try cli.expectFirstLine(expected_stderr, result.stderr);
             } else {
                 try std.testing.expectEqualStrings(expected_stderr, result.stderr);
             }
@@ -526,12 +482,7 @@ test "[cli] - [deinterleave]: IUPAC alphabet accepts ambiguous bases in both mat
         .data = "@iupac/1\nR\n+\n!\n@iupac/2\nY\n+\n#\n",
     });
     const iupac_paths = try outputPaths(allocator, &tmp.sub_path, "iupac");
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, iupac_paths),
-        0,
-        "",
-        "",
-    );
+    try cli.expectResult(try runDeinterleave(allocator, input_path, iupac_paths), 0, "", "");
     try expectFile(allocator, iupac_paths[0], "@iupac/1\nR\n+\n!\n");
     try expectFile(allocator, iupac_paths[1], "@iupac/2\nY\n+\n#\n");
 }
@@ -626,42 +577,28 @@ test "[cli] - [deinterleave]: line limit failures leave empty outputs" {
     }
 }
 
-test "[cli] - [deinterleave]: an existing first output is kept and the second is not created" {
+test "[cli] - [deinterleave]: an existing output is kept and the other output is not created" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
-    const out1_path = try cli.tempPath(allocator, &tmp.sub_path, "out1.fastq");
-    const out2_path = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq");
-    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "out1.fastq", .data = "keep-one" });
+    const names = [_][]const u8{ "out1.fastq", "out2.fastq" };
+    const kept = [_][]const u8{ "keep-one", "keep-two" };
+    for (0..2) |existing| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+        const out1_path = try cli.tempPath(allocator, &tmp.sub_path, "out1.fastq");
+        const out2_path = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq");
+        const paths = [_][]const u8{ out1_path, out2_path };
+        try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n" });
+        try tmp.dir.writeFile(io, .{ .sub_path = names[existing], .data = kept[existing] });
 
-    const expected = try std.fmt.allocPrint(allocator, "error: {s}: output path already exists\n", .{out1_path});
-    try cli.expectResult(try runDeinterleave(allocator, input_path, .{ out1_path, out2_path }), 3, "", expected);
-    try expectFile(allocator, out1_path, "keep-one");
-    try std.testing.expect(!try pathExists(io, out2_path));
-}
-
-test "[cli] - [deinterleave]: an existing second output is kept and the first is not created" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
-    const out1_path = try cli.tempPath(allocator, &tmp.sub_path, "out1.fastq");
-    const out2_path = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq");
-    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "out2.fastq", .data = "keep-two" });
-
-    const expected = try std.fmt.allocPrint(allocator, "error: {s}: output path already exists\n", .{out2_path});
-    try cli.expectResult(try runDeinterleave(allocator, input_path, .{ out1_path, out2_path }), 3, "", expected);
-    try std.testing.expect(!try pathExists(io, out1_path));
-    try expectFile(allocator, out2_path, "keep-two");
+        const expected = try std.fmt.allocPrint(allocator, "error: {s}: output path already exists\n", .{paths[existing]});
+        try cli.expectResult(try runDeinterleave(allocator, input_path, paths), 3, "", expected);
+        try expectFile(allocator, paths[existing], kept[existing]);
+        try std.testing.expect(!try pathExists(io, paths[1 - existing]));
+    }
 }
 
 test "[cli] - [deinterleave]: an output path equal to the other output or to the input is refused" {
@@ -739,7 +676,6 @@ test "[edge] - [deinterleave]: a line exactly at the line limit is accepted" {
     const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
     const out1_path = try cli.tempPath(allocator, &tmp.sub_path, "out1.fastq");
     const out2_path = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq");
-    // Eight bytes is the limit: every sequence and quality line below is exactly that long.
     const r1 = "@p/1\nAAAAAAAA\n+\n!!!!!!!!\n";
     const r2 = "@p/2\nTTTTTTTT\n+\n########\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = r1 ++ r2 });
@@ -781,11 +717,7 @@ test "[cli] - [deinterleave]: failure does not delete replaced or created output
     });
     defer process.kill(child_io);
 
-    var process_deadline = try cli.ProcessDeadline.init(
-        child_io,
-        &process,
-        cli.PROCESS_TIMEOUT,
-    );
+    var process_deadline = try cli.ProcessDeadline.init(child_io, &process, cli.PROCESS_TIMEOUT);
     defer process_deadline.deinit();
 
     while (true) {
@@ -797,10 +729,7 @@ test "[cli] - [deinterleave]: failure does not delete replaced or created output
     }
 
     try std.Io.Dir.cwd().deleteFile(child_io, out1_path);
-    try std.Io.Dir.cwd().writeFile(child_io, .{
-        .sub_path = out1_path,
-        .data = "replacement",
-    });
+    try std.Io.Dir.cwd().writeFile(child_io, .{ .sub_path = out1_path, .data = "replacement" });
     try std.Io.File.writeStreamingAll(
         process.stdin.?,
         child_io,
@@ -809,12 +738,7 @@ test "[cli] - [deinterleave]: failure does not delete replaced or created output
     process.stdin.?.close(child_io);
     process.stdin = null;
 
-    const result = try cli.finishSpawned(
-        allocator,
-        child_io,
-        &process,
-        &process_deadline,
-    );
+    const result = try cli.finishSpawned(allocator, child_io, &process, &process_deadline);
     const expected_stderr = "error: -: S002: sequence byte is outside the selected alphabet " ++
         "(record 0, line 2, offset 7)\n";
 
@@ -869,11 +793,7 @@ test "[cli] - [deinterleave]: missing input cannot be created as an output" {
     defer tmp.cleanup();
     const missing = try cli.tempPath(allocator, &tmp.sub_path, "missing.fastq");
     const other = try cli.tempPath(allocator, &tmp.sub_path, "other.fastq");
-    const missing_error = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: file not found\n",
-        .{missing},
-    );
+    const missing_error = try std.fmt.allocPrint(allocator, "error: {s}: file not found\n", .{missing});
     try cli.expectResult(
         try runDeinterleave(allocator, missing, .{ missing, other }),
         3,
@@ -942,12 +862,7 @@ test "[edge] - [deinterleave]: records spanning read-buffer refills on both side
     try expectFile(allocator, paths[1], r2.items);
 
     var gzip: std.ArrayList(u8) = .empty;
-    var offset: usize = 0;
-    while (offset < interleaved.items.len) {
-        const end = @min(offset + GZIP_MEMBER_INPUT_BYTES, interleaved.items.len);
-        try cli.appendGzipMember(allocator, &gzip, interleaved.items[offset..end], .{});
-        offset = end;
-    }
+    try appendGzipChunks(allocator, &gzip, interleaved.items);
     try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = gzip.items });
     const gzip_paths = try outputPaths(allocator, &tmp.sub_path, "gzip-large");
     try cli.expectResult(try runDeinterleave(allocator, input_path, gzip_paths), 0, "", "");
@@ -960,14 +875,7 @@ fn runDeinterleave(
     input_path: []const u8,
     paths: [2][]const u8,
 ) !cli.CommandResult {
-    return cli.run(allocator, &.{
-        "deinterleave",
-        "--out1",
-        paths[0],
-        "--out2",
-        paths[1],
-        input_path,
-    });
+    return cli.run(allocator, &.{ "deinterleave", "--out1", paths[0], "--out2", paths[1], input_path });
 }
 
 fn outputPaths(
@@ -979,6 +887,15 @@ fn outputPaths(
         try cli.tempPath(allocator, sub_path, try std.fmt.allocPrint(allocator, "{s}-r1.fastq", .{prefix})),
         try cli.tempPath(allocator, sub_path, try std.fmt.allocPrint(allocator, "{s}-r2.fastq", .{prefix})),
     };
+}
+
+fn appendGzipChunks(allocator: std.mem.Allocator, gzip: *std.ArrayList(u8), bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = @min(offset + GZIP_MEMBER_INPUT_BYTES, bytes.len);
+        try cli.appendGzipMember(allocator, gzip, bytes[offset..end], .{});
+        offset = end;
+    }
 }
 
 fn expectEmptyFile(path: []const u8) !void {

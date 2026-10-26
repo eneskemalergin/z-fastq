@@ -83,7 +83,6 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
     const forked = linux.fork();
     if (linux.errno(forked) != .SUCCESS) die("fork", program, linux.errno(forked));
     if (forked == 0) {
-        // Die with zexec, so a runner timeout cannot leave the program running.
         _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.KILL), 0, 0, 0);
         run(program, stdin_path, stdout_path, envp);
     }
@@ -108,7 +107,6 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         wall_us,
     }) catch unreachable;
     if (linux.write(@intCast(fd), text.ptr, text.len) != text.len) die("write", std.mem.span(report), null);
-    // A file the program did not write is not an error here.
     for (unlink_paths[0..unlink_count]) |path| _ = linux.unlinkat(linux.AT.FDCWD, path, 0);
 
     if (linux.W.IFSIGNALED(status)) {
@@ -119,7 +117,6 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
     linux.exit_group(linux.W.EXITSTATUS(status));
 }
 
-/// Applies the redirects and replaces this process with PROGRAM.
 fn run(program: []const u8, stdin_path: ?[*:0]const u8, stdout_path: ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
     if (stdin_path) |path| redirect(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (stdout_path) |path| redirect(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 1);
@@ -131,7 +128,6 @@ fn micros(t: linux.timeval) i64 {
     return @as(i64, t.sec) * 1_000_000 + t.usec;
 }
 
-/// Returns `arg` itself, or a copy in `pool` with every token replaced by the pid.
 fn expand(arg: [*:0]const u8) [*:0]const u8 {
     const text = std.mem.span(arg);
     if (std.mem.indexOf(u8, text, token) == null) return arg;
@@ -144,13 +140,11 @@ fn expand(arg: [*:0]const u8) [*:0]const u8 {
     return out[0..len :0].ptr;
 }
 
-/// Opens `path` onto descriptor `fd`, leaving no extra descriptor open.
 fn redirect(path: [*:0]const u8, flags: linux.O, fd: i32) void {
     const rc = linux.open(path, flags, 0o644);
     if (linux.errno(rc) != .SUCCESS) die("open", std.mem.span(path), linux.errno(rc));
     const opened: i32 = @intCast(rc);
     if (opened == fd) {
-        // Already on the target descriptor: only clear close-on-exec.
         _ = linux.fcntl(fd, linux.F.SETFD, 0);
         return;
     }

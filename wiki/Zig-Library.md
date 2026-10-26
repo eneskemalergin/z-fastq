@@ -42,13 +42,23 @@ defer owned.deinit();
 
 This distinction is central to the module. Borrowed records keep streaming work small. Owned records are the explicit escape hatch.
 
+A `Record`'s `id` is the first space- or tab-delimited token of `header` and points into the same bytes. `OwnedRecord.deinit` releases all fields of a copy made by `toOwned`.
+
 ## Writer behavior
 
-`Writer` emits four-line FASTQ records with LF endings. It rejects unequal sequence and quality lengths, invalid header or field bytes, embedded line breaks, and terminal carriage returns before writing the record.
+`Writer` emits four-line FASTQ records with LF endings. It rejects unequal sequence and quality lengths, invalid header or field bytes, embedded line breaks, and terminal carriage returns before writing the record. The sink adapter it writes to must outlive it, and output is complete only after `flush`.
+
+## Validation and statistics
+
+`validateRecord` checks only the sequence alphabet and Phred+33 quality bytes, without allocating. Record structure and equal field lengths are the reader's checks. `decodePhred33` rejects bytes outside ASCII 33 (`!`) through 126 (`~`).
+
+`Stats` allocates nothing. `addRecord` validates a record and changes no counter when it rejects it; `takeLastQualityError` returns the details of the last S006 failure. In `StatsResult`, the length minimum, maximum, and mean are null when no read was added, and a ratio is null when its denominator is zero.
 
 ## Reader and I/O behavior
 
 The reader consumes a `ByteSource`, exposes record offsets, and enforces the configured line limit. The caller opens and closes paths and streams; the I/O adapters only borrow them, so the FASTQ record types never handle files. The gzip adapter validates gzip framing while reading through its backing source.
+
+`ByteSource` and `ByteSink` are copied by value and point at their adapter, so the adapter must stay at a stable address and outlive every copy. A read fills a prefix of the destination and returns its length; zero for a nonempty destination means EOF, and a length beyond the destination is rejected. A write consumes the whole slice; a sink without a flush callback treats `flush` as a no-op. `FileSink` writes whole pages and keeps a partial last page buffered until the next write or `flush`.
 
 An error ends the reader. Read its diagnostic with `takeLastError` and do not call `next` again: the position and record index may reflect a partly read record.
 

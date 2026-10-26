@@ -58,8 +58,6 @@ pub fn build(b: *std.Build) void {
     const package_version = @import("build.zig.zon").version;
     const build_options = b.addOptions();
     build_options.addOption([:0]const u8, "version", package_version);
-    // Run-time selection needs the AVX2 object only when the target lacks AVX2;
-    // a target that has it uses AVX2 inline, and portable builds select nothing.
     const link_avx2_object = kernel_backend == .dispatch and
         !std.Target.x86.featureSetHas(target.result.cpu.features, .avx2);
     build_options.addOption(bool, "avx2_object", link_avx2_object);
@@ -73,7 +71,6 @@ pub fn build(b: *std.Build) void {
         const object_options = b.addOptions();
         object_options.addOption(bool, "simd_object", true);
         object_options.addOption(bool, "avx2_object", false);
-        // The root reaches only the kernel files; no exported kernel reaches I/O, so the object needs no Zipir import.
         const module = b.createModule(.{
             .root_source_file = b.path("src/simd.zig"),
             .target = b.resolveTargetQuery(query),
@@ -100,7 +97,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .single_threaded = true,
             .strip = strip,
-            // Stripped builds print no stack traces, so their unwind tables would go unused.
             .unwind_tables = if (strip) .none else null,
         }),
     });
@@ -135,7 +131,6 @@ pub fn build(b: *std.Build) void {
     const Suite = struct {
         path: []const u8,
         imports: []const std.Build.Module.Import = &.{},
-        // Suites that run the installed binary link libc and wait for the install step.
         runs_binary: bool = true,
     };
     const suites = [_]Suite{
@@ -150,7 +145,6 @@ pub fn build(b: *std.Build) void {
     };
 
     const test_step = b.step("test", "Run unit tests");
-    // The CLI's test binary also runs the in-file tests of every source file it imports.
     const source_tests = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
     test_step.dependOn(&source_tests.step);
     b.step("test-src", "Run the in-file tests of src/").dependOn(&source_tests.step);

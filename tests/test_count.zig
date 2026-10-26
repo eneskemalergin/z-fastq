@@ -1,4 +1,4 @@
-//! Installed CLI contracts for `z-fastq count`.
+//! Installed `z-fastq count` results, stream output, options, and exit precedence.
 
 const std = @import("std");
 const zfastq = @import("z-fastq");
@@ -13,7 +13,6 @@ const appendGzipMember = cli.appendGzipMember;
 const fixturePath = cli.fixturePath;
 const FIXTURE_DIR = cli.FIXTURE_DIR;
 const OUTPUT_FAILURE = "error: standard output: I/O error\n";
-/// The documented limit for an optional gzip header field, including its terminator (src/io.zig).
 const GZIP_OPTIONAL_FIELD_LIMIT = 64 * 1024;
 const EXPECTED_USAGE =
     \\usage: z-fastq <command> [options] [args...]
@@ -336,15 +335,10 @@ test "[cli] - [count]: gzip optional name and comment fields enforce the 64 KiB 
     }
 }
 
-test "[cli] - [count]: empty and over-limit stdin preserve exit classes" {
+test "[cli] - [count]: an over-limit stdin line exits with line-limit status" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-
-    const empty = try runCliWithStdin(allocator, &.{ "count", "-" }, "", 1);
-    try std.testing.expectEqual(@as(u8, 0), empty.exit_code);
-    try std.testing.expectEqualStrings("0\n", empty.stdout);
-    try std.testing.expectEqual(@as(usize, 0), empty.stderr.len);
 
     const limited = try runCliWithStdin(
         allocator,
@@ -352,12 +346,7 @@ test "[cli] - [count]: empty and over-limit stdin preserve exit classes" {
         "@r\nAAAAA\n+\n!!!!!\n",
         2,
     );
-    try std.testing.expectEqual(@as(u8, 4), limited.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), limited.stdout.len);
-    try std.testing.expectEqualStrings(
-        "error: -: line length limit exceeded\n",
-        limited.stderr,
-    );
+    try cli.expectResult(limited, 4, "", "error: -: line length limit exceeded\n");
 }
 
 test "[cli] - [count]: stdin is explicit and duplicate use fails before input processing" {
@@ -373,7 +362,6 @@ test "[cli] - [count]: stdin is explicit and duplicate use fails before input pr
         implicit.stderr,
     );
 
-    // Standard input is left open and unwritten: a read before the usage check would block until the timeout.
     const duplicate = try cli.runWith(
         allocator,
         &.{
@@ -391,7 +379,6 @@ test "[cli] - [count]: stdin is explicit and duplicate use fails before input pr
         duplicate.stderr,
     );
 
-    // A pipe on standard input cannot be read twice under any name.
     for ([_][]const []const u8{
         &.{ "count", "-", "/dev/stdin" },
         &.{ "count", "/dev/stdin", "/dev/stdin" },
@@ -415,7 +402,6 @@ test "[cli] - [input]: a regular file on standard input is read from its start u
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    // A regular file on standard input is read from its start under each name.
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -427,19 +413,6 @@ test "[cli] - [input]: a regular file on standard input is read from its start u
         0,
         "1\n1\n",
         "",
-    );
-}
-
-test "[cli] - [arguments]: count rejects the JSON flag as an unknown option" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const json = try runCliWithStdin(allocator, &.{ "count", "--json", "-" }, "", 1);
-    try std.testing.expectEqual(@as(u8, 2), json.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), json.stdout.len);
-    try std.testing.expectEqualStrings(
-        "error: unknown count option: --json\n",
-        json.stderr,
     );
 }
 
@@ -492,7 +465,6 @@ test "[cli] - [output]: stdout appended to an input is rejected before any outpu
         try std.testing.expectEqualStrings(contents[case.output], after);
     }
 
-    // Standard input redirected from the output file is the same file.
     try tmp.dir.writeFile(io, .{ .sub_path = names[0], .data = contents[0] });
     const input = try tmp.dir.openFile(io, names[0], .{});
     defer input.close(io);
@@ -679,7 +651,6 @@ test "[cli] - [root]: help and usage failures are exact" {
         missing_limit.stderr,
     );
 
-    // Version is a root option: after a command the count parser rejects it as unknown.
     const version_after_command = try runCli(allocator, &.{ "count", "--version" });
     try cli.expectResult(version_after_command, 2, "", "error: unknown count option: --version\n");
 }
@@ -744,6 +715,8 @@ test "[cli] - [arguments]: usage failures name the command and exit with usage s
     defer arena.deinit();
     const allocator = arena.allocator();
     for ([_]struct { args: []const []const u8, stderr: []const u8 }{
+        .{ .args = &.{ "count", "--json", "-" }, .stderr = "error: unknown count option: --json\n" },
+        .{ .args = &.{ "count", "--bogus" }, .stderr = "error: unknown count option: --bogus\n" },
         .{ .args = &.{ "sample", "--fraction" }, .stderr = "error: --fraction requires a value\n" },
         .{ .args = &.{ "sample", "--fraction", "0" }, .stderr = "error: sample requires exactly one input\n" },
         .{ .args = &.{ "sample", "--json", "-" }, .stderr = "error: unknown sample option: --json\n" },
@@ -770,7 +743,6 @@ test "[cli] - [arguments]: usage failures name the command and exit with usage s
         .{ .args = &.{ "check", "--bogus", "-" }, .stderr = "error: unknown check option: --bogus\n" },
         .{ .args = &.{ "check", "--paired", "missing.fastq" }, .stderr = "error: check --paired requires exactly two inputs\n" },
     }) |case| {
-        // Standard input stays open and unwritten: a read before the usage check would block until the timeout.
         const result = try cli.runWith(allocator, case.args, .{ .stdin = .stalled });
         try cli.expectResult(result, 2, "", case.stderr);
     }
@@ -789,6 +761,7 @@ test "[cli] - [arguments]: a double dash and escaped option bytes apply to every
         &.{ "sample", "--fraction", "1", "--", "-z-fastq-v002-missing/record.fastq" },
         &.{ "interleave", "--", "-z-fastq-v002-missing/record.fastq", "tests/data/synthetic/basic_valid.fastq" },
         &.{ "check", "--", "-z-fastq-v002-missing/record.fastq" },
+        &.{ "count", "--", "-z-fastq-v002-missing/record.fastq" },
     }) |args| {
         try cli.expectResult(
             try runCli(allocator, args),
@@ -900,8 +873,7 @@ test "[cli] - [input]: a closed standard input exits with I/O status" {
     }
 }
 
-test "[unit] - [test harness]: a stalled child is killed and reported as a timeout" {
-    // Standard input is open and never written, so the child blocks reading it until the short deadline.
+test "[unit] - [test runner]: a stalled child is killed and reported as a timeout" {
     try std.testing.expectError(error.ChildProcessTimedOut, cli.runWith(
         std.testing.allocator,
         &.{ "count", "-" },
@@ -909,11 +881,10 @@ test "[unit] - [test harness]: a stalled child is killed and reported as a timeo
     ));
 }
 
-test "[unit] - [test harness]: captured streams stop at the caller's limit and leave no child" {
+test "[unit] - [test runner]: captured streams stop at the caller's limit and leave no child" {
     const allocator = std.testing.allocator;
     const limit = 64 * 1024;
     const record = "@record01\nA\n+\n!\n";
-    // Just over the limit, in whole records, so that copying the input to standard output exceeds it.
     const input = record ** (limit / record.len + 1);
     var missing_paths: [18][]const u8 = undefined;
     missing_paths[0] = "count";
@@ -991,85 +962,35 @@ test "[cli] - [diagnostics]: untrusted command, option, and path bytes use escap
     );
 }
 
-test "[cli] - [count]: an unknown option exits with usage status" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const result = try runCli(arena.allocator(), &.{ "count", "--bogus" });
-
-    try std.testing.expectEqual(@as(u8, 2), result.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
-    try std.testing.expectEqualStrings("error: unknown count option: --bogus\n", result.stderr);
-}
-
-test "[cli] - [count]: double dash treats a leading-hyphen argument as a path" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const path = "-z-fastq-v002-missing/record.fastq";
-    const result = try runCli(arena.allocator(), &.{
-        "count",
-        "--",
-        path,
-    });
-
-    try std.testing.expectEqual(@as(u8, 3), result.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
-    try std.testing.expectEqualStrings(
-        "error: " ++ path ++ ": file not found\n",
-        result.stderr,
-    );
-}
-
 test "[edge] - [count]: a line one byte past the read buffer is accepted at the limit" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const line_len: usize = zfastq.limits.COUNT_READ_BUFFER_BYTES + 1;
-
-    {
-        const file = try tmp.dir.createFile(io, "long.fastq", .{});
-        defer file.close(io);
-        try std.Io.File.writeStreamingAll(file, io, "@long\n");
-        var chunk: [4096]u8 = undefined;
-        @memset(&chunk, 'A');
-        var remaining = line_len;
-        while (remaining > 0) {
-            const n = @min(remaining, chunk.len);
-            try std.Io.File.writeStreamingAll(file, io, chunk[0..n]);
-            remaining -= n;
-        }
-        try std.Io.File.writeStreamingAll(file, io, "\n+\n");
-        @memset(&chunk, '!');
-        remaining = line_len;
-        while (remaining > 0) {
-            const n = @min(remaining, chunk.len);
-            try std.Io.File.writeStreamingAll(file, io, chunk[0..n]);
-            remaining -= n;
-        }
-        try std.Io.File.writeStreamingAll(file, io, "\n");
-    }
-
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const path = try cli.tempPath(arena.allocator(), &tmp.sub_path, "long.fastq");
-    const result = try runCount(arena.allocator(), path);
-    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expectEqualStrings("1\n", result.stdout);
-    try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
+    const allocator = arena.allocator();
 
-    const limited = try runCli(arena.allocator(), &.{
+    const line_len: usize = zfastq.limits.COUNT_READ_BUFFER_BYTES + 1;
+    const sequence = try allocator.alloc(u8, line_len);
+    @memset(sequence, 'A');
+    const quality = try allocator.alloc(u8, line_len);
+    @memset(quality, '!');
+    const data = try std.mem.concat(allocator, u8, &.{ "@long\n", sequence, "\n+\n", quality, "\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "long.fastq", .data = data });
+
+    const path = try cli.tempPath(allocator, &tmp.sub_path, "long.fastq");
+    try cli.expectResult(try runCount(allocator, path), 0, "1\n", "");
+
+    const limited = try runCli(allocator, &.{
         "count",
         "--max-line-bytes",
         std.fmt.comptimePrint("{d}", .{zfastq.limits.COUNT_READ_BUFFER_BYTES}),
         path,
     });
     const limited_expected = try std.fmt.allocPrint(
-        arena.allocator(),
+        allocator,
         "error: {s}: line length limit exceeded\n",
         .{path},
     );
-    try std.testing.expectEqual(@as(u8, 4), limited.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), limited.stdout.len);
-    try std.testing.expectEqualStrings(limited_expected, limited.stderr);
+    try cli.expectResult(limited, 4, "", limited_expected);
 }

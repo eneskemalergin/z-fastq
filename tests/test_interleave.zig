@@ -1,21 +1,13 @@
-//! Installed CLI contracts for `z-fastq interleave`.
+//! Installed `z-fastq interleave` behavior: pairing, output, validation, and exit status.
 
 const std = @import("std");
 const cli = @import("utilities.zig");
 
-/// The CLI flushes its output in buffers of this size.
 const OUTPUT_BUFFER_BYTES = 64 * 1024;
 
 const FIRST_PAIR =
     "@ok/1\nA\n+\n!\n" ++
     "@ok/2\nT\n+\n#\n";
-
-/// Checks the first line of a multi-line diagnostic. The full text of pair
-/// diagnostics belongs to the check suite.
-fn expectFirstLine(expected: []const u8, stderr: []const u8) !void {
-    const end = std.mem.indexOfScalar(u8, stderr, '\n') orelse return error.MissingDiagnosticLine;
-    try std.testing.expectEqualStrings(expected, stderr[0 .. end + 1]);
-}
 
 test "[cli] - [interleave]: CRLF and LF mates keep input order and canonical LF output" {
     const io = std.testing.io;
@@ -62,13 +54,7 @@ test "[cli] - [interleave]: exact name policy pairs complete identifiers" {
     try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = "@same left\nA\n+\n!\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = "@same right\nT\n+\n#\n" });
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "interleave",
-            "--pair-names",
-            "exact",
-            r1_path,
-            r2_path,
-        }),
+        try cli.run(allocator, &.{ "interleave", "--pair-names", "exact", r1_path, r2_path }),
         0,
         "@same left\nA\n+\n!\n@same right\nT\n+\n#\n",
         "",
@@ -180,7 +166,6 @@ test "[cli] - [interleave]: a stdout alias of either input rejects before readin
         }
     }
 
-    // Standard error names the second input: the diagnostic must not be written into it.
     for ([_]bool{ false, true }) |append| {
         for (names) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = payload });
         const output: std.Io.File = .{
@@ -195,7 +180,11 @@ test "[cli] - [interleave]: a stdout alias of either input rejects before readin
         defer output.close(io);
         const stderr_file = try cli.openAppendOutput(tmp.dir, "r2.fastq");
         defer stderr_file.close(io);
-        try std.testing.expectEqual(@as(u8, 2), (try cli.runWith(allocator, &.{ "interleave", paths[0], paths[1] }, .{ .stdout = .{ .file = output }, .stderr = .{ .file = stderr_file } })).exit_code);
+        const result = try cli.runWith(allocator, &.{ "interleave", paths[0], paths[1] }, .{
+            .stdout = .{ .file = output },
+            .stderr = .{ .file = stderr_file },
+        });
+        try std.testing.expectEqual(@as(u8, 2), result.exit_code);
         for (names, 0..) |name, index| {
             const expected = if (!append and index == 1) "" else payload;
             try std.testing.expectEqualStrings(expected, try tmp.dir.readFileAlloc(io, name, allocator, .limited(1024)));
@@ -220,7 +209,6 @@ test "[cli] - [interleave]: FIFO inputs complete when a sequential writer feeds 
             for ([_][]const u8{ "r1", "r2" }) |name| {
                 const file = try self.dir.openFile(self.io, name, .{ .mode = .write_only });
                 defer file.close(self.io);
-                // The first write must exceed the pipe capacity to exercise backpressure.
                 try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(
                     std.os.linux.fcntl(file.handle, std.os.linux.F.SETPIPE_SZ, 4096),
                 ));
@@ -337,7 +325,6 @@ test "[cli] - [interleave]: plain and gzip mates interleave with exact output" {
         "",
     );
 
-    // The corrupt CRC fails after both records of the pair have been read, so the pair is written first.
     gzip2.items[cli.gzipCrcOffset(gzip2.items.len)] ^= 1;
     try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = gzip2.items });
     const error_text = try std.fmt.allocPrint(allocator, "error: {s}: I/O error\n", .{r2_path});
@@ -467,7 +454,7 @@ test "[cli] - [interleave]: an identifier mismatch in the first pair fails with 
     const result = try cli.run(allocator, &.{ "interleave", r1_path, r2_path });
     try std.testing.expectEqual(@as(u8, 1), result.exit_code);
     try std.testing.expectEqualStrings("", result.stdout);
-    try expectFirstLine(mismatch, result.stderr);
+    try cli.expectFirstLine(mismatch, result.stderr);
 }
 
 test "[cli] - [interleave]: an unequal mate count keeps the complete pairs before it" {
@@ -493,7 +480,7 @@ test "[cli] - [interleave]: an unequal mate count keeps the complete pairs befor
     const result = try cli.run(allocator, &.{ "interleave", r1_path, r2_path });
     try std.testing.expectEqual(@as(u8, 1), result.exit_code);
     try std.testing.expectEqualStrings(FIRST_PAIR, result.stdout);
-    try expectFirstLine(unequal, result.stderr);
+    try cli.expectFirstLine(unequal, result.stderr);
 }
 
 test "[cli] - [interleave]: pair-name and alphabet values are validated before input" {
@@ -535,41 +522,21 @@ test "[cli] - [interleave]: input, alphabet, and line limits identify their side
         .{r1_path},
     );
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "interleave",
-            "--alphabet",
-            "acgtn",
-            r1_path,
-            r2_path,
-        }),
+        try cli.run(allocator, &.{ "interleave", "--alphabet", "acgtn", r1_path, r2_path }),
         1,
         "",
         alphabet_error,
     );
 
-    const line_error = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: line length limit exceeded\n",
-        .{r1_path},
-    );
+    const line_error = try std.fmt.allocPrint(allocator, "error: {s}: line length limit exceeded\n", .{r1_path});
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "interleave",
-            "--max-line-bytes",
-            "4",
-            r1_path,
-            r2_path,
-        }),
+        try cli.run(allocator, &.{ "interleave", "--max-line-bytes", "4", r1_path, r2_path }),
         4,
         "",
         line_error,
     );
 
-    const missing_error = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: file not found\n",
-        .{missing},
-    );
+    const missing_error = try std.fmt.allocPrint(allocator, "error: {s}: file not found\n", .{missing});
     try cli.expectResult(
         try cli.run(allocator, &.{ "interleave", r1_path, missing }),
         3,
@@ -627,7 +594,6 @@ test "[edge] - [interleave]: a line exactly at the line limit is accepted" {
     const allocator = arena.allocator();
     const r1_path = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
     const r2_path = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
-    // Eight bytes is the limit: every sequence and quality line below is exactly that long.
     const r1 = "@p/1\nAAAAAAAA\n+\n!!!!!!!!\n";
     const r2 = "@p/2\nTTTTTTTT\n+\n########\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = r1 });

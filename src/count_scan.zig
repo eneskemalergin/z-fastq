@@ -8,7 +8,6 @@ const simd = @import("simd.zig");
 
 pub const Options = fastq.ReaderOptions;
 
-// Bare plus lines let the fast path derive every tail offset from the sequence length.
 const DenseLayout = struct {
     sequence_start: usize,
     sequence_end: usize,
@@ -87,7 +86,6 @@ const FastProgress = struct {
     records: usize = 0,
 };
 
-/// Allocation-free scanner; only `record_index` and `byte_offset` are caller-readable state.
 pub const Scanner = struct {
     options: Options,
     machine: fastq.Machine = .{},
@@ -107,17 +105,12 @@ pub const Scanner = struct {
         return .{ .options = options };
     }
 
-    /// Returns and clears the structural diagnostic retained after a parse error.
     pub fn takeLastError(self: *Scanner) ?fastq.ParseError {
         const err = self.last_error;
         self.last_error = null;
         return err;
     }
 
-    /// Consumes as many bytes as possible from one input chunk.
-    ///
-    /// On success the returned count equals `data.len`. Structural failures leave
-    /// details for `takeLastError`.
     pub fn feed(self: *Scanner, data: []const u8) fastq.ReaderError!usize {
         var pos: usize = 0;
         while (pos < data.len) {
@@ -147,7 +140,6 @@ pub const Scanner = struct {
         return pos;
     }
 
-    /// Finalizes an unterminated last line and rejects an incomplete record.
     pub fn finishEof(self: *Scanner) fastq.ReaderError!void {
         if (self.line.raw_len > 0) try self.finishLine(false);
         const missing_line = self.machine.missingLine() orelse return;
@@ -176,7 +168,6 @@ pub const Scanner = struct {
                         remaining = data[cursor..];
                         if (remaining.len < active.record_stride) continue;
                     }
-                    // A full remaining stride has already failed this layout proof.
                     if (remaining.len >= active.record_stride) self.observeDenseLayout(null);
                 }
             }
@@ -244,7 +235,6 @@ pub const Scanner = struct {
             const sequence_content_len = fastq.lineContentLen(data[sequence_start..sequence_end]);
             const plus_content_len = fastq.lineContentLen(data[plus_start..plus_end]);
             const quality_content_len = fastq.lineContentLen(data[quality_start..quality_end]);
-            // Failed normalized proofs keep line-limit and structural error order in the fallback.
             if (header_len < 2 or !fastq.headerPrefixIsValid(data[0], data[1]) or
                 header_len > self.options.max_line_bytes or
                 sequence_content_len > self.options.max_line_bytes or
@@ -417,9 +407,6 @@ pub const Scanner = struct {
     }
 };
 
-/// Counts all records in one slice and replaces `scanner` with the final state.
-///
-/// Structural failures leave details in `scanner` for `takeLastError`.
 pub fn countSlice(
     data: []const u8,
     options: Options,
@@ -715,8 +702,6 @@ test "[edge] - [count scanner]: byte-offset and record-count limits reject the r
         try std.testing.expectEqual(max, offset.byte_offset);
         try std.testing.expectEqual(@as(u64, 0), offset.record_index);
 
-        // The byte offset after a record-count error is not pinned: the fast path
-        // commits a feed's bytes together, while the line path commits each line.
         var records = Scanner.init(.{});
         records.fast_path_enabled = fast_path_enabled;
         records.record_index = max;

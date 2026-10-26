@@ -8,13 +8,6 @@ const ByteSource = io_layer.ByteSource;
 const ByteSink = io_layer.ByteSink;
 const WriteError = io_layer.WriteError;
 
-// --- Records ---
-
-/// Borrowed FASTQ fields with structural prefix bytes and line endings removed.
-///
-/// Values returned by `Reader.next` remain valid only until the reader advances
-/// again or is deinitialized. `id` is the first space- or tab-delimited token of
-/// `header` and aliases the same storage.
 pub const Record = struct {
     header: []const u8,
     id: []const u8,
@@ -23,7 +16,6 @@ pub const Record = struct {
     quality: []const u8,
 };
 
-/// Independently allocated fields released together by `deinit`.
 pub const OwnedRecord = struct {
     allocator: std.mem.Allocator,
     header: []u8,
@@ -42,7 +34,6 @@ pub const OwnedRecord = struct {
     }
 };
 
-/// Duplicates all record fields; the caller must invoke `OwnedRecord.deinit`.
 pub fn toOwned(allocator: std.mem.Allocator, record: Record) !OwnedRecord {
     const header = try allocator.dupe(u8, record.header);
     errdefer allocator.free(header);
@@ -68,8 +59,6 @@ fn firstToken(header: []const u8) []const u8 {
     const end = std.mem.findAny(u8, header, "\t ") orelse header.len;
     return header[0..end];
 }
-
-// --- Structural validation ---
 
 pub const LintCode = enum {
     s001_invalid_plus_line,
@@ -202,18 +191,12 @@ pub const Machine = struct {
     }
 };
 
-/// One logical line that arrives in chunks without its LF. Content excludes
-/// one CR before the LF, so a CR that ends the bytes seen so far is held: it
-/// is content only if more bytes follow or the line ends without LF. The
-/// content limit allows for that CR. The first two content bytes feed the
-/// structural checks.
 pub const LineBytes = struct {
     raw_len: usize = 0,
     first_byte: u8 = 0,
     second_byte: u8 = 0,
     last_byte: u8 = 0,
 
-    /// Adds `chunk` (no LF). A held CR still counts toward `raw_len`.
     pub inline fn add(self: *LineBytes, chunk: []const u8, max_line_bytes: usize) error{LineTooLong}!void {
         if (chunk.len == 0) return;
         const previous_len = self.raw_len;
@@ -224,17 +207,14 @@ pub const LineBytes = struct {
         if (self.raw_len - @intFromBool(self.last_byte == '\r') > max_line_bytes) return error.LineTooLong;
     }
 
-    /// True when the bytes so far end in a CR that LF may still claim.
     pub inline fn holdsCr(self: *const LineBytes) bool {
         return self.raw_len != 0 and self.last_byte == '\r';
     }
 
-    /// The bytes of a chunk just added that are content now: all but a held CR.
     pub inline fn contentOf(chunk: []const u8) []const u8 {
         return chunk[0 .. chunk.len - @intFromBool(chunk.len != 0 and chunk[chunk.len - 1] == '\r')];
     }
 
-    /// Content length when the line ends; LF claims a held CR.
     pub inline fn contentLen(self: *const LineBytes, terminated_by_lf: bool) usize {
         return self.raw_len - @intFromBool(terminated_by_lf and self.holdsCr());
     }
@@ -248,7 +228,6 @@ pub const LineBytes = struct {
     }
 };
 
-/// Excludes one trailing CR; callers check LF termination and handle EOF separately.
 pub fn lineContentLen(line: []const u8) usize {
     if (line.len > 0 and line[line.len - 1] == '\r') return line.len - 1;
     return line.len;
@@ -267,21 +246,13 @@ fn identifierFirstByteIsValid(byte: ?u8) bool {
     return byte != null and byte != ' ' and byte != '\t';
 }
 
-// The validation loops start on a cache-line boundary: on cores with a
-// decoded-instruction cache their speed otherwise shifts by up to a fifth
-// with where unrelated code changes happen to place them.
 const HOT_LOOP_ALIGNMENT = 64;
 
-// Saved positions remain valid only while the buffer's bytes and indexes stay unchanged.
-// Extern layout: the AVX2 record scanner shares it across the object boundary.
 const LineFeedSearch = extern struct {
     block_start: usize = 0,
     block_end: usize = 0,
     mask: u64 = 0,
 
-    /// The complete-record scanner searches whole structural blocks, so one
-    /// mask serves a record's header and plus lines; the reader projections
-    /// search at the inline width, which costs less on short lines.
     fn find(self: *LineFeedSearch, comptime lanes: usize, bytes: []const u8, start: usize) align(HOT_LOOP_ALIGNMENT) ?usize {
         comptime std.debug.assert(lanes <= simd.BLOCK_BYTES);
         var offset = start;
@@ -321,8 +292,6 @@ const LineFeedSearch = extern struct {
     }
 };
 
-// --- Semantic validation ---
-
 pub const Alphabet = enum {
     iupac,
     acgtn,
@@ -337,7 +306,6 @@ pub const SemanticField = enum {
     quality,
 };
 
-/// Describes the first semantic failure at a zero-based field-relative byte index.
 pub const SemanticError = struct {
     code: LintCode,
     message: []const u8,
@@ -345,8 +313,6 @@ pub const SemanticError = struct {
     byte_index: usize,
 };
 
-/// Checks only sequence alphabet and Phred+33 bytes without allocating.
-/// Structural prefixes, completeness, and equal field lengths remain caller-owned.
 pub fn validateRecord(record: Record, options: ValidationOptions) ?SemanticError {
     return switch (options.alphabet) {
         .iupac => validateRecordFor(.iupac, record),
@@ -420,10 +386,8 @@ fn validateRecordVector(
     return null;
 }
 
-/// Whether any sequence or quality byte is invalid; the scalar scans find which.
 const InvalidFields = packed struct(u8) { sequence: bool, quality: bool, _: u6 = 0 };
 
-/// `seq` and `qual` have equal length, at least `vector_len`.
 fn invalidFieldsVector(
     comptime vector_len: comptime_int,
     comptime alphabet: Alphabet,
@@ -474,8 +438,6 @@ fn invalidFieldsVector(
         byte_index += vector_len;
     }
     if (byte_index < seq.len) {
-        // The last vector overlaps bytes already checked; rechecking them
-        // cannot change whether any byte is invalid.
         const tail_start = seq.len - vector_len;
         const sequence: Bytes = seq[tail_start..][0..vector_len].*;
         sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence);
@@ -527,12 +489,10 @@ pub fn semanticParseError(
     };
 }
 
-/// Phred+33: a quality byte is its score plus 33, from '!' (33) to '~' (126).
 pub const PHRED_OFFSET = 33;
 pub const PHRED_MAX_BYTE = 126;
 pub const PHRED_MAX_SCORE = PHRED_MAX_BYTE - PHRED_OFFSET;
 
-/// Decodes one Phred+33 byte and rejects values outside ASCII 33 through 126.
 pub fn decodePhred33(quality_byte: u8) error{InvalidQuality}!u8 {
     if (quality_byte < PHRED_OFFSET or quality_byte > PHRED_MAX_BYTE) return error.InvalidQuality;
     return quality_byte - PHRED_OFFSET;
@@ -571,7 +531,6 @@ fn firstInvalidSequenceVector(
         byte_index += vector_len;
     }
     if (byte_index < sequence.len) {
-        // Overlapping bytes were already checked; see the record validator.
         const bytes: Bytes = sequence[sequence.len - vector_len ..][0..vector_len].*;
         invalid |= invalidSequenceVector(vector_len, alphabet, bytes);
     }
@@ -639,7 +598,6 @@ fn firstInvalidQualityVector(
         byte_index += vector_len;
     }
     if (byte_index < quality.len) {
-        // Overlapping bytes were already checked; see the record validator.
         const bytes: Bytes = quality[quality.len - vector_len ..][0..vector_len].*;
         invalid |= invalidQualityVector(vector_len, bytes);
     }
@@ -733,8 +691,6 @@ fn firstInvalidNarrowIupacSequence(
 ) ?usize {
     return switch (scanSequenceLineFor(.acgtn, sequence, false)) {
         .incomplete => null,
-        // Callers pass line content, so no LF arrives; one would be the
-        // first invalid byte.
         .line_end => |line_end| line_end,
         .invalid_start => |start| switch (scanSequenceLineFor(
             .iupac,
@@ -872,7 +828,6 @@ fn avx2FirstInvalid(field: SemanticField, alphabet: Alphabet, use_full_iupac: *b
     return if (index == bytes.len) null else index;
 }
 
-/// The first invalid byte of a sequence or quality chunk, or `len` when none.
 fn firstInvalidExport(field: u8, alphabet: u8, use_full_iupac: *bool, bytes: [*]const u8, len: usize) callconv(.c) usize {
     return firstInvalidChunk(@enumFromInt(field), @enumFromInt(alphabet), use_full_iupac, bytes[0..len]) orelse len;
 }
@@ -907,15 +862,11 @@ fn classifySemanticByte(
     }
 }
 
-// --- Buffered record validation ---
-
 const CompleteRecord = extern struct {
     line_ends: [4]usize,
     use_full_iupac: bool,
 };
 
-/// `sequence_len_hint` (the previous record's sequence length) picks the AVX2
-/// copy for long records on CPUs that have it; short records stay inline.
 inline fn scanCompleteRecord(
     buffer: []const u8,
     start: usize,
@@ -1002,10 +953,7 @@ fn scanCompleteRecordInline(
     };
 }
 
-// --- Reader ---
-
 pub const ReaderOptions = struct {
-    /// Maximum content bytes in one logical line, excluding LF and the optional CR.
     max_line_bytes: usize = io_layer.DEFAULT_MAX_LINE_BYTES,
 };
 
@@ -1139,13 +1087,9 @@ fn fieldStorageLimit(max_line_bytes: usize) usize {
     return std.math.add(usize, max_line_bytes, 1) catch std.math.maxInt(usize);
 }
 
-/// A complete, valid record borrowed from the reader's buffer until the next
-/// advance: its raw bytes, including any CR before each LF, and the relative
-/// position of each line's LF.
 pub const RecordSpan = struct {
     bytes: []const u8,
     line_ends: [4]usize,
-    /// Every line ends in LF alone, so `bytes` is canonical output.
     canonical: bool,
 
     fn contentEnd(self: RecordSpan, line: usize) usize {
@@ -1153,12 +1097,10 @@ pub const RecordSpan = struct {
         return end - @intFromBool(self.bytes[end - 1] == '\r');
     }
 
-    /// Header line content after `@`.
     pub fn header(self: RecordSpan) []const u8 {
         return self.bytes[1..self.contentEnd(0)];
     }
 
-    /// Record fields without line endings; `id` is empty.
     pub fn record(self: RecordSpan) Record {
         const header_bytes = self.header();
         return .{
@@ -1171,13 +1113,6 @@ pub const RecordSpan = struct {
     }
 };
 
-/// Streaming parser constructed with `init` over a byte source, or with
-/// `initStreamReader` over a borrowed `std.Io.Reader`; fields are
-/// implementation state. The copied source wrapper's referenced adapter must
-/// outlive the reader.
-///
-/// An error ends the reader: afterwards only `takeLastError` is meaningful, and
-/// the position, offsets, and record index may reflect a partly read record.
 pub const Reader = struct {
     allocator: std.mem.Allocator,
     transport: Transport,
@@ -1195,9 +1130,6 @@ pub const Reader = struct {
     current_record_offsets: ?RecordOffsets = null,
     transport_storage: []u8,
     pending_refill: ?struct { bytes: []u8, cursor: usize, end: usize } = null,
-    /// The complete-record scan already failed at the cursor, so the general
-    /// path skips repeating it. Skipping never changes a result: that path
-    /// validates the fields itself.
     span_missed: bool = false,
 
     const Transport = union(enum) {
@@ -1253,19 +1185,16 @@ pub const Reader = struct {
         return self.byte_offset;
     }
 
-    /// Returns decoded-stream line-start offsets for the current borrowed record.
     pub fn currentRecordOffsets(self: *const Reader) ?RecordOffsets {
         return self.current_record_offsets;
     }
 
-    /// Returns and clears structural details retained after a parse error.
     pub fn takeLastError(self: *Reader) ?ParseError {
         const err = self.last_error;
         self.last_error = null;
         return err;
     }
 
-    /// Returns the next borrowed record, or null at a clean EOF boundary.
     pub fn next(self: *Reader) ReaderError!?Record {
         var unused_canonical_span: ?[]const u8 = null;
         return self.nextRecord(&unused_canonical_span, true, false);
@@ -1412,9 +1341,6 @@ pub const Reader = struct {
         };
     }
 
-    /// Reads one record line by line through `readLine` (given `context`);
-    /// false at EOF before a record starts. `publish` makes its offsets the
-    /// current record's.
     fn ingestFallbackRecord(
         self: *Reader,
         comptime publish: bool,
@@ -1434,8 +1360,6 @@ pub const Reader = struct {
         }
     }
 
-    /// Reads one record line by line without retaining any field; `hook`
-    /// receives its sequence and quality bytes.
     fn readStreamedRecord(self: *Reader, comptime Hook: type, hook: *Hook) ReaderError!bool {
         return self.ingestFallbackRecord(true, hook, struct {
             fn read(reader: *Reader, state: *Hook) ReaderError!?Line {
@@ -1456,7 +1380,6 @@ pub const Reader = struct {
         }.read;
     }
 
-    /// Consumes one record without returning its fields, or returns false at clean EOF.
     pub fn advance(self: *Reader) ReaderError!bool {
         if (self.skipBufferedRecord()) return true;
         self.beginRecord();
@@ -1499,7 +1422,6 @@ pub const Reader = struct {
             self.span_missed = false;
             return .incomplete;
         }
-        // A refill clears the flag: the failed scan saw other bytes.
         if (self.cursor == self.fill_end and !try self.refill()) return .eof;
         const span_missed = self.span_missed;
         self.span_missed = false;
@@ -1597,10 +1519,6 @@ pub const Reader = struct {
             .{ .record = payload };
     }
 
-    /// Moves past a complete record at `start` (the cursor) whose LFs are at
-    /// `ends` (relative): its line offsets, cursor, byte offset, index, and
-    /// sequence length. The caller has checked `end_offset` and `next_index`.
-    /// `current` says what the current record's offsets become.
     inline fn commitRecord(
         self: *Reader,
         comptime current: enum { none, unchanged },
@@ -1627,11 +1545,6 @@ pub const Reader = struct {
         self.machine.sequence_len = sequence_len;
     }
 
-    /// Takes a complete, valid record straight from the buffered bytes, with
-    /// the same state changes as the general buffered path. Never refills;
-    /// null leaves the general path to refills, saved records, and error
-    /// reporting, and a failed scan sets `span_missed` so that path does not
-    /// repeat it.
     inline fn readRecordSpan(self: *Reader, validator: *AdaptiveRecordValidator) ?RecordSpan {
         if (self.span_missed or self.machine.expected != .header) return null;
         const buf = self.buf[0..self.fill_end];
@@ -1656,8 +1569,6 @@ pub const Reader = struct {
         for (ends) |end| canonical = canonical and buf[start + end - 1] != '\r';
         const span: RecordSpan = .{ .bytes = buf[start..][0..len], .line_ends = ends, .canonical = canonical };
 
-        // The commit is written out here rather than through `commitRecord`:
-        // this is the hottest record path, and the shared form costs it cycles.
         const offsets: RecordOffsets = .{
             .header = self.byte_offset,
             .sequence = self.byte_offset + ends[0] + 1,
@@ -1674,8 +1585,6 @@ pub const Reader = struct {
         return span;
     }
 
-    /// Line limits, the `@` and `+` prefixes, and equal sequence and quality
-    /// lengths; `header` and `plus` are line contents including the prefix.
     fn isStructurallyValid(
         self: *const Reader,
         header: []const u8,
@@ -1693,10 +1602,6 @@ pub const Reader = struct {
             sequence_len == quality_len;
     }
 
-    /// Skips a complete buffered record that passes the structural checks,
-    /// with the same state changes as the general path. Never refills; false
-    /// leaves the reader unchanged for the general path, which owns refills
-    /// and error reporting.
     fn skipBufferedRecord(self: *Reader) bool {
         if (self.machine.expected != .header) return false;
         const buf = self.buf[0..self.fill_end];
@@ -1738,16 +1643,12 @@ pub const Reader = struct {
         );
         const next_offset = if (valid) self.offsetAfter(record_len) catch null else null;
         if (next_offset) |end_offset| {
-            // The checked end also bounds every intermediate line offset. As on
-            // the line-by-line path, the record's bytes are consumed before
-            // its index can overflow.
             self.commitRecord(.unchanged, record_start, relative_ends, end_offset, self.record_index, sequence_len);
             self.record_index = std.math.add(u64, self.record_index, 1) catch
                 return error.ArithmeticLimit;
             return;
         }
 
-        // Replay rejected records in line order to preserve errors and partial progress.
         for (ranges, relative_ends) |range, relative_end| {
             const content = range.slice(self.buf);
             if (content.len > self.options.max_line_bytes) return error.LineTooLong;
@@ -1774,11 +1675,9 @@ pub const Reader = struct {
         const quality_end = quality_start + sequence_len;
         const quality_lf = quality_end + @intFromBool(bytes[quality_end] == '\r');
         if (quality_lf == bytes.len or bytes[quality_lf] != '\n') return false;
-        // Stripping a guessed CR could reject the length before quality validation can retry.
         if (quality_lf == quality_end and sequence_len != 0 and bytes[quality_end - 1] == '\r')
             return false;
 
-        // A guessed end must not hide an earlier length error with counter overflow.
         if (self.record_index == std.math.maxInt(u64)) return false;
         const consumed = std.math.cast(u64, quality_lf + 1) orelse return false;
         _ = std.math.add(u64, self.byte_offset, consumed) catch return false;
@@ -1978,9 +1877,6 @@ pub const Reader = struct {
         };
     }
 
-    /// `hook` (validation or streamed totals) sees the content bytes of a line
-    /// that is not retained, with their offsets in the line; a held CR reaches
-    /// it once it is known to be content.
     fn readLine(
         self: *Reader,
         comptime retain: bool,
@@ -2041,7 +1937,6 @@ pub const Reader = struct {
 
             const got_data = try self.refill();
             if (!got_data) {
-                // Without LF a held CR is content.
                 const content_len = line.raw_len;
                 if (content_len == 0) return null;
                 if (content_len > self.options.max_line_bytes) return error.LineTooLong;
@@ -2065,8 +1960,6 @@ pub const Reader = struct {
         }
     }
 
-    /// Adds one chunk of the current line (no LF): retained bytes are copied
-    /// into the line's field, discarded content goes to `hook`.
     fn takeLineBytes(
         self: *Reader,
         comptime retain: bool,
@@ -2084,7 +1977,6 @@ pub const Reader = struct {
         try line.add(chunk, self.options.max_line_bytes);
         if (retain) return self.appendLineBytes(field_index, content_start + line.raw_len, chunk, complete);
         if (hook) |state| {
-            // More bytes follow a held CR, so it is content.
             if (held_cr) try state.consume(self.machine.expected, "\r", chunk_start - 1);
             try state.consume(self.machine.expected, LineBytes.contentOf(chunk), chunk_start);
         }
@@ -2104,7 +1996,6 @@ pub const Reader = struct {
         const field = &self.fallback_fields[field_index];
         try self.ensureFieldCapacity(field_index, new_len, complete);
         if (self.buf.ptr == field.storage.ptr) {
-            // A replayed record prefix shares the sequence fallback allocation.
             @memmove(field.storage[field.len..new_len], chunk);
         } else @memcpy(field.storage[field.len..new_len], chunk);
         field.len = new_len;
@@ -2121,8 +2012,6 @@ pub const Reader = struct {
         const storage_limit = fieldStorageLimit(self.options.max_line_bytes);
         if (needed > storage_limit) return error.LineTooLong;
         const doubled = std.math.add(usize, field.storage.len, field.storage.len) catch needed;
-        // A line still open at a chunk edge starts at one read buffer and
-        // doubles, so lines of whole-buffer lengths fit without slack.
         var grown_len = if (complete)
             needed
         else
@@ -2143,7 +2032,6 @@ pub const Reader = struct {
                 if (available == null or donor.len < available.?.len) available = donor;
             }
             if (available) |donor| {
-                // No field slices escape before this fallback record is complete.
                 const shared = @min(field.len, donor.len);
                 for (field.storage[0..shared], donor.storage[0..shared]) |*a, *b| {
                     std.mem.swap(u8, a, b);
@@ -2163,8 +2051,6 @@ pub const Reader = struct {
             self.allocator.realloc(field.storage, grown_len) catch return error.OutOfMemory;
     }
 };
-
-// --- Record delivery ---
 
 pub const RecordPayload = struct {
     sequence: []const u8,
@@ -2227,7 +2113,6 @@ pub fn initStreamReader(
     return Reader.initTransport(allocator, .{ .borrowed = input }, options);
 }
 
-/// Leaves id empty; canonical_span is null when the record needs field-by-field output.
 pub fn nextWithSpan(
     reader: *Reader,
     canonical_span: *?[]const u8,
@@ -2235,7 +2120,6 @@ pub fn nextWithSpan(
     return reader.nextWithCanonicalSpan(canonical_span, false);
 }
 
-/// Leaves id empty and does not prepare a canonical output span.
 pub fn nextRecordFields(reader: *Reader) ReaderError!?Record {
     var unused_canonical_span: ?[]const u8 = null;
     return reader.nextRecord(&unused_canonical_span, false, false);
@@ -2243,16 +2127,9 @@ pub fn nextRecordFields(reader: *Reader) ReaderError!?Record {
 
 pub const PayloadOrStreamed = union(enum) {
     payload: PredictedPayload,
-    /// The record was larger than what is buffered: its sequence and quality
-    /// went to the hook instead of being copied.
     streamed,
 };
 
-/// The next record's sequence and quality, borrowed when the record is
-/// buffered; quality is predicted from the sequence length, so the caller
-/// validates it as Phred+33 and rereads from the checkpoint on rejection. A
-/// record that is not complete in the buffer streams through `hook` (see
-/// `readLine`) instead of being copied.
 pub fn nextPayloadOrStreamed(reader: *Reader, comptime Hook: type, hook: *Hook) ReaderError!?PayloadOrStreamed {
     reader.beginRecord();
     switch (try reader.readBufferedRecord(.predicted_payload, false, null, false)) {
@@ -2287,8 +2164,6 @@ pub fn nextValidatedRecord(
     return readValidatedRecord(reader, validator);
 }
 
-/// Never refills; null means the next record is not complete in the buffer
-/// or needs the general path, so read it with `nextValidatedRecord`.
 pub inline fn nextRecordSpan(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
@@ -2329,7 +2204,6 @@ fn finishValidatedRecord(
     };
 }
 
-/// Never refills; null means no complete buffered record. Leaves id empty.
 pub fn nextBufferedWithSpan(
     reader: *Reader,
     canonical_span: *?[]const u8,
@@ -2337,7 +2211,6 @@ pub fn nextBufferedWithSpan(
     return nextBufferedRecord(reader, canonical_span, true);
 }
 
-/// Never refills; null means no complete buffered record.
 pub fn nextBufferedValidatedRecord(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
@@ -2377,8 +2250,6 @@ fn nextBufferedRecord(
     };
 }
 
-/// May refill and update mate 1's views; both mates borrow until the next advance.
-/// On null, preserve the updated mate 1 before continuing with ordinary reads.
 pub fn nextValidatedMatePreservingRecord(
     reader: *Reader,
     first: *ValidatedRecord,
@@ -2395,7 +2266,6 @@ fn readMatePreservingRecord(
 ) ReaderError!?ValidatedRecord {
     if (try readBufferedValidatedRecord(reader, validator)) |second| return second;
     if (!reader.canBufferIncompleteRecord()) return null;
-    // Separate fallback fields can overlap the destination before they are copied.
     if (first.record.sequence.ptr == reader.fallback_fields[1].storage.ptr) return null;
     const span = first.canonical_span;
     const size = if (span) |bytes| bytes.len else canonicalRecordLen(first.record) orelse return null;
@@ -2410,13 +2280,10 @@ fn readMatePreservingRecord(
         }
         first.record.id = first.record.header[0..first.record.id.len];
     } else first.record = copyCanonicalRecord(saved, first.record);
-    // Staging writes one canonical span, including when the input uses CRLF.
     first.canonical_span = if (recordHasTerminalCr(first.record)) null else saved;
     return nextSavedPairMate(reader, size, validator);
 }
 
-/// May refill while keeping only mate 1's updated header alive through the mate-2 read.
-/// On null, preserve that header before continuing with ordinary reads.
 pub fn nextValidatedMatePreservingHeader(
     reader: *Reader,
     first_header: *[]const u8,
@@ -2473,7 +2340,6 @@ pub fn restoreFallbackRecordStorage(
     std.mem.swap([4]FallbackField, &reader.fallback_fields, &retained.fields);
 }
 
-/// May refill after field storage moves out; on null, continue with the fallback read.
 pub fn nextValidatedAfterFallbackTransfer(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
@@ -2496,11 +2362,8 @@ pub fn nextFallbackValidatedRecord(
     };
 }
 
-// --- Writer ---
-
 pub const WriterError = WriteError || error{InvalidRecord};
 
-/// Streaming writer constructed with `init`; its referenced sink adapter must outlive it.
 pub const Writer = struct {
     sink: ByteSink,
 
@@ -2508,7 +2371,6 @@ pub const Writer = struct {
         return .{ .sink = sink };
     }
 
-    /// Rejects invalid fields before output; accepted records use LF line endings.
     pub fn writeRecord(self: *Writer, record: Record) WriterError!void {
         if (record.sequence.len != record.quality.len or
             !identifierFirstByteIsValid(if (record.header.len == 0) null else record.header[0]) or
@@ -2523,7 +2385,6 @@ pub const Writer = struct {
         return writeRecordUnchecked(self, record);
     }
 
-    /// Flushes the underlying sink when it provides a flush callback.
     pub fn flush(self: *Writer) WriteError!void {
         return self.sink.flush();
     }
@@ -2536,15 +2397,12 @@ pub fn recordHasTerminalCr(record: Record) bool {
     return false;
 }
 
-/// Writes a record span that is already canonical (validated, LF-only) as is.
 pub fn writeCanonicalRecordSpan(writer: *Writer, span: []const u8) WriteError!void {
     return writer.sink.write(span);
 }
 
-/// Canonical framing adds '@', '+', and four LFs to the four fields.
 pub const RECORD_FRAMING_BYTES = 6;
 
-/// Bytes `record` takes in canonical framing, or null when that overflows.
 pub fn canonicalRecordLen(record: Record) ?usize {
     var total: usize = RECORD_FRAMING_BYTES;
     inline for (.{ record.header, record.sequence, record.plus, record.quality }) |field| {
@@ -2553,10 +2411,6 @@ pub fn canonicalRecordLen(record: Record) ?usize {
     return total;
 }
 
-/// Copies `record` in canonical framing, field by field in order, to `dest`
-/// of exactly `canonicalRecordLen(record)` bytes, and returns the record with
-/// its fields in `dest`. A field may overlap `dest` only where the copies of
-/// earlier fields cannot reach it.
 pub fn copyCanonicalRecord(dest: []u8, record: Record) Record {
     var copied = record;
     dest[0] = '@';
@@ -2579,9 +2433,6 @@ pub fn copyCanonicalRecord(dest: []u8, record: Record) Record {
     return copied;
 }
 
-/// Writes `record` in canonical framing without the checks `Writer.writeRecord`
-/// runs; the caller has proved them (equal lengths, an identifier, and no
-/// field that LF output cannot hold).
 pub fn writeRecordUnchecked(writer: *Writer, record: Record) WriteError!void {
     const fields = [_][]const u8{
         "@",
@@ -2601,8 +2452,6 @@ fn isWritableField(bytes: []const u8) bool {
     return std.mem.findScalar(u8, bytes, '\n') == null and
         (bytes.len == 0 or bytes[bytes.len - 1] != '\r');
 }
-
-// --- Check scanner ---
 
 pub const CheckScannerError = error{
     Format,
@@ -2709,7 +2558,6 @@ pub const CheckScanner = struct {
 
     pub fn finishEof(self: *CheckScanner) CheckScannerError!void {
         if (self.line.raw_len != 0) {
-            // Without LF a held CR is content.
             if (self.line.holdsCr()) {
                 if (self.line.raw_len > self.max_line_bytes) return error.LineTooLong;
                 self.classifyByte('\r', self.line.raw_len - 1);
@@ -2735,7 +2583,6 @@ pub const CheckScanner = struct {
     fn consumeLineBytes(self: *CheckScanner, bytes: []const u8) CheckScannerError!void {
         if (bytes.len == 0) return;
         const previous_len = self.line.raw_len;
-        // More bytes follow a held CR, so it is content.
         if (self.line.holdsCr()) self.classifyByte('\r', previous_len - 1);
         try self.line.add(bytes, self.max_line_bytes);
         try self.classifyBytes(LineBytes.contentOf(bytes), previous_len);
@@ -3145,7 +2992,6 @@ fn expectBufferedLineProgress(
             .byte_offset = 0,
             .line_in_record = 4,
         };
-        // Complete records avoid the different progress rules for an incomplete line.
         try std.testing.expect(try current.refill());
         try std.testing.expectEqual(input.len, current.fill_end);
     }
@@ -3241,7 +3087,6 @@ test "[property] - [reader]: complete buffered records preserve per-line results
     var storage: [128]u8 = undefined;
     @memcpy(storage[0..prefix.len], prefix);
     for (cases) |fields| {
-        // Bit `index` puts a carriage return on line `index`: none, or all.
         for ([_]usize{ 0, 15 }) |mask| {
             var end: usize = prefix.len;
             for (fields, 0..) |field, index| {
@@ -3363,7 +3208,6 @@ test "[property] - [reader]: predicted payloads preserve parsing and source prog
         first ++ "@r\nACG\n+\n!\n!\n",
         first ++ "@r\r\nAC\r\n+\r\n!\x7f\r\n",
     }) |input| {
-        // A split one byte before, at, and after each record start (after each line feed).
         for (input, 0..) |byte, index| {
             if (byte != '\n') continue;
             for ([_]usize{ index -| 1, index, index + 1 }) |position| {
@@ -3536,7 +3380,6 @@ fn expectRefillDelivery(
         const record_start = reader.byteOffset() - progress.bytes;
         var reference_span: ?[]const u8 = null;
         reference.beginRecord();
-        // Keep the pre-refill parser as a reference for fields and failures.
         const expected: ReaderError!?Record = result: {
             const buffered = reference.readBufferedRecord(.full, true, null, false) catch |err|
                 break :result err;
@@ -3617,7 +3460,6 @@ fn expectPairedRefill(
                 finished = true;
                 break :pair;
             }
-            // The reference owns mate 1 before an ordinary read invalidates it.
             var saved = try toOwned(std.testing.allocator, first.?.record);
             defer saved.deinit();
             const expected_second = nextValidatedRecord(&reference, &reference_validator);
@@ -3680,7 +3522,6 @@ test "[property] - [reader]: paired refills preserve fields, progress, and failu
             first ++ "@r/2\r\r\nR\rA\n+\r\r\n!!!\n",
             "@r/1\r\r\nAR\n+left\r\r\n!~\n" ++ first,
         }) |input| {
-            // One byte either side of each carriage return and line feed.
             for (input, 0..) |byte, index| {
                 if (byte != '\r' and byte != '\n') continue;
                 for ([_]usize{ index -| 1, index, index + 1 }) |split| {
@@ -3704,7 +3545,6 @@ test "[property] - [reader]: paired refills retain oversized and EOF fallbacks" 
     const capacity = io_layer.DEFAULT_READER_BUFFER_BYTES;
     const first = "@r/1\nAR\n+left\n!~\n";
     const last = "@last\nN\n+\n!\n";
-    // Second-mate lengths that put the record one byte below, at, and one byte above the read buffer.
     for ([_]usize{ capacity - first.len - 1, capacity - first.len, capacity - first.len + 1 }) |record_len| {
         const field_len = (record_len - 9) / 2;
         const second = try ReaderSpillFixture.init(std.testing.allocator, field_len, field_len, "\n", true);
@@ -3893,7 +3733,6 @@ test "[property] - [reader]: saved LF masks preserve searches after skips and re
             storage[newline] = '\n';
             storage[storage.len - 1] = '\n';
             var line_feeds: LineFeedSearch = .{};
-            // One byte either side of each vector and block boundary, and the end.
             for ([_]usize{ 0, lanes - 1, lanes, lanes + 1, 63, 64, 65, 127, 128, 129, 191, 192, 193 }) |start| {
                 const expected = if (std.mem.findScalar(u8, storage[start..], '\n')) |end|
                     start + end
@@ -3921,9 +3760,6 @@ test "[property] - [reader]: short and whole-input reads deliver the same record
     };
     for (cases) |data| {
         for (1..data.len + 1) |chunk_limit| {
-            // A read that delivers the whole input borrows every record from the transport buffer,
-            // so the only allocation is that buffer (index 0). A short read spills the record, and
-            // the spill is allowed to allocate.
             var source = ProjectionTestSource.init(data, 0, null);
             source.chunk_limit = chunk_limit;
             const whole_input = chunk_limit >= data.len;
@@ -3964,7 +3800,6 @@ test "[property] - [reader]: refill retries preserve records, progress, and fail
         "@r\r\r\nA\n+\r\r\n!\n", "@r\nR\rA\n+\n!!!\n",
     }) |input| {
         for ([_]ReaderOptions{ .{}, .{ .max_line_bytes = 2 } }) |options| {
-            // One byte either side of each line feed, which is where a record ends.
             for (input, 0..) |byte, index| {
                 if (byte != '\n') continue;
                 for ([_]usize{ index -| 1, index, index + 1 }) |split| {
@@ -4034,8 +3869,6 @@ test "[property] - [reader]: refill retries cover the transport capacity and ove
     }
 }
 
-/// Delivers `input` split one byte before, at, and after each carriage return
-/// and line feed, so every line ending falls on a delivery boundary once.
 fn expectPayloadProjectionAtLineEnds(input: []const u8, options: ReaderOptions) !void {
     try expectPayloadProjection(input, 0, null, options, .{});
     for (input, 0..) |byte, index| {
@@ -4111,7 +3944,6 @@ test "[property] - [reader]: validated records match separate parsing and valida
     }) |suffix| {
         var storage: [128]u8 = undefined;
         const input = try std.fmt.bufPrint(&storage, "{s}{s}{s}", .{ prefix, suffix, prefix });
-        // One byte either side of each line feed, where a record starts or ends.
         for (input, 0..) |byte, index| {
             if (byte != '\n') continue;
             for ([_]usize{ index -| 1, index, index + 1 }) |split| {
@@ -4214,82 +4046,56 @@ test "[edge] - [reader]: buffered validation preserves borrowed mates and valida
     try std.testing.expect(validator.use_full_iupac);
 }
 
-test "[edge] - [reader]: advance over a spilled record allocates no field storage" {
+test "[edge] - [reader]: spilled records keep field storage empty on advance, payload, and header paths" {
     const field_len = io_layer.DEFAULT_READER_BUFFER_BYTES + 17;
-    const input = try ReaderSpillFixture.init(
-        std.testing.allocator,
-        field_len,
-        field_len,
-        "\n",
-        true,
-    );
+    const input = try ReaderSpillFixture.init(std.testing.allocator, field_len, field_len, "\n", true);
     defer std.testing.allocator.free(input);
 
-    var source = io_layer.SliceSource.init(input);
-    var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{});
-    defer reader.deinit();
-    const initial_allocations = tracking.allocations;
+    {
+        var source = io_layer.SliceSource.init(input);
+        var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{});
+        defer reader.deinit();
+        const initial_allocations = tracking.allocations;
 
-    try std.testing.expect(try reader.advance());
-    try std.testing.expectEqual(initial_allocations, tracking.allocations);
-    try std.testing.expectEqual(@as(u64, 1), reader.recordIndex());
-    for (reader.fallback_fields) |field| {
-        try std.testing.expectEqual(@as(usize, 0), field.len);
+        try std.testing.expect(try reader.advance());
+        try std.testing.expectEqual(initial_allocations, tracking.allocations);
+        try std.testing.expectEqual(@as(u64, 1), reader.recordIndex());
+        for (reader.fallback_fields) |field| {
+            try std.testing.expectEqual(@as(usize, 0), field.len);
+        }
+    }
+
+    {
+        var source = io_layer.SliceSource.init(input);
+        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
+
+        const payload = (try reader.readPayload()).?;
+        try std.testing.expectEqual(field_len, payload.sequence.len);
+        try std.testing.expectEqual(field_len, payload.quality.len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[0].len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[2].len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[0].storage.len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[2].storage.len);
+    }
+
+    {
+        var source = io_layer.SliceSource.init(input);
+        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
+        var validator = AdaptiveRecordValidator.init(.{});
+
+        const validated = (try reader.readValidatedHeader(&validator)).?;
+        try std.testing.expectEqualStrings("abc", validated.header);
+        try std.testing.expect(validated.semantic_error == null);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[1].storage.len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[1].len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[2].storage.len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[3].storage.len);
     }
 }
 
-test "[edge] - [reader]: payload projection of a spilled record keeps the field storage empty" {
-    const field_len = io_layer.DEFAULT_READER_BUFFER_BYTES + 17;
-    const input = try ReaderSpillFixture.init(
-        std.testing.allocator,
-        field_len,
-        field_len,
-        "\n",
-        true,
-    );
-    defer std.testing.allocator.free(input);
-
-    var source = io_layer.SliceSource.init(input);
-    var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-
-    const payload = (try reader.readPayload()).?;
-    try std.testing.expectEqual(field_len, payload.sequence.len);
-    try std.testing.expectEqual(field_len, payload.quality.len);
-    try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[0].len);
-    try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[2].len);
-    try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[0].storage.len);
-    try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[2].storage.len);
-}
-
-test "[edge] - [reader]: validated header of a spilled record keeps the sequence and quality storage empty" {
-    const field_len = io_layer.DEFAULT_READER_BUFFER_BYTES + 17;
-    const input = try ReaderSpillFixture.init(
-        std.testing.allocator,
-        field_len,
-        field_len,
-        "\n",
-        true,
-    );
-    defer std.testing.allocator.free(input);
-
-    var source = io_layer.SliceSource.init(input);
-    var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-    var validator = AdaptiveRecordValidator.init(.{});
-
-    const validated = (try reader.readValidatedHeader(&validator)).?;
-    try std.testing.expectEqualStrings("abc", validated.header);
-    try std.testing.expect(validated.semantic_error == null);
-    try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[1].storage.len);
-    try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[1].len);
-    try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[2].storage.len);
-    try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[3].storage.len);
-}
-
-/// The offset and record count of the 32-bit crossing fixtures: the reader and the
-/// check scanner both carry their counters past this value.
 const CROSSING_32_BIT: u64 = 1 << 32;
 
 test "[edge] - [reader]: counts and locations cross 32 bits through buffered and fallback reads" {
@@ -4348,7 +4154,6 @@ test "[edge] - [reader]: counts and locations cross 32 bits through buffered and
 
 test "[edge] - [reader]: offset and record-count limits reject the record on buffered and fallback reads" {
     const data = "@r\nA\n+\n!\n";
-    // A split of 0 delivers the input in one read; a split of 1 forces the line-by-line fallback.
     for ([_]usize{ 0, 1 }) |split| {
         var offset_source = ProjectionTestSource.init(data, split, null);
         var offset_reader = try Reader.init(std.testing.allocator, offset_source.byteSource(), .{});
@@ -4371,7 +4176,6 @@ test "[edge] - [reader]: offset and record-count limits reject the record on buf
 }
 
 test "[failure] - [reader]: partial fallback ownership is released after allocation failure" {
-    // Fields longer than the transport buffer, so both fields are owned copies.
     const spill_len = 2 * io_layer.DEFAULT_READER_BUFFER_BYTES;
     const input = try ReaderSpillFixture.init(
         std.testing.allocator,
@@ -4394,7 +4198,6 @@ test "[failure] - [reader]: partial fallback ownership is released after allocat
     }
 }
 
-/// One record whose four lines each fill the line limit, with CRLF or LF endings.
 fn spillRecordFixture(allocator: std.mem.Allocator, max_line_bytes: usize, crlf: bool) ![]u8 {
     const fill_bytes = [_]u8{ 'h', 'A', 'p', 'I' };
     const prefix_bytes = [_]?u8{ '@', null, '+', null };
@@ -4435,7 +4238,6 @@ test "[edge] - [reader]: spill field capacities stop at the line limit" {
         try std.testing.expectEqual(max_line_bytes, record.quality.len);
         try std.testing.expect(std.mem.allEqual(u8, record.sequence, 'A'));
         try std.testing.expect(std.mem.allEqual(u8, record.quality, 'I'));
-        // CRLF records and the plus-line field spill to the full storage limit; the others keep one line.
         for (&reader.fallback_fields, 0..) |*field, field_index| {
             try std.testing.expectEqual(max_line_bytes, field.len);
             const expected_capacity = if (crlf or field_index == 3)
@@ -4483,7 +4285,6 @@ test "[property] - [reader]: spilled records keep field storage bounded and reus
             }
             try std.testing.expect(tracking.allocated_bytes - tracking.freed_bytes <=
                 2 * io_layer.DEFAULT_READER_BUFFER_BYTES + 3 * storage_limit);
-            // From the second record on, the sequence field first attempts whole-record refill assembly.
             if (count > 1) try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.fallback_fields[1].storage.len);
             if (crlf and count > 2) try std.testing.expectEqual(warm_allocated, tracking.allocated_bytes);
             warm_allocated = tracking.allocated_bytes;
@@ -4576,7 +4377,6 @@ test "[property] - [reader]: storage exchange keeps both live prefixes without a
         try std.testing.expect(std.mem.allEqual(u8, donor.storage[0..row.donor_live], 'h'));
     }
 
-    // A donor in a larger slot replaces a field that is too small for the request.
     var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var source = io_layer.SliceSource.init("");
     var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{});
@@ -4676,7 +4476,6 @@ test "[failure] - [reader]: heterogeneous storage reuse cleans up every allocati
 }
 
 test "[edge] - [reader]: quality spill reserves only its valid tail" {
-    // Just under 128 KiB; the cases vary only the quality field around this length.
     const sequence_len = 128 * 1024 - 2;
     const Case = struct {
         quality_len: usize,
@@ -4918,13 +4717,7 @@ test "[edge] - [record delivery]: a header longer than the read buffer has no ca
     defer std.testing.allocator.free(input);
     @memset(input, 'h');
     input[0] = '@';
-    input[header_len + 1] = '\n';
-    input[header_len + 2] = 'A';
-    input[header_len + 3] = '\n';
-    input[header_len + 4] = '+';
-    input[header_len + 5] = '\n';
-    input[header_len + 6] = '!';
-    input[header_len + 7] = '\n';
+    @memcpy(input[header_len + 1 ..], "\nA\n+\n!\n");
 
     var source = io_layer.SliceSource.init(input);
     var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
@@ -5058,7 +4851,6 @@ test "[integration] - [record delivery]: retained fallback storage survives a re
             const validated2 = buffered2 orelse (try nextFallbackValidatedRecord(&reader, &validator)).?;
             const record2 = validated2.record;
             try std.testing.expect(validated2.semantic_error == null);
-            // Mate 2 crosses the end of the transport chunk, so its fields use fallback storage.
             if (mate2_len == 2) {
                 try std.testing.expectEqual(allocations_before_refill + 4, tracking.allocations);
             }
@@ -5083,7 +4875,6 @@ test "[integration] - [record delivery]: retained fallback storage survives a re
 }
 
 test "[integration] - [writer]: prechecked Reader records match checked serialization" {
-    // Valid records carry CR inside a field, which canonical output keeps; the rest hold a terminal CR.
     const cases = [_]struct { input: []const u8, valid: bool }{
         .{ .input = "@r\rdesc\r\nACGT\r\n+note\rx\r\n!#$%\r\n", .valid = true },
         .{ .input = "@r\r\r\nA\n+\n!\n", .valid = false },
@@ -5137,8 +4928,6 @@ test "[property] - [writer]: the canonical copy matches written records" {
     }
 }
 
-// The check scanner keeps no input-sized buffer: its state is a line, a record,
-// and one diagnostic, which fit in three cache lines.
 comptime {
     const CACHE_LINE_BYTES = 64;
     const CACHE_LINES = 3;
@@ -5183,7 +4972,6 @@ test "[property] - [check scanner]: fused sequence scan finds the line feed at e
 
 test "[edge] - [check scanner]: fused sequence scan stops at a line feed after a block-boundary IUPAC code" {
     var bytes: [2 * simd.BLOCK_BYTES + 2]u8 = @splat('A');
-    @memset(&bytes, 'A');
     bytes[simd.BLOCK_BYTES] = 'R';
     bytes[simd.BLOCK_BYTES + 1] = '\n';
     try std.testing.expectEqual(
@@ -5227,8 +5015,7 @@ test "[property] - [check scanner]: fused sequence scan ends a CRLF line at the 
     }
 }
 
-// The IUPAC state changes at a block seam.
-test "[edge] - [check scanner]: adaptive IUPAC state holds across a block seam" {
+test "[edge] - [check scanner]: adaptive IUPAC state holds across a block boundary" {
     var block: [simd.BLOCK_BYTES]u8 = @splat('A');
     block[1] = '\n';
     block[2] = 'R';
@@ -5316,7 +5103,6 @@ test "[unit] - [check scanner]: complete record path commits only proved records
 }
 
 test "[property] - [validation]: long records get the same verdict on every kernel path" {
-    // Long records take the AVX2 object when the running CPU has it.
     const allocator = std.testing.allocator;
     for ([_]usize{ 1024, 1031, 4101 }) |len| {
         const data = try allocator.alloc(u8, 2 * len + 7);
@@ -5359,7 +5145,6 @@ test "[property] - [validation]: long records get the same verdict on every kern
                     try std.testing.expectEqual(bad.at, semantic.?.byte_index);
                 } else try std.testing.expect(semantic == null);
 
-                // The streaming classifier sees the same fields as chunks.
                 inline for (.{ SemanticField.sequence, SemanticField.quality }) |field| {
                     const chunk = if (field == .sequence) sequence else quality;
                     var inline_iupac = false;
@@ -5374,7 +5159,7 @@ test "[property] - [validation]: long records get the same verdict on every kern
     }
 }
 
-test "[unit] - [check scanner]: adaptive IUPAC state survives a chunk seam" {
+test "[unit] - [check scanner]: adaptive IUPAC state survives a feed boundary" {
     var scanner = CheckScanner.init(.{}, .{});
     _ = try scanner.feed("@r\nR");
     try std.testing.expect(scanner.use_full_iupac);
@@ -5384,7 +5169,6 @@ test "[unit] - [check scanner]: adaptive IUPAC state survives a chunk seam" {
 }
 
 test "[property] - [check scanner]: complete records accept mixed LF and CRLF endings" {
-    // Bit i selects CRLF for line i: all LF, alternating, the other alternation, and all CRLF.
     for ([_]usize{ 0, 5, 10, 15 }) |ending_mask| {
         var endings: [4][]const u8 = undefined;
         for (&endings, 0..) |*ending, index| {
@@ -5414,7 +5198,6 @@ test "[property] - [check scanner]: complete records accept mixed LF and CRLF en
         try std.testing.expectEqual(@as(u64, 1), scanner.record_index);
         try std.testing.expectEqual(@as(u64, data.len), scanner.byte_offset);
         try std.testing.expect(scanner.atRecordBoundary());
-        // A cut one byte before, at, and after each line ending leaves the record incomplete.
         for (line_ends) |line_end| {
             for ([_]usize{ line_end -| 1, line_end, line_end + 1 }) |cut| {
                 if (cut >= data.len) continue;
@@ -6131,7 +5914,6 @@ test "[property] - [record validation]: adaptive IUPAC state preserves byte poli
             validateRecord(record, .{}),
             validator.validate(record),
         );
-        // Only the IUPAC codes outside A, C, G, T, and N switch the validator to the full set.
         try std.testing.expectEqual(
             std.mem.indexOfScalar(u8, "URYSWKMBDHVuryswkmbdhv", sequence[0]) != null,
             validator.use_full_iupac,
@@ -6202,7 +5984,6 @@ test "[property] - [record validation]: vector kernels match the scalar referenc
         var sequence: [lanes + 1]u8 = undefined;
         var quality: [lanes + 1]u8 = undefined;
         for ([_]usize{ 0, 1, lanes - 1, lanes, lanes + 1 }) |len| {
-            // No invalid byte, then one invalid sequence and quality byte at the first and the last position.
             for ([_]?usize{ null, 0, if (len == 0) null else len - 1 }) |invalid| {
                 for (sequence[0..len], quality[0..len], 0..) |*base, *score, index| {
                     base.* = symbols[index % symbols.len];

@@ -15,9 +15,6 @@ pub const QualityError = struct {
     byte: u8,
 };
 
-/// Materialized counters and ratios; optional values are null for an empty population.
-/// A derived value kept as exact counts, so text output can round it without
-/// floating point; undefined when the denominator is zero.
 pub const Ratio = struct {
     numerator: u128,
     denominator: u128,
@@ -57,7 +54,6 @@ pub const StatsResult = struct {
     q30_fraction: ?f64,
 };
 
-/// Allocation-free accumulator whose totals change only after a complete valid update.
 pub const Stats = struct {
     reads: u64 = 0,
     bases: u64 = 0,
@@ -74,7 +70,6 @@ pub const Stats = struct {
     q30_bases: u64 = 0,
     last_quality_error: ?QualityError = null,
 
-    /// Validates and applies one record without partially changing any counter.
     pub fn addRecord(self: *Stats, record: fastq.Record) StatsError!void {
         self.last_quality_error = null;
         var quality_error: ?QualityError = null;
@@ -85,8 +80,6 @@ pub const Stats = struct {
         try self.applyTotals(delta);
     }
 
-    /// Applies one record accumulated by `StreamedTotals`, with the same
-    /// validation and all-or-nothing update as `addRecord`.
     pub fn addStreamed(self: *Stats, streamed: *const StreamedTotals) StatsError!void {
         self.last_quality_error = null;
         if (streamed.quality_error) |quality_error| {
@@ -120,14 +113,12 @@ pub const Stats = struct {
         self.* = updated;
     }
 
-    /// Returns and clears details retained after S006.
     pub fn takeLastQualityError(self: *Stats) ?QualityError {
         const quality_error = self.last_quality_error;
         self.last_quality_error = null;
         return quality_error;
     }
 
-    /// Materializes ratios without changing the accumulator.
     pub fn result(self: *const Stats) StatsResult {
         const exact = self.ratios();
         return .{
@@ -152,11 +143,9 @@ pub const Stats = struct {
         };
     }
 
-    /// Every ratio in `StatsResult` as exact counts, under the same names.
     pub fn ratios(self: *const Stats) Ratios {
         return .{
             .mean_length = .{ .numerator = self.bases, .denominator = self.reads },
-            // N and other symbols are not called bases here, so they stay out of GC.
             .gc_fraction = .{
                 .numerator = @as(u128, self.g) + self.c,
                 .denominator = @as(u128, self.a) + self.c + self.g + self.t,
@@ -181,11 +170,9 @@ const RecordTotals = struct {
     q30_bases: u64,
 };
 
-/// Bases at or above these scores count toward the Q20 and Q30 totals.
 const Q20_SCORE = 20;
 const Q30_SCORE = 30;
 
-// Extern layout: the AVX2 copy of `payloadTotals` returns it across the object boundary.
 const PayloadTotals = extern struct {
     base_counts: [6]usize = .{0} ** 6,
     quality_sum: u64 = 0,
@@ -199,7 +186,6 @@ fn recordTotals(
 ) StatsError!RecordTotals {
     if (record.sequence.len != record.quality.len) return error.S005LengthMismatch;
 
-    // The u128 total serves quality lines over 2^64 / 93 bytes, past any real input.
     const payload_totals = if (maxQualitySum(record.quality.len) != null)
         try payloadTotals(u64, record.sequence, record.quality, quality_error)
     else
@@ -223,9 +209,6 @@ fn totalsFromPayload(payload_totals: PayloadTotals, length: usize) StatsError!Re
     };
 }
 
-/// Totals of one record whose sequence and quality arrive as chunks of
-/// content, for a record larger than what the reader has buffered; nothing is
-/// copied.
 pub const StreamedTotals = struct {
     totals: PayloadTotals = .{},
     sequence_len: usize = 0,
@@ -290,13 +273,10 @@ fn payloadTotals(
     quality: []const u8,
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
-    // Long payloads take the AVX2 copy when the running CPU has it.
     if (sum_type == u64 and simd.useAvx2(quality.len)) return avx2Totals(.both, sequence, quality, quality_error);
     return payloadTotalsInline(sum_type, .both, sequence, quality, quality_error);
 }
 
-/// Totals of one chunk of a streamed record: `bytes` is sequence or quality,
-/// per `parts`. Long chunks take the AVX2 copy when the CPU has it.
 fn chunkTotals(comptime parts: Parts, bytes: []const u8, quality_error: *?QualityError) StatsError!PayloadTotals {
     const sequence = if (parts == .sequence) bytes else "";
     const quality = if (parts == .quality) bytes else "";
@@ -322,8 +302,6 @@ comptime {
     simd.exportKernel("payload_totals", &payloadTotalsExport);
 }
 
-/// 0 on success, 1 for an invalid quality byte (reported through the out
-/// parameters), 2 for counter overflow.
 fn payloadTotalsExport(
     parts: u8,
     sequence: [*]const u8,
@@ -348,8 +326,6 @@ fn payloadTotalsExport(
     return 0;
 }
 
-/// Which fields a call covers: whole records pass both (equal lengths);
-/// streamed chunks pass one field and leave the other empty.
 const Parts = enum { both, sequence, quality };
 
 fn payloadTotalsInline(
@@ -409,7 +385,6 @@ fn payloadTotalsScalar(
     };
 }
 
-/// The covered field holds at least `vector_len` bytes.
 fn payloadTotalsVector(
     comptime vector_len: comptime_int,
     comptime parts: Parts,
@@ -417,7 +392,6 @@ fn payloadTotalsVector(
     quality: []const u8,
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
-    // Score pairs are summed in u16 lanes, so a lane takes at most 257 vectors of u8 scores.
     comptime std.debug.assert(vector_len >= 2 and vector_len % 2 == 0 and
         vector_len <= std.math.maxInt(u16) / std.math.maxInt(u8));
     const half_len = vector_len / 2;
@@ -603,8 +577,6 @@ fn rejectInvalidQualityBlock(
             return error.S006InvalidQuality;
         };
     }
-    // The vector check flags a block only when one of its bytes fails the
-    // scalar decoding above; the tier test pins the two to each other.
     unreachable;
 }
 
@@ -627,8 +599,6 @@ test "[unit] - [statistics]: quality accumulator bound is the largest score sum 
     try std.testing.expect(maxQualitySum(boundary + 1) == null);
 }
 
-/// Lengths where the vector body changes shape: a partial vector, the block
-/// sizes of its 8-bit counters, and the byte after each.
 fn blockBoundaryLengths(comptime vector_len: comptime_int) [14]usize {
     const quality_block_len = vector_len * (std.math.maxInt(u8) - 1);
     const base_block_len = vector_len * std.math.maxInt(u8);
@@ -650,8 +620,6 @@ fn blockBoundaryLengths(comptime vector_len: comptime_int) [14]usize {
     };
 }
 
-/// Sequence bytes cycle through every byte value. Quality bytes cycle through
-/// the lowest and highest valid Phred+33 bytes and values between them.
 fn fillPayload(sequence: []u8, quality: []u8) void {
     const qualities = [_]u8{ 33, 52, 53, 62, 63, 126 };
     for (sequence, quality, 0..) |*base, *quality_byte, index| {
@@ -679,7 +647,6 @@ test "[property] - [statistics]: vector payload totals match the scalar path at 
                 try payloadTotals(u64, sequence_part, quality_part, &quality_error),
             );
             if (length < vector_len) continue;
-            // Each part is passed with the other field empty, as the streamed callers do.
             inline for (.{ Parts.both, Parts.sequence, Parts.quality }) |parts| {
                 const sequence_arg = if (parts == .quality) sequence_part[0..0] else sequence_part;
                 const quality_arg = if (parts == .sequence) quality_part[0..0] else quality_part;
@@ -692,7 +659,6 @@ test "[property] - [statistics]: vector payload totals match the scalar path at 
     }
 }
 
-/// Both paths reject the payload at `index`, and each names that byte.
 fn expectFirstInvalidQuality(
     comptime vector_len: comptime_int,
     sequence: []const u8,
@@ -723,7 +689,6 @@ test "[failure] - [statistics]: vector payload totals report the first invalid q
         const quality = try std.testing.allocator.alloc(u8, block_len);
         defer std.testing.allocator.free(quality);
 
-        // The last byte of the first vector and the first byte after it.
         const short_len = vector_len + 1;
         for ([_]usize{ vector_len - 1, vector_len }) |invalid_index| {
             fillPayload(sequence, quality);
@@ -731,7 +696,6 @@ test "[failure] - [statistics]: vector payload totals report the first invalid q
             try expectFirstInvalidQuality(vector_len, sequence[0..short_len], quality[0..short_len], invalid_index);
         }
 
-        // Bytes outside the valid range at the start and end of each counter block.
         const invalid_block = [_]struct { index: usize, byte: u8 }{
             .{ .index = 0, .byte = 32 },
             .{ .index = quality_block_len - 1, .byte = 127 },
@@ -744,7 +708,6 @@ test "[failure] - [statistics]: vector payload totals report the first invalid q
             try expectFirstInvalidQuality(vector_len, sequence, quality, invalid.index);
         }
 
-        // Two invalid bytes: the report names the earlier one.
         fillPayload(sequence, quality);
         quality[block_len - 1] = 127;
         quality[3 * vector_len + 1] = 32;

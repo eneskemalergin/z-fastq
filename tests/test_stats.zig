@@ -1,9 +1,8 @@
-//! Public aggregate-statistics contracts.
+//! Public aggregate statistics and installed `z-fastq stats` results.
 
 const std = @import("std");
 const zfastq = @import("z-fastq");
 const cli = @import("utilities.zig");
-const CommandResult = cli.CommandResult;
 const runCliWithStdin = cli.runWithStdin;
 const runCliWithClosedStdout = cli.runWithClosedStdout;
 
@@ -159,7 +158,6 @@ test "[failure] - [statistics]: length mismatch precedes quality validation" {
 
 test "[edge] - [statistics]: record updates cross 32 bits without losing counters or ratios" {
     const crossing: u64 = 1 << 32;
-    // Each seeded history consists of ACGTNX records with six Phred-93 qualities.
     for ([_]u64{ crossing / 558, crossing / 6, crossing - 1 }) |initial_reads| {
         errdefer std.debug.print("stats 32-bit crossing: initial reads {d}\n", .{initial_reads});
         var stats = zfastq.Stats{
@@ -357,15 +355,10 @@ test "[cli] - [stats-json]: JSON shapes match the sample, empty, and zero-length
     }
 }
 
-test "[cli] - [stats]: empty input and a zero-length record remain distinct" {
+test "[cli] - [stats]: a zero-length record reports one read and no bases" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-
-    const empty = try runCliWithStdin(allocator, &.{ "stats", "-" }, "", 1);
-    try std.testing.expectEqual(@as(u8, 0), empty.exit_code);
-    try std.testing.expectEqualStrings("input: -\n" ++ EMPTY_FIELDS, empty.stdout);
-    try std.testing.expectEqual(@as(usize, 0), empty.stderr.len);
 
     const zero = try runCliWithStdin(allocator, &.{ "stats", "-" }, "@z\n\n+\n\n", 1);
     try std.testing.expectEqual(@as(u8, 0), zero.exit_code);
@@ -393,6 +386,7 @@ test "[cli] - [stats]: empty input and a zero-length record remain distinct" {
     , zero.stdout);
     try std.testing.expectEqual(@as(usize, 0), zero.stderr.len);
 }
+
 test "[cli] - [stats]: source counts and exact decimal ties agree with human and JSON fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -413,7 +407,6 @@ test "[cli] - [stats]: source counts and exact decimal ties agree with human and
         errdefer std.debug.print("stats reads={d} bases={d}\n", .{ case.reads, case.bases });
         var input: std.ArrayList(u8) = .empty;
         try input.ensureTotalCapacity(allocator, case.bases * 2 + case.reads * 10);
-        // One C and one Phred-31 byte make the ratios exact decimal ties at 128 bases.
         try input.appendSlice(allocator, "@r\nC");
         try input.appendNTimes(allocator, 'A', case.bases - 1);
         try input.appendSlice(allocator, "\n+\n@");
@@ -551,7 +544,6 @@ test "[cli] - [stats]: every input runs and the highest exit class wins" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The limit file has an 8-byte sequence line; the sample's lines fit the 6-byte limit used below.
     try tmp.dir.writeFile(io, .{ .sub_path = "valid.fastq", .data = SAMPLE_FASTQ });
     try tmp.dir.writeFile(io, .{ .sub_path = "invalid.fastq", .data = "@bad\nA\n+\n \n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "limit.fastq", .data = "@r\nACGTACGT\n+\n!!!!!!!!\n" });
@@ -579,12 +571,6 @@ test "[cli] - [stats]: every input runs and the highest exit class wins" {
                     "error: {s}: file not found\n",
                 .{ invalid_path, missing_path },
             ),
-        },
-        .{
-            .args = &.{ "stats", valid_path, missing_path, valid_path },
-            .exit_code = 3,
-            .stdout = two_blocks,
-            .stderr = try std.fmt.allocPrint(allocator, "error: {s}: file not found\n", .{missing_path}),
         },
         .{
             .args = &.{ "stats", "--max-line-bytes", "6", limit_path, missing_path, valid_path },

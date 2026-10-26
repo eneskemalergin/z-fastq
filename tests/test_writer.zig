@@ -1,16 +1,32 @@
-//! Writer and plain output-adapter contracts.
+//! Writer output bytes, record round trips, sink failures, and plain output adapters.
 
 const std = @import("std");
 const zfastq = @import("z-fastq");
 
 const PAGE_BYTES = 4096;
-/// Multiplier and block size that give the file-sink pattern its byte sequence.
 const PATTERN_MULTIPLIER = 31;
 const PATTERN_BLOCK = 251;
-/// Write sizes step by STEP_FACTOR modulo STEP_LIMIT, and every VEC_EVERY-th write is vectored.
 const STEP_FACTOR = 7;
 const STEP_LIMIT = 5003;
 const VEC_EVERY = 3;
+
+fn expectRoundTrip(record: zfastq.Record, expected: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    var sink = zfastq.io.plain.SliceSink.init(&buf);
+    var writer = zfastq.Writer.init(sink.byteSink());
+
+    try writer.writeRecord(record);
+    try writer.flush();
+
+    try std.testing.expectEqualStrings(expected, sink.written());
+
+    var source = zfastq.io.plain.SliceSource.init(sink.written());
+    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
+    defer reader.deinit();
+    const parsed = (try reader.next()).?;
+    try std.testing.expectEqualDeep(record, parsed);
+    try std.testing.expect((try reader.next()) == null);
+}
 
 test "[integration] - [writer]: supported records serialize and round-trip exactly" {
     const cases = [_]struct {
@@ -70,21 +86,7 @@ test "[integration] - [writer]: supported records serialize and round-trip exact
     };
 
     for (cases) |case| {
-        var buf: [256]u8 = undefined;
-        var sink = zfastq.io.plain.SliceSink.init(&buf);
-        var writer = zfastq.Writer.init(sink.byteSink());
-
-        try writer.writeRecord(case.record);
-        try writer.flush();
-
-        try std.testing.expectEqualStrings(case.expected, sink.written());
-
-        var source = zfastq.io.plain.SliceSource.init(sink.written());
-        var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-        defer reader.deinit();
-        const parsed = (try reader.next()).?;
-        try std.testing.expectEqualDeep(case.record, parsed);
-        try std.testing.expect((try reader.next()) == null);
+        try expectRoundTrip(case.record, case.expected);
     }
 }
 
@@ -152,21 +154,7 @@ test "[edge] - [writer]: empty, interior-CR, and long fields serialize exactly a
     };
 
     for (cases) |case| {
-        var buf: [512]u8 = undefined;
-        var sink = zfastq.io.plain.SliceSink.init(&buf);
-        var writer = zfastq.Writer.init(sink.byteSink());
-
-        try writer.writeRecord(case.record);
-        try writer.flush();
-
-        try std.testing.expectEqualStrings(case.expected, sink.written());
-
-        var source = zfastq.io.plain.SliceSource.init(sink.written());
-        var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-        defer reader.deinit();
-        const parsed = (try reader.next()).?;
-        try std.testing.expectEqualDeep(case.record, parsed);
-        try std.testing.expect((try reader.next()) == null);
+        try expectRoundTrip(case.record, case.expected);
     }
 }
 
@@ -198,13 +186,11 @@ test "[property] - [file sink]: page-sized writes keep every byte in order" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Three pages and a partial page of bytes that differ from their neighbors.
     var pattern: [3 * PAGE_BYTES + 777]u8 = undefined;
     for (&pattern, 0..) |*byte, index| {
         byte.* = @truncate(index *% PATTERN_MULTIPLIER +% index / PATTERN_BLOCK);
     }
 
-    // Buffers below, between, and on page multiples keep partial pages across drains.
     for ([_]usize{ 100, PAGE_BYTES + 100, 2 * PAGE_BYTES }) |buffer_len| {
         const file = try tmp.dir.createFile(io, "sink", .{ .read = true, .truncate = true });
         defer file.close(io);
@@ -250,7 +236,6 @@ test "[integration] - [plain adapters]: reader, file source, and writer carry re
     try writer.flush();
     try std.testing.expectEqualStrings(input, fixed_writer.buffered());
 
-    // A three-byte read buffer makes the file source refill several times within one record.
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

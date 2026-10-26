@@ -37,7 +37,6 @@ const Line = struct {
     }
 };
 
-/// One output record, copied out of the reader's buffer.
 const Record = struct {
     lines: [4]std.ArrayList(u8) = .{ .empty, .empty, .empty, .empty },
     cr: [4]bool = .{ false, false, false, false },
@@ -57,14 +56,12 @@ const Record = struct {
     }
 };
 
-/// The input side: reads records until one matches, counting its index.
 const Walk = struct {
     reader: *std.Io.Reader,
     index: u64 = 0,
     plus: u64 = 0,
     cr: u64 = 0,
 
-    /// Advances to the next input record equal to `want`; false at end of input.
     fn find(self: *Walk, want: *const Record) !bool {
         while (true) {
             const h = Line.of(try self.reader.takeDelimiter('\n') orelse return false);
@@ -174,10 +171,8 @@ pub fn main(init: std.process.Init) void {
         if (mates or pairs) {
             if (kept % 2 == 1) {
                 first_index = walk.index;
-                // An interleaved pair starts on an odd input record.
                 if (pairs and walk.index % 2 == 0) paired = false;
             } else {
-                // The second mate is the first mate's partner.
                 const partner = if (mates) first_index else first_index + 1;
                 if (walk.index != partner) paired = false;
                 fnv(&hash, if (mates) first_index else (first_index + 1) / 2);
@@ -187,7 +182,6 @@ pub fn main(init: std.process.Init) void {
         }
     }
     if ((mates or pairs) and kept % 2 == 1) paired = false;
-    // Read the rest of the output, so the sampler is not stopped by a closed pipe.
     if (!ordered) _ = out_reader.interface.discardRemaining() catch |err| fail(io, "output", err);
 
     var plus: u64 = 0;

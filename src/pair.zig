@@ -65,8 +65,6 @@ pub fn namesMatch(name1: Name, name2: Name) bool {
     return name1.mate_markers == 0b01 and name2.mate_markers == 0b10;
 }
 
-// Read names are short, so the token kernels have only the scalar and
-// baseline tiers: no name would repay a call into the AVX2 object.
 const TOKEN_LANES = simd.tierWidth(.baseline);
 const TokenVector = @Vector(TOKEN_LANES, u8);
 const TokenMask = @Int(.unsigned, TOKEN_LANES);
@@ -265,8 +263,6 @@ test "[property] - [paired names]: illumina and exact policies accept the listed
 
 test "[property] - [paired names]: illumina matching keeps mate markers and opaque suffixes" {
     const Row = struct { suffix1: []const u8, suffix2: []const u8, matches: bool };
-    // Each row matches once a non-empty prefix precedes the suffixes; an empty
-    // prefix leaves the first token empty, which never matches.
     const rows = [_]Row{
         .{ .suffix1 = " 1:N:0:index-a", .suffix2 = "\t2:N:0:index-b", .matches = true },
         .{ .suffix1 = " 2:N:0:index-b", .suffix2 = " 1:N:0:index-a", .matches = false },

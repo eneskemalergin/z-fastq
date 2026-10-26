@@ -38,8 +38,6 @@ pub const Fraction = union(enum) {
     }
 };
 
-/// Parses a CLI decimal option: one or more ASCII digits, nothing else (no
-/// sign, prefix, separator, or space).
 pub fn parseDecimal(comptime T: type, text: []const u8) std.fmt.ParseIntError!T {
     if (text.len == 0) return error.InvalidCharacter;
     for (text) |byte| {
@@ -811,9 +809,6 @@ pub const Mt19937_64 = struct {
     }
 };
 
-/// Runs `exercise` with its first allocation failing. The body must report
-/// out-of-memory; storage taken before the failure is released, which the
-/// testing allocator's leak check verifies.
 fn expectFirstAllocationFails(comptime exercise: anytype) !void {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, exercise(failing.allocator()));

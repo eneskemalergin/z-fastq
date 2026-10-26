@@ -14,9 +14,6 @@ pub const DEFAULT_READER_BUFFER_BYTES: usize = 256 * 1024;
 pub const COUNT_READ_BUFFER_BYTES: usize = DEFAULT_READER_BUFFER_BYTES;
 const GZIP_OPTIONAL_HEADER_BYTES_MAX: usize = 64 * 1024;
 
-/// Copied pull interface whose adapter must remain at a stable address and outlive it.
-/// A read initializes the returned prefix and rejects a count beyond the destination.
-/// For a nonempty destination, zero reports EOF.
 pub const ByteSource = struct {
     vtable: *const VTable,
     ctx: *anyopaque,
@@ -32,8 +29,6 @@ pub const ByteSource = struct {
     }
 };
 
-/// Copied push interface whose adapter must remain at a stable address and outlive it.
-/// Writes consume the complete slice; a missing flush callback is a successful no-op.
 pub const ByteSink = struct {
     vtable: *const VTable,
     ctx: *anyopaque,
@@ -58,7 +53,6 @@ pub const ByteSink = struct {
     }
 };
 
-/// Pull adapter over borrowed in-memory bytes.
 pub const SliceSource = struct {
     data: []const u8,
     pos: usize = 0,
@@ -89,7 +83,6 @@ fn sliceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return copy_len;
 }
 
-/// Pull adapter over a borrowed standard reader.
 pub const ReaderSource = struct {
     reader: *std.Io.Reader,
 
@@ -171,7 +164,6 @@ fn byteSourceReadVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize 
     return 0;
 }
 
-/// Buffered pull adapter over a borrowed file handle and caller-owned buffer.
 pub const FileSource = struct {
     file_reader: std.Io.File.Reader,
 
@@ -200,10 +192,6 @@ fn fileSourceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return readShort(&self.file_reader.interface, dest);
 }
 
-// --- gzip input ---
-
-/// Streams and validates complete RFC 1952 member sequences from a borrowed reader.
-/// The reader accepts any buffer size and must share this adapter's stable lifetime.
 pub const GzipSource = struct {
     input: *std.Io.Reader,
     decoder: zipir.gzip.Decompressor = undefined,
@@ -242,7 +230,6 @@ fn gzipRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return readShort(self.decoded(), dest);
 }
 
-/// Push adapter into a borrowed fixed-capacity byte slice.
 pub const SliceSink = struct {
     buffer: []u8,
     pos: usize = 0,
@@ -275,7 +262,6 @@ fn sliceWrite(ctx: *anyopaque, data: []const u8) WriteError!void {
     self.pos = end;
 }
 
-/// Push adapter over a borrowed standard writer.
 pub const WriterSink = struct {
     writer: *std.Io.Writer,
 
@@ -331,19 +317,10 @@ fn writerFlush(ctx: *anyopaque) WriteError!void {
     self.writer.flush() catch return error.WriteFailed;
 }
 
-/// Buffered push adapter over a borrowed file handle and caller-owned buffer.
-/// It writes whole pages and keeps a partial last page buffered until the
-/// next write or flush: a write that ends inside a page makes the kernel
-/// update that page again on the next write, about twice the copy cost on
-/// page-cache file systems. A buffer shorter than a page writes everything
-/// it holds.
 pub const FileSink = struct {
-    /// Unbuffered file writer that owns positioning and write errors.
     file_writer: std.Io.File.Writer,
     writer: std.Io.Writer,
 
-    /// Writes from offset 0, falling back to streaming where the handle
-    /// cannot seek, like `std.Io.File.writer`.
     pub fn init(
         io: std.Io,
         file: std.Io.File,
@@ -352,7 +329,6 @@ pub const FileSink = struct {
         return wrap(file.writer(io, &.{}), write_buf);
     }
 
-    /// Writes at the handle's current position, like `std.Io.File.writerStreaming`.
     pub fn initStreaming(
         io: std.Io,
         file: std.Io.File,

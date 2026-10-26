@@ -8,10 +8,7 @@ const pairing = @import("pair.zig");
 const sampling = @import("sample.zig");
 const statistics = @import("stats.zig");
 
-// z-fastq never opens a network connection; this drops std.Io's DNS and socket code.
 pub const std_options: std.Options = .{ .networking = false };
-
-// --- Arguments ---
 
 const Command = enum { count, stats, check, sample, interleave, deinterleave };
 
@@ -85,13 +82,20 @@ fn printUsageAndExit(io: std.Io) noreturn {
     argumentError(io, USAGE, 2);
 }
 
+fn writeStderr(io: std.Io, message: []const u8) void {
+    std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
+}
+
+fn usageError(io: std.Io, message: []const u8) u8 {
+    writeStderr(io, message);
+    return 2;
+}
+
 fn printHelpAndExit(io: std.Io) noreturn {
     std.Io.File.writeStreamingAll(.stdout(), io, USAGE) catch std.process.exit(stdoutFailed(io, 0));
     std.process.exit(0);
 }
 
-/// Value options seen so far: each may be given once, so a later value never
-/// silently replaces an earlier one.
 const GivenOptions = struct {
     max_line_bytes: bool = false,
     alphabet: bool = false,
@@ -103,9 +107,16 @@ const GivenOptions = struct {
     out2: bool = false,
 };
 
-fn onlyOnce(io: std.Io, given: *bool, comptime option: []const u8) void {
+fn optionValue(
+    io: std.Io,
+    args: *std.process.Args.Iterator,
+    given: *bool,
+    comptime option: []const u8,
+) []const u8 {
+    const value = args.next() orelse argumentError(io, "error: " ++ option ++ " requires a value\n", 2);
     if (given.*) argumentError(io, "error: " ++ option ++ " may appear only once\n", 2);
     given.* = true;
+    return value;
 }
 
 fn printVersionAndExit(io: std.Io) noreturn {
@@ -134,8 +145,7 @@ fn validateRecordCommandInputs(
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
-    // A write to a closed pipe then fails with EPIPE, which ends the command
-    // with the documented I/O status instead of a signal.
+
     std.posix.sigaction(.PIPE, &.{
         .handler = .{ .handler = std.posix.SIG.IGN },
         .mask = std.posix.sigemptyset(),
@@ -206,10 +216,7 @@ pub fn main(init: std.process.Init) !void {
             printHelpAndExit(io);
         }
         if (std.mem.eql(u8, arg, "--max-line-bytes")) {
-            const value = args.next() orelse {
-                argumentError(io, "error: --max-line-bytes requires a value\n", 2);
-            };
-            onlyOnce(io, &given.max_line_bytes, "--max-line-bytes");
+            const value = optionValue(io, &args, &given.max_line_bytes, "--max-line-bytes");
             max_line_bytes = sampling.parseDecimal(usize, value) catch |err| switch (err) {
                 error.Overflow => {
                     argumentError(io, "error: --max-line-bytes exceeds supported limit\n", 4);
@@ -228,10 +235,7 @@ pub fn main(init: std.process.Init) !void {
             command == .deinterleave) and
             std.mem.eql(u8, arg, "--alphabet"))
         {
-            const value = args.next() orelse {
-                argumentError(io, "error: --alphabet requires a value\n", 2);
-            };
-            onlyOnce(io, &given.alphabet, "--alphabet");
+            const value = optionValue(io, &args, &given.alphabet, "--alphabet");
             alphabet = if (std.mem.eql(u8, value, "iupac"))
                 .iupac
             else if (std.mem.eql(u8, value, "acgtn"))
@@ -242,20 +246,14 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
         if (command == .sample and std.mem.eql(u8, arg, "--fraction")) {
-            const value = args.next() orelse {
-                argumentError(io, "error: --fraction requires a value\n", 2);
-            };
-            onlyOnce(io, &given.fraction, "--fraction");
+            const value = optionValue(io, &args, &given.fraction, "--fraction");
             fraction = sampling.Fraction.parse(value) catch {
                 argumentError(io, "error: invalid --fraction value\n", 2);
             };
             continue;
         }
         if (command == .sample and std.mem.eql(u8, arg, "--count")) {
-            const value = args.next() orelse {
-                argumentError(io, "error: --count requires a value\n", 2);
-            };
-            onlyOnce(io, &given.count, "--count");
+            const value = optionValue(io, &args, &given.count, "--count");
             sample_count = sampling.parseCount(value) catch |err| switch (err) {
                 error.InvalidCount => {
                     argumentError(io, "error: invalid --count value\n", 2);
@@ -267,10 +265,7 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
         if (command == .sample and std.mem.eql(u8, arg, "--seed")) {
-            const value = args.next() orelse {
-                argumentError(io, "error: --seed requires a value\n", 2);
-            };
-            onlyOnce(io, &given.seed, "--seed");
+            const value = optionValue(io, &args, &given.seed, "--seed");
             sample_seed = sampling.parseSeed(value) catch |err| switch (err) {
                 error.InvalidSeed => {
                     argumentError(io, "error: invalid --seed value\n", 2);
@@ -303,10 +298,7 @@ pub fn main(init: std.process.Init) !void {
             command == .deinterleave) and
             std.mem.eql(u8, arg, "--pair-names"))
         {
-            const value = args.next() orelse {
-                argumentError(io, "error: --pair-names requires a value\n", 2);
-            };
-            onlyOnce(io, &given.pair_names, "--pair-names");
+            const value = optionValue(io, &args, &given.pair_names, "--pair-names");
             pair_name_policy = if (std.mem.eql(u8, value, "illumina"))
                 .illumina
             else if (std.mem.eql(u8, value, "exact"))
@@ -320,19 +312,10 @@ pub fn main(init: std.process.Init) !void {
         if (command == .deinterleave and
             (std.mem.eql(u8, arg, "--out1") or std.mem.eql(u8, arg, "--out2")))
         {
-            const value = args.next() orelse {
-                const message = if (std.mem.eql(u8, arg, "--out1"))
-                    "error: --out1 requires a value\n"
-                else
-                    "error: --out2 requires a value\n";
-                argumentError(io, message, 2);
-            };
             if (std.mem.eql(u8, arg, "--out1")) {
-                onlyOnce(io, &given.out1, "--out1");
-                output1 = value;
+                output1 = optionValue(io, &args, &given.out1, "--out1");
             } else {
-                onlyOnce(io, &given.out2, "--out2");
-                output2 = value;
+                output2 = optionValue(io, &args, &given.out2, "--out2");
             }
             continue;
         }
@@ -393,8 +376,6 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(code);
 }
 
-// --- Command failures and diagnostics ---
-
 const CommandFailure = struct {
     code: []const u8,
     message: []const u8,
@@ -436,11 +417,8 @@ const INSPECT_FAILURE = CommandFailure.plain("io_error", "failed to inspect file
 
 const RECORD_LOCATION_UNAVAILABLE = CommandFailure.plain("io_error", "record location is unavailable", 3);
 
-/// For failures reported before a command's input labels exist.
 const OUT_OF_MEMORY_LINE = "error: " ++ OUT_OF_MEMORY.message ++ "\n";
 
-/// Output buffers: a JSON document is flushed when it outgrows its buffer;
-/// FASTQ output is written in whole pages from its buffer.
 const JSON_OUTPUT_BUFFER_BYTES = 16 * 1024;
 const RECORD_OUTPUT_BUFFER_BYTES = 64 * 1024;
 
@@ -503,7 +481,6 @@ const PairFailure = union(enum) {
     name_mismatch: PairNameFailure,
     count_mismatch: PairCountFailure,
 
-    /// Stable validation code, shared by text and JSON output.
     fn code(self: PairFailure) []const u8 {
         return switch (self) {
             .name_mismatch => "P001",
@@ -599,7 +576,6 @@ fn unwritableRecordFailure() CommandFailure {
     );
 }
 
-/// In interleaved input, mate 1 of pair `p` is record `2p`.
 fn interleavedPairIndex(mate1_record_index: u64) u64 {
     return mate1_record_index / 2;
 }
@@ -795,7 +771,6 @@ fn printOutputFailure(io: std.Io) void {
     ) catch {};
 }
 
-/// Reports a failed write to stdout and raises the exit status to the I/O class.
 fn stdoutFailed(io: std.Io, exit_code: u8) u8 {
     printOutputFailure(io);
     return @max(exit_code, 3);
@@ -838,8 +813,6 @@ fn writeDisplayRun(output: *std.Io.Writer, bytes: []const u8, comptime json_stri
     }
 }
 
-// --- Input opening ---
-
 const InputOptions = struct {
     max_line_bytes: usize = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
 };
@@ -849,7 +822,6 @@ const FileIdentity = struct {
     device_minor: u32,
     inode: u64,
 
-    // std.Io.File.Stat does not retain the device containing the inode, so identities come from statx.
     fn of(stat: std.os.linux.Statx) FileIdentity {
         return .{ .device_major = stat.dev_major, .device_minor = stat.dev_minor, .inode = stat.ino };
     }
@@ -863,7 +835,6 @@ const RecordInput = struct {
     read_buffer: [zfastq.limits.DEFAULT_READER_BUFFER_BYTES]u8,
     file_reader: std.Io.File.Reader,
     kind: enum { plain, gzip },
-    // Kept apart from `kind`: assigning null or a payload-free union tag zeroes this whole field.
     gzip: io_layer.GzipSource,
 
     fn init(
@@ -888,9 +859,7 @@ const RecordInput = struct {
         }
         const reader = &self.file_reader.interface;
         const sniff_filled = reader.bufferedLen() == reader.buffer.len;
-        // The sniff buffer is a prefix of `read_buffer`, so widening keeps the sniffed bytes.
         reader.buffer = &self.read_buffer;
-        // A full sniff read can end inside a record; topping up keeps it out of spill storage.
         if (sniff_filled) {
             reader.fillMore() catch |err| switch (err) {
                 error.EndOfStream => {},
@@ -935,7 +904,6 @@ fn initRecordInput(
     return null;
 }
 
-/// A directory opens like a file but fails on its first read; name it instead.
 fn inputTypeFailure(io: std.Io, file: std.Io.File) ?CommandFailure {
     const stat = statRecordFile(io, file) catch return null;
     if (stat.mode & std.os.linux.S.IFMT == std.os.linux.S.IFDIR) {
@@ -944,12 +912,10 @@ fn inputTypeFailure(io: std.Io, file: std.Io.File) ?CommandFailure {
     return null;
 }
 
-/// The CLI names standard input `-`.
 fn namesStdin(label: []const u8) bool {
     return std.mem.eql(u8, label, "-");
 }
 
-/// Standard input can be read only once, so it may be named only once.
 fn stdinRepeats(inputs: []const []const u8) bool {
     var seen = false;
     for (inputs) |label| {
@@ -981,7 +947,6 @@ fn initPairedRecordInputs(
 ) ?PairCommandFailure {
     for (inputs, 0..) |label, index| {
         if (namesStdin(label)) {
-            // Opening a path could reuse descriptor 0 if stdin is closed.
             _ = fileIdentity(io, .stdin()) catch
                 return pairCommandFailure(@intCast(index), IO_FAILURE);
         }
@@ -1011,7 +976,6 @@ fn initPairedRecordInputs(
 
 fn openNonblockingRecordFile(label: []const u8) std.posix.OpenError!std.Io.File {
     if (namesStdin(label)) return .stdin();
-    // R2's FIFO writer may wait for R1 to drain before opening R2.
     const handle = try std.posix.openat(std.Io.Dir.cwd().handle, label, .{
         .ACCMODE = .RDONLY,
         .NONBLOCK = true,
@@ -1025,7 +989,6 @@ fn prepareRecordFile(io: std.Io, file: *std.Io.File) (std.Io.Cancelable || error
     const linux = std.os.linux;
     const stat = try statRecordFile(io, file.*);
     if (stat.mode & linux.S.IFMT == linux.S.IFIFO) {
-        // A nonblocking FIFO open can precede its writer; reading now would report early EOF.
         var poll_fd = [1]linux.pollfd{.{ .fd = file.handle, .events = linux.POLL.IN, .revents = 0 }};
         while (true) switch (linux.errno(linux.poll(&poll_fd, 1, -1))) {
             .SUCCESS => break,
@@ -1062,7 +1025,6 @@ fn statRecordFile(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{ Io
 
 fn stdoutFileIdentity(io: std.Io) (std.Io.Cancelable || error{Io})!?FileIdentity {
     const stat = statRecordFile(io, .stdout()) catch |err| switch (err) {
-        // Inspect before opening inputs, which could reuse a closed descriptor 1.
         error.BadFileDescriptor => return null,
         else => |other| return other,
     };
@@ -1070,7 +1032,6 @@ fn stdoutFileIdentity(io: std.Io) (std.Io.Cancelable || error{Io})!?FileIdentity
     return .of(stat);
 }
 
-/// `stdoutFileIdentity`, with a failure to inspect stdout already reported (exit 3).
 fn checkedStdoutIdentity(io: std.Io) error{Reported}!?FileIdentity {
     return stdoutFileIdentity(io) catch {
         if (canReportInputFailure(io, null)) printOutputFailure(io);
@@ -1078,8 +1039,6 @@ fn checkedStdoutIdentity(io: std.Io) error{Reported}!?FileIdentity {
     };
 }
 
-/// The identity of the file named `path`, without opening it; null when it
-/// cannot be inspected, which the command reports when it reaches the input.
 fn pathIdentity(io: std.Io, path: []const u8) ?FileIdentity {
     const linux = std.os.linux;
     const path_z = std.posix.toPosixPath(path) catch return null;
@@ -1093,11 +1052,6 @@ fn pathIdentity(io: std.Io, path: []const u8) ?FileIdentity {
     return .of(stat);
 }
 
-/// Rejects, before any input is read or output written, an input that is
-/// stdout's file, and standard input named more than once under any name
-/// while it is a pipe or FIFO, which can be read only once. A regular file on
-/// standard input may also be named by path: each name reads it from the
-/// start.
 fn inputAliasFailure(io: std.Io, inputs: []const []const u8, output_identity: ?FileIdentity) ?u8 {
     const stdin_stat = statRecordFile(io, .stdin()) catch null;
     const stdin_identity: ?FileIdentity = if (stdin_stat) |stat| .of(stat) else null;
@@ -1110,12 +1064,7 @@ fn inputAliasFailure(io: std.Io, inputs: []const []const u8, output_identity: ?F
         if (reads_stdin) {
             stdin_uses += 1;
             if (stdin_uses > 1) {
-                std.Io.File.writeStreamingAll(
-                    .stderr(),
-                    io,
-                    "error: standard input may appear at most once\n",
-                ) catch {};
-                return 2;
+                return usageError(io, "error: standard input may appear at most once\n");
             }
         }
         const output = output_identity orelse continue;
@@ -1138,7 +1087,6 @@ fn outputFileFailure(io: std.Io, file: std.Io.File, output_identity: ?FileIdenti
 
 fn canReportInputFailure(io: std.Io, known_inputs: ?[]const FileIdentity) bool {
     const stat = statRecordFile(io, .stderr()) catch return false;
-    // Without input identities, a regular stderr file could be an input.
     const inputs = known_inputs orelse return stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG;
     const stderr_identity: FileIdentity = .of(stat);
     for (inputs) |input| {
@@ -1183,8 +1131,6 @@ fn pairedFilesFailure(io: std.Io, file1: std.Io.File, file2: std.Io.File, output
     return null;
 }
 
-// --- Record output ---
-
 fn recordHasUnwritableEnding(record: zfastq.Record, canonical_span: ?[]const u8) bool {
     return canonical_span == null and fastq.recordHasTerminalCr(record);
 }
@@ -1201,8 +1147,6 @@ fn writeCheckedRecord(
     }
 }
 
-/// A span is writable unless a field still ends in CR once its line ending
-/// is removed, which canonical LF output cannot represent.
 fn spanIsWritable(span: fastq.RecordSpan) bool {
     return span.canonical or !fastq.recordHasTerminalCr(span.record());
 }
@@ -1229,9 +1173,6 @@ fn headerNameMismatch(
     } } };
 }
 
-/// Four lines at the line limit, each with its LF: the largest canonical
-/// record. It saturates, so every command accepts the same line limits; no
-/// record reaches the size of the address space.
 fn recordStagingLimit(max_line_bytes: usize) usize {
     const line = std.math.add(usize, max_line_bytes, 1) catch return std.math.maxInt(usize);
     return std.math.mul(usize, line, 4) catch std.math.maxInt(usize);
@@ -1269,8 +1210,6 @@ fn stageCanonicalRecord(
     }
     _ = fastq.copyCanonicalRecord(staging.addManyAsSliceAssumeCapacity(required), record);
 }
-
-// --- Pair names and retained mates ---
 
 const PairMode = enum {
     none,
@@ -1383,8 +1322,6 @@ fn nextAfterPreservingInterleavedMate1(
             .record = record2,
             .first_storage = .retained,
         };
-        // Reader's four line limits cover CLI staging limits, including markers.
-        // Internal callers can supply a smaller limit and still need its error.
         if (staging_limit < recordStagingLimit(reader.options.max_line_bytes)) {
             if (try canonicalRecordSize(record1, canonical_span1) > staging_limit) {
                 return error.RecordStagingLimit;
@@ -1426,8 +1363,6 @@ fn writePreservedInterleavedMate1(
         fastq.restoreFallbackRecordStorage(reader, retained);
     }
 }
-
-// --- Count command ---
 
 const CountOutcome = union(enum) {
     success: u64,
@@ -1489,8 +1424,6 @@ fn mapScanFailure(scanner: *zfastq.count_scan.Scanner, err: zfastq.ReaderError) 
         else => mapInputFailure(@errorCast(err)),
     };
 }
-
-// --- Stats command ---
 
 const StatsOutcome = union(enum) {
     success: zfastq.Stats,
@@ -1575,7 +1508,6 @@ fn collectStats(
     defer reader.deinit();
 
     var stats: zfastq.Stats = .{};
-    // A record larger than what is buffered streams its totals here.
     var streamed: statistics.StreamedTotals = .{};
     while (true) {
         const next = fastq.nextPayloadOrStreamed(&reader, statistics.StreamedTotals, &streamed) catch |err| {
@@ -1638,14 +1570,10 @@ fn statsFailure(stats: *zfastq.Stats, reader: *zfastq.Reader, err: statistics.St
             ) catch return INPUT_LOCATION_LIMIT;
             return CommandFailure.lint(details);
         },
-        // The Reader rejects unequal lengths as S005 before a record reaches
-        // the statistics; a panic keeps a broken invariant a defined crash.
         error.S005LengthMismatch => @panic("Reader returned unequal sequence and quality lengths"),
         error.Overflow => return STATISTICS_LIMIT,
     }
 }
-
-// --- Check command ---
 
 const CheckOptions = struct {
     max_line_bytes: usize = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
@@ -1657,7 +1585,6 @@ const PairedCheckOptions = struct {
     alphabet: zfastq.Alphabet = .iupac,
     pair_mode: PairMode = .none,
     pair_name_policy: pairing.NamePolicy = .illumina,
-    /// Stdout's file, which no input may be (JSON output would land in it).
     output_identity: ?FileIdentity = null,
 };
 
@@ -1669,12 +1596,7 @@ fn runSingleCheckCommand(
     pair_names_set: bool,
 ) u8 {
     if (pair_names_set) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: --pair-names requires --paired or --interleaved\n",
-        ) catch {};
-        return 2;
+        return usageError(io, "error: --pair-names requires --paired or --interleaved\n");
     }
     return runCheck(io, inputs, options, json_output);
 }
@@ -1729,16 +1651,10 @@ fn validatePairedCheckInputs(
             "error: check --paired requires exactly two inputs\n"
         else
             "error: check --interleaved requires exactly one input\n";
-        std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
-        return 2;
+        return usageError(io, message);
     }
     if (pair_mode == .paired and stdinRepeats(inputs)) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: paired inputs may contain standard input at most once\n",
-        ) catch {};
-        return 2;
+        return usageError(io, "error: paired inputs may contain standard input at most once\n");
     }
     return null;
 }
@@ -1825,15 +1741,11 @@ fn checkPaired(
 }
 
 const PairStep = union(enum) {
-    /// Both inputs ended together.
     end,
     pair,
     failure: PairCommandFailure,
 };
 
-/// The verdict on the mates just read from two files (null at the end of an
-/// input): count mismatch, then mate 1's and mate 2's semantic failures, then
-/// their names.
 inline fn verifyPair(
     reader1: *const fastq.Reader,
     reader2: *const fastq.Reader,
@@ -1965,9 +1877,6 @@ fn checkInterleavedSource(
     }
 }
 
-/// Reads and verifies one interleaved pair without keeping either record:
-/// mate 1's semantic failure (after mate 2 proves it exists), mate 2's, then
-/// their names. `first` is mate 1 when the caller has already read it.
 inline fn verifyInterleavedPair(
     allocator: std.mem.Allocator,
     reader: *fastq.Reader,
@@ -2000,8 +1909,6 @@ inline fn verifyInterleavedPair(
         break :header validated2.record.header;
     } else header: {
         if (semantic1) |failure| {
-            // Mate 2 must exist, and its structural error comes first. The
-            // call stays out of line: this path ends the command.
             const exists = @call(.never_inline, fastq.Reader.advance, .{reader}) catch |err| {
                 return .{ .failure = pairCommandFailure(0, mapReaderFailure(reader, err)) };
             };
@@ -2101,8 +2008,6 @@ fn mapCheckScannerFailure(
     };
 }
 
-// --- Sample command ---
-
 const SampleOptions = struct {
     max_line_bytes: usize,
     alphabet: zfastq.Alphabet,
@@ -2150,16 +2055,8 @@ const ExactOutputCursor = struct {
     }
 };
 
-/// One unit (a record or a pair) of an exact-count second pass; a failed
-/// unit leaves its failure in the pass.
 const ExactUnit = enum { done, end, failed };
 
-/// The second pass of exact-count sampling: units in input order, selected
-/// ones written and the rest skipped; then no unit may follow and the inputs
-/// must be unchanged. `pass` reads its units with `write` and `skip`, checks
-/// for one more with `extra`, compares snapshots with `changed`, and names
-/// the failure for a changed input with `inputChanged`; failures go to
-/// `pass.failure`.
 inline fn runExactSecondPass(
     comptime Failure: type,
     cursor: *ExactOutputCursor,
@@ -2203,51 +2100,26 @@ fn runSample(
     var options = parsed_options;
     const mode: SampleMode = if (options.fraction) |fraction| blk: {
         if (options.count != null) {
-            std.Io.File.writeStreamingAll(
-                .stderr(),
-                io,
-                "error: --fraction and --count are mutually exclusive\n",
-            ) catch {};
-            return 2;
+            return usageError(io, "error: --fraction and --count are mutually exclusive\n");
         }
         break :blk .{ .fraction = fraction };
     } else if (options.count) |count|
         .{ .count = count }
     else {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: sample requires --fraction P or --count K\n",
-        ) catch {};
-        return 2;
+        return usageError(io, "error: sample requires --fraction P or --count K\n");
     };
     if (options.pair_mode != .none) {
         return runPairSampleCommand(io, allocator, inputs, mode, options);
     }
     if (options.pair_names_set) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: --pair-names requires --paired or --interleaved\n",
-        ) catch {};
-        return 2;
+        return usageError(io, "error: --pair-names requires --paired or --interleaved\n");
     }
     if (inputs.len != 1) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: sample requires exactly one input\n",
-        ) catch {};
-        return 2;
+        return usageError(io, "error: sample requires exactly one input\n");
     }
     const input = inputs[0];
     if (mode == .count and namesStdin(input)) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: exact-count sampling requires a file path\n",
-        ) catch {};
-        return 2;
+        return usageError(io, "error: exact-count sampling requires a file path\n");
     }
 
     options.output_identity = checkedStdoutIdentity(io) catch return 3;
@@ -2278,8 +2150,6 @@ fn runSample(
         writer.flush() catch {};
         return stdoutFailed(io, 0);
     };
-
-    // Messages follow detection order: a record's failure before the final flush's.
     const flushed = if (writer.flush()) true else |_| false;
     if (failure) |details| printCommandFailure(io, input, details);
     const output_exit: u8 = if (flushed) 0 else stdoutFailed(io, 0);
@@ -2300,28 +2170,17 @@ fn runPairSampleCommand(
             "error: sample --paired requires exactly two inputs\n"
         else
             "error: sample --interleaved requires exactly one input\n";
-        std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
-        return 2;
+        return usageError(io, message);
     }
     switch (mode) {
         .count => {
             for (inputs) |input| {
                 if (!namesStdin(input)) continue;
-                std.Io.File.writeStreamingAll(
-                    .stderr(),
-                    io,
-                    "error: paired exact-count sampling requires file paths\n",
-                ) catch {};
-                return 2;
+                return usageError(io, "error: paired exact-count sampling requires file paths\n");
             }
         },
         .fraction => if (options.pair_mode == .paired and stdinRepeats(inputs)) {
-            std.Io.File.writeStreamingAll(
-                .stderr(),
-                io,
-                "error: paired sample inputs may contain standard input at most once\n",
-            ) catch {};
-            return 2;
+            return usageError(io, "error: paired sample inputs may contain standard input at most once\n");
         },
     }
 
@@ -2372,7 +2231,6 @@ fn runPairSampleCommand(
         return stdoutFailed(io, 0);
     };
 
-    // Messages follow detection order: a pair's failure before the final flush's.
     const flushed = if (writer.flush()) true else |_| false;
     if (failure) |details| printPairCommandFailure(io, inputs, options.pair_mode, details);
     const output_exit: u8 = if (flushed) 0 else stdoutFailed(io, 0);
@@ -2432,8 +2290,6 @@ fn sampleInterleavedSource(
             .{ writer, writer },
             &span1,
         ) catch return error.WriteFailed) |failure| return failure;
-        // Drawn before the pair is read: an unselected pair is validated
-        // without being kept.
         if (!selection.selectPair()) {
             const first: ?fastq.ValidatedHeader = if (span1) |mate1| .{ .header = mate1.header(), .semantic_error = null } else null;
             switch (verifyInterleavedPair(allocator, &reader, &validator, &stored_name, options.pair_name_policy, first)) {
@@ -2495,8 +2351,6 @@ fn sampleFractionSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        // One draw per record, made before reading it: an unselected record
-        // is validated without being copied.
         const selected = selector.selectRecord();
         if (fastq.nextRecordSpan(&reader, &validator)) |span| {
             if (!selected) continue;
@@ -2518,7 +2372,6 @@ fn sampleFractionSource(
         var next = fastq.nextValidatedRecord(&reader, &validator) catch |err| {
             return mapReaderFailure(&reader, err);
         };
-        // A pointer capture reads the record where the reader built it.
         const validated = if (next) |*validated| validated else return null;
         if (mapCurrentSemanticFailure(
             validated.semantic_error,
@@ -2555,7 +2408,6 @@ fn sampleExactFile(
 ) error{WriteFailed}!?CommandFailure {
     var selector = sampling.ExactSelector.init(count, options.seed);
     defer selector.deinit(allocator);
-    // Both passes reuse this storage, so their read buffers touch the same stack pages.
     var input: RecordInput = undefined;
 
     const first = sampleExactFirstPass(io, allocator, &input, path, &selector, options);
@@ -2795,7 +2647,6 @@ fn sampleExactPairs(
 ) error{WriteFailed}!?PairCommandFailure {
     var selector = sampling.ExactSelector.init(count, options.seed);
     defer selector.deinit(allocator);
-    // Both passes reuse this storage, so their read buffers touch the same stack pages.
     var record_inputs: [2]RecordInput = undefined;
 
     const first = sampleExactPairFirstPass(
@@ -3083,7 +2934,6 @@ fn sampleExactPairedSecondPass(
             return .done;
         }
 
-        /// Blames the input that still has a record, or R1 when neither has.
         fn missingMate(got1: bool, got2: bool) PairCommandFailure {
             return inputChangedPairFailure(if (got1 != got2 and got2) 1 else 0);
         }
@@ -3302,7 +3152,6 @@ const ExactFile = union(enum) {
 };
 
 fn openExactInput(io: std.Io, path: []const u8, expected_snapshot: ?FileSnapshot) ExactFile {
-    // A FIFO must reach the descriptor type check without waiting for a writer.
     const handle = std.posix.openat(std.Io.Dir.cwd().handle, path, .{
         .ACCMODE = .RDONLY,
         .NONBLOCK = true,
@@ -3323,7 +3172,6 @@ fn openExactInput(io: std.Io, path: []const u8, expected_snapshot: ?FileSnapshot
             .failure = if (expected_snapshot != null and err == error.NotRegularFile)
                 inputChangedFailure()
             else if (err == error.NotRegularFile)
-                // An invalid request, as `-` is: exact-count sampling reads its input twice.
                 CommandFailure.plain(
                     "usage",
                     "exact-count sampling requires a regular file",
@@ -3409,8 +3257,6 @@ fn inputChangedPairFailure(input_index: u1) PairCommandFailure {
     return pairCommandFailure(input_index, inputChangedFailure());
 }
 
-// --- Interleave command ---
-
 const InterleaveOptions = struct {
     max_line_bytes: usize,
     alphabet: zfastq.Alphabet,
@@ -3456,9 +3302,6 @@ fn runInterleave(
     return exit_code;
 }
 
-/// Writes pairs straight from both readers' buffers until a mate needs the
-/// general path; `pending1` returns mate 1 when only it was taken. Kept out
-/// of line so the per-pair loop has its own small frame.
 noinline fn joinSpanPairs(
     writer: *zfastq.Writer,
     reader1: *zfastq.Reader,
@@ -3495,21 +3338,9 @@ noinline fn joinSpanPairs(
 }
 
 fn validateInterleaveInputs(io: std.Io, inputs: []const []const u8) ?u8 {
-    if (inputs.len != 2) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: interleave requires exactly two inputs\n",
-        ) catch {};
-        return 2;
-    }
+    if (inputs.len != 2) return usageError(io, "error: interleave requires exactly two inputs\n");
     if (stdinRepeats(inputs)) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: interleave inputs may contain standard input at most once\n",
-        ) catch {};
-        return 2;
+        return usageError(io, "error: interleave inputs may contain standard input at most once\n");
     }
     return null;
 }
@@ -3566,8 +3397,6 @@ fn interleaveSources(
             options.pair_name_policy,
             &span1,
         )) |failure| return failure;
-        // Drawn before the pair is read: an unselected pair is validated
-        // without being kept.
         if (!selection.selectPair()) {
             const header1 = if (span1) |mate1| fastq.ValidatedHeader{ .header = mate1.header(), .semantic_error = null } else fastq.nextValidatedHeader(&reader1, &validator1) catch |err| {
                 return pairCommandFailure(0, mapReaderFailure(&reader1, err));
@@ -3587,7 +3416,7 @@ fn interleaveSources(
         var next2 = fastq.nextValidatedRecord(&reader2, &validator2) catch |err| {
             return pairCommandFailure(1, mapReaderFailure(&reader2, err));
         };
-        // Pointer captures read both records where the readers built them.
+
         const maybe1: ?*const fastq.ValidatedRecord = if (next1) |*value| value else null;
         const maybe2: ?*const fastq.ValidatedRecord = if (next2) |*value| value else null;
         switch (verifyPair(
@@ -3616,8 +3445,6 @@ fn interleaveSources(
         try writeCheckedRecord(writer, record2.*, canonical_span2);
     }
 }
-
-// --- Deinterleave command ---
 
 const DeinterleaveOptions = struct {
     max_line_bytes: usize,
@@ -3680,7 +3507,6 @@ fn runDeinterleave(
         return failure.exit_code;
     };
     defer if (owns_input) input_file.close(io);
-    // Checked before any output exists, so a failure here creates nothing.
     if (inputTypeFailure(io, input_file)) |failure| {
         printCommandFailure(io, input_label, failure);
         return failure.exit_code;
@@ -3695,7 +3521,6 @@ fn runDeinterleave(
         return failure.exit_code;
     }
     if (output2.create(io)) |failure| {
-        // Output 1 was created empty a moment ago; leaving it would block a rerun.
         output1.close(io);
         std.Io.Dir.cwd().deleteFile(io, output1.path) catch {};
         printCommandFailure(io, output2.path, failure);
@@ -3742,35 +3567,23 @@ fn validateDeinterleaveArguments(
     output2_path: ?[]const u8,
 ) ?[2][]const u8 {
     if (inputs.len != 1) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: deinterleave requires exactly one input\n",
-        ) catch {};
+        writeStderr(io, "error: deinterleave requires exactly one input\n");
         return null;
     }
     const path1 = output1_path orelse {
-        std.Io.File.writeStreamingAll(.stderr(), io, "error: deinterleave requires --out1\n") catch {};
+        writeStderr(io, "error: deinterleave requires --out1\n");
         return null;
     };
     const path2 = output2_path orelse {
-        std.Io.File.writeStreamingAll(.stderr(), io, "error: deinterleave requires --out2\n") catch {};
+        writeStderr(io, "error: deinterleave requires --out2\n");
         return null;
     };
     if (namesStdin(path1) or namesStdin(path2)) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: deinterleave output paths cannot be standard output\n",
-        ) catch {};
+        writeStderr(io, "error: deinterleave output paths cannot be standard output\n");
         return null;
     }
     if (std.mem.eql(u8, path1, path2)) {
-        std.Io.File.writeStreamingAll(
-            .stderr(),
-            io,
-            "error: deinterleave output paths must differ\n",
-        ) catch {};
+        writeStderr(io, "error: deinterleave output paths must differ\n");
         return null;
     }
     return .{ path1, path2 };
@@ -3825,8 +3638,6 @@ fn deinterleaveSource(
     }
 }
 
-/// Where mate 1 of an interleaved pair lives while mate 2 is read, when the
-/// reader's buffer cannot keep it.
 const PreservedMate1 = struct {
     staged_record: std.ArrayList(u8) = .empty,
     retained: fastq.RetainedRecordStorage = .{},
@@ -3863,11 +3674,6 @@ const InterleavedPairStep = union(enum) {
     failure: PairCommandFailure,
 };
 
-/// Reads one interleaved pair for writing. Mate 1 stays alive through mate
-/// 2's read in the reader or in `mate1_storage`; both mates are validated,
-/// their names compared, and their endings checked writable. A pair whose
-/// mate 1 fails is reported as `verifyInterleavedPair` reports it. `span1`
-/// is mate 1 when the span loop has already taken it.
 fn readInterleavedPair(
     allocator: std.mem.Allocator,
     reader: *fastq.Reader,
@@ -3884,7 +3690,6 @@ fn readInterleavedPair(
     if (validated1.semantic_error != null) {
         return switch (verifyInterleavedPair(allocator, reader, validator, stored_name, policy, validated1.validatedHeader())) {
             .failure => |failure| .{ .failure = failure },
-            // A mate 1 that fails semantic validation fails its pair.
             .end, .pair => unreachable,
         };
     }
@@ -3953,12 +3758,6 @@ fn readInterleavedPair(
     } };
 }
 
-/// Takes interleaved pairs straight from the reader's buffer until a mate
-/// needs the general path; `pending1` returns mate 1 when only it was taken.
-/// Mate 1 goes to `writers[0]` and mate 2 to `writers[1]`. The selection
-/// draws once per pair, after both mates are taken and their names match, so
-/// a pair handed to the general path is drawn there. Kept out of line so the
-/// per-pair loop has its own small frame.
 noinline fn splitSpanPairs(
     reader: *zfastq.Reader,
     validator: *fastq.AdaptiveRecordValidator,
@@ -4001,8 +3800,6 @@ fn flushDeinterleaveWriters(
     writer1.flush() catch return error.Output1WriteFailed;
     writer2.flush() catch return error.Output2WriteFailed;
 }
-
-// --- JSON output ---
 
 fn beginJsonDocument(json: *std.json.Stringify, schema: []const u8) !void {
     try json.beginObject();
@@ -4187,8 +3984,6 @@ fn writeEscapedJsonString(json: *std.json.Stringify, bytes: []const u8) !void {
     json.endWriteRaw();
 }
 
-// --- Human output ---
-
 fn printCount(io: std.Io, n: u64) !void {
     var buf: [32]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, "{d}\n", .{n});
@@ -4210,7 +4005,6 @@ fn printStats(
     const output = &stdout_writer.interface;
     const result = stats.result();
     const ratios = stats.ratios();
-    // The fields and their order are the JSON document's.
     inline for (@typeInfo(zfastq.StatsResult).@"struct".fields) |field| {
         const value = @field(result, field.name);
         switch (field.type) {
@@ -4232,7 +4026,6 @@ fn writeOptionalUnsignedField(output: *std.Io.Writer, name: []const u8, value: ?
     try output.print("{s}: -\n", .{name});
 }
 
-/// Rounds the exact ratio to six decimals, so text output never depends on floating point.
 fn writeRatioField(
     output: *std.Io.Writer,
     name: []const u8,
@@ -4272,7 +4065,6 @@ const TestStream = struct {
     }
 };
 
-/// A `std.testing.tmpDir` and a file in it, relative to the repository root.
 const TEST_TEMP_DIR = ".zig-cache/tmp/{s}";
 const TEST_TEMP_PATH = TEST_TEMP_DIR ++ "/{s}";
 
@@ -4280,7 +4072,6 @@ fn testTempPath(allocator: std.mem.Allocator, sub_path: []const u8, name: []cons
     return std.fmt.allocPrint(allocator, TEST_TEMP_PATH, .{ sub_path, name });
 }
 
-/// Returns the per-input command failure; a structural pair failure is a test error here.
 fn commandFailure(failure: PairCommandFailure) error{ExpectedCommandFailure}!@FieldType(PairCommandFailure, "command") {
     return switch (failure) {
         .command => |command| command,
@@ -4288,12 +4079,25 @@ fn commandFailure(failure: PairCommandFailure) error{ExpectedCommandFailure}!@Fi
     };
 }
 
-/// The rejection exact sampling reports when an input's snapshot changed before or during sampling.
 fn expectInputChanged(failure: CommandFailure) !void {
     try std.testing.expectEqualStrings("input_changed", failure.code);
     try std.testing.expectEqualStrings("input changed during exact sampling", failure.message);
     try std.testing.expectEqual(@as(u8, 3), failure.exit_code);
 }
+
+const TEST_SAMPLE_OPTIONS: SampleOptions = .{
+    .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+    .alphabet = .iupac,
+    .fraction = null,
+    .count = 1,
+    .seed = 11,
+};
+
+const TEST_DEINTERLEAVE_OPTIONS: DeinterleaveOptions = .{
+    .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+    .alphabet = .iupac,
+    .pair_name_policy = .illumina,
+};
 
 test "[unit] - [interleaved staging]: releases oversized slack before a smaller mate" {
     var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
@@ -4466,9 +4270,7 @@ test "[edge] - [stats-json]: preserves the maximum u64 counter" {
 }
 
 test "[edge] - [stats command]: streamed totals match fixed totals at each buffer size" {
-    // Two reads with 4 bases; quality bytes 0, 20, 40, 30 sum to 90.
     const valid = "@r\r\nAc\r\n+\r\n!5\r\n@s\nNG\n+\nI?\n";
-    // The space is below the quality range; it is the second record's first quality byte.
     const invalid = "@r\nAc\n+\n!5\n@s\nNG\n+\n I\n";
     for ([_]usize{ 1, 4, 7, 64 }) |buffer_len| {
         var storage: [64]u8 = undefined;
@@ -4508,19 +4310,12 @@ test "[edge] - [stats command]: streamed totals match fixed totals at each buffe
     }
 }
 
-/// A standard I/O runtime over the testing runtime, which serves every operation not overridden
-/// here. Paths open relative to `dir`. It counts
-/// opened and closed files, positional writes and streaming reads. Standard output is captured
-/// when `stdout` is set; standard error is captured into `stderr` or discarded. The
-/// `fail_write`th positional write (1-based; 0 never fails) returns `error.NoSpaceLeft`.
 const FakeIo = struct {
     dir: std.Io.Dir,
     stdout: ?*std.Io.Writer = null,
     stderr: ?*std.Io.Writer = null,
-    /// Replaces the first opened path as soon as it opens.
     replace_first_open: ?FirstOpenReplacement = null,
     fail_write: usize = 0,
-    /// The nth streaming read (1-based; 0 never fails) returns `error.InputOutput`.
     fail_read: usize = 0,
     opened: usize = 0,
     closed: usize = 0,
@@ -4529,9 +4324,7 @@ const FakeIo = struct {
     vtable: @TypeOf(std.Io.failing.vtable.*) = undefined,
 
     const FirstOpenReplacement = union(enum) {
-        /// Renames the path aside and writes these bytes under its name.
         rewrite: []const u8,
-        /// Renames the path aside and hard-links this source under its name.
         link: []const u8,
     };
 
@@ -4659,7 +4452,6 @@ test "[failure] - [stats command]: a closed standard output keeps the partial re
     long_line[0] = '@';
     try tmp.dir.writeFile(io, .{ .sub_path = "limit.fastq", .data = long_line });
 
-    // Stats allocates nothing; the bounded allocator proves it stays untouched.
     const storage = try std.testing.allocator.alloc(u8, 2 * window);
     defer std.testing.allocator.free(storage);
     const block = "input: small.fastq\n" ++
@@ -4667,7 +4459,7 @@ test "[failure] - [stats command]: a closed standard output keeps the partial re
         "a: 1\nc: 0\ng: 0\nt: 0\nn: 0\nother_bases: 0\ngc_fraction: 0.000000\n" ++
         "quality_sum: 0\nmean_quality: 0.000000\nq20_bases: 0\nq20_fraction: 0.000000\n" ++
         "q30_bases: 0\nq30_fraction: 0.000000\n";
-    // Standard output holds the first report and a partial second one, then fails.
+
     const partial = block ++ "\ninput: small.fastq\n";
     var stdout_buffer: [partial.len]u8 = undefined;
     var stdout: std.Io.Writer = .fixed(&stdout_buffer);
@@ -4728,13 +4520,7 @@ test "[failure] - [exact sample]: selection allocation failure precedes later bl
         &record_inputs[0],
         path,
         &selector,
-        .{
-            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-            .alphabet = .iupac,
-            .fraction = null,
-            .count = 1,
-            .seed = 11,
-        },
+        TEST_SAMPLE_OPTIONS,
     );
     const failure = switch (result) {
         .success => return error.ExpectedFailure,
@@ -4776,13 +4562,7 @@ test "[failure] - [exact sample]: final record-count change keeps a valid prefix
         .{ .low_words = &.{1}, .middle_bytes = &.{0} },
         snapshot,
         2,
-        .{
-            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-            .alphabet = .iupac,
-            .fraction = null,
-            .count = 1,
-            .seed = 11,
-        },
+        TEST_SAMPLE_OPTIONS,
     )).?;
 
     try expectInputChanged(failure);
@@ -4809,13 +4589,7 @@ test "[failure] - [exact sample]: changed metadata stops the second pass before 
         .{ .low_words = &.{1}, .middle_bytes = &.{0} },
         snapshot,
         5,
-        .{
-            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-            .alphabet = .iupac,
-            .fraction = null,
-            .count = 1,
-            .seed = 11,
-        },
+        TEST_SAMPLE_OPTIONS,
     )).?;
 
     try expectInputChanged(failure);
@@ -4840,7 +4614,7 @@ test "[failure] - [exact sample]: a FIFO replacement reports input changed on re
         std.os.linux.S.IFIFO | 0o600,
         0,
     )));
-    // A connected FIFO keeps a blocking open of the path from hanging this in-process test.
+
     const keeper: std.Io.File = .{
         .handle = try std.posix.openat(tmp.dir.handle, name, .{
             .ACCMODE = .RDWR,
@@ -4881,13 +4655,7 @@ test "[failure] - [exact sample]: a failed read in the first pass reports io err
         &record_input,
         path,
         &selector,
-        .{
-            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-            .alphabet = .iupac,
-            .fraction = null,
-            .count = 1,
-            .seed = 11,
-        },
+        TEST_SAMPLE_OPTIONS,
     )) {
         .success => return error.ExpectedFailure,
         .failure => |failure| failure,
@@ -4898,8 +4666,6 @@ test "[failure] - [exact sample]: a failed read in the first pass reports io err
     try std.testing.expectEqual(@as(u64, 0), selector.record_count);
 }
 
-/// The gzip magic, deflate method, no flags, a zero modification time and extra flags, unknown
-/// operating system, then the final stored block's header byte (BFINAL set, BTYPE 00).
 const gzip_stored_member_header = [_]u8{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255, 1 };
 
 fn writeExactTestInput(
@@ -4916,7 +4682,6 @@ fn writeExactTestInput(
     if (gzip) {
         const len = std.math.cast(u16, bytes.len) orelse return error.TestFixtureTooLarge;
         try output.interface.writeAll(&gzip_stored_member_header);
-        // A stored block stores LEN and its one's complement NLEN before its bytes.
         try output.interface.writeInt(u16, len, .little);
         try output.interface.writeInt(u16, ~len, .little);
         try output.interface.writeAll(bytes);
@@ -5191,7 +4956,6 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
     const path = try testTempPath(allocator, &tmp.sub_path, "pairs");
     defer allocator.free(path);
     const small_prefix = "@a/1\nA\n+\n!\n@a/2\nT\n+\n#\n";
-    // The first pair starts this many bytes before the reader buffer ends, so its mate one crosses the refill.
     const refill_margin = 300;
     const options = SampleOptions{
         .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
@@ -5202,7 +4966,6 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
         .pair_mode = .interleaved,
     };
     const staging_limit = recordStagingLimit(options.max_line_bytes);
-    // The name change lands inside the 192-byte identifier that both mates share.
     const header_len = 192;
     const name_change_offset = 180;
     const Change = enum { valid, alphabet2, name, structure, write };
@@ -5210,7 +4973,6 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
         var input: std.ArrayList(u8) = .empty;
         defer input.deinit(allocator);
         if (storage == .reader) {
-            // Put the selected pair across the transport refill while both mates stay small.
             try input.appendSlice(allocator, "@a/1 ");
             try input.appendNTimes(allocator, 'x', zfastq.limits.DEFAULT_READER_BUFFER_BYTES - refill_margin - small_prefix.len - 1);
             try input.appendSlice(allocator, small_prefix[4..]);
@@ -5346,9 +5108,7 @@ test "[integration] - [interleaved exact sample]: revalidation survives mate sto
 }
 
 test "[integration] - [interleaved exact sample]: preserves the first mate parse failure" {
-    // Every line of this input fits; only the changed plus line fails the second pass.
     const small_line_limit = 64;
-    // The byte offset the diagnostic reports for the malformed plus line in `changed`.
     const plus_line_offset: u64 = 40;
     var record_inputs: [2]RecordInput = undefined;
     const SnapshotChangingSink = struct {
@@ -5634,7 +5394,6 @@ test "[integration] - [paired exact sample]: the output pass checks structure an
 }
 
 test "[unit] - [paired identifiers]: storage reuses its largest allocation" {
-    // One byte past the reader buffer, so the first long store must grow the storage.
     const name = try std.testing.allocator.alloc(u8, zfastq.limits.DEFAULT_READER_BUFFER_BYTES + 1);
     defer std.testing.allocator.free(name);
     @memset(name, 'r');
@@ -5654,7 +5413,6 @@ test "[unit] - [paired identifiers]: storage reuses its largest allocation" {
     }
     try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
 
-    // The second allocation grows the storage for the long name; failing it reports out of memory.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
     var storage: std.ArrayList(u8) = .empty;
     defer storage.deinit(failing.allocator());
@@ -5669,7 +5427,6 @@ fn exerciseExactAllocations(allocator: std.mem.Allocator) !void {
         "@a/1\nA\n+\n!\n@a/2\nT\n+\n!\n" ++
         "@b/1\nC\n+\n#\n@b/2\nG\n+\n#\n" ++
         "@c/1\nG\n+\n$\n@c/2\nC\n+\n$\n";
-    // Outputs for exact counts 0 to 4 with seed 11, pinned from the three inputs above.
     const record_a1 = "@a/1\nA\n+\n!\n";
     const record_b1 = "@b/1\nC\n+\n#\n";
     const record_c1 = "@c/1\nG\n+\n$\n";
@@ -5765,7 +5522,6 @@ test "[integration] - [paired inputs]: identity follows open descriptors after p
         defer std.testing.allocator.free(r1_path);
         const r2_path = try testTempPath(std.testing.allocator, &tmp.sub_path, "r2");
         defer std.testing.allocator.free(r2_path);
-        // The first open replaces the path it opened; the aliased pair must be refused before any read.
         var fake: FakeIo = .{
             .dir = std.Io.Dir.cwd(),
             .replace_first_open = if (aliases) .{ .rewrite = "replacement" } else .{ .link = r2_path },
@@ -5899,7 +5655,6 @@ test "[integration] - [output aliases]: rejection closes inputs on both exact pa
 
 test "[failure] - [input resources]: failed opens close owned files and keep borrowed files open" {
     const io = std.testing.io;
-    // Standard error is discarded, and the outputs open relative to the working directory like the other paths.
     var quiet: FakeIo = .{ .dir = std.Io.Dir.cwd() };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5948,7 +5703,6 @@ test "[failure] - [input resources]: failed opens close owned files and keep bor
         const stream_failure = initPairedRecordInputs(&input1, &input2, io, &paths, null).?;
         try std.testing.expectEqualStrings(expected, stream_failure.command.details.code);
         try std.testing.expectEqual(descriptors, try openDescriptorCount());
-        // Exact-count sampling rejects a directory as an invalid request.
         const exact_expected = if (index >= 3) "usage" else expected;
         const exact_failure = initExactPairedInputs(&input1, &input2, io, &paths, null, null).failure;
         try std.testing.expectEqualStrings(exact_expected, exact_failure.command.details.code);
@@ -5980,7 +5734,6 @@ test "[failure] - [input resources]: failed opens close owned files and keep bor
         .pair_name_policy = .illumina,
     }));
     try std.testing.expectEqual(descriptors, try openDescriptorCount());
-    // Output 2 already existed, so the output 1 it created is gone again.
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "out1", .{}));
 }
 
@@ -6012,9 +5765,6 @@ fn pairAllocationFailure(failure: PairCommandFailure) error{ OutOfMemory, Unexpe
 
 test "[failure] - [exact sample]: an allocation failure in exact sampling releases memory and descriptors" {
     try exerciseExactAllocations(std.testing.allocator);
-
-    // Every allocation in this body is first-pass reservoir growth, and the second pass allocates
-    // nothing for these inputs, so index 0 (the first reservoir growth) is the first induced failure.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, exerciseExactAllocations(failing.allocator()));
     try std.testing.expect(failing.has_induced_failure);
@@ -6050,7 +5800,6 @@ test "[edge] - [paired exact sample]: target above pair count keeps indexes impl
 test "[failure] - [paired exact sample]: a read failure follows complete earlier pairs" {
     const first1 = "@a/1\nA\n+\n!\n";
     const first2 = "@a/2\nT\n+\n!\n";
-    // The first input fails right after its first complete pair.
     var source1: ScriptedSource = .{
         .data = first1 ++ "@b/1\nC\n+\n#\n",
         .fail_at = first1.len,
@@ -6087,10 +5836,8 @@ test "[property] - [interleaved fraction sample]: source chunks preserve selecte
     const data = "@a/1 left\r\nAC\r\n+left\r\n!#\r\n@a/2 right\nGT\n+right\n$%\n" ++
         "@b/1\nG\n+\n&\n@b/2\nC\n+\n'\n" ++
         "@c/1\nTTA\n+one\n()*\n@c/2\nAAT\n+two\n+,-";
-    // Seed 11 at one half selects pair indexes 0 and 2.
     const expected = "@a/1 left\nAC\n+left\n!#\n@a/2 right\nGT\n+right\n$%\n" ++
         "@c/1\nTTA\n+one\n()*\n@c/2\nAAT\n+two\n+,-\n";
-    // Reads of one byte, two bytes, and the whole input.
     for ([_]usize{ 1, 2, data.len }) |chunk_len| {
         var source: ScriptedSource = .{ .data = data, .first_chunk = chunk_len, .chunk_len = chunk_len };
         var output: [expected.len]u8 = undefined;
@@ -6177,7 +5924,6 @@ test "[edge] - [paired fraction sample]: fraction zero reads buffered mate one w
     defer tmp.cleanup();
     var input_bytes: std.ArrayList(u8) = .empty;
     defer input_bytes.deinit(std.testing.allocator);
-    // Mate one is a 128 KiB header that fits in the reader buffer, so it is read in place.
     const long_header_len = 128 * 1024;
     try input_bytes.appendSlice(std.testing.allocator, "@large/1 ");
     try input_bytes.appendNTimes(std.testing.allocator, 'x', long_header_len);
@@ -6221,8 +5967,6 @@ test "[edge] - [paired fraction sample]: fraction zero reads buffered mate one w
     try std.testing.expectEqual(@as(usize, 0), sink.written().len);
 }
 
-/// A byte source over `data`. Its first read returns at most `first_chunk` bytes, later reads
-/// at most `chunk_len`, and a read at `fail_at` returns `error.ReadFailed` instead of data.
 const ScriptedSource = struct {
     data: []const u8,
     first_chunk: usize = std.math.maxInt(usize),
@@ -6258,7 +6002,6 @@ test "[property] - [interleaved input]: small pairs need no preservation allocat
     }) |mates| {
         const input = try std.mem.concat(std.testing.allocator, u8, &mates);
         defer std.testing.allocator.free(input);
-        // The second read point lands 7 bytes into the second mate's header.
         const into_second_header = 7;
         for ([_]usize{ mates[0].len, mates[0].len + into_second_header }) |first_chunk| {
             for (0..4) |command| {
@@ -6358,7 +6101,6 @@ test "[failure] - [interleave]: a write failure after the first mate keeps only 
     defer stream1.deinit();
     var stream2 = try TestStream.init(source2.byteSource());
     defer stream2.deinit();
-    // The sink holds exactly the first mate, so the second mate's first write is refused.
     var sink = DeinterleaveTestSink{ .capacity = mate1.len };
     var writer = zfastq.Writer.init(sink.byteSink());
     var selection: PairOutputSelector = .all;
@@ -6406,7 +6148,6 @@ test "[failure] - [deinterleave]: names the output whose write failed and writes
             .expected_error = error.Output2WriteFailed,
             .expected_output1 = first_mate,
         },
-        // Canonical staging submits the complete mate as one write, so a sink one byte short accepts none of it.
         .{
             .input = crlf_input,
             .output1_capacity = first_mate.len - 1,
@@ -6558,11 +6299,7 @@ test "[failure] - [deinterleave]: staging allocation failure emits no output" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
         .fail_index = 1,
     });
-    const options = DeinterleaveOptions{
-        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-        .alphabet = .iupac,
-        .pair_name_policy = .illumina,
-    };
+    const options = TEST_DEINTERLEAVE_OPTIONS;
 
     const failure = (try deinterleaveSource(
         failing.allocator(),
@@ -6575,19 +6312,14 @@ test "[failure] - [deinterleave]: staging allocation failure emits no output" {
 
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(@as(u8, 3), failure.exitCode());
-    const command_failure = switch (failure) {
-        .command => |command| command.details,
-        .pair => return error.ExpectedCommandFailure,
-    };
+    const command_failure = (try commandFailure(failure)).details;
     try std.testing.expectEqualStrings("out_of_memory", command_failure.code);
     try std.testing.expectEqual(@as(usize, 0), sink1.length);
     try std.testing.expectEqual(@as(usize, 0), sink2.length);
 }
 
-/// Mate one's record is 2 * first_len + 12 bytes, two bytes short of two reader buffers.
 const fallback_first_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES - 7;
 const fallback_second_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES;
-/// Header, both mate lines and the plus line of mate one, with the two sequence and quality fields.
 const fallback_first_record_len = "@pair/1\n".len + fallback_first_len + "\n+\n".len + fallback_first_len + "\n".len;
 
 fn fallbackPairInput(allocator: std.mem.Allocator) !std.ArrayList(u8) {
@@ -6657,11 +6389,7 @@ test "[failure] - [deinterleave]: a failed output write or a one-byte staging li
     defer input.deinit(std.testing.allocator);
     const output = try std.testing.allocator.alloc(u8, input.items.len);
     defer std.testing.allocator.free(output);
-    const options = DeinterleaveOptions{
-        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-        .alphabet = .iupac,
-        .pair_name_policy = .illumina,
-    };
+    const options = TEST_DEINTERLEAVE_OPTIONS;
 
     for (0..3) |failure_mode| {
         var source = io_layer.SliceSource.init(input.items);
@@ -6700,11 +6428,7 @@ test "[failure] - [deinterleave]: a failed output write or a one-byte staging li
 test "[failure] - [deinterleave]: malformed pairs fail with their diagnostic before any output" {
     var input = try fallbackPairInput(std.testing.allocator);
     defer input.deinit(std.testing.allocator);
-    const options = DeinterleaveOptions{
-        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-        .alphabet = .iupac,
-        .pair_name_policy = .illumina,
-    };
+    const options = TEST_DEINTERLEAVE_OPTIONS;
     const split = std.mem.find(u8, input.items, "@pair/2").?;
     for (0..5) |failure_mode| {
         if (failure_mode == 1) input.items[input.items.len - 2] = ' ';
@@ -6768,11 +6492,7 @@ fn exerciseRetainedPairAllocations(allocator: std.mem.Allocator, input: []const 
     var sink2 = io_layer.SliceSink.init(output[split..]);
     var writer1 = zfastq.Writer.init(sink1.byteSink());
     var writer2 = zfastq.Writer.init(sink2.byteSink());
-    const options = DeinterleaveOptions{
-        .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-        .alphabet = .iupac,
-        .pair_name_policy = .illumina,
-    };
+    const options = TEST_DEINTERLEAVE_OPTIONS;
     if (try deinterleaveSource(
         allocator,
         &stream.reader.interface,

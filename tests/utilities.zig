@@ -2,15 +2,12 @@
 
 const std = @import("std");
 
-/// The CLI's JSON output buffer: a longer document is flushed before it ends.
 pub const JSON_OUTPUT_BUFFER_BYTES = 16 * 1024;
 
-/// Tracked synthetic fixtures, relative to the repository root.
 pub const FIXTURE_DIR = "tests/data/synthetic";
 
 pub const EXPECTED_VERSION = @import("test_options").package_version;
 pub const ZFASTQ_BIN = "zig-out/bin/z-fastq";
-/// Captured stream limit of the harness: a longer stream is a test failure, not a truncated result.
 pub const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
 pub const PROCESS_TIMEOUT = std.Io.Duration.fromSeconds(30);
 
@@ -45,6 +42,11 @@ pub fn expectFailedPrefix(
 pub fn expectPrefix(valid: []const u8, actual: []const u8) !void {
     try std.testing.expect(actual.len <= valid.len);
     try std.testing.expectEqualSlices(u8, valid[0..actual.len], actual);
+}
+
+pub fn expectFirstLine(expected: []const u8, stderr: []const u8) !void {
+    const end = std.mem.indexOfScalar(u8, stderr, '\n') orelse return error.MissingDiagnosticLine;
+    try std.testing.expectEqualStrings(expected, stderr[0 .. end + 1]);
 }
 
 pub fn tempPath(
@@ -193,8 +195,6 @@ pub fn expectJsonDocument(
     };
 }
 
-/// Parses a versioned JSON document and returns its results. The parsed tree is
-/// allocated from `allocator` and not freed separately, so pass an arena.
 pub fn parseJsonResults(
     allocator: std.mem.Allocator,
     bytes: []const u8,
@@ -256,7 +256,6 @@ pub fn expectJsonErrorLocation(
     try expectJsonInteger(object.get("line_in_record"), line_in_record);
 }
 
-/// A failed result with the given code and record location.
 pub fn expectJsonFailure(
     value: std.json.Value,
     input: []const u8,
@@ -269,7 +268,6 @@ pub fn expectJsonFailure(
     try expectJsonErrorLocation(error_object, record_index, byte_offset, line_in_record);
 }
 
-/// A failed result with the given code and message and no record location.
 pub fn expectJsonFailureWithoutLocation(
     value: std.json.Value,
     input: []const u8,
@@ -337,13 +335,10 @@ pub fn appendGzipMember(
     try appendInt(u32, allocator, output, @truncate(payload.len));
 }
 
-/// Offset of the CRC-32 field in the eight-byte gzip trailer that ends a member
-/// of `member_len` bytes; the input size follows it.
 pub fn gzipCrcOffset(member_len: usize) usize {
     return member_len - GZIP_TRAILER_BYTES;
 }
 
-/// Offset of the little-endian input size (ISIZE) field in the gzip trailer.
 pub fn gzipSizeOffset(member_len: usize) usize {
     return member_len - GZIP_TRAILER_BYTES + 4;
 }
@@ -354,8 +349,6 @@ pub fn fixturePath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ FIXTURE_DIR, name });
 }
 
-/// Opens an existing file for writing in append mode, the way an output
-/// redirection does, so a write lands after any bytes already present.
 pub fn openAppendOutput(dir: std.Io.Dir, sub_path: []const u8) !std.Io.File {
     return .{
         .handle = try std.posix.openat(dir.handle, sub_path, .{
@@ -416,22 +409,6 @@ pub fn runWithStdoutFile(
     });
 }
 
-/// Runs the command with standard output and error redirected to files and
-/// standard input closed, and returns only the exit status.
-pub fn runWithOutputFiles(
-    allocator: std.mem.Allocator,
-    command_args: []const []const u8,
-    stdout_file: std.Io.File,
-    stderr_file: std.Io.File,
-) !u8 {
-    const result = try runWith(allocator, command_args, .{
-        .stdin = .closed,
-        .stdout = .{ .file = stdout_file },
-        .stderr = .{ .file = stderr_file },
-    });
-    return result.exit_code;
-}
-
 pub fn runWithClosedStdin(
     allocator: std.mem.Allocator,
     command_args: []const []const u8,
@@ -439,7 +416,6 @@ pub fn runWithClosedStdin(
     return runWith(allocator, command_args, .{ .stdin = .closed });
 }
 
-/// Completes a child that the caller spawned with piped stdout and stderr.
 pub fn finishSpawned(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -496,14 +472,10 @@ pub const RunOptions = struct {
     stdin: StdinMode = .{ .data = .{ .bytes = "", .chunk_len = 1 } },
     stdout: StdoutMode = .capture,
     stderr: StderrMode = .capture,
-    /// Time allowed for the child to exit; a longer run is killed and reported as a timeout.
     timeout: std.Io.Duration = PROCESS_TIMEOUT,
-    /// A captured stream longer than this many bytes aborts the run with `error.StreamTooLong`.
     output_limit: usize = PROCESS_OUTPUT_LIMIT,
 };
 
-/// The single spawn path for installed CLI runs. Captured streams are read
-/// until end of stream, so a child is never blocked on a full pipe.
 pub fn runWith(
     allocator: std.mem.Allocator,
     command_args: []const []const u8,
@@ -593,7 +565,6 @@ const CommandOutput = struct {
     stderr: []u8,
 };
 
-/// Reads the piped streams of the child; a stream that is not piped yields an empty slice.
 fn collectOutput(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -702,7 +673,6 @@ fn writeAndCloseStdin(
     write_stdin: while (pos < data.len) {
         const end = pos + @min(chunk_len, data.len - pos);
         std.Io.File.writeStreamingAll(file, io, data[pos..end]) catch |err| switch (err) {
-            // Usage failures may close stdin before the test finishes feeding it.
             error.BrokenPipe => break :write_stdin,
             else => return err,
         };

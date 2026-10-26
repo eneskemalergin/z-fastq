@@ -1,4 +1,4 @@
-//! Public library surface for z-fastq.
+//! Public exports of the z-fastq library.
 
 const build_options = @import("build_options");
 const fastq = @import("fastq.zig");

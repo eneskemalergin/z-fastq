@@ -11,9 +11,6 @@ const build_options = @import("build_options");
 
 pub const Tier = enum { baseline, avx2, avx512 };
 
-/// Vector width of each tier in bytes. AVX-512 is not selected yet: it needs
-/// CPU detection and its own object, tested on a host that has it. Kernels are
-/// tested at its width already.
 pub fn tierWidth(comptime tier: Tier) comptime_int {
     return switch (tier) {
         .baseline => 16,
@@ -22,40 +19,24 @@ pub fn tierWidth(comptime tier: Tier) comptime_int {
     };
 }
 
-/// The widest tier the compile target guarantees.
 pub const INLINE_TIER: Tier = if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) .avx2 else .baseline;
 pub const INLINE_LANES = tierWidth(INLINE_TIER);
 const BASELINE_LANES = tierWidth(.baseline);
 
-/// Structural block: one 64-bit mask holds the LF positions of 64 bytes.
 pub const BLOCK_BYTES = 64;
 
-// A call into the separate AVX2 object cannot be inlined, so shorter spans stay inline.
 const AVX2_MIN_BYTES = 1024;
 
 const SELECT_AT_RUN_TIME = build_options.avx2_object;
 
-/// True when a call that will process `len` bytes should take the AVX2 object:
-/// the build links it, the span repays the call, and the running CPU has AVX2.
-/// A search that cannot know its length first (`findNewline`, the complete
-/// record scanner) applies this to a bound or a hint instead.
 pub inline fn useAvx2(len: usize) bool {
     return SELECT_AT_RUN_TIME and len >= AVX2_MIN_BYTES and cpuHasAvx2();
 }
 
-// --- Kernel table ---
-
-// Each kernel's object entry point is declared once, as the exported function;
-// the caller's declaration takes its type from it.
-
-/// Exports `function` from the object under the kernel name `name`. Call from a
-/// `comptime` block; outside the object it does nothing.
 pub fn exportKernel(comptime name: []const u8, comptime function: anytype) void {
     if (build_options.simd_object) @export(function, .{ .name = symbol(INLINE_TIER, name) });
 }
 
-/// The AVX2 object's copy of the kernel exported as `name` from `function`.
-/// Reach it only behind `useAvx2`, which is false in builds without the object.
 pub fn avx2Kernel(comptime name: []const u8, comptime function: anytype) *const @TypeOf(function.*) {
     return @extern(*const @TypeOf(function.*), .{ .name = symbol(.avx2, name) });
 }
@@ -66,7 +47,6 @@ fn symbol(comptime tier: Tier, comptime name: []const u8) []const u8 {
 
 comptime {
     if (build_options.simd_object) {
-        // The object's root: the record scanner's and statistics' kernels are exported from their files.
         _ = @import("fastq.zig");
         _ = @import("stats.zig");
     }
@@ -75,10 +55,6 @@ comptime {
     exportKernel("contains_newline", &containsNewlineExport);
 }
 
-// --- Newline search ---
-
-/// Searches start inline; the bytes after the first `AVX2_MIN_BYTES` go to the
-/// object, so a short line never pays for the call.
 pub inline fn findNewline(bytes: []const u8) ?usize {
     if (!SELECT_AT_RUN_TIME) return @call(.always_inline, findNewlineFor, .{ INLINE_LANES, bytes });
     const head = @min(bytes.len, AVX2_MIN_BYTES);
@@ -119,8 +95,6 @@ fn containsNewlineExport(first: [*]const u8, second: ?[*]const u8, len: usize) c
     return containsNewlineFor(INLINE_LANES, first, second, len);
 }
 
-// --- CPU detection ---
-
 var avx2_state: std.atomic.Value(u8) = .init(0);
 
 fn cpuHasAvx2() bool {
@@ -137,7 +111,6 @@ fn detectAvx2() bool {
     const leaf1 = cpuid(1);
     const has_osxsave = leaf1.ecx & (1 << 27) != 0;
     const has_avx = leaf1.ecx & (1 << 28) != 0;
-    // AVX code faults unless the OS saves XMM and YMM state (XCR0 bits 1 and 2).
     if (!has_osxsave or !has_avx or xgetbv0() & 0x6 != 0x6) return false;
     return cpuid(7).ebx & (1 << 5) != 0;
 }
@@ -169,9 +142,6 @@ fn xgetbv0() u32 {
         : .{ .ecx = true, .edx = true });
 }
 
-// --- Kernels ---
-
-/// Bit `i` is set when `block[i]` is LF.
 pub inline fn newlineMask(comptime width: usize, block: *const [width]u8) @Int(.unsigned, width) {
     const Bytes = @Vector(width, u8);
     const bytes: Bytes = block.*;
@@ -186,7 +156,6 @@ inline fn blockMask(comptime width: usize, block: *const [BLOCK_BYTES]u8) u64 {
     return mask;
 }
 
-// The last 16 bytes are re-read, so the bits of bytes before `pos` are shifted out.
 inline fn tailMask(bytes: []const u8, pos: usize) u16 {
     const start = bytes.len - BASELINE_LANES;
     return newlineMask(BASELINE_LANES, bytes[start..][0..BASELINE_LANES]) >> @intCast(pos - start);
@@ -207,8 +176,6 @@ inline fn anyNewline(comptime lanes: usize, comptime len: usize, first: [*]const
     return @reduce(.Or, any);
 }
 
-// A short read's line never holds 192 LF-free bytes; long lines then skip
-// LF-free stretches 128 bytes at a time with one mask test.
 const SKIP_AFTER_EMPTY_BYTES = 192;
 
 inline fn skipLineBody(comptime lanes: usize, bytes: []const u8, start: usize) usize {
@@ -312,8 +279,6 @@ pub fn containsNewlineFor(comptime lanes: usize, first: [*]const u8, second: ?[*
     return false;
 }
 
-/// Every newline search, at every tier width and through the selected path,
-/// against `std.mem`; `second` is an LF-free or LF-bearing span of the same length.
 fn expectNewlineSearch(bytes: []const u8, second: []const u8) !void {
     var want_ends: [4]usize = undefined;
     var want_count: usize = 0;
@@ -339,14 +304,11 @@ fn expectNewlineSearch(bytes: []const u8, second: []const u8) !void {
 }
 
 test "[property] - [newline kernels]: every search matches a scalar scan at vector, block, and skip boundaries" {
-    // Lengths around each vector width, the 64-byte block, and the 192-byte
-    // run after which LF-free stretches are skipped 128 bytes at a time.
     const lengths = [_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 320, 449 };
     var storage: [449 + 2 * BLOCK_BYTES]u8 = undefined;
     var second_storage: [449 + 2 * BLOCK_BYTES]u8 = undefined;
     for ([_]usize{ 0, 1, BASELINE_LANES - 1 }) |alignment| {
         for (lengths) |len| {
-            // LF bytes just outside the span must never be reported.
             @memset(&storage, '\n');
             @memset(&second_storage, '\n');
             const bytes = storage[alignment..][0..len];
@@ -355,7 +317,6 @@ test "[property] - [newline kernels]: every search matches a scalar scan at vect
             @memset(bytes, 'A');
             try expectNewlineSearch(bytes, second);
             if (len == 0) continue;
-            // One LF at each end and one inside, then four LFs that straddle a block edge.
             for ([_]usize{ 0, len - 1, len / 2 }) |pos| {
                 bytes[pos] = '\n';
                 try expectNewlineSearch(bytes, second);
@@ -388,7 +349,6 @@ test "[edge] - [newline kernels]: masks set the bit of each LF at every width" {
 }
 
 test "[property] - [newline kernels]: the run-time selected path is exact around its length gate" {
-    // The span, one sentinel LF, and an LF-free span of the same length.
     var storage: [5 * AVX2_MIN_BYTES]u8 = undefined;
     const lengths = [_]usize{ AVX2_MIN_BYTES - 1, AVX2_MIN_BYTES, AVX2_MIN_BYTES + 1, 2 * AVX2_MIN_BYTES + 5 };
     const positions = [_]usize{ 0, AVX2_MIN_BYTES - 1, AVX2_MIN_BYTES, AVX2_MIN_BYTES + 31, 2 * AVX2_MIN_BYTES };
