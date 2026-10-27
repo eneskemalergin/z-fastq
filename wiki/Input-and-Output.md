@@ -29,13 +29,13 @@ An omitted path does not mean stdin. A command accepts stdin at most once. When 
 
 `count`, `stats`, and successful JSON output go to standard output. Diagnostics go to standard error. Sampling and interleaving commands write FASTQ to standard output.
 
-FASTQ output uses four logical lines per record and LF line endings. z-fastq does not currently write gzip output. Use an external compressor:
+FASTQ output uses four logical lines per record and LF line endings. Only `process --gzip` writes gzip; for the other commands, use an external compressor:
 
 ```bash
 z-fastq sample --fraction 0.1 reads.fastq | gzip > sample.fastq.gz
 ```
 
-`deinterleave` is the exception: it writes two requested output files.
+`deinterleave` and `process` are the exceptions: they write two requested output files.
 
 Standard output may not be one of the inputs: `z-fastq count a.fastq b.fastq >> b.fastq` exits with status `2` and `input file is output file` before reading anything, so the input is never changed. Every command that writes to standard output applies this check, including when stdin is redirected from the output file.
 

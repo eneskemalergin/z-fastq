@@ -5,6 +5,7 @@
 - Linux x86-64 builds.
 - Plain four-line FASTQ input.
 - gzip-compressed FASTQ input, including concatenated gzip members.
+- gzip output from `process` (`--gzip`).
 - Explicit standard input with `-`.
 - Phred+33 quality bytes from ASCII 33 through 126.
 - IUPAC sequence validation, or the narrower ACGTN policy.
@@ -13,7 +14,7 @@
 
 - FASTA input.
 - Wrapped sequence or quality lines.
-- gzip output from the CLI.
+- gzip output from commands other than `process`.
 - BGZF, ZIP, tar, bzip2, xz, and zstd containers.
 - Remote object stores or network paths.
 - Memory-mapped or worker-thread CLI execution.

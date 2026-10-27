@@ -21,6 +21,7 @@ Follow [Getting started](Getting-Started) for a small end-to-end run. It creates
 - [Understand R1 and R2 matching](Paired-Reads).
 - [Sample records without losing pair synchronization](Sampling).
 - [Convert between two-file and interleaved pairs](Interleaving).
+- [Validate paired reads into new files with a report](Processing).
 - [Use gzip, pipes, and output streams correctly](Input-and-Output).
 - [Integrate results into a script](Automation).
 - [Compare what z-fastq does with other FASTQ tools](Choosing-a-FASTQ-Tool).
@@ -29,7 +30,7 @@ Follow [Getting started](Getting-Started) for a small end-to-end run. It creates
 
 ## What z-fastq does
 
-The CLI currently has six commands:
+The CLI currently has seven commands:
 
 - `count` counts records from one or more plain or gzip inputs.
 - `stats` calculates read, base, GC, and Phred quality summaries.
@@ -37,8 +38,9 @@ The CLI currently has six commands:
 - `sample` selects records or read pairs by fraction or exact count.
 - `interleave` combines two validated mate streams into one stream.
 - `deinterleave` splits one validated interleaved stream into two files.
+- `process` validates two mate files into two new files, plain or gzip, with an optional JSON report.
 
-The reader accepts plain FASTQ, gzip-compressed FASTQ, and explicit standard input. FASTQ-producing commands write plain four-line records with LF endings. The current CLI does not write gzip output.
+The reader accepts plain FASTQ, gzip-compressed FASTQ, and explicit standard input. FASTQ-producing commands write four-line records with LF endings: plain FASTQ to standard output, except `deinterleave` and `process`, which write two files; `process --gzip` compresses them.
 
 ## What it is not
 

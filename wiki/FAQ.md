@@ -34,7 +34,7 @@ No. A pair is the selection unit. Both mates are written to the interleaved outp
 
 ## Does z-fastq write gzip output?
 
-No. Pipe FASTQ output through `gzip` when you need compression.
+Only `process`, with `--gzip`. The other commands write plain FASTQ; pipe it through `gzip` when you need compression.
 
 ## Can `deinterleave` overwrite an existing file?
 
