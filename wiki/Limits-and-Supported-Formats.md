@@ -19,7 +19,7 @@
 - Remote object stores or network paths.
 - Memory-mapped or worker-thread CLI execution.
 - Automatic repair or record recovery after malformed input.
-- Dropping reads in `process`: filters by length, quality, or `N` count, and fastp's removal of empty mates and adapter dimers.
+- fastp's average-quality, maximum-length, and low-complexity filters, and writing the surviving mate of a dropped pair.
 - fastp's automatic adapter detection and automatic poly-G mode.
 
 These are current boundaries, not promises about the final project. I would rather state them clearly than make a command appear broader than its tested behavior.

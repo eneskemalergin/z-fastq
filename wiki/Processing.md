@@ -1,6 +1,6 @@
 # Processing paired reads
 
-`process` reads two mate files in lockstep, validates every pair as `check --paired` does, and writes each accepted pair to two new files, plain or gzip. With trim options it removes adapters, mate overlaps, 3' poly-G runs, and low-quality 3' ends by fastp 1.1.0's rules; without them it changes no read. With `--report` it also writes a JSON report with per-mate statistics.
+`process` reads two mate files in lockstep, validates every pair as `check --paired` does, and writes each accepted pair to two new files, plain or gzip. With trim options it removes adapters, mate overlaps, 3' poly-G runs, and low-quality 3' ends, and with filter options it drops pairs by quality, `N` count, and length, all by fastp 1.1.0's rules; without them it changes and drops no read. With `--report` it also writes a JSON report with per-mate statistics.
 
 ```bash
 z-fastq process --gzip --out1 clean_R1.fastq.gz --out2 clean_R2.fastq.gz --report sample.json R1.fastq.gz R2.fastq.gz
@@ -32,7 +32,7 @@ z-fastq process --adapter1 CTGTCTCTTATACACATCT --adapter2 CTGTCTCTTATACACATCT --
   --trim-tail-window 4 --trim-tail-quality 20 --out1 trimmed_R1.fastq --out2 trimmed_R2.fastq R1.fastq.gz R2.fastq.gz
 ```
 
-The first command keeps the bases fastp keeps with `--adapter_sequence A1 --adapter_sequence_r2 A2 --disable_trim_poly_g -Q -L`, and the second the bases fastp keeps with `--adapter_sequence A --adapter_sequence_r2 A --trim_poly_g --poly_g_min_len 10 --cut_tail --cut_tail_window_size 4 --cut_tail_mean_quality 20 -Q -L`, for every pair fastp 1.1.0 writes. fastp 1.4.0 gives the same result except on mate 2 reads that hold the IUPAC letters `S`, `W`, or `D`, where its result depends on the CPU.
+The first command writes the records fastp 1.1.0 writes with `--adapter_sequence A1 --adapter_sequence_r2 A2 --disable_trim_poly_g -Q -L`, and the second those it writes with `--adapter_sequence A --adapter_sequence_r2 A --trim_poly_g --poly_g_min_len 10 --cut_tail --cut_tail_window_size 4 --cut_tail_mean_quality 20 -Q -L`. fastp 1.4.0 gives the same result except on mate 2 reads that hold the IUPAC letters `S`, `W`, or `D`, where its result depends on the CPU.
 
 The steps run in this order on each pair:
 
@@ -43,7 +43,33 @@ The steps run in this order on each pair:
 - Every trim removes a 3' end, cutting sequence and quality together; the header and plus lines are written unchanged.
 - Bases compare as written: a lowercase base never matches an adapter base or a poly-G `G`.
 - Adapters are 4 to 128 bases of uppercase `A`, `C`, `G`, and `T`, and are given together. The window is 1 to 1000 bases and the quality 1 to 30, given together; the poly-G minimum is at least 1.
-- Every pair is written, including a mate trimmed to zero bases, which becomes an empty record. fastp drops such a pair, and also drops a pair when both mates are 2 bases or shorter after an adapter or overlap cut; `process` does not drop pairs yet.
+- A pair whose mate is trimmed to nothing is dropped, and so is an adapter dimer; see [Filtering](#filtering).
+
+## Filtering
+
+Each filter is off unless its option is given. A pair is written only when both mates pass.
+
+```bash
+z-fastq process --adapter1 AGATCGGAAGAGCACACGTCTGAACTCCAGTCA --adapter2 AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT \
+  --low-quality 15 --max-low-quality-percent 40 --max-n 5 --min-length 15 \
+  --out1 clean_R1.fastq --out2 clean_R2.fastq R1.fastq.gz R2.fastq.gz
+```
+
+This writes the records fastp 1.1.0 writes with `--adapter_sequence A1 --adapter_sequence_r2 A2 --disable_trim_poly_g` and its default filters (`-q 15 -u 40 -n 5 -l 15`). fastp turns those filters on by default; z-fastq applies only the filters given.
+
+Each read is checked after trimming, in this order; the first check it fails is its reason:
+
+1. A read with no bases left: `too_short`.
+2. `--low-quality Q --max-low-quality-percent P`: more than `P` percent of its bases have a Phred quality below `Q`: `low_quality`. With 151 bases and 40 percent, 60 low-quality bases pass and 61 fail.
+3. `--max-n N`: more than `N` uppercase `N` bases: `too_many_n`. A lowercase `n` is not counted, as in fastp.
+4. `--min-length N`: fewer than `N` bases: `too_short`.
+
+- With adapters given, a pair whose overlap or adapter step cut either mate and left both mates at 2 bases or fewer is an adapter dimer: both mates fail as `adapter_dimer`.
+- The empty-read and adapter-dimer drops apply whenever any trim or filter option is given, as in fastp, where `-Q -L` leaves them on.
+- A dropped pair is dropped whole; neither mate is written anywhere.
+- The pair's reason is the higher of its mates' reasons in this order: `adapter_dimer`, `low_quality`, `too_short`, `too_many_n`. fastp counts both reads of a dropped pair under that reason, so its `*_reads` counts are twice the pair counts in the report.
+- Dropping pairs never changes the exit status. A malformed record still fails the run, also after dropped pairs, because every pair is validated before it is trimmed or filtered.
+- Ranges, as in fastp: `--min-length` 0 to 4294967295, `--max-n` 0 to 50, `--low-quality` 0 to 93, `--max-low-quality-percent` 0 to 100; the last two are given together.
 
 ## The report
 
@@ -53,9 +79,10 @@ The steps run in this order on each pair:
 - `inputs`: each input's path, and its size and modification time in nanoseconds when it is a regular file (`null` for a pipe).
 - `outputs`: the output paths.
 - `status`: `ok` or `error`; `input_complete`: whether both inputs were read to the end.
-- `pairs`: pairs `read` and `written`.
-- `mates`: one statistics object per mate, with the same fields as `stats --json`, under `raw` for the reads as they were read and `retained` for the reads as written. Without a trim option the two are the same.
-- `trimming`: one object per mate with an entry per step, `quality_tail`, `poly_g`, `overlap`, and `adapter`: the reads that step shortened and the bases it removed, or `null` when the step is off.
+- `pairs`: pairs `read`, `written`, and `dropped`. On a complete run, `read` is `written` plus `dropped`.
+- `mates`: one statistics object per mate, with the same fields as `stats --json`, under `raw` for the reads as they were read and `retained` for the reads as written. Without a trim or filter option the two are the same.
+- `trimming`: one object per mate with an entry per step, `quality_tail`, `poly_g`, `overlap`, and `adapter`: the reads that step shortened and the bases it removed, or `null` when the step is off. It counts every pair read, including pairs dropped later.
+- `filtering`: `dropped_pairs`, the dropped pairs by the pair's reason, and `failed_reads`, one object per mate with the reads that failed by their own reason (a passing mate of a dropped pair is not counted there); each holds `too_many_n`, `too_short`, `low_quality`, and `adapter_dimer`. `null` when no trim or filter option is given.
 - `failed_input`, `failed_output`, and `error`: the failure, in the form `check --paired --json` uses, or `null`.
 - `qc`: FastQC's core modules for each mate, under `raw` for the reads as they were read and `retained` for the reads as written: `per_base_quality`, `per_base_content`, `per_base_n`, `length_distribution`, `per_sequence_quality`, `per_sequence_gc` (101 values, percent 0 to 100), and `terminal_runs` (reads ending in at least 10 `G` or 10 `A`). The values follow FastQC 0.13.0's definitions, including its groups of cycles for long reads; a value FastQC prints as `NaN` is `null`. A mate with a read longer than 1024 bases reports its per-cycle modules and length distribution as `null`, with the reason in `unavailable`.
 

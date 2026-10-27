@@ -1,21 +1,27 @@
-//! Paired read trimming with fastp 1.1.0's rules: the 3' quality window, poly-G tails, and
-//! adapters found by mate overlap or by adapter sequence. Every trim keeps a prefix of the read,
-//! so a result is one kept length per mate; sequence and quality are cut together by the caller.
+//! Paired read trimming and pair retention with fastp 1.1.0's rules: the 3' quality window,
+//! poly-G tails, adapters found by mate overlap or by adapter sequence, then the empty-read,
+//! adapter-dimer, quality, N, and length checks. Every trim keeps a prefix of the read, so a
+//! result is one kept length per mate; sequence and quality are cut together by the caller.
 //! The overlap and adapter searches score a block of consecutive offsets per pass over the
 //! pattern, reading the read through a fixed stack window padded with zero bytes, which no read
-//! or adapter base equals. The block kernel uses the inline vector width only, with no AVX2
-//! object for builds whose target lacks AVX2.
+//! or adapter base equals. The block kernel, the reverse complement, and the low-quality and N
+//! count use the inline vector width only, with no AVX2 object for builds whose target lacks
+//! AVX2: each costs a small share of a trimmed or filtered run at every read length.
 
 const std = @import("std");
 
+const fastq = @import("fastq.zig");
 const simd = @import("simd.zig");
 
 pub const MIN_ADAPTER_BASES = 4;
 pub const MAX_ADAPTER_BASES = 128;
 pub const MAX_TAIL_WINDOW = 1000;
 pub const MAX_TAIL_QUALITY = 30;
+pub const MAX_N_LIMIT = 50;
+pub const MAX_LOW_QUALITY = fastq.PHRED_MAX_SCORE;
+pub const MAX_LOW_QUALITY_PERCENT = 100;
 
-const PHRED_OFFSET = 33;
+const PHRED_OFFSET = fastq.PHRED_OFFSET;
 const OVERLAP_REQUIRE = 30;
 const OVERLAP_DIFF_LIMIT = 5;
 const OVERLAP_DIFF_DIVISOR = 5;
@@ -24,6 +30,7 @@ const ADAPTER_MATCH_REQUIRE = 4;
 const ADAPTER_LEAD = 4;
 const BASES_PER_MISMATCH = 8;
 const POLY_G_MAX_MISMATCHES = 5;
+const DIMER_MAX_BASES = 2;
 const LANES = simd.INLINE_LANES;
 const MAX_LANES = simd.tierWidth(.avx512);
 const WINDOW_OFFSETS = 1024;
@@ -31,6 +38,7 @@ const WINDOW_SPAN = MAX_ADAPTER_BASES + MAX_LANES;
 const WINDOW_BYTES = ADAPTER_LEAD + WINDOW_OFFSETS + WINDOW_SPAN;
 const THRESHOLD_CLAMP = 1024;
 const PRUNE_COLUMNS = 16;
+const CASE_FOLD = 0xdf;
 
 const COMPLEMENT: [256]u8 = table: {
     var table = [_]u8{'N'} ** 256;
@@ -43,15 +51,124 @@ pub const Tail = struct {
     quality: u8,
 };
 
+pub const LowQuality = struct {
+    quality: u8,
+    percent: u8,
+};
+
 pub const Options = struct {
     adapters: ?[2][]const u8 = null,
     poly_g: ?u32 = null,
     tail: ?Tail = null,
+    min_length: ?u32 = null,
+    max_n: ?u8 = null,
+    low_quality: ?LowQuality = null,
 
     pub fn trims(self: Options) bool {
         return self.adapters != null or self.poly_g != null or self.tail != null;
     }
+
+    pub fn filters(self: Options) bool {
+        return self.min_length != null or self.max_n != null or self.low_quality != null;
+    }
+
+    pub fn changesReads(self: Options) bool {
+        return self.trims() or self.filters();
+    }
 };
+
+pub const Reason = enum { too_many_n, too_short, low_quality, adapter_dimer };
+
+pub const REASON_COUNT = @typeInfo(Reason).@"enum".fields.len;
+
+pub const Decision = struct {
+    reads: [2]?Reason,
+    pair: ?Reason,
+};
+
+pub const FilterCounts = struct {
+    dropped_pairs: [REASON_COUNT]u64 = @splat(0),
+    failed_reads: [2][REASON_COUNT]u64 = @splat(@splat(0)),
+
+    pub fn add(self: *FilterCounts, decision: Decision) error{Overflow}!void {
+        const pair = decision.pair orelse return;
+        const dropped = &self.dropped_pairs[@intFromEnum(pair)];
+        dropped.* = try std.math.add(u64, dropped.*, 1);
+        for (&self.failed_reads, decision.reads) |*mate, reason| {
+            const failed = &mate[@intFromEnum(reason orelse continue)];
+            failed.* = try std.math.add(u64, failed.*, 1);
+        }
+    }
+};
+
+pub fn decide(options: Options, result: *const Result, sequences: [2][]const u8, qualities: [2][]const u8) Decision {
+    std.debug.assert(sequences[0].len == result.kept[0] and sequences[1].len == result.kept[1]);
+    var reads = [2]?Reason{ readReason(options, sequences[0], qualities[0]), readReason(options, sequences[1], qualities[1]) };
+    const cut = result.adapter_cut[0] or result.adapter_cut[1];
+    if (cut and sequences[0].len <= DIMER_MAX_BASES and sequences[1].len <= DIMER_MAX_BASES) {
+        reads = .{ .adapter_dimer, .adapter_dimer };
+    }
+    return .{ .reads = reads, .pair = higherReason(reads[0], reads[1]) };
+}
+
+fn higherReason(first: ?Reason, second: ?Reason) ?Reason {
+    const a = first orelse return second;
+    const b = second orelse return first;
+    return if (@intFromEnum(a) >= @intFromEnum(b)) a else b;
+}
+
+const LowAndN = struct {
+    low: usize,
+    n: usize,
+};
+
+fn countLowAndN(comptime lanes: comptime_int, sequence: []const u8, quality: []const u8, threshold: u8) LowAndN {
+    std.debug.assert(sequence.len == quality.len);
+    const Bytes = @Vector(lanes, u8);
+    const Wide = @Vector(lanes, u16);
+    const one: Bytes = @splat(1);
+    const zero: Bytes = @splat(0);
+    var counts: LowAndN = .{ .low = 0, .n = 0 };
+    const whole = sequence.len - sequence.len % lanes;
+    var offset: usize = 0;
+    while (offset < whole) {
+        const stop = @min(whole, offset + std.math.maxInt(u8) * lanes);
+        var low = zero;
+        var n_bases = zero;
+        while (offset < stop) : (offset += lanes) {
+            const bytes: Bytes = quality[offset..][0..lanes].*;
+            const bases: Bytes = sequence[offset..][0..lanes].*;
+            low += @select(u8, bytes < @as(Bytes, @splat(threshold)), one, zero);
+            n_bases += @select(u8, bases == @as(Bytes, @splat('N')), one, zero);
+        }
+        counts.low += @reduce(.Add, @as(Wide, low));
+        counts.n += @reduce(.Add, @as(Wide, n_bases));
+    }
+    for (sequence[whole..], quality[whole..]) |base, byte| {
+        counts.low += @intFromBool(byte < threshold);
+        counts.n += @intFromBool(base == 'N');
+    }
+    return counts;
+}
+
+fn readReason(options: Options, sequence: []const u8, quality: []const u8) ?Reason {
+    std.debug.assert(sequence.len == quality.len);
+    if (sequence.len == 0) return .too_short;
+    if (options.low_quality != null or options.max_n != null) {
+        const threshold: u8 = if (options.low_quality) |low_quality| PHRED_OFFSET + low_quality.quality else 0;
+        const counts = countLowAndN(LANES, sequence, quality, threshold);
+        if (options.low_quality) |low_quality| {
+            if (counts.low * 100 > @as(usize, low_quality.percent) * sequence.len) return .low_quality;
+        }
+        if (options.max_n) |max_n| {
+            if (counts.n > max_n) return .too_many_n;
+        }
+    }
+    if (options.min_length) |min_length| {
+        if (sequence.len < min_length) return .too_short;
+    }
+    return null;
+}
 
 pub const Step = enum { quality_tail, poly_g, overlap, adapter };
 
@@ -159,8 +276,8 @@ const Window = struct {
         const count = @min(self.source.len -| begin, WINDOW_BYTES - zeros);
         const target = self.bytes[zeros..][0..count];
         if (self.complement) {
-            const last = self.source.len -% 1 -% begin;
-            for (target, 0..) |*byte, index| byte.* = COMPLEMENT[self.source[last - index]];
+            const end = self.source.len - begin;
+            reverseComplement(LANES, target, self.source[end - count .. end]);
         } else {
             @memcpy(target, self.source[begin..][0..count]);
         }
@@ -205,7 +322,7 @@ fn findOverlap(window1: *Window, read2: []const u8) ?Overlap {
     const read1 = window1.source;
     var head2: [OVERLAP_COMPARE_LIMIT]u8 = undefined;
     const head2_len = @min(read2.len, OVERLAP_COMPARE_LIMIT);
-    for (head2[0..head2_len], 0..) |*byte, index| byte.* = COMPLEMENT[read2[read2.len - 1 - index]];
+    reverseComplement(LANES, head2[0..head2_len], read2[read2.len - head2_len ..]);
     var splats: [OVERLAP_COMPARE_LIMIT]@Vector(LANES, u8) = undefined;
     if (read1.len > OVERLAP_REQUIRE) {
         splatPattern(LANES, head2[0..head2_len], &splats);
@@ -304,6 +421,27 @@ const AdapterRule = struct {
         return compared - skipped - compared / BASES_PER_MISMATCH;
     }
 };
+
+fn reverseComplement(comptime lanes: comptime_int, target: []u8, source: []const u8) void {
+    std.debug.assert(target.len == source.len);
+    const Bytes = @Vector(lanes, u8);
+    const reverse = comptime mask: {
+        var indexes: [lanes]i32 = undefined;
+        for (&indexes, 0..) |*index, lane| index.* = lanes - 1 - lane;
+        break :mask indexes;
+    };
+    var done: usize = 0;
+    while (done + lanes <= target.len) : (done += lanes) {
+        const block: Bytes = source[source.len - done - lanes ..][0..lanes].*;
+        const folded = @shuffle(u8, block, undefined, reverse) & @as(Bytes, @splat(CASE_FOLD));
+        var complement: Bytes = @splat('N');
+        inline for ("ACGT", "TGCA") |base, paired| {
+            complement = @select(u8, folded == @as(Bytes, @splat(base)), @as(Bytes, @splat(paired)), complement);
+        }
+        target[done..][0..lanes].* = complement;
+    }
+    for (target[done..], done..) |*byte, index| byte.* = COMPLEMENT[source[source.len - 1 - index]];
+}
 
 fn splatPattern(comptime lanes: comptime_int, pattern: []const u8, splats: []@Vector(lanes, u8)) void {
     for (pattern, splats[0..pattern.len]) |base, *splat| splat.* = @splat(base);
@@ -422,6 +560,106 @@ test "[property] - [preprocess]: block searches find the first offset the scalar
             try std.testing.expectEqual(expected_adapter, firstAccepted(lanes, adapter, &window, splats[0..case.length], -4, adapter_end));
             const overlap_length = @min(case.length, OVERLAP_COMPARE_LIMIT);
             try std.testing.expectEqual(expected_overlap, firstAccepted(lanes, overlap, &window, splats[0..overlap_length], 0, overlap_end));
+        }
+    }
+}
+
+fn decideReads(options: Options, reads: [2][]const u8, qualities: [2][]const u8, adapter_cut: [2]bool) Decision {
+    const result: Result = .{ .kept = .{ reads[0].len, reads[1].len }, .adapter_cut = adapter_cut };
+    return decide(options, &result, reads, qualities);
+}
+
+test "[unit] - [preprocess]: each read check fails on one side of its threshold and passes on the other" {
+    const quality: Options = .{ .low_quality = .{ .quality = 15, .percent = 40 } };
+    const Case = struct { options: Options, sequence: []const u8, quality: []const u8, expected: ?Reason };
+    const cases = [_]Case{
+        .{ .options = .{}, .sequence = "", .quality = "", .expected = .too_short },
+        .{ .options = quality, .sequence = "ACGTA", .quality = "//000", .expected = null },
+        .{ .options = quality, .sequence = "ACGTA", .quality = "///00", .expected = .low_quality },
+        .{ .options = quality, .sequence = "ACG", .quality = "/00", .expected = null },
+        .{ .options = quality, .sequence = "ACG", .quality = "//0", .expected = .low_quality },
+        .{ .options = .{ .low_quality = .{ .quality = 15, .percent = 0 } }, .sequence = "ACG", .quality = "000", .expected = null },
+        .{ .options = .{ .low_quality = .{ .quality = 15, .percent = 0 } }, .sequence = "ACG", .quality = "00/", .expected = .low_quality },
+        .{ .options = .{ .low_quality = .{ .quality = 0, .percent = 0 } }, .sequence = "A", .quality = "!", .expected = null },
+        .{ .options = .{ .max_n = 5 }, .sequence = "NNNNNA", .quality = "IIIIII", .expected = null },
+        .{ .options = .{ .max_n = 5 }, .sequence = "NNNNNN", .quality = "IIIIII", .expected = .too_many_n },
+        .{ .options = .{ .max_n = 0 }, .sequence = "AnnnA", .quality = "IIIII", .expected = null },
+        .{ .options = .{ .max_n = 0 }, .sequence = "ANA", .quality = "III", .expected = .too_many_n },
+        .{ .options = .{ .min_length = 15 }, .sequence = "A" ** 14, .quality = "I" ** 14, .expected = .too_short },
+        .{ .options = .{ .min_length = 15 }, .sequence = "A" ** 15, .quality = "I" ** 15, .expected = null },
+        .{ .options = .{ .min_length = 30 }, .sequence = "A" ** 29, .quality = "I" ** 29, .expected = .too_short },
+        .{ .options = .{ .min_length = 30 }, .sequence = "A" ** 30, .quality = "I" ** 30, .expected = null },
+        .{ .options = .{ .min_length = 30 }, .sequence = "A" ** 31, .quality = "I" ** 31, .expected = null },
+        .{ .options = .{ .min_length = 0 }, .sequence = "", .quality = "", .expected = .too_short },
+        .{ .options = .{ .low_quality = .{ .quality = 15, .percent = 40 }, .max_n = 0, .min_length = 9 }, .sequence = "NNNN", .quality = "!!!!", .expected = .low_quality },
+        .{ .options = .{ .max_n = 0, .min_length = 9 }, .sequence = "NNNN", .quality = "!!!!", .expected = .too_many_n },
+        .{ .options = .{ .min_length = 9 }, .sequence = "NNNN", .quality = "!!!!", .expected = .too_short },
+    };
+    for (cases, 0..) |case, index| {
+        errdefer std.debug.print("case {d}\n", .{index});
+        try std.testing.expectEqual(case.expected, readReason(case.options, case.sequence, case.quality));
+    }
+}
+
+test "[unit] - [preprocess]: a pair keeps both mates or drops both, under the higher reason" {
+    const options: Options = .{ .adapters = .{ "ACGT", "ACGT" }, .low_quality = .{ .quality = 15, .percent = 40 }, .max_n = 1, .min_length = 4 };
+    const good = "ACGTA";
+    const good_quality = "IIIII";
+    const Case = struct { reads: [2][]const u8, qualities: [2][]const u8, cut: [2]bool = .{ false, false }, expected: Decision };
+    const cases = [_]Case{
+        .{ .reads = .{ good, good }, .qualities = .{ good_quality, good_quality }, .expected = .{ .reads = .{ null, null }, .pair = null } },
+        .{ .reads = .{ "NNACG", good }, .qualities = .{ good_quality, good_quality }, .expected = .{ .reads = .{ .too_many_n, null }, .pair = .too_many_n } },
+        .{ .reads = .{ good, "ACG" }, .qualities = .{ good_quality, "III" }, .expected = .{ .reads = .{ null, .too_short }, .pair = .too_short } },
+        .{ .reads = .{ "NNACG", "ACG" }, .qualities = .{ good_quality, "III" }, .expected = .{ .reads = .{ .too_many_n, .too_short }, .pair = .too_short } },
+        .{ .reads = .{ "ACG", good }, .qualities = .{ "III", "!!!II" }, .expected = .{ .reads = .{ .too_short, .low_quality }, .pair = .low_quality } },
+        .{ .reads = .{ "", good }, .qualities = .{ "", good_quality }, .expected = .{ .reads = .{ .too_short, null }, .pair = .too_short } },
+        .{ .reads = .{ "AC", "G" }, .qualities = .{ "II", "I" }, .cut = .{ true, false }, .expected = .{ .reads = .{ .adapter_dimer, .adapter_dimer }, .pair = .adapter_dimer } },
+        .{ .reads = .{ "", "" }, .qualities = .{ "", "" }, .cut = .{ false, true }, .expected = .{ .reads = .{ .adapter_dimer, .adapter_dimer }, .pair = .adapter_dimer } },
+        .{ .reads = .{ "AC", "G" }, .qualities = .{ "II", "I" }, .expected = .{ .reads = .{ .too_short, .too_short }, .pair = .too_short } },
+        .{ .reads = .{ "ACG", "G" }, .qualities = .{ "III", "I" }, .cut = .{ true, true }, .expected = .{ .reads = .{ .too_short, .too_short }, .pair = .too_short } },
+    };
+    for (cases, 0..) |case, index| {
+        errdefer std.debug.print("case {d}\n", .{index});
+        try std.testing.expectEqual(case.expected, decideReads(options, case.reads, case.qualities, case.cut));
+    }
+    var counts: FilterCounts = .{};
+    for (cases) |case| try counts.add(decideReads(options, case.reads, case.qualities, case.cut));
+    try std.testing.expectEqual([REASON_COUNT]u64{ 1, 5, 1, 2 }, counts.dropped_pairs);
+    try std.testing.expectEqual([REASON_COUNT]u64{ 2, 4, 0, 2 }, counts.failed_reads[0]);
+    try std.testing.expectEqual([REASON_COUNT]u64{ 0, 4, 1, 2 }, counts.failed_reads[1]);
+}
+
+test "[property] - [preprocess]: vector low-quality and N counts match a scalar count at every tier width" {
+    var sequence: [255 * 64 + 65]u8 = undefined;
+    var quality: [255 * 64 + 65]u8 = undefined;
+    for (&sequence, &quality, 0..) |*base, *byte, index| {
+        base.* = "ACGTNnRN"[index * 7 % 8];
+        byte.* = @intCast(33 + (index * 13) % 94);
+    }
+    for ([_]usize{ 0, 1, 15, 16, 17, 63, 64, 65, 255 * 16 + 1, 255 * 32 + 1, 255 * 64 + 1, 255 * 64 + 65 }) |length| {
+        for ([_]u8{ 0, 48, 126, 127 }) |threshold| {
+            var expected: LowAndN = .{ .low = 0, .n = 0 };
+            for (sequence[0..length], quality[0..length]) |base, byte| {
+                expected.low += @intFromBool(byte < threshold);
+                expected.n += @intFromBool(base == 'N');
+            }
+            inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
+                try std.testing.expectEqual(expected, countLowAndN(lanes, sequence[0..length], quality[0..length], threshold));
+            }
+        }
+    }
+}
+
+test "[property] - [preprocess]: vector reverse complement matches the scalar table at every tier width" {
+    var source: [150]u8 = undefined;
+    for (&source, 0..) |*byte, index| byte.* = "ACGTacgtNnRYSWKMBDHV.-*XxIi"[index % 27];
+    for ([_]usize{ 0, 15, 16, 17, 63, 64, 65, 150 }) |length| {
+        var expected: [150]u8 = undefined;
+        for (expected[0..length], 0..) |*byte, index| byte.* = COMPLEMENT[source[length - 1 - index]];
+        inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
+            var target: [150]u8 = undefined;
+            reverseComplement(lanes, target[0..length], source[0..length]);
+            try std.testing.expectEqualSlices(u8, expected[0..length], target[0..length]);
         }
     }
 }

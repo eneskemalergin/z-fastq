@@ -60,6 +60,11 @@ const USAGE =
     \\                       Trim the 3' end by a W-base quality window (with quality)
     \\  --trim-tail-quality Q
     \\                       Mean Phred quality the 3' window must reach (with window)
+    \\  --min-length N       Drop pairs with a read shorter than N bases
+    \\  --max-n N            Drop pairs with a read of more than N unknown (N) bases
+    \\  --low-quality Q      Count bases below Phred Q as low quality (with percent)
+    \\  --max-low-quality-percent P
+    \\                       Drop pairs with a read over P% low-quality bases
     \\
     \\Count usage:
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
@@ -87,7 +92,7 @@ const USAGE =
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
     \\Process usage:
-    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
+    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 
@@ -130,6 +135,10 @@ const GivenOptions = struct {
     trim_poly_g: bool = false,
     trim_tail_window: bool = false,
     trim_tail_quality: bool = false,
+    min_length: bool = false,
+    max_n: bool = false,
+    low_quality: bool = false,
+    max_low_quality_percent: bool = false,
 };
 
 fn optionValue(
@@ -181,23 +190,34 @@ fn rangeOption(
     return value;
 }
 
-fn processTrimOptions(
-    io: std.Io,
-    adapters: [2]?[]const u8,
-    poly_g: ?u32,
-    tail_window: ?u16,
-    tail_quality: ?u8,
-) preprocess.Options {
-    if ((adapters[0] == null) != (adapters[1] == null)) {
+const ReadOptionValues = struct {
+    adapters: [2]?[]const u8 = .{ null, null },
+    poly_g: ?u32 = null,
+    tail_window: ?u16 = null,
+    tail_quality: ?u8 = null,
+    min_length: ?u32 = null,
+    max_n: ?u8 = null,
+    low_quality: ?u8 = null,
+    max_low_quality_percent: ?u8 = null,
+};
+
+fn processReadOptions(io: std.Io, values: ReadOptionValues) preprocess.Options {
+    if ((values.adapters[0] == null) != (values.adapters[1] == null)) {
         argumentError(io, "error: --adapter1 and --adapter2 must be given together\n", 2);
     }
-    if ((tail_window == null) != (tail_quality == null)) {
+    if ((values.tail_window == null) != (values.tail_quality == null)) {
         argumentError(io, "error: --trim-tail-window and --trim-tail-quality must be given together\n", 2);
     }
+    if ((values.low_quality == null) != (values.max_low_quality_percent == null)) {
+        argumentError(io, "error: --low-quality and --max-low-quality-percent must be given together\n", 2);
+    }
     return .{
-        .adapters = if (adapters[0]) |adapter1| .{ adapter1, adapters[1].? } else null,
-        .poly_g = poly_g,
-        .tail = if (tail_window) |window| .{ .window = window, .quality = tail_quality.? } else null,
+        .adapters = if (values.adapters[0]) |adapter1| .{ adapter1, values.adapters[1].? } else null,
+        .poly_g = values.poly_g,
+        .tail = if (values.tail_window) |window| .{ .window = window, .quality = values.tail_quality.? } else null,
+        .min_length = values.min_length,
+        .max_n = values.max_n,
+        .low_quality = if (values.low_quality) |quality| .{ .quality = quality, .percent = values.max_low_quality_percent.? } else null,
     };
 }
 
@@ -286,10 +306,7 @@ pub fn main(init: std.process.Init) !void {
     var report_path: ?[]const u8 = null;
     var gzip_output = false;
     var max_pairs: ?u64 = null;
-    var adapters: [2]?[]const u8 = .{ null, null };
-    var trim_poly_g: ?u32 = null;
-    var trim_tail_window: ?u16 = null;
-    var trim_tail_quality: ?u8 = null;
+    var read_options: ReadOptionValues = .{};
     var given: GivenOptions = .{};
     var positional = std.ArrayList([]const u8).empty;
     defer positional.deinit(gpa);
@@ -431,23 +448,39 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
         if (command == .process and std.mem.eql(u8, arg, "--adapter1")) {
-            adapters[0] = adapterOption(io, &args, &given.adapter1, "--adapter1");
+            read_options.adapters[0] = adapterOption(io, &args, &given.adapter1, "--adapter1");
             continue;
         }
         if (command == .process and std.mem.eql(u8, arg, "--adapter2")) {
-            adapters[1] = adapterOption(io, &args, &given.adapter2, "--adapter2");
+            read_options.adapters[1] = adapterOption(io, &args, &given.adapter2, "--adapter2");
             continue;
         }
         if (command == .process and std.mem.eql(u8, arg, "--trim-poly-g")) {
-            trim_poly_g = rangeOption(io, &args, &given.trim_poly_g, u32, "--trim-poly-g", 1, std.math.maxInt(u32));
+            read_options.poly_g = rangeOption(io, &args, &given.trim_poly_g, u32, "--trim-poly-g", 1, std.math.maxInt(u32));
             continue;
         }
         if (command == .process and std.mem.eql(u8, arg, "--trim-tail-window")) {
-            trim_tail_window = rangeOption(io, &args, &given.trim_tail_window, u16, "--trim-tail-window", 1, preprocess.MAX_TAIL_WINDOW);
+            read_options.tail_window = rangeOption(io, &args, &given.trim_tail_window, u16, "--trim-tail-window", 1, preprocess.MAX_TAIL_WINDOW);
             continue;
         }
         if (command == .process and std.mem.eql(u8, arg, "--trim-tail-quality")) {
-            trim_tail_quality = rangeOption(io, &args, &given.trim_tail_quality, u8, "--trim-tail-quality", 1, preprocess.MAX_TAIL_QUALITY);
+            read_options.tail_quality = rangeOption(io, &args, &given.trim_tail_quality, u8, "--trim-tail-quality", 1, preprocess.MAX_TAIL_QUALITY);
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--min-length")) {
+            read_options.min_length = rangeOption(io, &args, &given.min_length, u32, "--min-length", 0, std.math.maxInt(u32));
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--max-n")) {
+            read_options.max_n = rangeOption(io, &args, &given.max_n, u8, "--max-n", 0, preprocess.MAX_N_LIMIT);
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--low-quality")) {
+            read_options.low_quality = rangeOption(io, &args, &given.low_quality, u8, "--low-quality", 0, preprocess.MAX_LOW_QUALITY);
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--max-low-quality-percent")) {
+            read_options.max_low_quality_percent = rangeOption(io, &args, &given.max_low_quality_percent, u8, "--max-low-quality-percent", 0, preprocess.MAX_LOW_QUALITY_PERCENT);
             continue;
         }
         if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
@@ -512,7 +545,7 @@ pub fn main(init: std.process.Init) !void {
             .report = report_path,
             .gzip = gzip_output,
             .max_pairs = max_pairs,
-            .trim = processTrimOptions(io, adapters, trim_poly_g, trim_tail_window, trim_tail_quality),
+            .trim = processReadOptions(io, read_options),
         }),
     };
     std.process.exit(code);
@@ -3964,6 +3997,7 @@ const ProcessOptions = struct {
 const ProcessCounts = struct {
     read: u64 = 0,
     written: u64 = 0,
+    dropped: u64 = 0,
     input_complete: bool = false,
 };
 
@@ -4039,9 +4073,9 @@ fn runProcess(
     };
 
     var input_failure = processed;
-    const trims = options.trim.trims();
+    const changes_reads = options.trim.changesReads();
     var stats: [2][2]zfastq.Stats = @splat(.{ .{}, .{} });
-    finishCollectors(&collectors.qc, trims, &stats, &input_failure);
+    finishCollectors(&collectors.qc, changes_reads, &stats, &input_failure);
 
     var exit_code: u8 = 0;
     if (input_failure) |failure| {
@@ -4071,8 +4105,9 @@ fn runProcess(
         .counts = counts,
         .stats = &stats,
         .qc = &collectors.qc,
-        .trims = trims,
+        .changes_reads = changes_reads,
         .trimming = &collectors.trimming,
+        .filtering = &collectors.filtering,
         .input_failure = input_failure,
         .failed_output = if (failed_output) |index| paths[index] else null,
     };
@@ -4090,6 +4125,7 @@ fn runProcess(
 const ProcessCollectors = struct {
     qc: [2]qc.MatePopulations = .{ .{}, .{} },
     trimming: [2]preprocess.MateCounts = .{ .{}, .{} },
+    filtering: preprocess.FilterCounts = .{},
 
     fn deinit(self: *ProcessCollectors, allocator: std.mem.Allocator) void {
         for (&self.qc) |*populations| populations.deinit(allocator);
@@ -4098,13 +4134,13 @@ const ProcessCollectors = struct {
 
 fn finishCollectors(
     collectors: *[2]qc.MatePopulations,
-    trims: bool,
+    changes_reads: bool,
     stats: *[2][2]zfastq.Stats,
     input_failure: *?PairCommandFailure,
 ) void {
     for (collectors, 0..) |*populations, index| {
         populations.finish();
-        const retained = if (trims) &populations.retained else &populations.raw;
+        const retained = if (changes_reads) &populations.retained else &populations.raw;
         for ([_]*const qc.MateQc{ &populations.raw, retained }, stats) |collector, *population_stats| {
             population_stats[index] = collector.stats() catch |err| stats: {
                 if (input_failure.* == null) input_failure.* = pairCommandFailure(@intCast(index), qcFailure(err));
@@ -4221,8 +4257,8 @@ const ProcessPairs = struct {
                 return pairCommandFailure(@intCast(index), qcFailure(err));
             };
         }
-        if (self.trimmer.options.trims()) {
-            self.emitTrimmed(records, spans) catch |err| switch (err) {
+        if (self.trimmer.options.changesReads()) {
+            self.emitTransformed(records, spans) catch |err| switch (err) {
                 error.TrimFailed => return self.trim_failure,
                 error.Output1WriteFailed, error.Output2WriteFailed => |write_error| return write_error,
             };
@@ -4234,7 +4270,7 @@ const ProcessPairs = struct {
         return null;
     }
 
-    fn emitTrimmed(
+    fn emitTransformed(
         self: *ProcessPairs,
         records: [2]zfastq.Record,
         spans: [2]?[]const u8,
@@ -4243,13 +4279,35 @@ const ProcessPairs = struct {
             .{ records[0].sequence, records[1].sequence },
             .{ records[0].quality, records[1].quality },
         );
-        var trimmed = records;
-        var trimmed_spans = spans;
-        for (&trimmed, &trimmed_spans, result.kept, result.removed, 0..) |*record, *span, kept, removed, index| {
-            self.collectors.trimming[index].add(removed) catch {
+        for (&self.collectors.trimming, result.removed, 0..) |*counts, removed, index| {
+            counts.add(removed) catch {
                 self.trim_failure = pairCommandFailure(@intCast(index), STATISTICS_LIMIT);
                 return error.TrimFailed;
             };
+        }
+        const decision = preprocess.decide(
+            self.trimmer.options,
+            &result,
+            .{ records[0].sequence[0..result.kept[0]], records[1].sequence[0..result.kept[1]] },
+            .{ records[0].quality[0..result.kept[0]], records[1].quality[0..result.kept[1]] },
+        );
+        if (decision.pair != null) {
+            self.collectors.filtering.add(decision) catch {
+                self.trim_failure = pairCommandFailure(0, STATISTICS_LIMIT);
+                return error.TrimFailed;
+            };
+            for (&self.collectors.qc, records, 0..) |*collector, record, index| {
+                collector.dropRetained(self.allocator, record.sequence, record.quality) catch |err| {
+                    self.trim_failure = pairCommandFailure(@intCast(index), qcFailure(err));
+                    return error.TrimFailed;
+                };
+            }
+            self.counts.dropped += 1;
+            return;
+        }
+        var trimmed = records;
+        var trimmed_spans = spans;
+        for (&trimmed, &trimmed_spans, result.kept, 0..) |*record, *span, kept, index| {
             self.collectors.qc[index].addRetained(self.allocator, record.sequence, record.quality, kept) catch |err| {
                 self.trim_failure = pairCommandFailure(@intCast(index), qcFailure(err));
                 return error.TrimFailed;
@@ -4374,8 +4432,9 @@ const ProcessReport = struct {
     counts: ProcessCounts,
     stats: *const [2][2]zfastq.Stats,
     qc: *const [2]qc.MatePopulations,
-    trims: bool,
+    changes_reads: bool,
     trimming: *const [2]preprocess.MateCounts,
+    filtering: *const preprocess.FilterCounts,
     input_failure: ?PairCommandFailure,
     failed_output: ?[]const u8,
 };
@@ -4405,6 +4464,14 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     try json.write(if (trim.tail) |tail| tail.window else null);
     try json.objectField("trim_tail_quality");
     try json.write(if (trim.tail) |tail| tail.quality else null);
+    try json.objectField("min_length");
+    try json.write(trim.min_length);
+    try json.objectField("max_n");
+    try json.write(trim.max_n);
+    try json.objectField("low_quality");
+    try json.write(if (trim.low_quality) |low_quality| low_quality.quality else null);
+    try json.objectField("max_low_quality_percent");
+    try json.write(if (trim.low_quality) |low_quality| low_quality.percent else null);
     try json.endObject();
 
     try json.objectField("inputs");
@@ -4440,6 +4507,8 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     try json.write(report.counts.read);
     try json.objectField("written");
     try json.write(report.counts.written);
+    try json.objectField("dropped");
+    try json.write(report.counts.dropped);
     try json.endObject();
     try json.objectField("mates");
     try json.beginObject();
@@ -4456,7 +4525,7 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     try json.endObject();
     try json.objectField("qc");
     try json.beginObject();
-    for ([_][]const u8{ "raw", "retained" }, [_]bool{ false, report.trims }) |population, retained| {
+    for ([_][]const u8{ "raw", "retained" }, [_]bool{ false, report.changes_reads }) |population, retained| {
         try json.objectField(population);
         try json.beginArray();
         for (report.qc) |*populations| {
@@ -4469,6 +4538,8 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     try json.beginArray();
     for (report.trimming) |*mate_counts| try writeTrimCounts(json, trim, mate_counts);
     try json.endArray();
+    try json.objectField("filtering");
+    if (report.changes_reads) try writeFilterCounts(json, report.filtering) else try json.write(null);
 
     const failed_input: ?[]const u8 = if (report.input_failure) |failure| switch (failure) {
         .command => |details| report.inputs[details.input_index],
@@ -4514,6 +4585,26 @@ fn writeTrimCounts(
         try json.objectField("bases");
         try json.write(step_counts.bases);
         try json.endObject();
+    }
+    try json.endObject();
+}
+
+fn writeFilterCounts(json: *std.json.Stringify, counts: *const preprocess.FilterCounts) !void {
+    try json.beginObject();
+    try json.objectField("dropped_pairs");
+    try writeReasonCounts(json, &counts.dropped_pairs);
+    try json.objectField("failed_reads");
+    try json.beginArray();
+    for (&counts.failed_reads) |*mate| try writeReasonCounts(json, mate);
+    try json.endArray();
+    try json.endObject();
+}
+
+fn writeReasonCounts(json: *std.json.Stringify, counts: *const [preprocess.REASON_COUNT]u64) !void {
+    try json.beginObject();
+    for (std.enums.values(preprocess.Reason), counts) |reason, count| {
+        try json.objectField(@tagName(reason));
+        try json.write(count);
     }
     try json.endObject();
 }
@@ -6995,7 +7086,7 @@ test "[failure] - [interleave]: a write failure after the first mate keeps only 
 test "[failure] - [process]: a mate 2 write failure keeps mate 1 and counts no written pair" {
     const mate1 = "@pair/1\nA\n+left\n!\n";
     const mate2 = "@pair/2\nT\n+right\n#\n";
-    const trims = [_]preprocess.Options{ .{}, .{ .adapters = .{ "ACGT", "ACGT" } } };
+    const trims = [_]preprocess.Options{ .{}, .{ .adapters = .{ "ACGT", "ACGT" } }, .{ .max_n = 0, .min_length = 1 } };
     for (trims, 0..) |trim, case| {
         errdefer std.debug.print("case {d}\n", .{case});
         var source1 = io_layer.SliceSource.init(mate1);
@@ -7034,6 +7125,89 @@ test "[failure] - [process]: a mate 2 write failure keeps mate 1 and counts no w
         try std.testing.expectEqual(@as(u64, 1), counts.read);
         try std.testing.expectEqual(@as(u64, 0), counts.written);
         try std.testing.expect(!counts.input_complete);
+    }
+}
+
+test "[property] - [process]: trimmed, dropped, and long pairs release every allocation" {
+    const allocator = std.testing.allocator;
+    const Pair = struct { name: []const u8, length: usize, quality: u8 = 'I', kept: bool };
+    const pairs = [_]Pair{
+        .{ .name = "kept", .length = 60, .kept = true },
+        .{ .name = "short", .length = 10, .kept = false },
+        .{ .name = "long", .length = 1100, .kept = true },
+        .{ .name = "low", .length = 60, .quality = '#', .kept = false },
+        .{ .name = "after", .length = 60, .kept = true },
+    };
+    var inputs: [2]std.ArrayList(u8) = .{ .empty, .empty };
+    defer for (&inputs) |*input| input.deinit(allocator);
+    var state: u32 = 7;
+    for (pairs) |pair| {
+        for (&inputs, 1..) |*input, mate| {
+            try input.print(allocator, "@{s}/{d}\n", .{ pair.name, mate });
+            for (0..pair.length) |_| {
+                state = state *% 1103515245 +% 12345;
+                try input.append(allocator, "ACGT"[(state >> 16) & 3]);
+            }
+            try input.appendSlice(allocator, "\n+\n");
+            try input.appendNTimes(allocator, pair.quality, pair.length);
+            try input.append(allocator, '\n');
+        }
+    }
+    var source1 = io_layer.SliceSource.init(inputs[0].items);
+    var source2 = io_layer.SliceSource.init(inputs[1].items);
+    var stream1 = try TestStream.init(source1.byteSource());
+    defer stream1.deinit();
+    var stream2 = try TestStream.init(source2.byteSource());
+    defer stream2.deinit();
+    var output1: [4096]u8 = undefined;
+    var output2: [4096]u8 = undefined;
+    var sink1 = io_layer.SliceSink.init(&output1);
+    var sink2 = io_layer.SliceSink.init(&output2);
+    var writer1 = zfastq.Writer.init(sink1.byteSink());
+    var writer2 = zfastq.Writer.init(sink2.byteSink());
+    var collectors: ProcessCollectors = .{};
+    defer collectors.deinit(allocator);
+    var counts: ProcessCounts = .{};
+
+    try std.testing.expectEqual(@as(?PairCommandFailure, null), try processSources(
+        allocator,
+        .{ &stream1.reader.interface, &stream2.reader.interface },
+        .{ &writer1, &writer2 },
+        &collectors,
+        &counts,
+        .{
+            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+            .alphabet = .iupac,
+            .pair_name_policy = .illumina,
+            .output1 = null,
+            .output2 = null,
+            .report = null,
+            .gzip = false,
+            .max_pairs = null,
+            .trim = .{
+                .adapters = .{ "CTGTCTCTTATACACATCT", "CTGTCTCTTATACACATCT" },
+                .poly_g = 10,
+                .tail = .{ .window = 4, .quality = 20 },
+                .min_length = 30,
+                .max_n = 5,
+                .low_quality = .{ .quality = 15, .percent = 40 },
+            },
+        },
+    ));
+    try writer1.flush();
+    try writer2.flush();
+    try std.testing.expect(counts.input_complete);
+    try std.testing.expectEqual(ProcessCounts{ .read = 5, .written = 3, .dropped = 2, .input_complete = true }, counts);
+    try std.testing.expectEqual(@as(u64, 1), collectors.filtering.dropped_pairs[@intFromEnum(preprocess.Reason.too_short)]);
+    try std.testing.expectEqual(@as(u64, 1), collectors.filtering.dropped_pairs[@intFromEnum(preprocess.Reason.low_quality)]);
+    var stats: [2][2]zfastq.Stats = @splat(.{ .{}, .{} });
+    var failure: ?PairCommandFailure = null;
+    finishCollectors(&collectors.qc, true, &stats, &failure);
+    try std.testing.expectEqual(@as(?PairCommandFailure, null), failure);
+    for (stats[0], stats[1]) |raw, retained| {
+        try std.testing.expectEqual(@as(u64, 5), raw.reads);
+        try std.testing.expectEqual(@as(u64, 3), retained.reads);
+        try std.testing.expectEqual(@as(u64, 1220), retained.bases);
     }
 }
 

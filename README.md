@@ -29,7 +29,7 @@ z-fastq is a single-core command-line toolkit for working with plain and gzip-co
 - Validate structure, sequence alphabets, quality bytes, and paired-read names.
 - Sample records by fraction or exact count, including paired and interleaved input.
 - Interleave and deinterleave paired FASTQ.
-- Validate paired FASTQ into two plain or gzip outputs with a per-mate JSON report.
+- Validate, trim, and filter paired FASTQ into two plain or gzip outputs with a per-mate JSON report.
 - Read plain FASTQ and gzip input through the same streaming interface.
 - Emit machine-readable JSON for selected statistics and validation workflows.
 
@@ -80,7 +80,7 @@ Use `z-fastq --help` for the complete command and option reference.
 - `sample`: select records or read pairs by fraction or exact count.
 - `interleave`: combine R1 and R2 into a validated interleaved stream.
 - `deinterleave`: split validated interleaved reads into two output files.
-- `process`: validate and trim two mate files into two plain or gzip outputs, with an optional JSON report.
+- `process`: validate, trim, and filter two mate files into two plain or gzip outputs, with an optional JSON report.
 
 All commands report errors with non-zero exit status. Validation and parsing failures identify the affected record and source location where available.
 

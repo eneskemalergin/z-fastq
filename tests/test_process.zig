@@ -13,7 +13,7 @@ const RF2 = "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT";
 const FF = "CTGTCTCTTATACACATCT";
 const TRIM_STEPS = [_][]const u8{ "quality_tail", "poly_g", "overlap", "adapter" };
 
-const Probe = struct { name: []const u8, rf: [2]usize, ff: [2]usize };
+const Probe = struct { name: []const u8, rf: ?[2]usize, ff: ?[2]usize };
 
 const PROBES = [_]Probe{
     .{ .name = "ov_rev_L45", .rf = .{ 45, 45 }, .ff = .{ 45, 45 } },
@@ -37,43 +37,43 @@ const PROBES = [_]Probe{
     .{ .name = "ad_partial_k8_mm1", .rf = .{ 30, 60 }, .ff = .{ 30, 60 } },
     .{ .name = "ad_mm_at_limit", .rf = .{ 30, 60 }, .ff = .{ 30, 60 } },
     .{ .name = "ad_mm_limit_plus1", .rf = .{ 63, 60 }, .ff = .{ 49, 60 } },
-    .{ .name = "ad_start_full", .rf = .{ 0, 60 }, .ff = .{ 0, 60 } },
-    .{ .name = "ad_start_suffix4", .rf = .{ 0, 60 }, .ff = .{ 0, 60 } },
+    .{ .name = "ad_start_full", .rf = null, .ff = null },
+    .{ .name = "ad_start_suffix4", .rf = null, .ff = null },
     .{ .name = "ad_internal_full", .rf = .{ 20, 60 }, .ff = .{ 20, 60 } },
     .{ .name = "ad_internal_lookalike", .rf = .{ 60, 60 }, .ff = .{ 60, 60 } },
     .{ .name = "ad_indel_internal", .rf = .{ 72, 60 }, .ff = .{ 58, 60 } },
     .{ .name = "ad_indel_start", .rf = .{ 41, 60 }, .ff = .{ 27, 60 } },
     .{ .name = "gap_start_del_cfill", .rf = .{ 41, 60 }, .ff = .{ 27, 60 } },
-    .{ .name = "gap_start_ins_cfill", .rf = .{ 0, 60 }, .ff = .{ 0, 60 } },
+    .{ .name = "gap_start_ins_cfill", .rf = null, .ff = null },
     .{ .name = "gap_internal_del_cfill", .rf = .{ 72, 60 }, .ff = .{ 58, 60 } },
     .{ .name = "gap_internal_ins_cfill", .rf = .{ 74, 60 }, .ff = .{ 60, 60 } },
     .{ .name = "ad_N_in_adapter", .rf = .{ 30, 60 }, .ff = .{ 30, 60 } },
     .{ .name = "ad_r2_only", .rf = .{ 60, 30 }, .ff = .{ 60, 30 } },
     .{ .name = "ad_both_30", .rf = .{ 30, 30 }, .ff = .{ 30, 30 } },
     .{ .name = "ad_unequal_60_40", .rf = .{ 45, 40 }, .ff = .{ 45, 40 } },
-    .{ .name = "dimer_both2", .rf = .{ 2, 2 }, .ff = .{ 2, 2 } },
+    .{ .name = "dimer_both2", .rf = null, .ff = null },
     .{ .name = "dimer_both3", .rf = .{ 3, 3 }, .ff = .{ 3, 3 } },
     .{ .name = "dimer_r1_only_r2_60", .rf = .{ 2, 60 }, .ff = .{ 2, 60 } },
-    .{ .name = "dimer_r1_trim_r2_short", .rf = .{ 2, 0 }, .ff = .{ 31, 0 } },
-    .{ .name = "short_no_adapter_2_2", .rf = .{ 2, 0 }, .ff = .{ 0, 0 } },
+    .{ .name = "dimer_r1_trim_r2_short", .rf = null, .ff = null },
+    .{ .name = "short_no_adapter_2_2", .rf = null, .ff = null },
     .{ .name = "qt_all_good_12", .rf = .{ 12, 12 }, .ff = .{ 12, 12 } },
     .{ .name = "qt_mean20_last_window", .rf = .{ 12, 12 }, .ff = .{ 12, 12 } },
     .{ .name = "qt_mean19_75_window", .rf = .{ 12, 12 }, .ff = .{ 8, 12 } },
     .{ .name = "qt_b20_window", .rf = .{ 14, 14 }, .ff = .{ 9, 14 } },
     .{ .name = "qt_b19_window", .rf = .{ 14, 14 }, .ff = .{ 8, 14 } },
     .{ .name = "qt_all_low_12", .rf = .{ 12, 12 }, .ff = .{ 1, 12 } },
-    .{ .name = "qt_len4", .rf = .{ 4, 4 }, .ff = .{ 0, 0 } },
+    .{ .name = "qt_len4", .rf = .{ 4, 4 }, .ff = null },
     .{ .name = "qt_len5", .rf = .{ 5, 5 }, .ff = .{ 5, 5 } },
     .{ .name = "qt_trailing_N", .rf = .{ 22, 22 }, .ff = .{ 20, 22 } },
     .{ .name = "qt_middle_N", .rf = .{ 21, 21 }, .ff = .{ 21, 21 } },
-    .{ .name = "qt_only_N", .rf = .{ 6, 6 }, .ff = .{ 0, 6 } },
+    .{ .name = "qt_only_N", .rf = .{ 6, 6 }, .ff = null },
     .{ .name = "pg_g9_after_20", .rf = .{ 29, 30 }, .ff = .{ 20, 30 } },
     .{ .name = "pg_g10_after_20", .rf = .{ 30, 30 }, .ff = .{ 20, 30 } },
     .{ .name = "pg_g11_after_20", .rf = .{ 31, 30 }, .ff = .{ 20, 30 } },
     .{ .name = "pg_g9_only", .rf = .{ 9, 9 }, .ff = .{ 9, 9 } },
-    .{ .name = "pg_g10_only", .rf = .{ 10, 10 }, .ff = .{ 0, 10 } },
+    .{ .name = "pg_g10_only", .rf = .{ 10, 10 }, .ff = null },
     .{ .name = "pg_run_mm_A", .rf = .{ 31, 31 }, .ff = .{ 20, 31 } },
-    .{ .name = "pg_allG_then_A", .rf = .{ 13, 13 }, .ff = .{ 0, 13 } },
+    .{ .name = "pg_allG_then_A", .rf = .{ 13, 13 }, .ff = null },
     .{ .name = "pg_both_mates", .rf = .{ 30, 30 }, .ff = .{ 20, 20 } },
     .{ .name = "pg_r2_only", .rf = .{ 25, 30 }, .ff = .{ 25, 20 } },
     .{ .name = "pg_before_adapter", .rf = .{ 49, 39 }, .ff = .{ 30, 39 } },
@@ -170,6 +170,9 @@ test "[cli] - [process]: pairs pass through with LF endings and the report count
         try std.testing.expectEqual(std.json.Value.null, trimStep(report, index, step));
     };
     try std.testing.expectEqual(std.json.Value.null, report.get("options").?.object.get("adapter1").?);
+    try std.testing.expectEqual(std.json.Value.null, report.get("options").?.object.get("min_length").?);
+    try std.testing.expectEqual(std.json.Value.null, report.get("filtering").?);
+    try cli.expectJsonInteger(report.get("pairs").?.object.get("dropped"), 0);
     try std.testing.expectEqual(std.json.Value.null, report.get("error").?);
     try std.testing.expectEqual(std.json.Value.null, report.get("failed_input").?);
     try cli.expectJsonInteger(report.get("inputs").?.array.items[1].object.get("size"), R2.len);
@@ -268,6 +271,13 @@ test "[cli] - [process]: invalid invocations fail before any input is read or ou
         .{ .args = &.{ "process", "--trim-poly-g", "0", p.r1, p.r2 }, .stderr = "error: --trim-poly-g must be 1 to 4294967295\n" },
         .{ .args = &.{ "process", "--trim-poly-g", "4294967296", p.r1, p.r2 }, .stderr = "error: --trim-poly-g must be 1 to 4294967295\n" },
         .{ .args = &.{ "process", "--trim-poly-g", "1x", p.r1, p.r2 }, .stderr = "error: --trim-poly-g must be 1 to 4294967295\n" },
+        .{ .args = &.{ "process", "--min-length", "4294967296", p.r1, p.r2 }, .stderr = "error: --min-length must be 0 to 4294967295\n" },
+        .{ .args = &.{ "process", "--min-length", "-1", p.r1, p.r2 }, .stderr = "error: --min-length must be 0 to 4294967295\n" },
+        .{ .args = &.{ "process", "--max-n", "51", p.r1, p.r2 }, .stderr = "error: --max-n must be 0 to 50\n" },
+        .{ .args = &.{ "process", "--low-quality", "94", "--max-low-quality-percent", "40", p.r1, p.r2 }, .stderr = "error: --low-quality must be 0 to 93\n" },
+        .{ .args = &.{ "process", "--max-low-quality-percent", "101", p.r1, p.r2 }, .stderr = "error: --max-low-quality-percent must be 0 to 100\n" },
+        .{ .args = &.{ "process", "--low-quality", "15", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --low-quality and --max-low-quality-percent must be given together\n" },
+        .{ .args = &.{ "process", "--max-n", "5", "--max-n", "5", p.r1, p.r2 }, .stderr = "error: --max-n may appear only once\n" },
     };
     for (cases, 0..) |case, index| {
         errdefer std.debug.print("case {d}\n", .{index});
@@ -412,7 +422,7 @@ test "[cli] - [process]: a report on standard output appended to an input is rej
     try std.testing.expect(!pathExists(p.out1));
 }
 
-test "[cli] - [process]: trimming keeps the prefixes fastp 1.1.0 keeps on the probe pairs" {
+test "[cli] - [process]: trimming writes the records fastp 1.1.0 writes on the probe pairs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -445,7 +455,11 @@ test "[cli] - [process]: trimming keeps the prefixes fastp 1.1.0 keeps on the pr
             var written = std.mem.splitScalar(u8, try readPath(allocator, output), '\n');
             for (PROBES) |probe| {
                 errdefer std.debug.print("{s} {s} mate {d}\n", .{ family.name, probe.name, mate_index + 1 });
-                const kept = (if (family_index == 0) probe.rf else probe.ff)[mate_index];
+                const lengths = (if (family_index == 0) probe.rf else probe.ff) orelse {
+                    for (0..4) |_| _ = source.next().?;
+                    continue;
+                };
+                const kept = lengths[mate_index];
                 const header = source.next().?;
                 try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "@{s}/{d}", .{ probe.name, mate_index + 1 }), header);
                 try std.testing.expectEqualStrings(header, written.next().?);
@@ -459,7 +473,7 @@ test "[cli] - [process]: trimming keeps the prefixes fastp 1.1.0 keeps on the pr
     }
 }
 
-test "[cli] - [process]: option range boundaries are accepted and empty mates are written as empty records" {
+test "[cli] - [process]: option range boundaries are accepted, and a pair with an emptied mate is dropped" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -477,8 +491,8 @@ test "[cli] - [process]: option range boundaries are accepted and empty mates ar
         },
         .{
             .options = &.{ "--adapter1", "A" ** 128, "--adapter2", "C" ** 128, "--trim-poly-g", "4294967295", "--trim-tail-window", "1000", "--trim-tail-quality", "30" },
-            .r1 = "@p1/1 desc\n\n+\n\n@p2/1\n\n+p2\n\n",
-            .r2 = "@p1/2 desc\n\n+\n\n@p2/2\n\n+\n\n",
+            .r1 = "",
+            .r2 = "",
         },
     };
     for (cases, 0..) |case, index| {
@@ -506,10 +520,15 @@ test "[cli] - [process]: option range boundaries are accepted and empty mates ar
     const report = try parseReport(allocator, (try cli.run(allocator, &.{
         "process", "--report", "-", "--out1", p.out1, "--out2", p.out2, "--trim-tail-window", "1000", "--trim-tail-quality", "30", p.r1, p.r2,
     })).stdout);
+    try cli.expectJsonInteger(report.get("pairs").?.object.get("written"), 0);
+    try cli.expectJsonInteger(report.get("pairs").?.object.get("dropped"), 2);
+    try cli.expectJsonInteger(report.get("filtering").?.object.get("dropped_pairs").?.object.get("too_short"), 2);
     for (0..2) |index| {
         try expectTrimStep(report, index, "quality_tail", 2, 8);
-        try cli.expectJsonInteger(mate(report, "retained", index).get("reads"), 2);
+        try cli.expectJsonInteger(mate(report, "raw", index).get("reads"), 2);
+        try cli.expectJsonInteger(mate(report, "retained", index).get("reads"), 0);
         try cli.expectJsonInteger(mate(report, "retained", index).get("bases"), 0);
+        try cli.expectJsonInteger(report.get("filtering").?.object.get("failed_reads").?.array.items[index].object.get("too_short"), 2);
         try std.testing.expectEqual(std.json.Value.null, trimStep(report, index, "poly_g"));
         try std.testing.expectEqual(std.json.Value.null, trimStep(report, index, "adapter"));
     }
@@ -553,6 +572,80 @@ test "[cli] - [process]: a trimmed record keeps its header and plus field and th
     const lengths = report.get("qc").?.object.get("retained").?.array.items[0].object.get("length_distribution").?.array.items;
     try cli.expectJsonInteger(lengths[lengths.len - 1].object.get("count"), 1);
     try cli.expectJsonString(lengths[lengths.len - 1].object.get("length"), "30");
+}
+
+test "[cli] - [process]: filters drop whole pairs, count each reason, and keep the exit status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const p = try Paths.init(allocator, &tmp);
+    const kept1 = "@ok/1\nACGTACGT\n+\nIIIIIIII\n";
+    const kept2 = "@ok/2\nTTGGCCAA\n+\nIIIIIIII\n";
+    const r1 = "@n/1\nANNACGTA\n+\nIIIIIIII\n" ++ kept1 ++ "@short/1\nACG\n+\nIII\n@low/1\nACGTACGT\n+\nIIIIIIII\n";
+    const r2 = "@n/2\nACGTACGT\n+\nIIIIIIII\n" ++ kept2 ++ "@short/2\nACGTACGT\n+\nIIIIIIII\n@low/2\nACGTNACG\n+\nII!!!!II\n";
+    try writeInputs(&tmp, r1, r2);
+
+    const options = [_][]const u8{ "--min-length", "4", "--max-n", "1", "--low-quality", "15", "--max-low-quality-percent", "40" };
+    const args = try std.mem.concat(allocator, []const u8, &.{ &.{ "process", "--report", "-", "--out1", p.out1, "--out2", p.out2 }, &options, &.{ p.r1, p.r2 } });
+    const result = try cli.run(allocator, args);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings(kept1, try readPath(allocator, p.out1));
+    try std.testing.expectEqualStrings(kept2, try readPath(allocator, p.out2));
+
+    const report = try parseReport(allocator, result.stdout);
+    const pairs = report.get("pairs").?.object;
+    try cli.expectJsonInteger(pairs.get("read"), 4);
+    try cli.expectJsonInteger(pairs.get("written"), 1);
+    try cli.expectJsonInteger(pairs.get("dropped"), 3);
+    const filtering = report.get("filtering").?.object;
+    const dropped = filtering.get("dropped_pairs").?.object;
+    try cli.expectJsonInteger(dropped.get("too_many_n"), 1);
+    try cli.expectJsonInteger(dropped.get("too_short"), 1);
+    try cli.expectJsonInteger(dropped.get("low_quality"), 1);
+    try cli.expectJsonInteger(dropped.get("adapter_dimer"), 0);
+    const failed = filtering.get("failed_reads").?.array.items;
+    try cli.expectJsonInteger(failed[0].object.get("too_many_n"), 1);
+    try cli.expectJsonInteger(failed[0].object.get("too_short"), 1);
+    try cli.expectJsonInteger(failed[0].object.get("low_quality"), 0);
+    try cli.expectJsonInteger(failed[1].object.get("low_quality"), 1);
+    try cli.expectJsonInteger(failed[1].object.get("too_short"), 0);
+    try cli.expectJsonInteger(mate(report, "raw", 0).get("reads"), 4);
+    try cli.expectJsonInteger(mate(report, "retained", 0).get("reads"), 1);
+    try cli.expectJsonInteger(mate(report, "retained", 1).get("bases"), 8);
+    try cli.expectJsonInteger(mate(report, "retained", 1).get("n"), 0);
+    try std.testing.expectEqual(std.json.Value.null, trimStep(report, 0, "adapter"));
+    const options_json = report.get("options").?.object;
+    try cli.expectJsonInteger(options_json.get("min_length"), 4);
+    try cli.expectJsonInteger(options_json.get("max_n"), 1);
+    try cli.expectJsonInteger(options_json.get("low_quality"), 15);
+    try cli.expectJsonInteger(options_json.get("max_low_quality_percent"), 40);
+    const retained_lengths = report.get("qc").?.object.get("retained").?.array.items[0].object.get("length_distribution").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), retained_lengths.len);
+    try cli.expectJsonInteger(retained_lengths[0].object.get("count"), 1);
+}
+
+test "[cli] - [process]: a malformed record after dropped pairs still fails the run" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const p = try Paths.init(allocator, &tmp);
+    const r1 = "@a/1\nAC\n+\nII\n@b/1\nACGTACGT\n+\nIIIIIIII\n@c/1\nACGT\n+\nIII\n";
+    const r2 = "@a/2\nACGTACGT\n+\nIIIIIIII\n@b/2\nACGTACGT\n+\nIIIIIIII\n@c/2\nACGT\n+\nIIII\n";
+    try writeInputs(&tmp, r1, r2);
+
+    const result = try cli.run(allocator, &.{ "process", "--min-length", "4", "--report", "-", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 });
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("@b/1\nACGTACGT\n+\nIIIIIIII\n", try readPath(allocator, p.out1));
+    try std.testing.expectEqualStrings("@b/2\nACGTACGT\n+\nIIIIIIII\n", try readPath(allocator, p.out2));
+    const report = try parseReport(allocator, result.stdout);
+    try cli.expectJsonString(report.get("status"), "error");
+    try cli.expectJsonString(report.get("error").?.object.get("code"), "S005");
+    try cli.expectJsonInteger(report.get("pairs").?.object.get("dropped"), 1);
+    try cli.expectJsonInteger(report.get("pairs").?.object.get("written"), 1);
 }
 
 test "[cli] - [process]: a record longer than the read buffer passes through unchanged" {

@@ -60,6 +60,11 @@ const EXPECTED_USAGE =
     \\                       Trim the 3' end by a W-base quality window (with quality)
     \\  --trim-tail-quality Q
     \\                       Mean Phred quality the 3' window must reach (with window)
+    \\  --min-length N       Drop pairs with a read shorter than N bases
+    \\  --max-n N            Drop pairs with a read of more than N unknown (N) bases
+    \\  --low-quality Q      Count bases below Phred Q as low quality (with percent)
+    \\  --max-low-quality-percent P
+    \\                       Drop pairs with a read over P% low-quality bases
     \\
     \\Count usage:
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
@@ -87,7 +92,7 @@ const EXPECTED_USAGE =
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
     \\Process usage:
-    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
+    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 

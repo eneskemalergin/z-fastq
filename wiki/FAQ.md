@@ -42,5 +42,5 @@ No. It creates output paths exclusively to avoid silently truncating an existing
 
 ## Is z-fastq a replacement for fastp or SeqKit?
 
-No. It covers a narrower set of streaming FASTQ tasks. `process` trims paired reads with fastp's rules for adapters, mate overlaps, poly-G, and 3' quality, but it does not filter or deduplicate reads. See [Choosing a FASTQ tool](Choosing-a-FASTQ-Tool).
+No. It covers a narrower set of streaming FASTQ tasks. `process` trims and filters paired reads with fastp's rules for adapters, mate overlaps, poly-G, 3' quality, low-quality bases, `N` count, and length, but it does not deduplicate, correct, or merge reads. See [Choosing a FASTQ tool](Choosing-a-FASTQ-Tool).
 

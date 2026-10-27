@@ -1,10 +1,12 @@
 //! Per-mate FASTQ quality distributions for `process`, computed as FastQC 0.13.0 computes its core
 //! modules: per-cycle quality and base content, per-read quality and GC, read lengths, and
-//! terminal homopolymer runs. The retained population of a trimmed run counts only the removed
-//! 3' ends per cycle and takes its per-cycle tables as raw minus removed, until raw drops its
-//! tables for a read past the cycle limit; from then on it counts its reads in full.
+//! terminal homopolymer runs. The retained population of a trimmed or filtered run counts only
+//! the removed 3' ends and dropped reads per cycle and takes its per-cycle tables as raw minus
+//! removed, until raw drops its tables for a read past the cycle limit; from then on it counts
+//! its reads in full.
 
 const std = @import("std");
+const fastq = @import("fastq.zig");
 const simd = @import("simd.zig");
 const statistics = @import("stats.zig");
 
@@ -12,8 +14,8 @@ pub const MAX_CYCLES = 1024;
 pub const TERMINAL_RUN_MIN = 10;
 pub const TOO_LONG = "a read is longer than 1024 bases";
 
-const PHRED_OFFSET = 33;
-const QUALITY_BINS = 94;
+const PHRED_OFFSET = fastq.PHRED_OFFSET;
+const QUALITY_BINS = fastq.PHRED_MAX_SCORE + 1;
 const GC_BINS = 101;
 const PERCENTILE_MIN_READS = 100;
 const GROUPING_MIN_LENGTH = 75;
@@ -76,26 +78,50 @@ pub const MatePopulations = struct {
         std.debug.assert(kept <= sequence.len and sequence.len == quality.len);
         if (!self.derived) return self.retained.addRead(allocator, sequence[0..kept], quality[0..kept]);
         const retained = &self.retained;
-        if (sequence.len > retained.quality.items.len) try retained.growCycles(allocator, sequence.len);
         var facts = self.last;
         if (kept < sequence.len) {
-            var removed_sum: u64 = 0;
-            for (
-                sequence[kept..],
-                quality[kept..],
-                retained.quality.items[kept..sequence.len],
-                retained.bases.items[kept..sequence.len],
-            ) |base, byte, *qualities, *bases| {
-                qualities[byte - PHRED_OFFSET] += 1;
-                removed_sum += byte;
-                const kind = BASE_KIND[base];
-                if (kind != .other) bases[@intFromEnum(kind)] += 1;
-            }
+            const removed_sum = try self.removeCycles(allocator, sequence, quality, kept);
             facts = .{ .quality_sum = facts.quality_sum - removed_sum, .gc_count = gcCountScalar(sequence[0..gcKeptLength(kept)]) };
+        } else if (sequence.len > retained.quality.items.len) {
+            try retained.growCycles(allocator, sequence.len);
         }
         retained.lengths[kept] += 1;
         self.retained_cycles = @max(self.retained_cycles, kept);
         if (kept != 0) retained.addSummary(sequence[0..kept], facts);
+    }
+
+    pub fn dropRetained(
+        self: *MatePopulations,
+        allocator: std.mem.Allocator,
+        sequence: []const u8,
+        quality: []const u8,
+    ) error{OutOfMemory}!void {
+        std.debug.assert(sequence.len == quality.len);
+        if (self.derived) _ = try self.removeCycles(allocator, sequence, quality, 0);
+    }
+
+    fn removeCycles(
+        self: *MatePopulations,
+        allocator: std.mem.Allocator,
+        sequence: []const u8,
+        quality: []const u8,
+        from: usize,
+    ) error{OutOfMemory}!u64 {
+        const retained = &self.retained;
+        if (sequence.len > retained.quality.items.len) try retained.growCycles(allocator, sequence.len);
+        var removed_sum: u64 = 0;
+        for (
+            sequence[from..],
+            quality[from..],
+            retained.quality.items[from..sequence.len],
+            retained.bases.items[from..sequence.len],
+        ) |base, byte, *qualities, *bases| {
+            qualities[byte - PHRED_OFFSET] += 1;
+            removed_sum += byte;
+            const kind = BASE_KIND[base];
+            if (kind != .other) bases[@intFromEnum(kind)] += 1;
+        }
+        return removed_sum;
     }
 
     pub fn finish(self: *MatePopulations) void {
@@ -880,18 +906,20 @@ test "[property] - [qc]: a retained population derived from raw equals one colle
     var long_sequence: [MAX_CYCLES + 5]u8 = undefined;
     for (&long_sequence, 0..) |*base, index| base.* = "ACGTGGCAN"[index % 9];
     const long_quality: [MAX_CYCLES + 5]u8 = @splat('5');
-    const Read = struct { sequence: []const u8, quality: []const u8, kept: usize };
+    const Read = struct { sequence: []const u8, quality: []const u8, kept: usize, dropped: bool = false };
     const reads = [_]Read{
         .{ .sequence = "ACGTNNacgtGGGG", .quality = "II#5!IIII?5+#2", .kept = 9 },
         .{ .sequence = "GGGCCCAT", .quality = "JJJJJJJJ", .kept = 8 },
+        .{ .sequence = "AACCGGTTNNAC", .quality = "IIII#####III", .kept = 12, .dropped = true },
         .{ .sequence = "TTTTAAAAGGGGGGGGGGGG", .quality = "IIIIIIIIIIIIIIIIIII#", .kept = 0 },
         .{ .sequence = "", .quality = "", .kept = 0 },
         .{ .sequence = "NNNNACGTACGT", .quality = "!!!!IIIIIIII", .kept = 3 },
         .{ .sequence = &long_sequence, .quality = &long_quality, .kept = 700 },
         .{ .sequence = "CCCCAAAAAAAAAAAA", .quality = "IIIIIIIIIIIIIIII", .kept = 16 },
+        .{ .sequence = "GGGGGGGGGGGGGGGGGG", .quality = "!!!!!!!!!!!!!!!!!!", .kept = 4, .dropped = true },
         .{ .sequence = "ACGT", .quality = "IIII", .kept = 1 },
     };
-    for ([_]usize{ 5, reads.len }) |count| {
+    for ([_]usize{ 6, reads.len }) |count| {
         errdefer std.debug.print("{d} reads\n", .{count});
         var populations: MatePopulations = .{};
         defer populations.deinit(allocator);
@@ -899,6 +927,10 @@ test "[property] - [qc]: a retained population derived from raw equals one colle
         defer expected.deinit(allocator);
         for (reads[0..count]) |read| {
             try populations.addRead(allocator, read.sequence, read.quality);
+            if (read.dropped) {
+                try populations.dropRetained(allocator, read.sequence, read.quality);
+                continue;
+            }
             try populations.addRetained(allocator, read.sequence, read.quality, read.kept);
             try expected.addRead(allocator, read.sequence[0..read.kept], read.quality[0..read.kept]);
         }
