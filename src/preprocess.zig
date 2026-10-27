@@ -77,6 +77,50 @@ pub const Options = struct {
     }
 };
 
+pub const INSERT_BINS = 512;
+
+pub const InsertCounts = struct {
+    pairs: u64 = 0,
+    overlapping: u64 = 0,
+    histogram: [INSERT_BINS + 1]u64 = @splat(0),
+
+    pub fn add(self: *InsertCounts, result: *const Result) error{Overflow}!void {
+        const lengths = result.overlap_lengths orelse return;
+        self.pairs = try std.math.add(u64, self.pairs, 1);
+        var bin: usize = INSERT_BINS;
+        if (result.overlap) |overlap| {
+            self.overlapping += 1;
+            const size = if (overlap.offset > 0) lengths[0] + lengths[1] - overlap.length else overlap.length;
+            bin = @min(size, INSERT_BINS);
+        }
+        self.histogram[bin] += 1;
+    }
+
+    pub fn unknown(self: *const InsertCounts) u64 {
+        return self.histogram[INSERT_BINS];
+    }
+
+    pub fn peak(self: *const InsertCounts) usize {
+        var best: usize = 0;
+        for (self.histogram[0..INSERT_BINS], 0..) |count, size| {
+            if (count > self.histogram[best]) best = size;
+        }
+        return best;
+    }
+
+    pub fn median(self: *const InsertCounts) ?usize {
+        const known = self.pairs - self.unknown();
+        if (known == 0) return null;
+        const half = known - known / 2;
+        var seen: u64 = 0;
+        for (self.histogram[0..INSERT_BINS], 0..) |count, size| {
+            seen += count;
+            if (seen >= half) return size;
+        }
+        unreachable;
+    }
+};
+
 pub const Reason = enum { too_many_n, too_short, low_quality, adapter_dimer };
 
 pub const REASON_COUNT = @typeInfo(Reason).@"enum".fields.len;
@@ -183,6 +227,7 @@ pub const Result = struct {
     kept: [2]usize,
     removed: [2][STEP_COUNT]usize = @splat(@splat(0)),
     overlap: ?Overlap = null,
+    overlap_lengths: ?[2]usize = null,
     adapter_cut: [2]bool = .{ false, false },
 
     fn cut(self: *Result, mate: usize, step: Step, kept: usize) void {
@@ -233,6 +278,7 @@ pub const Trimmer = struct {
         }
         const adapters = options.adapters orelse return result;
         const reads = [2][]const u8{ sequences[0][0..result.kept[0]], sequences[1][0..result.kept[1]] };
+        result.overlap_lengths = .{ reads[0].len, reads[1].len };
         var windows: [2]Window = .{ .{ .source = reads[0], .complement = false }, .{ .source = reads[1], .complement = false } };
         result.overlap = findOverlap(&windows[0], reads[1]);
         if (result.overlap) |overlap| if (overlap.offset < 0) {
@@ -662,4 +708,79 @@ test "[property] - [preprocess]: vector reverse complement matches the scalar ta
             try std.testing.expectEqualSlices(u8, expected[0..length], target[0..length]);
         }
     }
+}
+
+fn insertOf(options: Options, read1: []const u8, read2: []const u8) InsertCounts {
+    var counts: InsertCounts = .{};
+    const quality1 = ("I" ** 200)[0..read1.len];
+    const quality2 = ("I" ** 200)[0..read2.len];
+    const trimmer: Trimmer = .init(options);
+    const result = trimmer.trimPair(.{ read1, read2 }, .{ quality1, quality2 });
+    counts.add(&result) catch unreachable;
+    return counts;
+}
+
+fn reverseComplementOf(comptime text: []const u8) [text.len]u8 {
+    var out: [text.len]u8 = undefined;
+    for (&out, 0..) |*byte, index| byte.* = COMPLEMENT[text[text.len - 1 - index]];
+    return out;
+}
+
+test "[unit] - [preprocess]: insert sizes follow fastp's overlap formula and its unknown bin" {
+    const fragment = "ACCTTAATGGGCGTGGACGTCTCTTGCTTGGAGGCTGGTGTGCACCCCTCATTATGACATCTCAGGAGAGGTATAGAGGAG";
+    const tail = "AAAGCGGCACTTGTGAAGTGTTCCCCACGCCGCTTGGGTCTTCTGTGTTGTTC";
+    const options: Options = .{ .adapters = .{ "CTGTCTCTTATACACATCT", "CTGTCTCTTATACACATCT" } };
+    const Case = struct { insert: usize, length1: usize, length2: usize, expected: ?usize };
+    const cases = [_]Case{
+        .{ .insert = 40, .length1 = 50, .length2 = 50, .expected = 40 },
+        .{ .insert = 31, .length1 = 50, .length2 = 50, .expected = 31 },
+        .{ .insert = 30, .length1 = 50, .length2 = 50, .expected = null },
+        .{ .insert = 50, .length1 = 50, .length2 = 50, .expected = 50 },
+        .{ .insert = 60, .length1 = 50, .length2 = 50, .expected = 60 },
+        .{ .insert = 69, .length1 = 50, .length2 = 50, .expected = 69 },
+        .{ .insert = 70, .length1 = 50, .length2 = 50, .expected = null },
+        .{ .insert = 45, .length1 = 50, .length2 = 40, .expected = 50 },
+        .{ .insert = 45, .length1 = 40, .length2 = 50, .expected = 40 },
+    };
+    inline for (cases, 0..) |case, index| {
+        errdefer std.debug.print("case {d}\n", .{index});
+        const insert = fragment[0..case.insert];
+        var read1: [100]u8 = undefined;
+        var read2: [100]u8 = undefined;
+        const source1 = insert ++ tail;
+        @memcpy(read1[0..case.length1], source1[0..case.length1]);
+        const complement = reverseComplementOf(insert);
+        var source2: [complement.len + tail.len]u8 = undefined;
+        @memcpy(source2[0..complement.len], &complement);
+        @memcpy(source2[complement.len..], tail);
+        @memcpy(read2[0..case.length2], source2[0..case.length2]);
+        const counts = insertOf(options, read1[0..case.length1], read2[0..case.length2]);
+        try std.testing.expectEqual(@as(u64, 1), counts.pairs);
+        try std.testing.expectEqual(@as(u64, @intFromBool(case.expected != null)), counts.overlapping);
+        try std.testing.expectEqual(@as(u64, @intFromBool(case.expected == null)), counts.unknown());
+        if (case.expected) |size| try std.testing.expectEqual(@as(u64, 1), counts.histogram[size]);
+    }
+    const no_adapters = insertOf(.{ .poly_g = 10 }, fragment[0..40], fragment[0..40]);
+    try std.testing.expectEqual(@as(u64, 0), no_adapters.pairs);
+    const emptied = insertOf(.{ .adapters = options.adapters, .tail = .{ .window = 4, .quality = 20 } }, fragment[0..40], "ACGT");
+    try std.testing.expectEqual(@as(u64, 0), emptied.pairs);
+}
+
+test "[unit] - [preprocess]: the insert peak takes the lowest tied size and the median the lower middle" {
+    var counts: InsertCounts = .{};
+    try std.testing.expectEqual(@as(usize, 0), counts.peak());
+    try std.testing.expectEqual(@as(?usize, null), counts.median());
+    for ([_]usize{ 40, 40, 60, 60, 100 }) |size| {
+        const result: Result = .{ .kept = .{ size, size }, .overlap = .{ .offset = -1, .length = size }, .overlap_lengths = .{ size, size } };
+        try counts.add(&result);
+    }
+    const unknown: Result = .{ .kept = .{ 50, 50 }, .overlap_lengths = .{ 50, 50 } };
+    try counts.add(&unknown);
+    const large: Result = .{ .kept = .{ 600, 600 }, .overlap = .{ .offset = -1, .length = 512 }, .overlap_lengths = .{ 600, 600 } };
+    try counts.add(&large);
+    try std.testing.expectEqual(@as(u64, 7), counts.pairs);
+    try std.testing.expectEqual(@as(u64, 6), counts.overlapping);
+    try std.testing.expectEqual(@as(u64, 2), counts.unknown());
+    try std.testing.expectEqual(@as(usize, 40), counts.peak());
+    try std.testing.expectEqual(@as(?usize, 60), counts.median());
 }

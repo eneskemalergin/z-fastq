@@ -1,9 +1,11 @@
 //! Per-mate FASTQ quality distributions for `process`, computed as FastQC 0.13.0 computes its core
-//! modules: per-cycle quality and base content, per-read quality and GC, read lengths, and
-//! terminal homopolymer runs. The retained population of a trimmed or filtered run counts only
-//! the removed 3' ends and dropped reads per cycle and takes its per-cycle tables as raw minus
-//! removed, until raw drops its tables for a read past the cycle limit; from then on it counts
-//! its reads in full.
+//! modules: per-cycle quality and base content, per-read quality and GC, read lengths, terminal
+//! homopolymer runs, and Adapter Content for FastQC's bundled adapter list, where a read exactly
+//! one adapter long counts as FastQC-Rust counts it. The retained population of a trimmed or
+//! filtered run counts only the removed 3' ends and dropped reads per cycle and takes its
+//! per-cycle tables as raw minus removed, until raw drops its tables for a read past the cycle
+//! limit; from then on it counts its reads in full. Adapter matches are searched once per raw
+//! read and count for the retained read when they lie inside its kept bases.
 
 const std = @import("std");
 const fastq = @import("fastq.zig");
@@ -41,9 +43,30 @@ const BASE_KIND: [256]BaseKind = table: {
     break :table kinds;
 };
 
+const Adapter = struct {
+    name: []const u8,
+    sequence: *const [ADAPTER_LENGTH]u8,
+};
+
+const ADAPTER_LENGTH = 12;
+
+const ADAPTERS = [_]Adapter{
+    .{ .name = "Illumina Universal Adapter", .sequence = "AGATCGGAAGAG" },
+    .{ .name = "Illumina Small RNA 3' Adapter", .sequence = "TGGAATTCTCGG" },
+    .{ .name = "Illumina Small RNA 5' Adapter", .sequence = "GATCGTCGGACT" },
+    .{ .name = "Nextera Transposase Sequence", .sequence = "CTGTCTCTTATA" },
+    .{ .name = "PolyA", .sequence = "AAAAAAAAAAAA" },
+    .{ .name = "PolyG", .sequence = "GGGGGGGGGGGG" },
+};
+
+const ADAPTER_COUNT = ADAPTERS.len;
+const NO_MATCH = std.math.maxInt(u16);
+const AdapterStarts = [ADAPTER_COUNT]u16;
+
 const ReadFacts = struct {
     quality_sum: u64 = 0,
     gc_count: usize = 0,
+    adapter_starts: AdapterStarts = @splat(NO_MATCH),
 };
 
 pub const MatePopulations = struct {
@@ -81,12 +104,16 @@ pub const MatePopulations = struct {
         var facts = self.last;
         if (kept < sequence.len) {
             const removed_sum = try self.removeCycles(allocator, sequence, quality, kept);
-            facts = .{ .quality_sum = facts.quality_sum - removed_sum, .gc_count = gcCountScalar(sequence[0..gcKeptLength(kept)]) };
+            facts.quality_sum -= removed_sum;
+            facts.gc_count = gcCountScalar(sequence[0..gcKeptLength(kept)]);
         } else if (sequence.len > retained.quality.items.len) {
             try retained.growCycles(allocator, sequence.len);
         }
         retained.lengths[kept] += 1;
         self.retained_cycles = @max(self.retained_cycles, kept);
+        for (facts.adapter_starts, &retained.adapter_starts) |start, *starts| {
+            if (start != NO_MATCH and start + ADAPTER_LENGTH <= kept) starts[start] += 1;
+        }
         if (kept != 0) retained.addSummary(sequence[0..kept], facts);
     }
 
@@ -162,6 +189,7 @@ pub const MateQc = struct {
     gc_model: GcModel = .{},
     terminal_g: u64 = 0,
     terminal_a: u64 = 0,
+    adapter_starts: [ADAPTER_COUNT][MAX_CYCLES]u64 = @splat(@splat(0)),
     too_long: bool = false,
     long_stats: statistics.Stats = .{},
 
@@ -210,7 +238,13 @@ pub const MateQc = struct {
             for (quality) |byte| quality_sum += byte;
             break :too_long gcCountScalar(sequence[0..gc_length]);
         } else try self.addCycles(allocator, sequence, quality, gc_length, &quality_sum);
-        const facts: ReadFacts = .{ .quality_sum = quality_sum, .gc_count = gc_count };
+        var facts: ReadFacts = .{ .quality_sum = quality_sum, .gc_count = gc_count };
+        if (!self.too_long) {
+            facts.adapter_starts = firstAdapterMatches(sequence);
+            for (facts.adapter_starts, &self.adapter_starts) |start, *starts| {
+                if (start != NO_MATCH) starts[start] += 1;
+            }
+        }
         if (sequence.len != 0) self.addSummary(sequence, facts);
         return facts;
     }
@@ -319,8 +353,49 @@ pub const MateQc = struct {
         try json.objectField("a");
         try json.write(self.terminal_a);
         try json.endObject();
+        try json.objectField("adapter_content");
+        if (cycles_known) try self.writeAdapterContent(json) else try json.write(null);
         try json.objectField("unavailable");
         if (cycles_known) try json.write(null) else try json.write(TOO_LONG);
+        try json.endObject();
+    }
+
+    fn writeAdapterContent(self: *const MateQc, json: *std.json.Stringify) !void {
+        try json.beginObject();
+        try json.objectField("adapters");
+        try json.beginArray();
+        for (ADAPTERS) |adapter| try json.write(adapter.name);
+        try json.endArray();
+        try json.objectField("rows");
+        try json.beginArray();
+        var reads: u64 = 0;
+        for (self.lengths) |count| reads += count;
+        const longest = std.mem.lastIndexOfNone(u64, &self.lengths, &.{0}) orelse 0;
+        if (reads != 0 and longest > ADAPTER_LENGTH) {
+            const total: f64 = @floatFromInt(reads);
+            var running: [ADAPTER_COUNT]u64 = @splat(0);
+            var position: usize = 0;
+            var groups = Groups.init(longest - ADAPTER_LENGTH + 1);
+            while (groups.next()) |group| {
+                var sums: [ADAPTER_COUNT]f64 = @splat(0);
+                while (position < group.last) : (position += 1) {
+                    for (&running, &sums, &self.adapter_starts) |*count, *sum, *starts| {
+                        count.* += starts[position];
+                        sum.* += @as(f64, @floatFromInt(count.*)) * 100.0 / total;
+                    }
+                }
+                const width: f64 = @floatFromInt(group.last - group.first);
+                try json.beginObject();
+                try json.objectField("position");
+                try writeRangeLabel(json, group.first + 1, group.last);
+                try json.objectField("values");
+                try json.beginArray();
+                for (sums) |sum| try json.write(sum / width);
+                try json.endArray();
+                try json.endObject();
+            }
+        }
+        try json.endArray();
         try json.endObject();
     }
 
@@ -536,6 +611,88 @@ fn cyclePercentile(counts: QualityCounts, reads: u64, percent: u7) usize {
 fn percentOf(count: u64, total: u64) ?f64 {
     if (total == 0) return null;
     return @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(total)) * 100.0;
+}
+
+const WINDOW_BYTES = 8;
+const WINDOW_STRIDE = ADAPTER_LENGTH - WINDOW_BYTES;
+const WINDOW_FOLD: u64 = 0x0101_0101_0101_0101 * CASE_FOLD;
+const WINDOW_SLOT_BITS = 7;
+
+const WindowSlot = struct {
+    key: u64 = 0,
+    adapters: u8 = 0,
+    offsets: [ADAPTER_COUNT]u8 = @splat(0),
+};
+
+fn windowKey(bytes: *const [WINDOW_BYTES]u8) u64 {
+    return std.mem.readInt(u64, bytes, .little) & WINDOW_FOLD;
+}
+
+fn windowSlot(key: u64, multiplier: u64) usize {
+    return @intCast((key *% multiplier) >> (64 - WINDOW_SLOT_BITS));
+}
+
+const WindowTable = struct {
+    multiplier: u64,
+    slots: [1 << WINDOW_SLOT_BITS]WindowSlot,
+};
+
+const WINDOW_TABLE: WindowTable = table: {
+    @setEvalBranchQuota(1_000_000);
+    var multiplier: u64 = 0x9e37_79b9_7f4a_7c15;
+    while (true) : (multiplier +%= 2) {
+        var slots: [1 << WINDOW_SLOT_BITS]WindowSlot = @splat(.{});
+        var clean = true;
+        for (ADAPTERS, 0..) |adapter, index| {
+            for (0..WINDOW_STRIDE) |offset| {
+                const key = windowKey(adapter.sequence[offset..][0..WINDOW_BYTES]);
+                const slot = &slots[windowSlot(key, multiplier)];
+                if (slot.key != 0 and slot.key != key) clean = false;
+                slot.key = key;
+                slot.adapters |= 1 << index;
+                slot.offsets[index] |= 1 << offset;
+            }
+        }
+        if (clean) {
+            const result: WindowTable = .{ .multiplier = multiplier, .slots = slots };
+            break :table result;
+        }
+    }
+};
+
+fn firstAdapterMatches(sequence: []const u8) AdapterStarts {
+    var starts: AdapterStarts = @splat(NO_MATCH);
+    if (sequence.len < ADAPTER_LENGTH) return starts;
+    var found: u8 = 0;
+    var window: usize = 0;
+    while (window + WINDOW_BYTES <= sequence.len) : (window += WINDOW_STRIDE) {
+        const key = windowKey(sequence[window..][0..WINDOW_BYTES]);
+        const slot = &WINDOW_TABLE.slots[windowSlot(key, WINDOW_TABLE.multiplier)];
+        if (slot.key != key or slot.adapters & ~found == 0) continue;
+        for (slot.offsets, 0..) |offsets, adapter| {
+            const bit = @as(u8, 1) << @intCast(adapter);
+            if (offsets == 0 or found & bit != 0) continue;
+            var offset: usize = WINDOW_STRIDE;
+            while (offset > 0) {
+                offset -= 1;
+                if (offsets & (@as(u8, 1) << @intCast(offset)) == 0 or offset > window) continue;
+                const at = window - offset;
+                if (at + ADAPTER_LENGTH <= sequence.len and adapterAt(sequence, at, ADAPTERS[adapter].sequence)) {
+                    starts[adapter] = @intCast(at);
+                    found |= bit;
+                    break;
+                }
+            }
+        }
+        if (found == (1 << ADAPTER_COUNT) - 1) break;
+    }
+    return starts;
+}
+
+fn adapterAt(sequence: []const u8, at: usize, adapter: *const [ADAPTER_LENGTH]u8) bool {
+    const head = std.mem.readInt(u64, sequence[at..][0..8], .little) & WINDOW_FOLD;
+    const tail = std.mem.readInt(u32, sequence[at + 8 ..][0..4], .little) & @as(u32, @truncate(WINDOW_FOLD));
+    return head == std.mem.readInt(u64, adapter[0..8], .little) and tail == std.mem.readInt(u32, adapter[8..12], .little);
 }
 
 fn endsInRun(sequence: []const u8, base: u8) bool {
@@ -819,7 +976,7 @@ test "[edge] - [qc]: a terminal run needs the last ten bases to match" {
     }
 }
 
-test "[edge] - [qc]: a read past the cycle limit makes only the per-cycle modules unavailable" {
+test "[edge] - [qc]: a read past the cycle limit makes only the per-cycle modules unavailable, one at it keeps them" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const long_sequence = try arena.allocator().alloc(u8, MAX_CYCLES + 1);
@@ -830,12 +987,22 @@ test "[edge] - [qc]: a read past the cycle limit makes only the per-cycle module
     defer mate.deinit(std.testing.allocator);
 
     const report = try reportOf(arena.allocator(), &mate);
-    for ([_][]const u8{ "per_base_quality", "per_base_content", "per_base_n", "length_distribution" }) |key| {
+    for ([_][]const u8{ "per_base_quality", "per_base_content", "per_base_n", "length_distribution", "adapter_content" }) |key| {
         try std.testing.expectEqual(std.json.Value.null, report.get(key).?);
     }
     try std.testing.expectEqualStrings(TOO_LONG, report.get("unavailable").?.string);
     try std.testing.expectEqual(@as(usize, 1), report.get("per_sequence_quality").?.array.items.len);
     try std.testing.expectEqual(@as(usize, 0), mate.quality.capacity);
+
+    const limit_sequence = try arena.allocator().dupe(u8, long_sequence[0..MAX_CYCLES]);
+    @memcpy(limit_sequence[MAX_CYCLES - ADAPTER_LENGTH ..], ADAPTERS[0].sequence);
+    var limit = try collect(std.testing.allocator, &.{.{ limit_sequence, long_quality[0..MAX_CYCLES] }});
+    defer limit.deinit(std.testing.allocator);
+    const limit_report = try reportOf(arena.allocator(), &limit);
+    try std.testing.expectEqual(std.json.Value.null, limit_report.get("unavailable").?);
+    const rows = limit_report.get("adapter_content").?.object.get("rows").?.array.items;
+    try std.testing.expectEqualStrings("1000-1013", rows[rows.len - 1].object.get("position").?.string);
+    try std.testing.expectEqual(@as(?f64, 100.0 / 14.0), numberOf(rows[rows.len - 1].object.get("values").?.array.items[0]));
 }
 
 test "[failure] - [qc]: a failed cycle allocation leaves the counts unchanged" {
@@ -909,6 +1076,8 @@ test "[property] - [qc]: a retained population derived from raw equals one colle
     const Read = struct { sequence: []const u8, quality: []const u8, kept: usize, dropped: bool = false };
     const reads = [_]Read{
         .{ .sequence = "ACGTNNacgtGGGG", .quality = "II#5!IIII?5+#2", .kept = 9 },
+        .{ .sequence = "CCAGATCGGAAGAGTTCTGTCTCTTATACC", .quality = "IIIIIIIIIIIIIIIIIIIIIIIIIIIIII", .kept = 25 },
+        .{ .sequence = "AGATCGGAAGAGTTAAAAAAAAAAAAAAAG", .quality = "IIIIIIIIIIIIIIIIIIIIIIIIIIIIII", .kept = 30 },
         .{ .sequence = "GGGCCCAT", .quality = "JJJJJJJJ", .kept = 8 },
         .{ .sequence = "AACCGGTTNNAC", .quality = "IIII#####III", .kept = 12, .dropped = true },
         .{ .sequence = "TTTTAAAAGGGGGGGGGGGG", .quality = "IIIIIIIIIIIIIIIIIII#", .kept = 0 },
@@ -937,12 +1106,115 @@ test "[property] - [qc]: a retained population derived from raw equals one colle
         populations.finish();
         const want = try reportOf(arena.allocator(), &expected);
         const got = try reportOf(arena.allocator(), &populations.retained);
-        inline for (.{ "per_base_quality", "per_base_content", "per_base_n", "length_distribution", "per_sequence_quality", "per_sequence_gc", "terminal_runs", "unavailable" }) |module| {
+        inline for (.{ "per_base_quality", "per_base_content", "per_base_n", "length_distribution", "per_sequence_quality", "per_sequence_gc", "terminal_runs", "adapter_content", "unavailable" }) |module| {
             errdefer std.debug.print("{s}\n", .{module});
             const want_text = try std.json.Stringify.valueAlloc(arena.allocator(), want.get(module).?, .{});
             const got_text = try std.json.Stringify.valueAlloc(arena.allocator(), got.get(module).?, .{});
             try std.testing.expectEqualStrings(want_text, got_text);
         }
         try std.testing.expectEqual(try expected.stats(), try populations.retained.stats());
+    }
+}
+
+fn adapterRows(arena: std.mem.Allocator, reads: []const []const u8) ![]const std.json.Value {
+    var mate: MateQc = .{};
+    defer mate.deinit(std.testing.allocator);
+    for (reads) |read| {
+        const quality = try arena.alloc(u8, read.len);
+        @memset(quality, 'I');
+        try mate.addRead(std.testing.allocator, read, quality);
+    }
+    const report = try reportOf(arena, &mate);
+    return report.get("adapter_content").?.object.get("rows").?.array.items;
+}
+
+fn expectAdapterRow(row: std.json.Value, label: []const u8, values: [ADAPTER_COUNT]f64) !void {
+    try std.testing.expectEqualStrings(label, row.object.get("position").?.string);
+    for (row.object.get("values").?.array.items, values) |got, want| try std.testing.expectEqual(@as(?f64, want), numberOf(got));
+}
+
+test "[property] - [qc]: adapter content counts first exact matches cumulatively over all reads, as FastQC-Rust does" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const u = "AGATCGGAAGAG";
+    const third = 33.333333333333336;
+    const two_thirds = 66.66666666666667;
+
+    const two_starts = try adapterRows(a, &.{ u ++ "CCCCCCCC", "TTTTT" ++ u ++ "GGGG", "ACACACACACACAC" });
+    try std.testing.expectEqual(@as(usize, 10), two_starts.len);
+    try expectAdapterRow(two_starts[0], "1", .{ third, 0, 0, 0, 0, 0 });
+    try expectAdapterRow(two_starts[4], "5", .{ third, 0, 0, 0, 0, 0 });
+    try expectAdapterRow(two_starts[5], "6", .{ two_thirds, 0, 0, 0, 0, 0 });
+    try expectAdapterRow(two_starts[9], "10", .{ two_thirds, 0, 0, 0, 0, 0 });
+
+    const short_first = try adapterRows(a, &.{ "ACGTA", "ACGTACGTACG", u, "C" ++ u });
+    try std.testing.expectEqual(@as(usize, 2), short_first.len);
+    try expectAdapterRow(short_first[0], "1", .{ 25, 0, 0, 0, 0, 0 });
+    try expectAdapterRow(short_first[1], "2", .{ 50, 0, 0, 0, 0, 0 });
+
+    const empty_reads = try adapterRows(a, &.{ "", u ++ "CCCCCCCCC", "", "ACGT" ** 5 });
+    try expectAdapterRow(empty_reads[0], "1", .{ 25, 0, 0, 0, 0, 0 });
+
+    const several_adapters = try adapterRows(a, &.{ u ++ "CCCCC" ++ "TGGAATTCTCGG" ++ "A", "GGGG" ++ "CTGTCTCTTATA" });
+    try expectAdapterRow(several_adapters[several_adapters.len - 1], "19", .{ 50, 50, 0, 50, 0, 0 });
+
+    const repeated = try adapterRows(a, &.{ u ++ "AAAA" ++ u, "C" ** 29 });
+    try expectAdapterRow(repeated[repeated.len - 1], "18", .{ 50, 0, 0, 0, 0, 0 });
+
+    const unknown_bases = try adapterRows(a, &.{ "AGATNGGAAGAG" ++ "CCCCCCCC", "AGATCGGAAGNG" ++ "CCCC", u ++ "CCCC" });
+    try expectAdapterRow(unknown_bases[0], "1", .{ third, 0, 0, 0, 0, 0 });
+
+    const grouped = try adapterRows(a, &.{u ++ "C" ** 75});
+    try std.testing.expectEqual(@as(usize, 43), grouped.len);
+    try expectAdapterRow(grouped[9], "10-11", .{ 100, 0, 0, 0, 0, 0 });
+    try std.testing.expectEqualStrings("76", grouped[42].object.get("position").?.string);
+
+    const short = try adapterRows(a, &.{ u, "ACGTACG" });
+    try std.testing.expectEqual(@as(usize, 0), short.len);
+    const none = try adapterRows(a, &.{});
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+fn firstAdapterMatchesScalar(sequence: []const u8) AdapterStarts {
+    var starts: AdapterStarts = @splat(NO_MATCH);
+    for (ADAPTERS, &starts) |adapter, *start| {
+        for (0..sequence.len -| (ADAPTER_LENGTH - 1)) |at| {
+            if (std.ascii.eqlIgnoreCase(sequence[at..][0..ADAPTER_LENGTH], adapter.sequence)) {
+                start.* = @intCast(at);
+                break;
+            }
+        }
+    }
+    return starts;
+}
+
+test "[property] - [qc]: the strided adapter search finds the first match a direct search finds" {
+    const reads = [_][]const u8{
+        "",                         "AGATCGGAAGA",                          "AGATCGGAAGAG",      "agatcggaagagNAGATCGGAAGAG", "GGGGGGGGGGGGGG", "AAAAAAAAAAAAAAAAAGATCGGAAGAG",
+        "CTGTCTCTTATACTGTCTCTTATA", "TGGAATTCTCGGATCGTCGGACTRAAAAAAAAAAAA", "ACGTNACGTACGTACGT", "GATCGTCGGACTGATCGTCGGACT",
+    };
+    for (reads, 0..) |text, index| {
+        errdefer std.debug.print("read {d}\n", .{index});
+        try std.testing.expectEqual(firstAdapterMatchesScalar(text), firstAdapterMatches(text));
+    }
+    var read: [80]u8 = undefined;
+    var state: u32 = 3;
+    for (&read) |*base| {
+        state = state *% 1103515245 +% 12345;
+        base.* = "ACGTacgt"[(state >> 16) & 7];
+    }
+    for (ADAPTERS, 0..) |adapter, adapter_index| {
+        for ([_]usize{ 0, 11, 12, 13, 15, 16, 19, 20, 23, 31, 40, 79, 80 }) |length| {
+            for (0..length -| (ADAPTER_LENGTH - 1)) |at| {
+                errdefer std.debug.print("adapter {d} length {d} at {d}\n", .{ adapter_index, length, at });
+                var copy = read;
+                @memcpy(copy[at..][0..ADAPTER_LENGTH], adapter.sequence);
+                if (at % 3 == 1) copy[at + 4] = std.ascii.toLower(copy[at + 4]);
+                if (at % 7 == 2 and at + 20 < length) @memcpy(copy[at + 8 ..][0..ADAPTER_LENGTH], adapter.sequence);
+                if (at % 5 == 3) copy[(at + 6) % length] = 'N';
+                try std.testing.expectEqual(firstAdapterMatchesScalar(copy[0..length]), firstAdapterMatches(copy[0..length]));
+            }
+        }
     }
 }

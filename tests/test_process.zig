@@ -172,6 +172,7 @@ test "[cli] - [process]: pairs pass through with LF endings and the report count
     try std.testing.expectEqual(std.json.Value.null, report.get("options").?.object.get("adapter1").?);
     try std.testing.expectEqual(std.json.Value.null, report.get("options").?.object.get("min_length").?);
     try std.testing.expectEqual(std.json.Value.null, report.get("filtering").?);
+    try std.testing.expectEqual(std.json.Value.null, report.get("inserts").?);
     try cli.expectJsonInteger(report.get("pairs").?.object.get("dropped"), 0);
     try std.testing.expectEqual(std.json.Value.null, report.get("error").?);
     try std.testing.expectEqual(std.json.Value.null, report.get("failed_input").?);
@@ -624,6 +625,52 @@ test "[cli] - [process]: filters drop whole pairs, count each reason, and keep t
     const retained_lengths = report.get("qc").?.object.get("retained").?.array.items[0].object.get("length_distribution").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), retained_lengths.len);
     try cli.expectJsonInteger(retained_lengths[0].object.get("count"), 1);
+}
+
+test "[cli] - [process]: the report counts inserts from the mate overlap and adapter content per population" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const p = try Paths.init(allocator, &tmp);
+    const quality = "I" ** 50;
+    const r1 = "@overlap/1\nACCTTAATGGGCGTGGACGTCTCTTGCTTGGAGGCTGGTGAAAGCGGCAC\n+\n" ++ quality ++ "\n@apart/1\nAGATCGGAAGAGTTTTCCCCAAAAGGGGTTTTCCCCAAAAGGGGTTTTCC\n+\n" ++ quality ++ "\n";
+    const r2 = "@overlap/2\nCACCAGCCTCCAAGCAAGAGACGTCCACGCCCATTAAGGTAAAGCGGCAC\n+\n" ++ quality ++ "\n@apart/2\nGGGGGGGGGGGGGGGGACACACACACACACACACACACACACACACACAC\n+\n" ++ quality ++ "\n";
+    try writeInputs(&tmp, r1, r2);
+
+    const result = try cli.run(allocator, &.{ "process", "--report", "-", "--adapter1", RF1, "--adapter2", RF2, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 });
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    const report = try parseReport(allocator, result.stdout);
+    const inserts = report.get("inserts").?.object;
+    try cli.expectJsonInteger(inserts.get("pairs"), 2);
+    try cli.expectJsonInteger(inserts.get("overlapping"), 1);
+    try cli.expectJsonInteger(inserts.get("unknown"), 1);
+    try cli.expectJsonInteger(inserts.get("peak"), 40);
+    try cli.expectJsonInteger(inserts.get("median"), 40);
+    const histogram = inserts.get("histogram").?.array.items;
+    try std.testing.expectEqual(@as(usize, 512), histogram.len);
+    try cli.expectJsonInteger(histogram[40], 1);
+
+    const qc = report.get("qc").?.object;
+    for ([_][]const u8{ "raw", "retained" }) |population| {
+        const content = qc.get(population).?.array.items[0].object.get("adapter_content").?.object;
+        try std.testing.expectEqual(@as(usize, 6), content.get("adapters").?.array.items.len);
+        try cli.expectJsonString(content.get("adapters").?.array.items[0], "Illumina Universal Adapter");
+        const rows = content.get("rows").?.array.items;
+        try std.testing.expect(rows.len > 0);
+        try std.testing.expectEqual(@as(?f64, 50), numberValue(rows[0].object.get("values").?.array.items[0]));
+    }
+    const raw_mate2 = qc.get("raw").?.array.items[1].object.get("adapter_content").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(?f64, 50), numberValue(raw_mate2[0].object.get("values").?.array.items[5]));
+}
+
+fn numberValue(value: std.json.Value) ?f64 {
+    return switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        else => null,
+    };
 }
 
 test "[cli] - [process]: a malformed record after dropped pairs still fails the run" {

@@ -4108,6 +4108,7 @@ fn runProcess(
         .changes_reads = changes_reads,
         .trimming = &collectors.trimming,
         .filtering = &collectors.filtering,
+        .inserts = &collectors.inserts,
         .input_failure = input_failure,
         .failed_output = if (failed_output) |index| paths[index] else null,
     };
@@ -4126,6 +4127,7 @@ const ProcessCollectors = struct {
     qc: [2]qc.MatePopulations = .{ .{}, .{} },
     trimming: [2]preprocess.MateCounts = .{ .{}, .{} },
     filtering: preprocess.FilterCounts = .{},
+    inserts: preprocess.InsertCounts = .{},
 
     fn deinit(self: *ProcessCollectors, allocator: std.mem.Allocator) void {
         for (&self.qc) |*populations| populations.deinit(allocator);
@@ -4279,6 +4281,10 @@ const ProcessPairs = struct {
             .{ records[0].sequence, records[1].sequence },
             .{ records[0].quality, records[1].quality },
         );
+        self.collectors.inserts.add(&result) catch {
+            self.trim_failure = pairCommandFailure(0, STATISTICS_LIMIT);
+            return error.TrimFailed;
+        };
         for (&self.collectors.trimming, result.removed, 0..) |*counts, removed, index| {
             counts.add(removed) catch {
                 self.trim_failure = pairCommandFailure(@intCast(index), STATISTICS_LIMIT);
@@ -4435,6 +4441,7 @@ const ProcessReport = struct {
     changes_reads: bool,
     trimming: *const [2]preprocess.MateCounts,
     filtering: *const preprocess.FilterCounts,
+    inserts: *const preprocess.InsertCounts,
     input_failure: ?PairCommandFailure,
     failed_output: ?[]const u8,
 };
@@ -4540,6 +4547,8 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     try json.endArray();
     try json.objectField("filtering");
     if (report.changes_reads) try writeFilterCounts(json, report.filtering) else try json.write(null);
+    try json.objectField("inserts");
+    if (trim.adapters != null) try writeInsertCounts(json, report.inserts) else try json.write(null);
 
     const failed_input: ?[]const u8 = if (report.input_failure) |failure| switch (failure) {
         .command => |details| report.inputs[details.input_index],
@@ -4586,6 +4595,25 @@ fn writeTrimCounts(
         try json.write(step_counts.bases);
         try json.endObject();
     }
+    try json.endObject();
+}
+
+fn writeInsertCounts(json: *std.json.Stringify, counts: *const preprocess.InsertCounts) !void {
+    try json.beginObject();
+    try json.objectField("pairs");
+    try json.write(counts.pairs);
+    try json.objectField("overlapping");
+    try json.write(counts.overlapping);
+    try json.objectField("unknown");
+    try json.write(counts.unknown());
+    try json.objectField("peak");
+    try json.write(counts.peak());
+    try json.objectField("median");
+    try json.write(counts.median());
+    try json.objectField("histogram");
+    try json.beginArray();
+    for (counts.histogram[0..preprocess.INSERT_BINS]) |count| try json.write(count);
+    try json.endArray();
     try json.endObject();
 }
 
