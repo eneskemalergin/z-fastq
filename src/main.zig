@@ -4344,7 +4344,7 @@ const ProcessPairs = struct {
     ) DeinterleaveWriteError!?PairCommandFailure {
         self.counts.read += 1;
         if (self.collect_qc) for (&self.collectors.qc, records, 0..) |*collector, record, index| {
-            collector.addRead(self.allocator, record.sequence, record.quality) catch |err| {
+            collector.addRead(self.allocator, record.header, record.sequence, record.quality) catch |err| {
                 return pairCommandFailure(@intCast(index), qcFailure(err));
             };
         };
@@ -4403,7 +4403,7 @@ const ProcessPairs = struct {
         var trimmed = records;
         var trimmed_spans = spans;
         for (&trimmed, &trimmed_spans, result.kept, 0..) |*record, *span, kept, index| {
-            if (self.collect_qc) self.collectors.qc[index].addRetained(self.allocator, record.sequence, record.quality, kept) catch |err| {
+            if (self.collect_qc) self.collectors.qc[index].addRetained(self.allocator, record.header, record.sequence, record.quality, kept) catch |err| {
                 self.trim_failure = pairCommandFailure(@intCast(index), qcFailure(err));
                 return error.TrimFailed;
             };

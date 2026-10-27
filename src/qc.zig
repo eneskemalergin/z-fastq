@@ -85,12 +85,16 @@ pub const MatePopulations = struct {
     retained_sequences: SequenceCounts = .{},
     retained_enabled: bool = false,
     last_key: SequenceKey = .{},
+    raw_tiles: TileQuality = .{},
+    retained_tiles: TileQuality = .{},
 
     pub fn deinit(self: *MatePopulations, allocator: std.mem.Allocator) void {
         self.raw.deinit(allocator);
         self.retained.deinit(allocator);
         self.raw_sequences.deinit(allocator);
         self.retained_sequences.deinit(allocator);
+        self.raw_tiles.deinit(allocator);
+        self.retained_tiles.deinit(allocator);
     }
 
     pub fn enableRetained(self: *MatePopulations) void {
@@ -101,6 +105,7 @@ pub const MatePopulations = struct {
     pub fn addRead(
         self: *MatePopulations,
         allocator: std.mem.Allocator,
+        header: []const u8,
         sequence: []const u8,
         quality: []const u8,
     ) (error{OutOfMemory} || statistics.StatsError)!void {
@@ -110,6 +115,7 @@ pub const MatePopulations = struct {
         self.raw_sequences.prefetch(key);
         self.last = try self.raw.collect(allocator, sequence, quality);
         self.raw_sequences.add(key);
+        try self.raw_tiles.add(allocator, header, quality);
         if (self.retained_enabled) {
             self.last_key = key;
             self.retained_sequences.prefetch(key);
@@ -119,6 +125,7 @@ pub const MatePopulations = struct {
     pub fn addRetained(
         self: *MatePopulations,
         allocator: std.mem.Allocator,
+        header: []const u8,
         sequence: []const u8,
         quality: []const u8,
         kept: usize,
@@ -127,6 +134,7 @@ pub const MatePopulations = struct {
         std.debug.assert(self.retained_enabled);
         const key = if (kept >= @min(sequence.len, KEY_LENGTH)) self.last_key else SequenceKey.of(sequence[0..kept]);
         try self.retained_sequences.reserve(allocator);
+        try self.retained_tiles.add(allocator, header, quality[0..kept]);
         if (!self.derived) {
             try self.retained.addRead(allocator, sequence[0..kept], quality[0..kept]);
             self.retained_sequences.add(key);
@@ -192,7 +200,11 @@ pub const MatePopulations = struct {
     }
 
     pub fn writeJson(self: *const MatePopulations, json: *std.json.Stringify, retained: bool, contaminants: ?*const ContaminantList) !void {
-        const view: SequenceView = .{ .counts = if (retained) &self.retained_sequences else &self.raw_sequences, .contaminants = contaminants };
+        const view: PopulationView = .{
+            .counts = if (retained) &self.retained_sequences else &self.raw_sequences,
+            .tiles = if (retained) &self.retained_tiles else &self.raw_tiles,
+            .contaminants = contaminants,
+        };
         try (if (retained) &self.retained else &self.raw).writeJson(json, view);
     }
 
@@ -363,7 +375,7 @@ pub const MateQc = struct {
         return result;
     }
 
-    fn writeJson(self: *const MateQc, json: *std.json.Stringify, sequences: SequenceView) !void {
+    fn writeJson(self: *const MateQc, json: *std.json.Stringify, sequences: PopulationView) !void {
         std.debug.assert(self.pending_reads == 0);
         try json.beginObject();
         const cycles_known = !self.too_long;
@@ -398,6 +410,10 @@ pub const MateQc = struct {
         try sequences.writeDuplication(json);
         try json.objectField("overrepresented");
         try sequences.writeOverrepresented(json);
+        try json.objectField("per_tile_quality");
+        try sequences.tiles.writeJson(json);
+        try json.objectField("per_tile_unavailable");
+        try json.write(sequences.tiles.unavailable());
         try json.objectField("unavailable");
         if (cycles_known) try json.write(null) else try json.write(TOO_LONG);
         try json.endObject();
@@ -1151,15 +1167,16 @@ const SequenceCounts = struct {
     }
 };
 
-const SequenceView = struct {
+const PopulationView = struct {
     counts: *const SequenceCounts,
+    tiles: *const TileQuality,
     contaminants: ?*const ContaminantList,
 
-    fn writeDuplication(self: SequenceView, json: *std.json.Stringify) !void {
+    fn writeDuplication(self: PopulationView, json: *std.json.Stringify) !void {
         try self.counts.writeDuplication(json);
     }
 
-    fn writeOverrepresented(self: SequenceView, json: *std.json.Stringify) !void {
+    fn writeOverrepresented(self: PopulationView, json: *std.json.Stringify) !void {
         try self.counts.writeOverrepresented(json, self.contaminants);
     }
 };
@@ -1342,6 +1359,262 @@ pub const ContaminantList = struct {
     }
 };
 
+const TILE_LIMIT = 2500;
+const TILE_SAMPLE_ALL = 10_000;
+const TILE_SAMPLE_EVERY = 10;
+const TILE_FLUSH_READS = 1 << 24;
+const NO_TILE_FIELD = "the read headers have no tile field";
+const BAD_TILE = "a read header has no valid tile number";
+const TOO_MANY_TILES = "more than 2500 tiles";
+const NO_TILE_READS = "no read has a quality string";
+
+const TileQuality = struct {
+    tiles: std.ArrayList(Tile) = .empty,
+    index: std.AutoHashMapUnmanaged(i32, u32) = .empty,
+    reads: u64 = 0,
+    countdown: u8 = TILE_SAMPLE_EVERY,
+    last: ?u32 = null,
+    longest: usize = 0,
+    field: ?u3 = null,
+    stopped: ?[]const u8 = null,
+
+    const Tile = struct {
+        number: i32,
+        pending: u32 = 0,
+        sums: std.ArrayList(u32) = .empty,
+        lengths: std.ArrayList(u32) = .empty,
+        carried_sums: std.ArrayList(u64) = .empty,
+        carried_lengths: std.ArrayList(u64) = .empty,
+
+        fn deinit(self: *Tile, allocator: std.mem.Allocator) void {
+            self.sums.deinit(allocator);
+            self.lengths.deinit(allocator);
+            self.carried_sums.deinit(allocator);
+            self.carried_lengths.deinit(allocator);
+        }
+
+        fn flush(self: *Tile, allocator: std.mem.Allocator) error{OutOfMemory}!void {
+            try self.carried_sums.ensureTotalCapacity(allocator, self.sums.items.len);
+            try self.carried_lengths.ensureTotalCapacity(allocator, self.lengths.items.len);
+            self.carried_sums.appendNTimesAssumeCapacity(0, self.sums.items.len - self.carried_sums.items.len);
+            self.carried_lengths.appendNTimesAssumeCapacity(0, self.lengths.items.len - self.carried_lengths.items.len);
+            for (self.carried_sums.items, self.sums.items) |*total, *partial| {
+                total.* += partial.*;
+                partial.* = 0;
+            }
+            for (self.carried_lengths.items, self.lengths.items) |*total, *count| {
+                total.* += count.*;
+                count.* = 0;
+            }
+            self.pending = 0;
+        }
+
+        fn qualitySum(self: *const Tile, position: usize) u64 {
+            const carried = if (position < self.carried_sums.items.len) self.carried_sums.items[position] else 0;
+            return carried + self.sums.items[position];
+        }
+
+        fn readsOfLength(self: *const Tile, length: usize) u64 {
+            const carried = if (length < self.carried_lengths.items.len) self.carried_lengths.items[length] else 0;
+            return carried + self.lengths.items[length];
+        }
+    };
+
+    fn deinit(self: *TileQuality, allocator: std.mem.Allocator) void {
+        for (self.tiles.items) |*tile| tile.deinit(allocator);
+        self.tiles.deinit(allocator);
+        self.index.deinit(allocator);
+    }
+
+    fn stop(self: *TileQuality, allocator: std.mem.Allocator, reason: []const u8) void {
+        self.deinit(allocator);
+        self.* = .{ .reads = self.reads, .stopped = reason };
+    }
+
+    inline fn add(self: *TileQuality, allocator: std.mem.Allocator, header: []const u8, quality: []const u8) error{OutOfMemory}!void {
+        if (self.stopped != null or quality.len == 0) return;
+        self.reads += 1;
+        if (self.reads > TILE_SAMPLE_ALL) {
+            self.countdown -= 1;
+            if (self.countdown != 0) return;
+            self.countdown = TILE_SAMPLE_EVERY;
+        }
+        return self.addSampled(allocator, header, quality);
+    }
+
+    fn addSampled(self: *TileQuality, allocator: std.mem.Allocator, header: []const u8, quality: []const u8) error{OutOfMemory}!void {
+        if (quality.len > MAX_CYCLES) return self.stop(allocator, TOO_LONG);
+        const number = self.tileNumber(header) catch |err| return self.stop(allocator, switch (err) {
+            error.NoTileField => NO_TILE_FIELD,
+            error.BadTile => BAD_TILE,
+        });
+        const cached = if (self.last) |position| self.tiles.items[position].number == number else false;
+        const found = if (cached) self.last else self.index.get(number);
+        const tile = if (found) |position| tile: {
+            self.last = position;
+            break :tile &self.tiles.items[position];
+        } else created: {
+            if (self.tiles.items.len > TILE_LIMIT) return self.stop(allocator, TOO_MANY_TILES);
+            try self.tiles.ensureUnusedCapacity(allocator, 1);
+            try self.index.ensureUnusedCapacity(allocator, 1);
+            self.index.putAssumeCapacityNoClobber(number, @intCast(self.tiles.items.len));
+            self.tiles.appendAssumeCapacity(.{ .number = number });
+            self.last = @intCast(self.tiles.items.len - 1);
+            break :created &self.tiles.items[self.tiles.items.len - 1];
+        };
+        if (tile.sums.items.len < quality.len) {
+            try tile.sums.ensureTotalCapacity(allocator, quality.len);
+            try tile.lengths.ensureTotalCapacity(allocator, quality.len + 1);
+            tile.sums.appendNTimesAssumeCapacity(0, quality.len - tile.sums.items.len);
+            tile.lengths.appendNTimesAssumeCapacity(0, quality.len + 1 - tile.lengths.items.len);
+        }
+        if (tile.pending == TILE_FLUSH_READS) try tile.flush(allocator);
+        for (quality, tile.sums.items[0..quality.len]) |byte, *sum| sum.* += byte - PHRED_OFFSET;
+        tile.lengths.items[quality.len] += 1;
+        tile.pending += 1;
+        self.longest = @max(self.longest, quality.len);
+    }
+
+    fn tileNumber(self: *TileQuality, header: []const u8) error{ NoTileField, BadTile }!i32 {
+        if (self.field) |field| {
+            const text = headerField(header, field) orelse return error.BadTile;
+            return javaInt(text) orelse error.BadTile;
+        }
+        var fields: [7][]const u8 = undefined;
+        var count: usize = 0;
+        var rest = header;
+        var trailing_empty: usize = 0;
+        while (true) {
+            const end = std.mem.indexOfScalar(u8, rest, ':') orelse rest.len;
+            const field = rest[0..end];
+            if (count < fields.len) fields[count] = field;
+            trailing_empty = if (count > 0 and field.len == 0) trailing_empty + 1 else 0;
+            count += 1;
+            if (end == rest.len) break;
+            rest = rest[end + 1 ..];
+        }
+        count -= trailing_empty;
+        const field: u3 = if (count >= 7) 4 else if (count >= 5) 2 else return error.NoTileField;
+        self.field = field;
+        return javaInt(fields[field]) orelse error.BadTile;
+    }
+
+    fn headerField(header: []const u8, field: usize) ?[]const u8 {
+        const Chunk = @Vector(16, u8);
+        var seen: usize = 0;
+        var start: usize = 0;
+        var offset: usize = 0;
+        while (offset + 16 <= header.len) : (offset += 16) {
+            const chunk: Chunk = header[offset..][0..16].*;
+            var colons: u16 = @bitCast(chunk == @as(Chunk, @splat(':')));
+            while (colons != 0) : (colons &= colons - 1) {
+                const at = offset + @ctz(colons);
+                if (seen == field) return header[start..at];
+                seen += 1;
+                start = at + 1;
+            }
+        }
+        for (header[offset..], offset..) |byte, at| {
+            if (byte != ':') continue;
+            if (seen == field) return header[start..at];
+            seen += 1;
+            start = at + 1;
+        }
+        return if (seen == field) header[start..] else null;
+    }
+
+    fn javaInt(text: []const u8) ?i32 {
+        const digits = if (text.len > 0 and (text[0] == '+' or text[0] == '-')) text[1..] else text;
+        if (digits.len == 0) return null;
+        var value: i64 = 0;
+        for (digits) |byte| {
+            if (byte < '0' or byte > '9') return null;
+            value = value * 10 + (byte - '0');
+            if (value > 1 << 31) return null;
+        }
+        if (text[0] == '-') value = -value;
+        return std.math.cast(i32, value);
+    }
+
+    fn unavailable(self: *const TileQuality) ?[]const u8 {
+        if (self.stopped) |reason| return reason;
+        if (self.longest == 0) return NO_TILE_READS;
+        return null;
+    }
+
+    fn mean(tile: *const Tile, group: Group, counts: []const u64) f64 {
+        var total: f64 = 0;
+        var positions: usize = 0;
+        for (group.first..group.last) |position| {
+            if (position >= tile.sums.items.len or counts[position] == 0) continue;
+            total += @as(f64, @floatFromInt(tile.qualitySum(position))) / @as(f64, @floatFromInt(counts[position]));
+            positions += 1;
+        }
+        return if (positions == 0) 0 else total / @as(f64, @floatFromInt(positions));
+    }
+
+    fn positionCounts(tile: *const Tile, counts: *[MAX_CYCLES]u64) void {
+        var reads: u64 = 0;
+        var position = tile.lengths.items.len;
+        while (position > 0) {
+            position -= 1;
+            if (position < MAX_CYCLES) counts[position] = reads;
+            reads += tile.readsOfLength(position);
+        }
+    }
+
+    fn lessNumber(self: *const TileQuality, a: u16, b: u16) bool {
+        return self.tiles.items[a].number < self.tiles.items[b].number;
+    }
+
+    fn writeJson(self: *const TileQuality, json: *std.json.Stringify) !void {
+        if (self.unavailable() != null) return json.write(null);
+        var order: [TILE_LIMIT + 1]u16 = undefined;
+        const sorted = order[0..self.tiles.items.len];
+        for (sorted, 0..) |*entry, index| entry.* = @intCast(index);
+        std.sort.pdq(u16, sorted, self, lessNumber);
+        const groups = Groups.init(self.longest);
+        var counts: [MAX_CYCLES]u64 = undefined;
+        var averages: [MAX_CYCLES]f64 = @splat(0);
+        for (sorted) |entry| {
+            const tile = &self.tiles.items[entry];
+            positionCounts(tile, &counts);
+            var iterator = groups;
+            var index: usize = 0;
+            while (iterator.next()) |group| : (index += 1) averages[index] += mean(tile, group, &counts);
+        }
+        const tile_count: f64 = @floatFromInt(sorted.len);
+        try json.beginObject();
+        try json.objectField("positions");
+        try json.beginArray();
+        var labels = groups;
+        var group_count: usize = 0;
+        while (labels.next()) |group| : (group_count += 1) {
+            averages[group_count] /= tile_count;
+            try writeRangeLabel(json, group.first + 1, group.last);
+        }
+        try json.endArray();
+        try json.objectField("tiles");
+        try json.beginArray();
+        for (sorted) |entry| {
+            const tile = &self.tiles.items[entry];
+            positionCounts(tile, &counts);
+            try json.beginObject();
+            try json.objectField("tile");
+            try json.write(tile.number);
+            try json.objectField("deviations");
+            try json.beginArray();
+            var iterator = groups;
+            var index: usize = 0;
+            while (iterator.next()) |group| : (index += 1) try json.write(mean(tile, group, &counts) - averages[index]);
+            try json.endArray();
+            try json.endObject();
+        }
+        try json.endArray();
+        try json.endObject();
+    }
+};
+
 const TestRead = struct { []const u8, []const u8 };
 
 fn collect(allocator: std.mem.Allocator, reads: []const TestRead) !MateQc {
@@ -1357,7 +1630,8 @@ fn reportOf(arena: std.mem.Allocator, mate: *MateQc) !std.json.ObjectMap {
     try sequences.finish(arena);
     var output: std.Io.Writer.Allocating = .init(arena);
     var json: std.json.Stringify = .{ .writer = &output.writer };
-    try mate.writeJson(&json, .{ .counts = &sequences, .contaminants = null });
+    const tiles: TileQuality = .{};
+    try mate.writeJson(&json, .{ .counts = &sequences, .tiles = &tiles, .contaminants = null });
     const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, output.written(), .{});
     return value.object;
 }
@@ -1544,9 +1818,9 @@ test "[failure] - [qc]: a failed retained allocation leaves the retained counts 
     var populations: MatePopulations = .{};
     defer populations.deinit(failing.allocator());
     populations.enableRetained();
-    try populations.addRead(failing.allocator(), "ACGT", "IIII");
+    try populations.addRead(failing.allocator(), "r", "ACGT", "IIII");
     failing.fail_index = failing.alloc_index;
-    try std.testing.expectError(error.OutOfMemory, populations.addRetained(failing.allocator(), "ACGT", "IIII", 2));
+    try std.testing.expectError(error.OutOfMemory, populations.addRetained(failing.allocator(), "r", "ACGT", "IIII", 2));
     try std.testing.expectEqual(@as(u64, 0), populations.retained.lengths[2]);
     try std.testing.expectEqual(@as(usize, 0), populations.retained_cycles);
     try std.testing.expectEqual(@as(u64, 1), populations.raw.lengths[4]);
@@ -1623,19 +1897,19 @@ test "[property] - [qc]: a retained population derived from raw equals one colle
         var expected: MatePopulations = .{};
         defer expected.deinit(allocator);
         for (reads[0..count]) |read| {
-            try populations.addRead(allocator, read.sequence, read.quality);
+            try populations.addRead(allocator, "A00123:8:HFLKW:1:1101:1:2 1:N:0:ACGT", read.sequence, read.quality);
             if (read.dropped) {
                 try populations.dropRetained(allocator, read.sequence, read.quality);
                 continue;
             }
-            try populations.addRetained(allocator, read.sequence, read.quality, read.kept);
-            try expected.addRead(allocator, read.sequence[0..read.kept], read.quality[0..read.kept]);
+            try populations.addRetained(allocator, "A00123:8:HFLKW:1:1101:1:2 1:N:0:ACGT", read.sequence, read.quality, read.kept);
+            try expected.addRead(allocator, "A00123:8:HFLKW:1:1101:1:2 1:N:0:ACGT", read.sequence[0..read.kept], read.quality[0..read.kept]);
         }
         try populations.finish(allocator);
         try expected.finish(allocator);
         const want = try populationReportOf(arena.allocator(), &expected, false);
         const got = try populationReportOf(arena.allocator(), &populations, true);
-        inline for (.{ "per_base_quality", "per_base_content", "per_base_n", "length_distribution", "per_sequence_quality", "per_sequence_gc", "terminal_runs", "adapter_content", "duplication", "overrepresented", "unavailable" }) |module| {
+        inline for (.{ "per_base_quality", "per_base_content", "per_base_n", "length_distribution", "per_sequence_quality", "per_sequence_gc", "terminal_runs", "adapter_content", "duplication", "overrepresented", "per_tile_quality", "per_tile_unavailable", "unavailable" }) |module| {
             errdefer std.debug.print("{s}\n", .{module});
             const want_text = try std.json.Stringify.valueAlloc(arena.allocator(), want.get(module).?, .{});
             const got_text = try std.json.Stringify.valueAlloc(arena.allocator(), got.get(module).?, .{});
@@ -1949,4 +2223,107 @@ test "[unit] - [qc]: contaminant hits follow FastQC's exact and one-mismatch win
 
     try std.testing.expectError(error.InvalidBase, ContaminantList.parse(std.testing.allocator, "ok\tACGT\nbad\tACNT\n", &failed_line));
     try std.testing.expectEqual(@as(usize, 2), failed_line);
+}
+
+fn casavaHeader(buffer: []u8, tile: i64) []const u8 {
+    return std.fmt.bufPrint(buffer, "A00123:8:HFLKW:1:{d}:1000:2000 1:N:0:ACGT", .{tile}) catch unreachable;
+}
+
+fn tileRows(arena: std.mem.Allocator, tiles: *const TileQuality) !std.json.Value {
+    var output: std.Io.Writer.Allocating = .init(arena);
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try tiles.writeJson(&json);
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, output.written(), .{});
+}
+
+test "[unit] - [qc]: the tile is header field 4 of 7 or more, or field 2 of 5 or 6, as a Java int" {
+    const Case = struct { headers: []const []const u8, tile: ?i32, reason: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{ .headers = &.{"A00123:8:HFLKW:1:1101:1000:2000 1:N:0:ACGT"}, .tile = 1101 },
+        .{ .headers = &.{"HWUSI-EAS100R:6:73:941:1973#0/1"}, .tile = 73 },
+        .{ .headers = &.{"A:B:C:D:+0012:E:F"}, .tile = 12 },
+        .{ .headers = &.{"A:B:C:D:-2147483648:E:F"}, .tile = -2147483648 },
+        .{ .headers = &.{"A:B:C:D:2147483648:E:F"}, .tile = null, .reason = BAD_TILE },
+        .{ .headers = &.{"A:B:C:D:+:E:F"}, .tile = null, .reason = BAD_TILE },
+        .{ .headers = &.{"A:B:12:D:"}, .tile = null, .reason = NO_TILE_FIELD },
+        .{ .headers = &.{"A:B:12:D:E::"}, .tile = 12 },
+        .{ .headers = &.{"read1/1"}, .tile = null, .reason = NO_TILE_FIELD },
+        .{ .headers = &.{ "HWUSI:6:73:941:1973", "A00123:8:HFLKW:1:1101:1000:2000" }, .tile = null, .reason = BAD_TILE },
+        .{ .headers = &.{ "A00123:8:HFLKW:1:1101:1000:2000", "A:B:C" }, .tile = null, .reason = BAD_TILE },
+    };
+    for (cases, 0..) |case, index| {
+        errdefer std.debug.print("case {d}\n", .{index});
+        var tiles: TileQuality = .{};
+        defer tiles.deinit(std.testing.allocator);
+        for (case.headers) |header| try tiles.add(std.testing.allocator, header, "IIII");
+        try std.testing.expectEqual(case.reason, tiles.stopped);
+        if (case.tile) |tile| try std.testing.expectEqual(tile, tiles.tiles.items[0].number);
+    }
+}
+
+test "[unit] - [qc]: tile deviations are tile means minus the average of tile means, 0 for an uncovered group" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tiles: TileQuality = .{};
+    defer tiles.deinit(std.testing.allocator);
+    var buffer: [64]u8 = undefined;
+    for (0..3) |_| try tiles.add(std.testing.allocator, casavaHeader(&buffer, 2101), "??");
+    for (0..2) |_| try tiles.add(std.testing.allocator, casavaHeader(&buffer, 1101), "5555");
+    try tiles.add(std.testing.allocator, casavaHeader(&buffer, 1101), "+");
+    const value = try tileRows(arena.allocator(), &tiles);
+    const rows = value.object.get("tiles").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), value.object.get("positions").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 1101), rows[0].object.get("tile").?.integer);
+    const low = rows[0].object.get("deviations").?.array.items;
+    const high = rows[1].object.get("deviations").?.array.items;
+    const first_low: f64 = (20.0 + 20.0 + 10.0) / 3.0;
+    try std.testing.expectEqual(first_low - (first_low + 30.0) / 2.0, numberOf(low[0]).?);
+    try std.testing.expectEqual(20.0 - (20.0 + 30.0) / 2.0, numberOf(low[1]).?);
+    try std.testing.expectEqual(20.0 - (20.0 + 0.0) / 2.0, numberOf(low[2]).?);
+    try std.testing.expectEqual(0.0 - (20.0 + 0.0) / 2.0, numberOf(high[3]).?);
+}
+
+test "[edge] - [qc]: after 10,000 reads every tenth read counts, and a 2,502nd tile stops the module" {
+    var buffer: [64]u8 = undefined;
+    var tiles: TileQuality = .{};
+    defer tiles.deinit(std.testing.allocator);
+    for (0..10_000) |_| try tiles.add(std.testing.allocator, casavaHeader(&buffer, 1101), "I");
+    try tiles.add(std.testing.allocator, casavaHeader(&buffer, 1101), "");
+    for (0..9) |_| try tiles.add(std.testing.allocator, casavaHeader(&buffer, 7), "I");
+    try std.testing.expectEqual(@as(usize, 1), tiles.tiles.items.len);
+    try tiles.add(std.testing.allocator, casavaHeader(&buffer, 7), "I");
+    try std.testing.expectEqual(@as(usize, 2), tiles.tiles.items.len);
+
+    var many: TileQuality = .{};
+    defer many.deinit(std.testing.allocator);
+    for (0..TILE_LIMIT + 1) |tile| try many.add(std.testing.allocator, casavaHeader(&buffer, @intCast(tile)), "I");
+    try std.testing.expectEqual(@as(?[]const u8, null), many.stopped);
+    try many.add(std.testing.allocator, casavaHeader(&buffer, TILE_LIMIT + 1), "I");
+    try std.testing.expectEqual(@as(?[]const u8, TOO_MANY_TILES), many.stopped);
+    try std.testing.expectEqual(@as(usize, 0), many.tiles.items.len);
+}
+
+test "[edge] - [qc]: per-tile counters flushed into wide carries give the same values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buffer: [64]u8 = undefined;
+    var flushed: TileQuality = .{};
+    defer flushed.deinit(std.testing.allocator);
+    var direct: TileQuality = .{};
+    defer direct.deinit(std.testing.allocator);
+    const reads = [_][]const u8{ "IIII", "#", "??55", "+++++++", "I" };
+    for (reads, 0..) |quality, index| {
+        for ([_]*TileQuality{ &flushed, &direct }) |tiles| {
+            try tiles.add(std.testing.allocator, casavaHeader(&buffer, 1101 + @as(i64, @intCast(index % 2))), quality);
+        }
+        for (flushed.tiles.items) |*tile| try tile.flush(std.testing.allocator);
+    }
+    try std.testing.expect(flushed.tiles.items[0].carried_sums.items.len != 0);
+    const want = try std.json.Stringify.valueAlloc(arena.allocator(), try tileRows(arena.allocator(), &direct), .{});
+    const got = try std.json.Stringify.valueAlloc(arena.allocator(), try tileRows(arena.allocator(), &flushed), .{});
+    try std.testing.expectEqualStrings(want, got);
+    try std.testing.expectEqualStrings("1101", TileQuality.headerField("A00123:8:HFLKW:1:1101:1000:2000", 4).?);
+    try std.testing.expectEqualStrings("", TileQuality.headerField("A:B:C:D:", 4).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), TileQuality.headerField("A:B:C", 4));
+    try std.testing.expectEqualStrings("12", TileQuality.headerField("LONG-INSTRUMENT-NAME-0123:run:flowcell:lane:12", 4).?);
 }

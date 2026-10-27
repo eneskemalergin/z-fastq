@@ -720,6 +720,39 @@ test "[cli] - [process]: the report counts duplicated, overrepresented, and dupl
     try std.testing.expectEqual(std.json.Value.null, plain_rows[0].object.get("possible_source").?);
 }
 
+test "[cli] - [process]: the report gives per-tile deviations from Casava headers and a reason without them" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const p = try Paths.init(allocator, &tmp);
+    const r1 = "@A00123:8:HFLKW:1:1101:1:2 1:N:0:ACGT\nACGTACGT\n+\n????????\n@A00123:8:HFLKW:1:2101:1:2 1:N:0:ACGT\nACGTACGT\n+\n55555555\n";
+    const r2 = "@A00123:8:HFLKW:1:1101:1:2 2:N:0:ACGT\nTTTTTTTT\n+\nIIIIIIII\n@A00123:8:HFLKW:1:2101:1:2 2:N:0:ACGT\nGGGGGGGG\n+\nIIIIIIII\n";
+    try writeInputs(&tmp, r1, r2);
+    const result = try cli.run(allocator, &.{ "process", "--report", "-", "--low-quality", "25", "--max-low-quality-percent", "50", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 });
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    const report = try parseReport(allocator, result.stdout);
+    const raw = report.get("qc").?.object.get("raw").?.array.items[0].object;
+    try std.testing.expectEqual(std.json.Value.null, raw.get("per_tile_unavailable").?);
+    const tiles = raw.get("per_tile_quality").?.object.get("tiles").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), tiles.len);
+    try cli.expectJsonInteger(tiles[0].object.get("tile"), 1101);
+    try std.testing.expectEqual(@as(?f64, 5), numberValue(tiles[0].object.get("deviations").?.array.items[0]));
+    try std.testing.expectEqual(@as(?f64, -5), numberValue(tiles[1].object.get("deviations").?.array.items[0]));
+    const retained = report.get("qc").?.object.get("retained").?.array.items[0].object;
+    try std.testing.expectEqual(@as(usize, 1), retained.get("per_tile_quality").?.object.get("tiles").?.array.items.len);
+
+    const plain1 = try cli.tempPath(allocator, &tmp.sub_path, "plain1.fastq");
+    const plain2 = try cli.tempPath(allocator, &tmp.sub_path, "plain2.fastq");
+    try writeInputs(&tmp, R1, R2);
+    const opaque_result = try cli.run(allocator, &.{ "process", "--report", "-", "--out1", plain1, "--out2", plain2, p.r1, p.r2 });
+    const opaque_report = try parseReport(allocator, opaque_result.stdout);
+    const opaque_mate = opaque_report.get("qc").?.object.get("raw").?.array.items[0].object;
+    try std.testing.expectEqual(std.json.Value.null, opaque_mate.get("per_tile_quality").?);
+    try cli.expectJsonString(opaque_mate.get("per_tile_unavailable"), "the read headers have no tile field");
+}
+
 test "[cli] - [process]: an unreadable or invalid contaminant list fails before outputs exist" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
