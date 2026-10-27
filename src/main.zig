@@ -51,6 +51,7 @@ const USAGE =
     \\
     \\Process options:
     \\  --gzip               Write both outputs as gzip
+    \\  --gzip-preset P      Compression preset: fast (default), even, or dense
     \\  --max-pairs N        Stop after the first N pairs
     \\  --report PATH        Write a z-fastq/process-v1 JSON report (- for stdout)
     \\  --contaminants PATH  Name overrepresented sequences from a FastQC contaminant list
@@ -94,7 +95,7 @@ const USAGE =
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
     \\Process usage:
-    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--contaminants PATH] [--pair-duplication] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
+    \\  z-fastq process [--gzip] [--gzip-preset fast|even|dense] [--max-pairs N] [--report PATH] [--contaminants PATH] [--pair-duplication] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 
@@ -132,6 +133,7 @@ const GivenOptions = struct {
     out2: bool = false,
     report: bool = false,
     contaminants: bool = false,
+    gzip_preset: bool = false,
     max_pairs: bool = false,
     adapter1: bool = false,
     adapter2: bool = false,
@@ -310,6 +312,7 @@ pub fn main(init: std.process.Init) !void {
     var contaminants_path: ?[]const u8 = null;
     var pair_duplication = false;
     var gzip_output = false;
+    var gzip_preset: ?io_layer.GzipPreset = null;
     var max_pairs: ?u64 = null;
     var read_options: ReadOptionValues = .{};
     var given: GivenOptions = .{};
@@ -436,6 +439,13 @@ pub fn main(init: std.process.Init) !void {
             gzip_output = true;
             continue;
         }
+        if (command == .process and std.mem.eql(u8, arg, "--gzip-preset")) {
+            const value = optionValue(io, &args, &given.gzip_preset, "--gzip-preset");
+            gzip_preset = std.meta.stringToEnum(io_layer.GzipPreset, value) orelse {
+                argumentError(io, "error: --gzip-preset must be fast, even, or dense\n", 2);
+            };
+            continue;
+        }
         if (command == .process and std.mem.eql(u8, arg, "--report")) {
             report_path = optionValue(io, &args, &given.report, "--report");
             continue;
@@ -509,6 +519,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const options = InputOptions{ .max_line_bytes = max_line_bytes };
+    if (command == .process and gzip_preset != null and !gzip_output) {
+        argumentError(io, "error: --gzip-preset requires --gzip\n", 2);
+    }
     if (command == .process and report_path == null) {
         if (contaminants_path != null) argumentError(io, "error: --contaminants requires --report\n", 2);
         if (pair_duplication) argumentError(io, "error: --pair-duplication requires --report\n", 2);
@@ -563,6 +576,7 @@ pub fn main(init: std.process.Init) !void {
             .contaminants = contaminants_path,
             .pair_duplication = pair_duplication,
             .gzip = gzip_output,
+            .gzip_preset = gzip_preset orelse .fast,
             .max_pairs = max_pairs,
             .trim = processReadOptions(io, read_options),
         }),
@@ -3657,6 +3671,7 @@ const RecordOutput = struct {
     write_buffer: [RECORD_OUTPUT_BUFFER_BYTES]u8 = undefined,
     sink: io_layer.FileSink = undefined,
     gzip: ?*io_layer.GzipSink = null,
+    gzip_preset: io_layer.GzipPreset = .fast,
     writer: zfastq.Writer = undefined,
 
     fn init(path: []const u8) RecordOutput {
@@ -3668,7 +3683,7 @@ const RecordOutput = struct {
         const file = self.file.?;
         self.sink = io_layer.FileSink.init(io, file, &self.write_buffer);
         if (self.gzip) |gzip| {
-            gzip.init(&self.sink.writer) catch return IO_FAILURE;
+            gzip.init(&self.sink.writer, self.gzip_preset) catch return IO_FAILURE;
             self.writer = zfastq.Writer.init(gzip.byteSink());
         } else {
             self.writer = zfastq.Writer.init(self.sink.byteSink());
@@ -4011,6 +4026,7 @@ const ProcessOptions = struct {
     contaminants: ?[]const u8 = null,
     pair_duplication: bool = false,
     gzip: bool,
+    gzip_preset: io_layer.GzipPreset = .fast,
     max_pairs: ?u64,
     trim: preprocess.Options,
 };
@@ -4074,6 +4090,7 @@ fn runProcess(
     defer for (&outputs) |*output| output.close(io);
     for (&outputs, gzip_sinks, 0..) |*output, gzip_sink, index| {
         output.gzip = gzip_sink;
+        output.gzip_preset = options.gzip_preset;
         if (output.create(io)) |failure| {
             removeCreatedOutputs(io, outputs[0..index]);
             printCommandFailure(io, output.path, failure);
@@ -4547,6 +4564,8 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     try json.beginObject();
     try json.objectField("gzip");
     try json.write(report.options.gzip);
+    try json.objectField("gzip_preset");
+    try json.write(if (report.options.gzip) @tagName(report.options.gzip_preset) else null);
     try json.objectField("max_pairs");
     try json.write(report.options.max_pairs);
     try json.objectField("pair_names");

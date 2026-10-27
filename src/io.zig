@@ -192,11 +192,13 @@ fn fileSourceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return readShort(&self.file_reader.interface, dest);
 }
 
+pub const GzipPreset = zipir.Preset;
+
 pub const GzipSink = struct {
     compressor: zipir.gzip.Compressor,
 
-    pub fn init(self: *GzipSink, output: *std.Io.Writer) WriteError!void {
-        self.compressor.init(output, .{}) catch return error.WriteFailed;
+    pub fn init(self: *GzipSink, output: *std.Io.Writer, preset: GzipPreset) WriteError!void {
+        self.compressor.init(output, .{ .preset = preset }) catch return error.WriteFailed;
     }
 
     pub fn byteSink(self: *GzipSink) ByteSink {
@@ -446,7 +448,7 @@ test "[unit] - [gzip sink]: records decode unchanged and a sink flush leaves the
     var output: std.Io.Writer = .fixed(&compressed);
     const sink = try std.testing.allocator.create(GzipSink);
     defer std.testing.allocator.destroy(sink);
-    try sink.init(&output);
+    try sink.init(&output, .fast);
     const byte_sink = sink.byteSink();
     try byte_sink.write("@r\nACGT\n");
     try byte_sink.flush();
@@ -468,11 +470,11 @@ test "[failure] - [gzip sink]: a full output fails the header or the finish" {
     defer std.testing.allocator.destroy(sink);
     var header_space: [4]u8 = undefined;
     var too_small: std.Io.Writer = .fixed(&header_space);
-    try std.testing.expectError(error.WriteFailed, sink.init(&too_small));
+    try std.testing.expectError(error.WriteFailed, sink.init(&too_small, .fast));
 
     var trailer_space: [12]u8 = undefined;
     var no_trailer: std.Io.Writer = .fixed(&trailer_space);
-    try sink.init(&no_trailer);
+    try sink.init(&no_trailer, .fast);
     try sink.byteSink().write("@r\nACGT\n+\nIIII\n");
     try std.testing.expectError(error.WriteFailed, sink.finish());
 }

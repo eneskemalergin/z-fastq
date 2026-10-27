@@ -188,7 +188,7 @@ test "[cli] - [process]: pairs pass through with LF endings and the report count
     try std.testing.expectEqual(@as(usize, 101), qc_mates[1].object.get("per_sequence_gc").?.array.items.len);
 }
 
-test "[cli] - [process]: gzip outputs decode to the same records, and empty input gives empty members" {
+test "[cli] - [process]: gzip outputs decode to the same records with every preset, and empty input gives empty members" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -206,6 +206,16 @@ test "[cli] - [process]: gzip outputs decode to the same records, and empty inpu
         try cli.expectResult(result, 0, "", "");
         try std.testing.expectEqualStrings(inputs[0], try gunzipPath(allocator, out1));
         try std.testing.expectEqualStrings(inputs[1], try gunzipPath(allocator, out2));
+    }
+    try writeInputs(&tmp, R1, R2);
+    for ([_][]const u8{ "fast", "even", "dense" }) |preset| {
+        errdefer std.debug.print("preset {s}\n", .{preset});
+        const out1 = try cli.tempPath(allocator, &tmp.sub_path, try std.fmt.allocPrint(allocator, "{s}_1.fastq.gz", .{preset}));
+        const out2 = try cli.tempPath(allocator, &tmp.sub_path, try std.fmt.allocPrint(allocator, "{s}_2.fastq.gz", .{preset}));
+        const result = try cli.run(allocator, &.{ "process", "--gzip", "--gzip-preset", preset, "--out1", out1, "--out2", out2, r1, r2 });
+        try cli.expectResult(result, 0, "", "");
+        try std.testing.expectEqualStrings(R1, try gunzipPath(allocator, out1));
+        try std.testing.expectEqualStrings(R2, try gunzipPath(allocator, out2));
     }
 }
 
@@ -281,6 +291,9 @@ test "[cli] - [process]: invalid invocations fail before any input is read or ou
         .{ .args = &.{ "process", "--max-n", "5", "--max-n", "5", p.r1, p.r2 }, .stderr = "error: --max-n may appear only once\n" },
         .{ .args = &.{ "process", "--contaminants", p.r1, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --contaminants requires --report\n" },
         .{ .args = &.{ "process", "--pair-duplication", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --pair-duplication requires --report\n" },
+        .{ .args = &.{ "process", "--gzip-preset", "even", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --gzip-preset requires --gzip\n" },
+        .{ .args = &.{ "process", "--gzip", "--gzip-preset", "level9", "--out1", gz1, "--out2", gz2, p.r1, p.r2 }, .stderr = "error: --gzip-preset must be fast, even, or dense\n" },
+        .{ .args = &.{ "process", "--gzip", "--gzip-preset", "fast", "--gzip-preset", "fast", "--out1", gz1, "--out2", gz2, p.r1, p.r2 }, .stderr = "error: --gzip-preset may appear only once\n" },
     };
     for (cases, 0..) |case, index| {
         errdefer std.debug.print("case {d}\n", .{index});
