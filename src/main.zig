@@ -53,6 +53,8 @@ const USAGE =
     \\  --gzip               Write both outputs as gzip
     \\  --max-pairs N        Stop after the first N pairs
     \\  --report PATH        Write a z-fastq/process-v1 JSON report (- for stdout)
+    \\  --contaminants PATH  Name overrepresented sequences from a FastQC contaminant list
+    \\  --pair-duplication   Report fastp's pair duplication rate (up to 1 GiB of memory)
     \\  --adapter1 SEQ       Trim mate 1 adapters and mate overlaps (with --adapter2)
     \\  --adapter2 SEQ       Trim mate 2 adapters and mate overlaps (with --adapter1)
     \\  --trim-poly-g N      Trim 3' poly-G runs, scanning at least N bases
@@ -92,7 +94,7 @@ const USAGE =
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
     \\Process usage:
-    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
+    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--contaminants PATH] [--pair-duplication] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 
@@ -129,6 +131,7 @@ const GivenOptions = struct {
     out1: bool = false,
     out2: bool = false,
     report: bool = false,
+    contaminants: bool = false,
     max_pairs: bool = false,
     adapter1: bool = false,
     adapter2: bool = false,
@@ -304,6 +307,8 @@ pub fn main(init: std.process.Init) !void {
     var output1: ?[]const u8 = null;
     var output2: ?[]const u8 = null;
     var report_path: ?[]const u8 = null;
+    var contaminants_path: ?[]const u8 = null;
+    var pair_duplication = false;
     var gzip_output = false;
     var max_pairs: ?u64 = null;
     var read_options: ReadOptionValues = .{};
@@ -435,6 +440,14 @@ pub fn main(init: std.process.Init) !void {
             report_path = optionValue(io, &args, &given.report, "--report");
             continue;
         }
+        if (command == .process and std.mem.eql(u8, arg, "--contaminants")) {
+            contaminants_path = optionValue(io, &args, &given.contaminants, "--contaminants");
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--pair-duplication")) {
+            pair_duplication = true;
+            continue;
+        }
         if (command == .process and std.mem.eql(u8, arg, "--max-pairs")) {
             const value = optionValue(io, &args, &given.max_pairs, "--max-pairs");
             max_pairs = sampling.parseDecimal(u64, value) catch |err| switch (err) {
@@ -496,6 +509,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const options = InputOptions{ .max_line_bytes = max_line_bytes };
+    if (command == .process and report_path == null) {
+        if (contaminants_path != null) argumentError(io, "error: --contaminants requires --report\n", 2);
+        if (pair_duplication) argumentError(io, "error: --pair-duplication requires --report\n", 2);
+    }
     const code = switch (command) {
         .count => runCount(io, positional.items, options),
         .stats => runStats(io, gpa, positional.items, options, json_output),
@@ -543,6 +560,8 @@ pub fn main(init: std.process.Init) !void {
             .output1 = output1,
             .output2 = output2,
             .report = report_path,
+            .contaminants = contaminants_path,
+            .pair_duplication = pair_duplication,
             .gzip = gzip_output,
             .max_pairs = max_pairs,
             .trim = processReadOptions(io, read_options),
@@ -3989,6 +4008,8 @@ const ProcessOptions = struct {
     output1: ?[]const u8,
     output2: ?[]const u8,
     report: ?[]const u8,
+    contaminants: ?[]const u8 = null,
+    pair_duplication: bool = false,
     gzip: bool,
     max_pairs: ?u64,
     trim: preprocess.Options,
@@ -4027,6 +4048,19 @@ fn runProcess(
         fileSnapshot(input2.file, io) catch null,
     };
 
+    var contaminants: ?qc.ContaminantList = null;
+    defer if (contaminants) |*list| list.deinit();
+    if (options.contaminants) |path| {
+        if (loadContaminants(io, allocator, path, &contaminants)) |code| return code;
+    }
+    var pair_duplication: preprocess.PairDuplication = undefined;
+    std.debug.assert(!options.pair_duplication or options.report != null);
+    if (options.pair_duplication) pair_duplication.init(allocator) catch {
+        writeStderr(io, OUT_OF_MEMORY_LINE);
+        return OUT_OF_MEMORY.exit_code;
+    };
+    defer if (options.pair_duplication) pair_duplication.deinit(allocator);
+
     var gzip_sinks: [2]?*io_layer.GzipSink = .{ null, null };
     defer for (gzip_sinks) |slot| if (slot) |sink| allocator.destroy(sink);
     if (options.gzip) for (&gzip_sinks) |*slot| {
@@ -4056,7 +4090,7 @@ fn runProcess(
         }
     };
 
-    var collectors: ProcessCollectors = .{};
+    var collectors: ProcessCollectors = .{ .pair_duplication = if (options.pair_duplication) &pair_duplication else null };
     defer collectors.deinit(allocator);
     var counts: ProcessCounts = .{};
     var failed_output: ?u1 = null;
@@ -4073,9 +4107,15 @@ fn runProcess(
     };
 
     var input_failure = processed;
+    if (collectors.pair_duplication) |pairs| pairs.flush(allocator) catch |err| {
+        if (input_failure == null) input_failure = pairCommandFailure(0, switch (err) {
+            error.OutOfMemory => OUT_OF_MEMORY,
+            error.Overflow => STATISTICS_LIMIT,
+        });
+    };
     const changes_reads = options.trim.changesReads();
     var stats: [2][2]zfastq.Stats = @splat(.{ .{}, .{} });
-    finishCollectors(&collectors.qc, changes_reads, &stats, &input_failure);
+    if (options.report != null) finishCollectors(allocator, &collectors.qc, changes_reads, &stats, &input_failure);
 
     var exit_code: u8 = 0;
     if (input_failure) |failure| {
@@ -4109,6 +4149,8 @@ fn runProcess(
         .trimming = &collectors.trimming,
         .filtering = &collectors.filtering,
         .inserts = &collectors.inserts,
+        .contaminants = if (contaminants) |*list| list else null,
+        .pair_duplication = collectors.pair_duplication,
         .input_failure = input_failure,
         .failed_output = if (failed_output) |index| paths[index] else null,
     };
@@ -4128,6 +4170,7 @@ const ProcessCollectors = struct {
     trimming: [2]preprocess.MateCounts = .{ .{}, .{} },
     filtering: preprocess.FilterCounts = .{},
     inserts: preprocess.InsertCounts = .{},
+    pair_duplication: ?*preprocess.PairDuplication = null,
 
     fn deinit(self: *ProcessCollectors, allocator: std.mem.Allocator) void {
         for (&self.qc) |*populations| populations.deinit(allocator);
@@ -4135,13 +4178,16 @@ const ProcessCollectors = struct {
 };
 
 fn finishCollectors(
+    allocator: std.mem.Allocator,
     collectors: *[2]qc.MatePopulations,
     changes_reads: bool,
     stats: *[2][2]zfastq.Stats,
     input_failure: *?PairCommandFailure,
 ) void {
     for (collectors, 0..) |*populations, index| {
-        populations.finish();
+        populations.finish(allocator) catch {
+            if (input_failure.* == null) input_failure.* = pairCommandFailure(@intCast(index), OUT_OF_MEMORY);
+        };
         const retained = if (changes_reads) &populations.retained else &populations.raw;
         for ([_]*const qc.MateQc{ &populations.raw, retained }, stats) |collector, *population_stats| {
             population_stats[index] = collector.stats() catch |err| stats: {
@@ -4150,6 +4196,33 @@ fn finishCollectors(
             };
         }
     }
+}
+
+fn loadContaminants(io: std.Io, allocator: std.mem.Allocator, path: []const u8, list: *?qc.ContaminantList) ?u8 {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(qc.CONTAMINANT_FILE_LIMIT)) catch |err| {
+        const failure: CommandFailure = switch (err) {
+            error.OutOfMemory => OUT_OF_MEMORY,
+            error.StreamTooLong => CommandFailure.plain("file_limit", "contaminant list exceeds 1 MiB", 4),
+            error.FileNotFound => CommandFailure.plain("io_error", "file not found", 3),
+            else => CommandFailure.plain("io_error", "failed to read file", 3),
+        };
+        printPathError(io, path, failure.message);
+        return failure.exit_code;
+    };
+    defer allocator.free(text);
+    var failed_line: usize = 0;
+    list.* = qc.ContaminantList.parse(allocator, text, &failed_line) catch |err| switch (err) {
+        error.OutOfMemory => {
+            writeStderr(io, OUT_OF_MEMORY_LINE);
+            return OUT_OF_MEMORY.exit_code;
+        },
+        error.InvalidBase => {
+            var buffer: [96]u8 = undefined;
+            printPathError(io, path, std.fmt.bufPrint(&buffer, "line {d}: contaminant sequence has a base other than A, C, G or T", .{failed_line}) catch unreachable);
+            return 2;
+        },
+    };
+    return null;
 }
 
 fn qcFailure(err: (error{OutOfMemory} || statistics.StatsError)) CommandFailure {
@@ -4241,6 +4314,7 @@ const ProcessPairs = struct {
     max_pairs: ?u64,
     policy: pairing.NamePolicy,
     trimmer: preprocess.Trimmer,
+    collect_qc: bool,
     trim_failure: ?PairCommandFailure = null,
 
     fn atCap(self: *const ProcessPairs) bool {
@@ -4253,12 +4327,27 @@ const ProcessPairs = struct {
         records: [2]zfastq.Record,
         spans: [2]?[]const u8,
     ) DeinterleaveWriteError!?PairCommandFailure {
+        const pairs = self.collectors.pair_duplication orelse return self.emitPair(records, spans);
+        const hash = pairs.hash(records[0].sequence, records[1].sequence);
+        if (try self.emitPair(records, spans)) |failure| return failure;
+        pairs.push(self.allocator, hash) catch |err| return pairCommandFailure(0, switch (err) {
+            error.OutOfMemory => OUT_OF_MEMORY,
+            error.Overflow => STATISTICS_LIMIT,
+        });
+        return null;
+    }
+
+    inline fn emitPair(
+        self: *ProcessPairs,
+        records: [2]zfastq.Record,
+        spans: [2]?[]const u8,
+    ) DeinterleaveWriteError!?PairCommandFailure {
         self.counts.read += 1;
-        for (&self.collectors.qc, records, 0..) |*collector, record, index| {
+        if (self.collect_qc) for (&self.collectors.qc, records, 0..) |*collector, record, index| {
             collector.addRead(self.allocator, record.sequence, record.quality) catch |err| {
                 return pairCommandFailure(@intCast(index), qcFailure(err));
             };
-        }
+        };
         if (self.trimmer.options.changesReads()) {
             self.emitTransformed(records, spans) catch |err| switch (err) {
                 error.TrimFailed => return self.trim_failure,
@@ -4302,19 +4391,19 @@ const ProcessPairs = struct {
                 self.trim_failure = pairCommandFailure(0, STATISTICS_LIMIT);
                 return error.TrimFailed;
             };
-            for (&self.collectors.qc, records, 0..) |*collector, record, index| {
+            if (self.collect_qc) for (&self.collectors.qc, records, 0..) |*collector, record, index| {
                 collector.dropRetained(self.allocator, record.sequence, record.quality) catch |err| {
                     self.trim_failure = pairCommandFailure(@intCast(index), qcFailure(err));
                     return error.TrimFailed;
                 };
-            }
+            };
             self.counts.dropped += 1;
             return;
         }
         var trimmed = records;
         var trimmed_spans = spans;
         for (&trimmed, &trimmed_spans, result.kept, 0..) |*record, *span, kept, index| {
-            self.collectors.qc[index].addRetained(self.allocator, record.sequence, record.quality, kept) catch |err| {
+            if (self.collect_qc) self.collectors.qc[index].addRetained(self.allocator, record.sequence, record.quality, kept) catch |err| {
                 self.trim_failure = pairCommandFailure(@intCast(index), qcFailure(err));
                 return error.TrimFailed;
             };
@@ -4367,6 +4456,9 @@ fn processSources(
     counts: *ProcessCounts,
     options: ProcessOptions,
 ) DeinterleaveWriteError!?PairCommandFailure {
+    if (options.report != null and options.trim.changesReads()) {
+        for (&collectors.qc) |*populations| populations.enableRetained();
+    }
     const reader_options: fastq.ReaderOptions = .{ .max_line_bytes = options.max_line_bytes };
     var reader1 = fastq.initStreamReader(allocator, sources[0], reader_options);
     defer reader1.deinit();
@@ -4386,6 +4478,7 @@ fn processSources(
         .max_pairs = options.max_pairs,
         .policy = options.pair_name_policy,
         .trimmer = .init(options.trim),
+        .collect_qc = options.report != null,
     };
 
     while (true) {
@@ -4442,6 +4535,8 @@ const ProcessReport = struct {
     trimming: *const [2]preprocess.MateCounts,
     filtering: *const preprocess.FilterCounts,
     inserts: *const preprocess.InsertCounts,
+    contaminants: ?*const qc.ContaminantList = null,
+    pair_duplication: ?*const preprocess.PairDuplication = null,
     input_failure: ?PairCommandFailure,
     failed_output: ?[]const u8,
 };
@@ -4479,6 +4574,10 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     try json.write(if (trim.low_quality) |low_quality| low_quality.quality else null);
     try json.objectField("max_low_quality_percent");
     try json.write(if (trim.low_quality) |low_quality| low_quality.percent else null);
+    try json.objectField("contaminants");
+    try json.write(report.options.contaminants);
+    try json.objectField("pair_duplication");
+    try json.write(report.options.pair_duplication);
     try json.endObject();
 
     try json.objectField("inputs");
@@ -4536,7 +4635,7 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
         try json.objectField(population);
         try json.beginArray();
         for (report.qc) |*populations| {
-            try (if (retained) &populations.retained else &populations.raw).writeJson(json);
+            try populations.writeJson(json, retained, report.contaminants);
         }
         try json.endArray();
     }
@@ -4549,6 +4648,8 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     if (report.changes_reads) try writeFilterCounts(json, report.filtering) else try json.write(null);
     try json.objectField("inserts");
     if (trim.adapters != null) try writeInsertCounts(json, report.inserts) else try json.write(null);
+    try json.objectField("pair_duplication");
+    if (report.pair_duplication) |pairs| try pairs.writeJson(json) else try json.write(null);
 
     const failed_input: ?[]const u8 = if (report.input_failure) |failure| switch (failure) {
         .command => |details| report.inputs[details.input_index],
@@ -7209,7 +7310,7 @@ test "[property] - [process]: trimmed, dropped, and long pairs release every all
             .pair_name_policy = .illumina,
             .output1 = null,
             .output2 = null,
-            .report = null,
+            .report = "-",
             .gzip = false,
             .max_pairs = null,
             .trim = .{
@@ -7230,7 +7331,7 @@ test "[property] - [process]: trimmed, dropped, and long pairs release every all
     try std.testing.expectEqual(@as(u64, 1), collectors.filtering.dropped_pairs[@intFromEnum(preprocess.Reason.low_quality)]);
     var stats: [2][2]zfastq.Stats = @splat(.{ .{}, .{} });
     var failure: ?PairCommandFailure = null;
-    finishCollectors(&collectors.qc, true, &stats, &failure);
+    finishCollectors(allocator, &collectors.qc, true, &stats, &failure);
     try std.testing.expectEqual(@as(?PairCommandFailure, null), failure);
     for (stats[0], stats[1]) |raw, retained| {
         try std.testing.expectEqual(@as(u64, 5), raw.reads);

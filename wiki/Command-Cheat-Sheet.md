@@ -52,6 +52,12 @@ With adapters, poly-G, a 3' quality window, and filters, `process` trims each pa
 z-fastq process --adapter1 CTGTCTCTTATACACATCT --adapter2 CTGTCTCTTATACACATCT --trim-poly-g 10 --trim-tail-window 4 --trim-tail-quality 20 --low-quality 15 --max-low-quality-percent 40 --max-n 5 --min-length 30 --out1 trimmed_R1.fastq --out2 trimmed_R2.fastq R1.fastq.gz R2.fastq.gz
 ```
 
+The report always holds FastQC's duplication and overrepresented sequences; `--contaminants` names the sequences from a FastQC contaminant list, and `--pair-duplication` adds fastp's pair duplication rate:
+
+```bash
+z-fastq process --report sample.json --contaminants contaminant_list.txt --pair-duplication --out1 R1_out.fastq --out2 R2_out.fastq R1.fastq.gz R2.fastq.gz
+```
+
 ## Input shapes
 
 ```text

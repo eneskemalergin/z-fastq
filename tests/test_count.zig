@@ -53,6 +53,8 @@ const EXPECTED_USAGE =
     \\  --gzip               Write both outputs as gzip
     \\  --max-pairs N        Stop after the first N pairs
     \\  --report PATH        Write a z-fastq/process-v1 JSON report (- for stdout)
+    \\  --contaminants PATH  Name overrepresented sequences from a FastQC contaminant list
+    \\  --pair-duplication   Report fastp's pair duplication rate (up to 1 GiB of memory)
     \\  --adapter1 SEQ       Trim mate 1 adapters and mate overlaps (with --adapter2)
     \\  --adapter2 SEQ       Trim mate 2 adapters and mate overlaps (with --adapter1)
     \\  --trim-poly-g N      Trim 3' poly-G runs, scanning at least N bases
@@ -92,7 +94,7 @@ const EXPECTED_USAGE =
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
     \\Process usage:
-    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
+    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--contaminants PATH] [--pair-duplication] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 

@@ -4,6 +4,8 @@
 //! comptime lane count. Inline code uses the widest tier the compile target
 //! guarantees. When the target lacks AVX2, the same bodies are also compiled
 //! into a separate AVX2 object, and long spans call it on CPUs that have AVX2.
+//! Kernels whose work per call outweighs the call at any length, such as
+//! fastp's pair sum in preprocess.zig, use the AVX2 object whenever it applies.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -33,6 +35,10 @@ pub inline fn useAvx2(len: usize) bool {
     return SELECT_AT_RUN_TIME and len >= AVX2_MIN_BYTES and cpuHasAvx2();
 }
 
+pub inline fn avx2Selected() bool {
+    return SELECT_AT_RUN_TIME and cpuHasAvx2();
+}
+
 pub fn exportKernel(comptime name: []const u8, comptime function: anytype) void {
     if (build_options.simd_object) @export(function, .{ .name = symbol(INLINE_TIER, name) });
 }
@@ -49,6 +55,7 @@ comptime {
     if (build_options.simd_object) {
         _ = @import("fastq.zig");
         _ = @import("stats.zig");
+        _ = @import("preprocess.zig");
     }
     exportKernel("find_newline", &findNewlineExport);
     exportKernel("collect_newlines", &collectNewlinesExport);

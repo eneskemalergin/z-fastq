@@ -279,6 +279,8 @@ test "[cli] - [process]: invalid invocations fail before any input is read or ou
         .{ .args = &.{ "process", "--max-low-quality-percent", "101", p.r1, p.r2 }, .stderr = "error: --max-low-quality-percent must be 0 to 100\n" },
         .{ .args = &.{ "process", "--low-quality", "15", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --low-quality and --max-low-quality-percent must be given together\n" },
         .{ .args = &.{ "process", "--max-n", "5", "--max-n", "5", p.r1, p.r2 }, .stderr = "error: --max-n may appear only once\n" },
+        .{ .args = &.{ "process", "--contaminants", p.r1, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --contaminants requires --report\n" },
+        .{ .args = &.{ "process", "--pair-duplication", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --pair-duplication requires --report\n" },
     };
     for (cases, 0..) |case, index| {
         errdefer std.debug.print("case {d}\n", .{index});
@@ -663,6 +665,83 @@ test "[cli] - [process]: the report counts inserts from the mate overlap and ada
     }
     const raw_mate2 = qc.get("raw").?.array.items[1].object.get("adapter_content").?.object.get("rows").?.array.items;
     try std.testing.expectEqual(@as(?f64, 50), numberValue(raw_mate2[0].object.get("values").?.array.items[5]));
+}
+
+const SE_ADAPTER_1 = "GATCGGAAGAGCTCGTATGCCGTCTTCTGCTTG";
+
+test "[cli] - [process]: the report counts duplicated, overrepresented, and duplicate pairs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const p = try Paths.init(allocator, &tmp);
+    const quality = "I" ** 33;
+    const other = "ACGTTGCAACGTTGCAACGTTGCAACGTTGCAA";
+    const mate2 = "TTTTTCCCCCGGGGGAAAAATTTTTCCCCCGGG";
+    const r1 = "@a/1\n" ++ SE_ADAPTER_1 ++ "\n+\n" ++ quality ++ "\n@b/1\n" ++ SE_ADAPTER_1 ++ "\n+\n" ++ quality ++ "\n@c/1\n" ++ other ++ "\n+\n" ++ quality ++ "\n";
+    const r2 = "@a/2\n" ++ mate2 ++ "\n+\n" ++ quality ++ "\n@b/2\n" ++ mate2 ++ "\n+\n" ++ quality ++ "\n@c/2\n" ++ other ++ "\n+\n" ++ quality ++ "\n";
+    try writeInputs(&tmp, r1, r2);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "contaminants.txt", .data = "# list\nIllumina Single End Adapter 1\t\t" ++ SE_ADAPTER_1 ++ "\n" });
+    const contaminants = try cli.tempPath(allocator, &tmp.sub_path, "contaminants.txt");
+
+    const result = try cli.run(allocator, &.{ "process", "--report", "-", "--contaminants", contaminants, "--pair-duplication", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 });
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    const report = try parseReport(allocator, result.stdout);
+    try cli.expectJsonString(report.get("options").?.object.get("contaminants"), contaminants);
+    try std.testing.expectEqual(std.json.Value{ .bool = true }, report.get("options").?.object.get("pair_duplication").?);
+    const pairs = report.get("pair_duplication").?.object;
+    try cli.expectJsonInteger(pairs.get("pairs"), 3);
+    try cli.expectJsonInteger(pairs.get("duplicates"), 1);
+
+    const mate1 = report.get("qc").?.object.get("raw").?.array.items[0].object;
+    const duplication = mate1.get("duplication").?.object;
+    try cli.expectJsonInteger(duplication.get("reads"), 3);
+    try cli.expectJsonInteger(duplication.get("stored_sequences"), 2);
+    try std.testing.expectEqual(@as(?f64, @as(f64, 2) / 3 * 100), numberValue(duplication.get("total_deduplicated_percentage").?));
+    try std.testing.expectEqual(@as(usize, 16), duplication.get("levels").?.array.items.len);
+    const rows = mate1.get("overrepresented").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try cli.expectJsonString(rows[0].object.get("sequence"), SE_ADAPTER_1);
+    try cli.expectJsonInteger(rows[0].object.get("count"), 2);
+    const source = rows[0].object.get("possible_source").?.object;
+    try cli.expectJsonString(source.get("name"), "Illumina Single End Adapter 1");
+    try cli.expectJsonInteger(source.get("identity"), 100);
+    try cli.expectJsonInteger(source.get("length"), 33);
+    try std.testing.expectEqual(std.json.Value.null, rows[1].object.get("possible_source").?);
+
+    const plain1 = try cli.tempPath(allocator, &tmp.sub_path, "plain1.fastq");
+    const plain2 = try cli.tempPath(allocator, &tmp.sub_path, "plain2.fastq");
+    const plain = try cli.run(allocator, &.{ "process", "--report", "-", "--out1", plain1, "--out2", plain2, p.r1, p.r2 });
+    try std.testing.expectEqual(@as(u8, 0), plain.exit_code);
+    const plain_report = try parseReport(allocator, plain.stdout);
+    try std.testing.expectEqual(std.json.Value.null, plain_report.get("pair_duplication").?);
+    const plain_rows = plain_report.get("qc").?.object.get("raw").?.array.items[0].object.get("overrepresented").?.array.items;
+    try std.testing.expectEqual(std.json.Value.null, plain_rows[0].object.get("possible_source").?);
+}
+
+test "[cli] - [process]: an unreadable or invalid contaminant list fails before outputs exist" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const p = try Paths.init(allocator, &tmp);
+    try writeInputs(&tmp, "@a/1\nACGT\n+\nIIII\n", "@a/2\nACGT\n+\nIIII\n");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.txt", .data = "good\tACGT\nbad\tACNT\n" });
+    const Case = struct { file: []const u8, exit_code: u8, message: []const u8 };
+    for ([_]Case{
+        .{ .file = "bad.txt", .exit_code = 2, .message = "line 2: contaminant sequence has a base other than A, C, G or T" },
+        .{ .file = "missing.txt", .exit_code = 3, .message = "file not found" },
+    }) |case| {
+        const path = try cli.tempPath(allocator, &tmp.sub_path, case.file);
+        const result = try cli.run(allocator, &.{ "process", "--report", p.report, "--contaminants", path, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 });
+        try std.testing.expectEqual(case.exit_code, result.exit_code);
+        try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, result.stderr, "\n"), case.message));
+        try std.testing.expect(!pathExists(p.out1));
+        try std.testing.expect(!pathExists(p.out2));
+        try std.testing.expect(!pathExists(p.report));
+    }
 }
 
 fn numberValue(value: std.json.Value) ?f64 {

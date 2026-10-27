@@ -6,7 +6,12 @@
 //! pattern, reading the read through a fixed stack window padded with zero bytes, which no read
 //! or adapter base equals. The block kernel, the reverse complement, and the low-quality and N
 //! count use the inline vector width only, with no AVX2 object for builds whose target lacks
-//! AVX2: each costs a small share of a trimmed or filtered run at every read length.
+//! AVX2: each costs a small share of a trimmed or filtered run at every read length. Insert sizes
+//! follow fastp's overlap rule. The pair duplication estimate is fastp's: the bases of mate 1, then
+//! mate 2, hash to one position in each of two 2^32-bit arrays, and a pair whose two positions are
+//! both set already counts as a duplicate, hash collisions included. Only the set positions are
+//! kept, per 65,536-bit block as a sorted list of offsets or, past 4,096 of them, as a bitmap, so
+//! memory follows the pairs read instead of fastp's fixed 1 GiB. The pair sum has an AVX2 kernel.
 
 const std = @import("std");
 
@@ -118,6 +123,314 @@ pub const InsertCounts = struct {
             if (seen >= half) return size;
         }
         unreachable;
+    }
+};
+
+pub const PairDuplication = struct {
+    sets: [ARRAY_COUNT]PositionSet = .{ .{}, .{} },
+    primes: Primes = undefined,
+    pending: ?Hash = null,
+    pairs: u64 = 0,
+    duplicates: u64 = 0,
+
+    const ARRAY_COUNT = 2;
+    const PRIME_ROW = 512;
+    const PRIME_START = 10_000;
+    const PRIME_GAP = 10_000;
+    const OTHER_VALUE = 13;
+
+    const Hash = [ARRAY_COUNT]u32;
+    const Sums = [ARRAY_COUNT]u64;
+    const SUM_LANES = 8;
+    const Primes = [ARRAY_COUNT][PRIME_ROW + SUM_LANES]u32;
+    const VECTOR_LENGTH_LIMIT = 1 << 31;
+
+    const BASE_VALUE: [256]u64 = table: {
+        var values: [256]u64 = @splat(OTHER_VALUE);
+        values['A'] = 7;
+        values['C'] = 74;
+        values['G'] = 31;
+        values['T'] = 222;
+        break :table values;
+    };
+
+    const DIVISORS = divisors: {
+        @setEvalBranchQuota(1_000_000);
+        var found: [600]u32 = undefined;
+        var count: usize = 0;
+        var candidate: u32 = 2;
+        while (candidate < 4096) : (candidate += 1) {
+            var prime = true;
+            for (found[0..count]) |divisor| {
+                if (divisor * divisor > candidate) break;
+                if (candidate % divisor == 0) {
+                    prime = false;
+                    break;
+                }
+            }
+            if (prime) {
+                found[count] = candidate;
+                count += 1;
+            }
+        }
+        const result = found[0..count].*;
+        break :divisors result;
+    };
+
+    pub fn init(self: *PairDuplication, allocator: std.mem.Allocator) error{OutOfMemory}!void {
+        self.* = .{};
+        errdefer self.deinit(allocator);
+        for (&self.sets) |*set| try set.init(allocator);
+        var number: u32 = PRIME_START;
+        for (0..PRIME_ROW * ARRAY_COUNT) |index| {
+            number += 1;
+            while (!isPrime(number)) number += 1;
+            self.primes[index % ARRAY_COUNT][index / ARRAY_COUNT] = number;
+            number += PRIME_GAP;
+        }
+        for (&self.primes) |*row| @memcpy(row[PRIME_ROW..], row[0..SUM_LANES]);
+    }
+
+    fn isPrime(number: u32) bool {
+        std.debug.assert(number < 4096 * 4096);
+        for (DIVISORS) |divisor| {
+            if (divisor * divisor > number) return true;
+            if (number % divisor == 0) return false;
+        }
+        return true;
+    }
+
+    pub fn deinit(self: *PairDuplication, allocator: std.mem.Allocator) void {
+        for (&self.sets) |*set| set.deinit(allocator);
+    }
+
+    pub fn hash(self: *const PairDuplication, read1: []const u8, read2: []const u8) Hash {
+        var sums: Sums = @splat(0);
+        if (read1.len + read2.len >= VECTOR_LENGTH_LIMIT) {
+            sumsScalar(&self.primes, read1, 0, &sums);
+            sumsScalar(&self.primes, read2, read1.len, &sums);
+        } else if (simd.INLINE_TIER == .baseline and simd.avx2Selected()) {
+            simd.avx2Kernel("pair_sums", &pairSumsExport)(&self.primes, read1.ptr, read1.len, read2.ptr, read2.len, &sums);
+        } else if (simd.INLINE_TIER == .avx2) {
+            pairSumsVector(&self.primes, read1, read2, &sums);
+        } else {
+            sumsScalar(&self.primes, read1, 0, &sums);
+            sumsScalar(&self.primes, read2, read1.len, &sums);
+        }
+        var bits: Hash = undefined;
+        for (sums, &bits, &self.sets) |sum, *bit, *set| {
+            bit.* = @truncate(sum);
+            set.prefetch(bit.*);
+        }
+        return bits;
+    }
+
+    fn sumsScalar(primes: *const Primes, read: []const u8, start: usize, sums: *Sums) void {
+        for (read, start..) |base, position| {
+            const value = BASE_VALUE[base] +% position;
+            for (sums, primes) |*sum, *row| sum.* +%= @as(u64, row[position % PRIME_ROW]) *% value;
+        }
+    }
+
+    fn pairSumsVector(primes: *const Primes, read1: []const u8, read2: []const u8, sums: *Sums) void {
+        sumsVector(primes, read1, 0, sums);
+        sumsVector(primes, read2, read1.len, sums);
+    }
+
+    fn pairSumsExport(primes: *const Primes, read1: [*]const u8, len1: usize, read2: [*]const u8, len2: usize, sums: *Sums) callconv(.c) void {
+        pairSumsVector(primes, read1[0..len1], read2[0..len2], sums);
+    }
+
+    fn sumsVector(primes: *const Primes, read: []const u8, start: usize, sums: *Sums) void {
+        const Lanes32 = @Vector(SUM_LANES, u32);
+        const Lanes64 = @Vector(SUM_LANES, u64);
+        var totals: [ARRAY_COUNT]Lanes64 = @splat(@splat(0));
+        const steps: Lanes32 = std.simd.iota(u32, SUM_LANES);
+        var index: usize = 0;
+        while (index + SUM_LANES <= read.len) : (index += SUM_LANES) {
+            const bytes: @Vector(SUM_LANES, u8) = read[index..][0..SUM_LANES].*;
+            var values: Lanes32 = @splat(OTHER_VALUE);
+            inline for (.{ 'A', 'C', 'G', 'T' }) |base| {
+                const matches = bytes == @as(@Vector(SUM_LANES, u8), @splat(base));
+                values = @select(u32, matches, @as(Lanes32, @splat(@intCast(BASE_VALUE[base]))), values);
+            }
+            const position = start + index;
+            const terms: Lanes64 = values + @as(Lanes32, @splat(@intCast(position))) + steps;
+            const row = position % PRIME_ROW;
+            for (&totals, primes) |*total, *factors| {
+                const wide: Lanes64 = @as(Lanes32, factors[row..][0..SUM_LANES].*);
+                total.* +%= wide * terms;
+            }
+        }
+        for (&totals, sums) |total, *sum| {
+            for (@as([SUM_LANES]u64, total)) |lane| sum.* +%= lane;
+        }
+        sumsScalar(primes, read[index..], start + index, sums);
+    }
+
+    pub fn push(self: *PairDuplication, allocator: std.mem.Allocator, bits: Hash) error{ OutOfMemory, Overflow }!void {
+        if (self.pending) |previous| try self.record(allocator, previous);
+        for (&self.sets, bits) |*set, bit| set.prefetchBlock(bit);
+        self.pending = bits;
+    }
+
+    pub fn flush(self: *PairDuplication, allocator: std.mem.Allocator) error{ OutOfMemory, Overflow }!void {
+        const previous = self.pending orelse return;
+        try self.record(allocator, previous);
+        self.pending = null;
+    }
+
+    fn record(self: *PairDuplication, allocator: std.mem.Allocator, bits: Hash) error{ OutOfMemory, Overflow }!void {
+        const pairs = try std.math.add(u64, self.pairs, 1);
+        var probes: [ARRAY_COUNT]PositionSet.Probe = undefined;
+        for (&probes, &self.sets, bits) |*probe, *set, bit| probe.* = set.find(bit);
+        for (&probes, &self.sets) |*probe, *set| try set.reserve(allocator, probe);
+        var seen = true;
+        for (probes) |probe| {
+            if (probe.present) continue;
+            seen = false;
+            PositionSet.insert(probe);
+        }
+        self.pairs = pairs;
+        if (seen) self.duplicates += 1;
+    }
+
+    pub fn rate(self: *const PairDuplication) f64 {
+        if (self.pairs == 0) return 0;
+        return @as(f64, @floatFromInt(self.duplicates)) / @as(f64, @floatFromInt(self.pairs));
+    }
+
+    pub fn writeJson(self: *const PairDuplication, json: *std.json.Stringify) !void {
+        try json.beginObject();
+        try json.objectField("pairs");
+        try json.write(self.pairs);
+        try json.objectField("duplicates");
+        try json.write(self.duplicates);
+        try json.objectField("rate");
+        try json.write(self.rate());
+        try json.endObject();
+    }
+};
+
+comptime {
+    simd.exportKernel("pair_sums", &PairDuplication.pairSumsExport);
+}
+
+const PositionSet = struct {
+    blocks: []Block = &.{},
+
+    const BLOCK_COUNT = 1 << 16;
+    const LIST_MAX = 4096;
+    const BITMAP_WORDS = BLOCK_COUNT / 64;
+    const BITMAP = std.math.maxInt(u32);
+
+    const Block = struct {
+        data: ?*anyopaque = null,
+        count: u32 = 0,
+        capacity: u32 = 0,
+
+        fn list(self: Block) []u16 {
+            const items: [*]u16 = @ptrCast(@alignCast(self.data.?));
+            return items[0..self.count];
+        }
+
+        fn bitmap(self: Block) *[BITMAP_WORDS]u64 {
+            return @ptrCast(@alignCast(self.data.?));
+        }
+    };
+
+    const Probe = struct {
+        block: *Block,
+        low: u16,
+        index: u32,
+        present: bool,
+    };
+
+    fn init(self: *PositionSet, allocator: std.mem.Allocator) error{OutOfMemory}!void {
+        self.blocks = try allocator.alloc(Block, BLOCK_COUNT);
+        @memset(self.blocks, .{});
+    }
+
+    fn deinit(self: *PositionSet, allocator: std.mem.Allocator) void {
+        for (self.blocks) |block| {
+            const data = block.data orelse continue;
+            if (block.count == BITMAP) {
+                allocator.destroy(block.bitmap());
+            } else {
+                const items: [*]u16 = @ptrCast(@alignCast(data));
+                allocator.free(items[0..block.capacity]);
+            }
+        }
+        allocator.free(self.blocks);
+        self.blocks = &.{};
+    }
+
+    fn prefetch(self: *const PositionSet, position: u32) void {
+        @prefetch(&self.blocks[position >> 16], .{ .rw = .write });
+    }
+
+    fn prefetchBlock(self: *const PositionSet, position: u32) void {
+        const block = self.blocks[position >> 16];
+        if (block.data == null) return;
+        const low: u16 = @truncate(position);
+        if (block.count == BITMAP) {
+            @prefetch(&block.bitmap()[low >> 6], .{ .rw = .write });
+        } else {
+            const items = block.list();
+            @prefetch(items.ptr, .{ .rw = .write });
+            if (items.len > 32) @prefetch(&items[items.len / 2], .{});
+        }
+    }
+
+    fn find(self: *PositionSet, position: u32) Probe {
+        const block = &self.blocks[position >> 16];
+        const low: u16 = @truncate(position);
+        if (block.count == BITMAP) {
+            const present = block.bitmap()[low >> 6] & (@as(u64, 1) << @intCast(low & 63)) != 0;
+            return .{ .block = block, .low = low, .index = 0, .present = present };
+        }
+        const index = if (block.data == null) 0 else std.sort.lowerBound(u16, block.list(), low, orderU16);
+        const present = index < block.count and block.list()[index] == low;
+        return .{ .block = block, .low = low, .index = @intCast(index), .present = present };
+    }
+
+    fn orderU16(wanted: u16, item: u16) std.math.Order {
+        return std.math.order(wanted, item);
+    }
+
+    fn reserve(self: *PositionSet, allocator: std.mem.Allocator, probe: *Probe) error{OutOfMemory}!void {
+        _ = self;
+        const block = probe.block;
+        if (probe.present or block.count == BITMAP or block.count < block.capacity) return;
+        if (block.count == LIST_MAX) {
+            const words = try allocator.create([BITMAP_WORDS]u64);
+            @memset(words, 0);
+            const items = block.list();
+            for (items) |item| words[item >> 6] |= @as(u64, 1) << @intCast(item & 63);
+            allocator.free(@as([*]u16, @ptrCast(@alignCast(block.data.?)))[0..block.capacity]);
+            block.* = .{ .data = words, .count = BITMAP, .capacity = 0 };
+            return;
+        }
+        const capacity: u32 = @min(LIST_MAX, @max(4, block.capacity * 2));
+        const old: []u16 = if (block.data) |data| @as([*]u16, @ptrCast(@alignCast(data)))[0..block.capacity] else &.{};
+        const items = try allocator.realloc(old, capacity);
+        block.data = items.ptr;
+        block.capacity = capacity;
+    }
+
+    fn insert(probe: Probe) void {
+        std.debug.assert(!probe.present);
+        const block = probe.block;
+        if (block.count == BITMAP) {
+            block.bitmap()[probe.low >> 6] |= @as(u64, 1) << @intCast(probe.low & 63);
+            return;
+        }
+        std.debug.assert(block.count < block.capacity);
+        const items: [*]u16 = @ptrCast(@alignCast(block.data.?));
+        var index = block.count;
+        while (index > probe.index) : (index -= 1) items[index] = items[index - 1];
+        items[probe.index] = probe.low;
+        block.count += 1;
     }
 };
 
@@ -783,4 +1096,105 @@ test "[unit] - [preprocess]: the insert peak takes the lowest tied size and the 
     try std.testing.expectEqual(@as(u64, 2), counts.unknown());
     try std.testing.expectEqual(@as(usize, 40), counts.peak());
     try std.testing.expectEqual(@as(?usize, 60), counts.median());
+}
+
+test "[unit] - [preprocess]: pair duplicates follow fastp's hash of R1 then R2" {
+    var pairs: PairDuplication = undefined;
+    try pairs.init(std.testing.allocator);
+    defer pairs.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 10007), pairs.primes[0][0]);
+    const Case = struct { []const u8, []const u8, bool };
+    const cases = [_]Case{
+        .{ "ACGTACGT", "TTGGCCAA", false },
+        .{ "ACGTACGT", "TTGGCCAA", true },
+        .{ "TTGGCCAA", "ACGTACGT", false },
+        .{ "ACGTACGT", "TTGGCCAT", false },
+        .{ "ACGTAC", "GTTTGGCCAA", true },
+        .{ "acgtNNNN", "TTGGCCAA", false },
+        .{ "NNNNnnnn", "TTGGCCAA", true },
+        .{ "", "", false },
+        .{ "", "", true },
+    };
+    var duplicates: u64 = 0;
+    for (cases, 0..) |case, index| {
+        errdefer std.debug.print("case {d}\n", .{index});
+        try pairs.record(std.testing.allocator, pairs.hash(case[0], case[1]));
+        duplicates += @intFromBool(case[2]);
+        try std.testing.expectEqual(duplicates, pairs.duplicates);
+    }
+    try std.testing.expectEqual(@as(u64, cases.len), pairs.pairs);
+    try std.testing.expectEqual(4.0 / 9.0, pairs.rate());
+
+    var streamed: PairDuplication = undefined;
+    try streamed.init(std.testing.allocator);
+    defer streamed.deinit(std.testing.allocator);
+    for (cases) |case| try streamed.push(std.testing.allocator, streamed.hash(case[0], case[1]));
+    try std.testing.expectEqual(@as(u64, cases.len - 1), streamed.pairs);
+    try streamed.flush(std.testing.allocator);
+    try std.testing.expectEqual(pairs.pairs, streamed.pairs);
+    try std.testing.expectEqual(pairs.duplicates, streamed.duplicates);
+}
+
+test "[property] - [preprocess]: the position set answers membership as a full bitmap does" {
+    var set: PositionSet = .{};
+    try set.init(std.testing.allocator);
+    defer set.deinit(std.testing.allocator);
+    var reference = std.AutoHashMap(u32, void).init(std.testing.allocator);
+    defer reference.deinit();
+    var state: u64 = 5;
+    for (0..30_000) |step| {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        const random: u32 = @truncate(state >> 32);
+        const position = switch (step % 3) {
+            0 => random,
+            1 => 0x0007_0000 | (random & 0x3fff),
+            else => 0xffff_0000 | (random & 0x00ff),
+        };
+        var probe = set.find(position);
+        try std.testing.expectEqual(reference.contains(position), probe.present);
+        try set.reserve(std.testing.allocator, &probe);
+        if (!probe.present) PositionSet.insert(probe);
+        try reference.put(position, {});
+    }
+    try std.testing.expectEqual(PositionSet.BITMAP, set.blocks[7].count);
+    try std.testing.expect(set.blocks[0xffff].count <= 256);
+}
+
+test "[failure] - [preprocess]: a failed position allocation leaves the pair counts unchanged" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var pairs: PairDuplication = undefined;
+    try pairs.init(failing.allocator());
+    defer pairs.deinit(failing.allocator());
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, pairs.record(failing.allocator(), pairs.hash("ACGT", "TTGG")));
+    try std.testing.expectEqual(@as(u64, 0), pairs.pairs);
+    failing.fail_index = std.math.maxInt(usize);
+    try pairs.record(failing.allocator(), pairs.hash("ACGT", "TTGG"));
+    try pairs.record(failing.allocator(), pairs.hash("ACGT", "TTGG"));
+    try std.testing.expectEqual(@as(u64, 2), pairs.pairs);
+    try std.testing.expectEqual(@as(u64, 1), pairs.duplicates);
+}
+
+test "[property] - [preprocess]: the vector pair sums equal fastp's per-base sums" {
+    var pairs: PairDuplication = undefined;
+    try pairs.init(std.testing.allocator);
+    defer pairs.deinit(std.testing.allocator);
+    var read: [1500]u8 = undefined;
+    var state: u32 = 9;
+    for (&read) |*base| {
+        state = state *% 1103515245 +% 12345;
+        base.* = "ACGTNacgtR"[(state >> 16) % 10];
+    }
+    for ([_]usize{ 0, 1, 7, 8, 9, 151, 300, 505, 511, 512, 513, 1500 }) |length1| {
+        for ([_]usize{ 0, 1, 8, 151, 512, 1300 }) |length2| {
+            errdefer std.debug.print("lengths {d} {d}\n", .{ length1, length2 });
+            const read2 = read[(length1 * 7) % 200 ..][0..length2];
+            var scalar: PairDuplication.Sums = @splat(0);
+            PairDuplication.sumsScalar(&pairs.primes, read[0..length1], 0, &scalar);
+            PairDuplication.sumsScalar(&pairs.primes, read2, length1, &scalar);
+            var vector: PairDuplication.Sums = @splat(0);
+            PairDuplication.pairSumsVector(&pairs.primes, read[0..length1], read2, &vector);
+            try std.testing.expectEqual(scalar, vector);
+        }
+    }
 }

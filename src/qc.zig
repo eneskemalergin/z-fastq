@@ -5,7 +5,13 @@
 //! filtered run counts only the removed 3' ends and dropped reads per cycle and takes its
 //! per-cycle tables as raw minus removed, until raw drops its tables for a read past the cycle
 //! limit; from then on it counts its reads in full. Adapter matches are searched once per raw
-//! read and count for the retained read when they lie inside its kept bases.
+//! read and count for the retained read when they lie inside its kept bases. Sequence Duplication
+//! Levels and Overrepresented sequences share FastQC's sequence table, one per population: the
+//! uppercase read cut to 50 bases is the key, at most 100,000 keys are stored, and later reads
+//! count only toward stored keys and the total. A key is kept as 50 five-bit codes, the low five
+//! bits of each IUPAC letter, which are distinct and nonzero. Overrepresented ties keep
+//! first-appearance order, and Possible Source comes from a FastQC contaminant list matched by
+//! FastQC's rules.
 
 const std = @import("std");
 const fastq = @import("fastq.zig");
@@ -75,10 +81,21 @@ pub const MatePopulations = struct {
     derived: bool = true,
     retained_cycles: usize = 0,
     last: ReadFacts = .{},
+    raw_sequences: SequenceCounts = .{},
+    retained_sequences: SequenceCounts = .{},
+    retained_enabled: bool = false,
+    last_key: SequenceKey = .{},
 
     pub fn deinit(self: *MatePopulations, allocator: std.mem.Allocator) void {
         self.raw.deinit(allocator);
         self.retained.deinit(allocator);
+        self.raw_sequences.deinit(allocator);
+        self.retained_sequences.deinit(allocator);
+    }
+
+    pub fn enableRetained(self: *MatePopulations) void {
+        std.debug.assert(self.raw_sequences.reads == 0);
+        self.retained_enabled = true;
     }
 
     pub fn addRead(
@@ -88,7 +105,15 @@ pub const MatePopulations = struct {
         quality: []const u8,
     ) (error{OutOfMemory} || statistics.StatsError)!void {
         if (self.derived and !self.raw.too_long and sequence.len > MAX_CYCLES) self.materialize();
+        const key: SequenceKey = .of(sequence);
+        try self.raw_sequences.reserve(allocator);
+        self.raw_sequences.prefetch(key);
         self.last = try self.raw.collect(allocator, sequence, quality);
+        self.raw_sequences.add(key);
+        if (self.retained_enabled) {
+            self.last_key = key;
+            self.retained_sequences.prefetch(key);
+        }
     }
 
     pub fn addRetained(
@@ -99,15 +124,22 @@ pub const MatePopulations = struct {
         kept: usize,
     ) (error{OutOfMemory} || statistics.StatsError)!void {
         std.debug.assert(kept <= sequence.len and sequence.len == quality.len);
-        if (!self.derived) return self.retained.addRead(allocator, sequence[0..kept], quality[0..kept]);
+        std.debug.assert(self.retained_enabled);
+        const key = if (kept >= @min(sequence.len, KEY_LENGTH)) self.last_key else SequenceKey.of(sequence[0..kept]);
+        try self.retained_sequences.reserve(allocator);
+        if (!self.derived) {
+            try self.retained.addRead(allocator, sequence[0..kept], quality[0..kept]);
+            self.retained_sequences.add(key);
+            return;
+        }
         const retained = &self.retained;
+        if (sequence.len > retained.quality.items.len) try retained.growCycles(allocator, sequence.len);
+        self.retained_sequences.add(key);
         var facts = self.last;
         if (kept < sequence.len) {
             const removed_sum = try self.removeCycles(allocator, sequence, quality, kept);
             facts.quality_sum -= removed_sum;
             facts.gc_count = gcCountScalar(sequence[0..gcKeptLength(kept)]);
-        } else if (sequence.len > retained.quality.items.len) {
-            try retained.growCycles(allocator, sequence.len);
         }
         retained.lengths[kept] += 1;
         self.retained_cycles = @max(self.retained_cycles, kept);
@@ -151,10 +183,17 @@ pub const MatePopulations = struct {
         return removed_sum;
     }
 
-    pub fn finish(self: *MatePopulations) void {
+    pub fn finish(self: *MatePopulations, allocator: std.mem.Allocator) error{OutOfMemory}!void {
         if (self.derived) self.materialize();
         self.raw.finish();
         self.retained.finish();
+        try self.raw_sequences.finish(allocator);
+        if (self.retained_enabled) try self.retained_sequences.finish(allocator);
+    }
+
+    pub fn writeJson(self: *const MatePopulations, json: *std.json.Stringify, retained: bool, contaminants: ?*const ContaminantList) !void {
+        const view: SequenceView = .{ .counts = if (retained) &self.retained_sequences else &self.raw_sequences, .contaminants = contaminants };
+        try (if (retained) &self.retained else &self.raw).writeJson(json, view);
     }
 
     fn materialize(self: *MatePopulations) void {
@@ -324,7 +363,7 @@ pub const MateQc = struct {
         return result;
     }
 
-    pub fn writeJson(self: *const MateQc, json: *std.json.Stringify) !void {
+    fn writeJson(self: *const MateQc, json: *std.json.Stringify, sequences: SequenceView) !void {
         std.debug.assert(self.pending_reads == 0);
         try json.beginObject();
         const cycles_known = !self.too_long;
@@ -355,6 +394,10 @@ pub const MateQc = struct {
         try json.endObject();
         try json.objectField("adapter_content");
         if (cycles_known) try self.writeAdapterContent(json) else try json.write(null);
+        try json.objectField("duplication");
+        try sequences.writeDuplication(json);
+        try json.objectField("overrepresented");
+        try sequences.writeOverrepresented(json);
         try json.objectField("unavailable");
         if (cycles_known) try json.write(null) else try json.write(TOO_LONG);
         try json.endObject();
@@ -827,6 +870,478 @@ fn fillWeights(weights: *GcWeights, length: usize) void {
     }
 }
 
+const KEY_LIMIT = 100_000;
+const KEY_LENGTH = 50;
+const KEY_WORDS = 7;
+const SLOT_LOAD_PERCENT = 80;
+const SLOT_MIN = 1024;
+const CODE_BITS = 5;
+const CODE_MASK = (1 << CODE_BITS) - 1;
+const PACKED_WORDS = 4;
+const OVERREPRESENTED_PERCENT = 0.1;
+const OVERREPRESENTED_MAX = 1000;
+const LEVEL_LABELS = [_][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", ">10", ">50", ">100", ">500", ">1k", ">5k", ">10k+" };
+pub const CONTAMINANT_FILE_LIMIT = 1 << 20;
+
+const LEVEL_EDGES = [_]u64{ 9, 49, 99, 499, 999, 4999, 9999 };
+const EXACT_MATCH_MIN = 8;
+const EXACT_MATCH_END = 20;
+const WINDOW_RUN_MIN = 21;
+const KEY_SECRETS = [_]u64{
+    0xa076_1d64_78bd_642f, 0xe703_7ed1_a0b4_28db, 0x8ebc_6af0_9c88_c6e3, 0x5899_65cc_7537_4cc3,
+    0x1d8e_4e27_c47d_124f, 0x9e37_79b9_7f4a_7c15, 0xc2b2_ae3d_27d4_eb4f, 0x1656_67b1_9e37_79f9,
+};
+
+const SequenceKey = struct {
+    words: [KEY_WORDS]u64 = @splat(0),
+    hash: u64 = 0,
+
+    const WORD_MASKS: [KEY_WORDS]u64 = masks: {
+        var bytes: [KEY_WORDS * 8]u8 = @splat(CODE_MASK);
+        for (bytes[KEY_LENGTH..]) |*byte| byte.* = 0;
+        break :masks @bitCast(bytes);
+    };
+
+    fn of(sequence: []const u8) SequenceKey {
+        var words: [KEY_WORDS]u64 = undefined;
+        if (sequence.len >= KEY_WORDS * 8) {
+            for (&words, WORD_MASKS, 0..) |*word, mask, index| {
+                word.* = std.mem.readInt(u64, sequence[index * 8 ..][0..8], .little) & mask;
+            }
+        } else {
+            var bytes: [KEY_WORDS * 8]u8 = @splat(0);
+            const length = @min(sequence.len, KEY_LENGTH);
+            @memcpy(bytes[0..length], sequence[0..length]);
+            for (&words, WORD_MASKS, 0..) |*word, mask, index| {
+                word.* = std.mem.readInt(u64, bytes[index * 8 ..][0..8], .little) & mask;
+            }
+        }
+        return .{ .words = words, .hash = mix(
+            mix(words[0] ^ KEY_SECRETS[0], words[1] ^ KEY_SECRETS[1]) ^
+                mix(words[2] ^ KEY_SECRETS[2], words[3] ^ KEY_SECRETS[3]) ^
+                mix(words[4] ^ KEY_SECRETS[4], words[5] ^ KEY_SECRETS[5]) ^ KEY_SECRETS[6],
+            words[6] ^ KEY_SECRETS[7],
+        ) };
+    }
+
+    fn mix(a: u64, b: u64) u64 {
+        const product = @as(u128, a) * b;
+        return @as(u64, @truncate(product)) ^ @as(u64, @truncate(product >> 64));
+    }
+
+    fn tag(self: SequenceKey) u32 {
+        return @truncate(self.hash >> 32);
+    }
+
+    fn pack(self: SequenceKey) [PACKED_WORDS]u64 {
+        var packed_words: [PACKED_WORDS + 1]u64 = @splat(0);
+        for (self.words, 0..) |word, chunk| {
+            var codes = word;
+            codes = (codes & 0x001f_001f_001f_001f) | ((codes >> 3) & 0x03e0_03e0_03e0_03e0);
+            codes = (codes & 0x0000_03ff_0000_03ff) | ((codes >> 6) & 0x000f_fc00_000f_fc00);
+            codes = (codes & 0x0000_0000_000f_ffff) | ((codes >> 12) & 0x0000_00ff_fff0_0000);
+            const bit = chunk * 8 * CODE_BITS;
+            packed_words[bit / 64] |= codes << @intCast(bit % 64);
+            if (bit % 64 > 64 - 8 * CODE_BITS) packed_words[bit / 64 + 1] |= codes >> @intCast(64 - bit % 64);
+        }
+        std.debug.assert(packed_words[PACKED_WORDS] == 0);
+        return packed_words[0..PACKED_WORDS].*;
+    }
+};
+
+const PackedKey = [PACKED_WORDS]u64;
+
+fn decodeKey(words: PackedKey, buffer: *[KEY_LENGTH]u8) []const u8 {
+    for (buffer, 0..) |*byte, index| {
+        const bit = index * CODE_BITS;
+        var code = words[bit / 64] >> @intCast(bit % 64);
+        if (bit % 64 > 64 - CODE_BITS) code |= words[bit / 64 + 1] << @intCast(64 - bit % 64);
+        code &= CODE_MASK;
+        if (code == 0) return buffer[0..index];
+        byte.* = 0x40 | @as(u8, @intCast(code));
+    }
+    return buffer;
+}
+
+const Levels = struct {
+    bins: [LEVEL_LABELS.len]f64,
+    deduplicated: f64,
+    total: f64,
+};
+
+const SequenceCounts = struct {
+    records: std.ArrayList(Record) = .empty,
+    slots: []u64 = &.{},
+    limit: u32 = KEY_LIMIT,
+    reads: u64 = 0,
+    reads_at_limit: u64 = 0,
+    levels: ?Levels = null,
+
+    const Record = struct {
+        words: PackedKey,
+        reads: u64,
+    };
+
+    fn deinit(self: *SequenceCounts, allocator: std.mem.Allocator) void {
+        self.records.deinit(allocator);
+        allocator.free(self.slots);
+    }
+
+    fn limited(self: *const SequenceCounts) bool {
+        return self.records.items.len == self.limit;
+    }
+
+    inline fn reserve(self: *SequenceCounts, allocator: std.mem.Allocator) error{ OutOfMemory, Overflow }!void {
+        std.debug.assert(self.levels == null);
+        _ = try std.math.add(u64, self.reads, 1);
+        if (self.limited()) return;
+        const needed = self.records.items.len + 1;
+        if (needed <= self.records.capacity and needed * 100 <= self.slots.len * SLOT_LOAD_PERCENT) return;
+        return self.grow(allocator);
+    }
+
+    fn grow(self: *SequenceCounts, allocator: std.mem.Allocator) error{OutOfMemory}!void {
+        const needed = self.records.items.len + 1;
+        if (needed > self.records.capacity) {
+            try self.records.ensureTotalCapacityPrecise(allocator, @min(self.limit, @max(needed, self.records.capacity * 2, 256)));
+        }
+        if (needed * 100 > self.slots.len * SLOT_LOAD_PERCENT) try self.growSlots(allocator);
+    }
+
+    fn growSlots(self: *SequenceCounts, allocator: std.mem.Allocator) error{OutOfMemory}!void {
+        const slots = try allocator.alloc(u64, @max(SLOT_MIN, self.slots.len * 2));
+        @memset(slots, 0);
+        const mask = slots.len - 1;
+        for (self.slots) |slot| {
+            if (slot == 0) continue;
+            var index: usize = @as(u32, @truncate(slot >> 32)) & mask;
+            while (slots[index] != 0) index = (index + 1) & mask;
+            slots[index] = slot;
+        }
+        allocator.free(self.slots);
+        self.slots = slots;
+    }
+
+    fn prefetch(self: *const SequenceCounts, key: SequenceKey) void {
+        if (self.slots.len == 0) return;
+        @prefetch(&self.slots[key.tag() & (self.slots.len - 1)], .{ .rw = .write });
+    }
+
+    fn add(self: *SequenceCounts, key: SequenceKey) void {
+        std.debug.assert(self.levels == null and self.slots.len != 0);
+        const reads = self.reads + 1;
+        const full = self.limited();
+        const mask = self.slots.len - 1;
+        const tag = key.tag();
+        var packed_key: ?PackedKey = null;
+        var index: usize = tag & mask;
+        while (true) : (index = (index + 1) & mask) {
+            const slot = self.slots[index];
+            if (slot == 0) break;
+            if (@as(u32, @truncate(slot >> 32)) != tag) continue;
+            const record = &self.records.items[@as(u32, @truncate(slot)) - 1];
+            const wanted = packed_key orelse key.pack();
+            packed_key = wanted;
+            if (!std.mem.eql(u64, &record.words, &wanted)) continue;
+            record.reads += 1;
+            if (!full) self.reads_at_limit = reads;
+            self.reads = reads;
+            return;
+        }
+        self.reads = reads;
+        if (full) return;
+        self.records.appendAssumeCapacity(.{ .words = packed_key orelse key.pack(), .reads = 1 });
+        self.slots[index] = @as(u64, tag) << 32 | self.records.items.len;
+        self.reads_at_limit = reads;
+    }
+
+    fn finish(self: *SequenceCounts, allocator: std.mem.Allocator) error{OutOfMemory}!void {
+        if (self.levels != null) return;
+        const counts = try allocator.alloc(u64, self.records.items.len);
+        defer allocator.free(counts);
+        for (self.records.items, counts) |record, *count| count.* = record.reads;
+        std.sort.pdq(u64, counts, {}, std.sort.asc(u64));
+        var levels: Levels = .{ .bins = @splat(0), .deduplicated = 0, .total = 0 };
+        var start: usize = 0;
+        while (start < counts.len) {
+            const level = counts[start];
+            var end = start + 1;
+            while (end < counts.len and counts[end] == level) end += 1;
+            const corrected = correctedCount(self.reads_at_limit, self.reads, level, end - start);
+            const weighted = corrected * @as(f64, @floatFromInt(level));
+            levels.deduplicated += corrected;
+            levels.total += weighted;
+            levels.bins[levelBin(level)] += weighted;
+            start = end;
+        }
+        self.levels = levels;
+    }
+
+    fn writeDuplication(self: *const SequenceCounts, json: *std.json.Stringify) !void {
+        const levels = self.levels.?;
+        try json.beginObject();
+        try json.objectField("reads");
+        try json.write(self.reads);
+        try json.objectField("stored_sequences");
+        try json.write(self.records.items.len);
+        try json.objectField("reads_at_limit");
+        try json.write(self.reads_at_limit);
+        try json.objectField("total_deduplicated_percentage");
+        try json.write(if (levels.total == 0) 100.0 else levels.deduplicated / levels.total * 100.0);
+        try json.objectField("levels");
+        try json.beginArray();
+        for (LEVEL_LABELS, levels.bins) |label, bin| {
+            try json.beginObject();
+            try json.objectField("level");
+            try json.write(label);
+            try json.objectField("percentage");
+            if (levels.total == 0) try json.write(null) else try json.write(bin / levels.total * 100.0);
+            try json.endObject();
+        }
+        try json.endArray();
+        try json.endObject();
+    }
+
+    fn percentage(self: *const SequenceCounts, reads: u64) f64 {
+        return @as(f64, @floatFromInt(reads)) / @as(f64, @floatFromInt(self.reads)) * 100.0;
+    }
+
+    fn moreReads(self: *const SequenceCounts, a: u32, b: u32) bool {
+        const first = self.records.items[a].reads;
+        const second = self.records.items[b].reads;
+        return first > second or (first == second and a < b);
+    }
+
+    fn writeOverrepresented(self: *const SequenceCounts, json: *std.json.Stringify, contaminants: ?*const ContaminantList) !void {
+        var rows: [OVERREPRESENTED_MAX]u32 = undefined;
+        var row_count: usize = 0;
+        for (self.records.items, 0..) |record, index| {
+            if (!(self.percentage(record.reads) > OVERREPRESENTED_PERCENT)) continue;
+            rows[row_count] = @intCast(index);
+            row_count += 1;
+        }
+        std.sort.pdq(u32, rows[0..row_count], self, moreReads);
+        try json.beginArray();
+        for (rows[0..row_count]) |index| {
+            const record = self.records.items[index];
+            var buffer: [KEY_LENGTH]u8 = undefined;
+            const key = decodeKey(record.words, &buffer);
+            try json.beginObject();
+            try json.objectField("sequence");
+            try json.write(key);
+            try json.objectField("count");
+            try json.write(record.reads);
+            try json.objectField("percentage");
+            try json.write(self.percentage(record.reads));
+            try json.objectField("possible_source");
+            const hit = if (contaminants) |list| list.bestHit(key) else null;
+            if (hit) |found| {
+                try json.beginObject();
+                try json.objectField("name");
+                try json.write(found.name);
+                try json.objectField("identity");
+                try json.write(found.identity);
+                try json.objectField("length");
+                try json.write(found.length);
+                try json.endObject();
+            } else try json.write(null);
+            try json.endObject();
+        }
+        try json.endArray();
+    }
+};
+
+const SequenceView = struct {
+    counts: *const SequenceCounts,
+    contaminants: ?*const ContaminantList,
+
+    fn writeDuplication(self: SequenceView, json: *std.json.Stringify) !void {
+        try self.counts.writeDuplication(json);
+    }
+
+    fn writeOverrepresented(self: SequenceView, json: *std.json.Stringify) !void {
+        try self.counts.writeOverrepresented(json, self.contaminants);
+    }
+};
+
+fn levelBin(level: u64) usize {
+    const offset = level - 1;
+    if (offset <= LEVEL_EDGES[0]) return @intCast(offset);
+    for (LEVEL_EDGES[1..], LEVEL_EDGES[0]..) |edge, bin| {
+        if (offset <= edge) return bin;
+    }
+    return LEVEL_LABELS.len - 1;
+}
+
+fn correctedCount(limit: u64, total: u64, level: u64, observations: usize) f64 {
+    const count: f64 = @floatFromInt(observations);
+    if (limit == total or total - observations < limit) return count;
+    std.debug.assert(level <= total and total < 1 << 53);
+    const floor = 1.0 - count / (count + 0.01);
+    var unseen: f64 = 1.0;
+    var numerator: f64 = @floatFromInt(total - level);
+    var denominator: f64 = @floatFromInt(total);
+    for (0..limit) |_| {
+        unseen *= numerator / denominator;
+        if (unseen < floor) {
+            unseen = 0;
+            break;
+        }
+        numerator -= 1;
+        denominator -= 1;
+    }
+    return count / (1.0 - unseen);
+}
+
+const Hit = struct {
+    name: []const u8,
+    identity: u32,
+    length: u32,
+};
+
+const Contaminant = struct {
+    name: []const u8,
+    forward: []const u8,
+    reverse: []const u8,
+
+    fn match(self: Contaminant, key: []const u8) ?Hit {
+        if (key.len >= EXACT_MATCH_MIN and key.len < EXACT_MATCH_END) {
+            if (std.mem.indexOf(u8, self.forward, key) != null or std.mem.indexOf(u8, self.reverse, key) != null) {
+                return .{ .name = self.name, .identity = 100, .length = @intCast(key.len) };
+            }
+        }
+        var best: ?Hit = null;
+        for ([_][]const u8{ self.forward, self.reverse }) |sequence| {
+            var offset: isize = @as(isize, EXACT_MATCH_END) - @as(isize, @intCast(sequence.len));
+            while (offset < @as(isize, @intCast(key.len)) - EXACT_MATCH_END) : (offset += 1) {
+                const hit = self.alignAt(sequence, key, offset) orelse continue;
+                if (best == null or hit.length > best.?.length) best = hit;
+            }
+        }
+        return best;
+    }
+
+    fn alignAt(self: Contaminant, sequence: []const u8, key: []const u8, offset: isize) ?Hit {
+        var best: ?Hit = null;
+        var mismatches: u32 = 0;
+        var start: isize = 0;
+        var end: isize = 0;
+        for (sequence, 0..) |base, index| {
+            const position = @as(isize, @intCast(index)) + offset;
+            const signed_index: isize = @intCast(index);
+            if (position < 0) {
+                start = signed_index + 1;
+                continue;
+            }
+            if (position >= key.len) break;
+            if (base == key[@intCast(position)]) {
+                end = signed_index;
+                continue;
+            }
+            mismatches += 1;
+            if (mismatches > 1) {
+                best = better(best, self.run(start, end, mismatches - 1));
+                start = signed_index + 1;
+                end = signed_index + 1;
+                mismatches = 0;
+            }
+        }
+        return better(best, self.run(start, end, mismatches));
+    }
+
+    fn run(self: Contaminant, start: isize, end: isize, mismatches: u32) ?Hit {
+        const length = 1 + end - start;
+        if (length < WINDOW_RUN_MIN) return null;
+        const bases: u32 = @intCast(length);
+        return .{ .name = self.name, .identity = (bases - mismatches) * 100 / bases, .length = bases };
+    }
+
+    fn better(best: ?Hit, hit: ?Hit) ?Hit {
+        const found = hit orelse return best;
+        const current = best orelse return found;
+        if (current.length < found.length) return found;
+        if (current.length == found.length and current.identity < found.identity) return found;
+        return current;
+    }
+};
+
+pub const ContaminantList = struct {
+    arena: std.heap.ArenaAllocator,
+    items: []const Contaminant,
+
+    pub const ParseError = error{ OutOfMemory, InvalidBase };
+
+    pub fn parse(allocator: std.mem.Allocator, text: []const u8, failed_line: *usize) ParseError!ContaminantList {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        var items: std.ArrayList(Contaminant) = .empty;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        var line_number: usize = 0;
+        while (lines.next()) |raw_line| {
+            line_number += 1;
+            const line = std.mem.trimEnd(u8, raw_line, "\r");
+            if (std.mem.startsWith(u8, line, "#")) continue;
+            if (isBlank(line)) continue;
+            var fields: [2][]const u8 = undefined;
+            const count = splitTabs(line, &fields) orelse continue;
+            if (count != 2) continue;
+            const forward = try owned.alloc(u8, fields[1].len);
+            const reverse = try owned.alloc(u8, fields[1].len);
+            for (fields[1], forward, 0..) |byte, *upper, index| {
+                upper.* = std.ascii.toUpper(byte);
+                reverse[reverse.len - 1 - index] = switch (upper.*) {
+                    'A' => 'T',
+                    'C' => 'G',
+                    'G' => 'C',
+                    'T' => 'A',
+                    else => {
+                        failed_line.* = line_number;
+                        return error.InvalidBase;
+                    },
+                };
+            }
+            try items.append(owned, .{ .name = try owned.dupe(u8, fields[0]), .forward = forward, .reverse = reverse });
+        }
+        return .{ .arena = arena, .items = items.items };
+    }
+
+    fn isBlank(line: []const u8) bool {
+        for (line) |byte| {
+            if (byte > ' ') return false;
+        }
+        return true;
+    }
+
+    fn splitTabs(line: []const u8, fields: *[2][]const u8) ?usize {
+        var count: usize = 0;
+        var parts = std.mem.splitScalar(u8, std.mem.trimEnd(u8, line, "\t"), '\t');
+        var first = true;
+        while (parts.next()) |part| {
+            if (part.len == 0 and !first) continue;
+            first = false;
+            if (count == fields.len) return null;
+            fields[count] = part;
+            count += 1;
+        }
+        return count;
+    }
+
+    pub fn deinit(self: *ContaminantList) void {
+        self.arena.deinit();
+    }
+
+    pub fn bestHit(self: *const ContaminantList, key: []const u8) ?Hit {
+        var best: ?Hit = null;
+        for (self.items) |contaminant| {
+            const hit = contaminant.match(key) orelse continue;
+            if (best == null or hit.length > best.?.length or
+                (hit.length == best.?.length and hit.identity > best.?.identity)) best = hit;
+        }
+        return best;
+    }
+};
+
 const TestRead = struct { []const u8, []const u8 };
 
 fn collect(allocator: std.mem.Allocator, reads: []const TestRead) !MateQc {
@@ -838,9 +1353,19 @@ fn collect(allocator: std.mem.Allocator, reads: []const TestRead) !MateQc {
 
 fn reportOf(arena: std.mem.Allocator, mate: *MateQc) !std.json.ObjectMap {
     mate.finish();
+    var sequences: SequenceCounts = .{};
+    try sequences.finish(arena);
     var output: std.Io.Writer.Allocating = .init(arena);
     var json: std.json.Stringify = .{ .writer = &output.writer };
-    try mate.writeJson(&json);
+    try mate.writeJson(&json, .{ .counts = &sequences, .contaminants = null });
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, output.written(), .{});
+    return value.object;
+}
+
+fn populationReportOf(arena: std.mem.Allocator, populations: *const MatePopulations, retained: bool) !std.json.ObjectMap {
+    var output: std.Io.Writer.Allocating = .init(arena);
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try populations.writeJson(&json, retained, null);
     const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, output.written(), .{});
     return value.object;
 }
@@ -1015,10 +1540,12 @@ test "[failure] - [qc]: a failed cycle allocation leaves the counts unchanged" {
 }
 
 test "[failure] - [qc]: a failed retained allocation leaves the retained counts unchanged" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var populations: MatePopulations = .{};
     defer populations.deinit(failing.allocator());
+    populations.enableRetained();
     try populations.addRead(failing.allocator(), "ACGT", "IIII");
+    failing.fail_index = failing.alloc_index;
     try std.testing.expectError(error.OutOfMemory, populations.addRetained(failing.allocator(), "ACGT", "IIII", 2));
     try std.testing.expectEqual(@as(u64, 0), populations.retained.lengths[2]);
     try std.testing.expectEqual(@as(usize, 0), populations.retained_cycles);
@@ -1092,7 +1619,8 @@ test "[property] - [qc]: a retained population derived from raw equals one colle
         errdefer std.debug.print("{d} reads\n", .{count});
         var populations: MatePopulations = .{};
         defer populations.deinit(allocator);
-        var expected: MateQc = .{};
+        populations.enableRetained();
+        var expected: MatePopulations = .{};
         defer expected.deinit(allocator);
         for (reads[0..count]) |read| {
             try populations.addRead(allocator, read.sequence, read.quality);
@@ -1103,16 +1631,17 @@ test "[property] - [qc]: a retained population derived from raw equals one colle
             try populations.addRetained(allocator, read.sequence, read.quality, read.kept);
             try expected.addRead(allocator, read.sequence[0..read.kept], read.quality[0..read.kept]);
         }
-        populations.finish();
-        const want = try reportOf(arena.allocator(), &expected);
-        const got = try reportOf(arena.allocator(), &populations.retained);
-        inline for (.{ "per_base_quality", "per_base_content", "per_base_n", "length_distribution", "per_sequence_quality", "per_sequence_gc", "terminal_runs", "adapter_content", "unavailable" }) |module| {
+        try populations.finish(allocator);
+        try expected.finish(allocator);
+        const want = try populationReportOf(arena.allocator(), &expected, false);
+        const got = try populationReportOf(arena.allocator(), &populations, true);
+        inline for (.{ "per_base_quality", "per_base_content", "per_base_n", "length_distribution", "per_sequence_quality", "per_sequence_gc", "terminal_runs", "adapter_content", "duplication", "overrepresented", "unavailable" }) |module| {
             errdefer std.debug.print("{s}\n", .{module});
             const want_text = try std.json.Stringify.valueAlloc(arena.allocator(), want.get(module).?, .{});
             const got_text = try std.json.Stringify.valueAlloc(arena.allocator(), got.get(module).?, .{});
             try std.testing.expectEqualStrings(want_text, got_text);
         }
-        try std.testing.expectEqual(try expected.stats(), try populations.retained.stats());
+        try std.testing.expectEqual(try expected.raw.stats(), try populations.retained.stats());
     }
 }
 
@@ -1217,4 +1746,207 @@ test "[property] - [qc]: the strided adapter search finds the first match a dire
             }
         }
     }
+}
+
+fn countsOf(allocator: std.mem.Allocator, reads: []const []const u8) !SequenceCounts {
+    var counts: SequenceCounts = .{};
+    errdefer counts.deinit(allocator);
+    for (reads) |read| {
+        try counts.reserve(allocator);
+        counts.add(.of(read));
+    }
+    try counts.finish(allocator);
+    return counts;
+}
+
+fn sequenceReportOf(arena: std.mem.Allocator, counts: *const SequenceCounts, contaminants: ?*const ContaminantList) !std.json.ObjectMap {
+    var output: std.Io.Writer.Allocating = .init(arena);
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    try json.beginObject();
+    try json.objectField("duplication");
+    try counts.writeDuplication(&json);
+    try json.objectField("overrepresented");
+    try counts.writeOverrepresented(&json, contaminants);
+    try json.endObject();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, output.written(), .{});
+    return value.object;
+}
+
+fn jsonNumber(value: std.json.Value) f64 {
+    return switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        else => std.math.nan(f64),
+    };
+}
+
+fn sharePercent(part: f64, whole: f64) f64 {
+    return part / whole * 100.0;
+}
+
+fn levelValue(report: std.json.ObjectMap, bin: usize) f64 {
+    return jsonNumber(report.get("duplication").?.object.get("levels").?.array.items[bin].object.get("percentage").?);
+}
+
+fn deduplicatedPercent(report: std.json.ObjectMap) f64 {
+    return jsonNumber(report.get("duplication").?.object.get("total_deduplicated_percentage").?);
+}
+
+fn indexedKey(buffer: *[KEY_LENGTH]u8, index: usize) []const u8 {
+    var value = index;
+    for (buffer) |*base| {
+        base.* = "ACGT"[value & 3];
+        value >>= 2;
+    }
+    return buffer;
+}
+
+test "[unit] - [qc]: duplication levels count uppercase keys cut to 50 bases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const long = "ACGTACGTAC" ** 5;
+
+    var mixed_reads: std.ArrayList([]const u8) = .empty;
+    for ([_]usize{ 7, 5, 3, 2, 2, 1, 1, 1 }, 0..) |copies, index| {
+        const read = try std.fmt.allocPrint(a, "{s}{d}", .{ "GATTACA", index });
+        for (0..copies) |_| try mixed_reads.append(a, read);
+    }
+    var mixed = try countsOf(std.testing.allocator, mixed_reads.items);
+    defer mixed.deinit(std.testing.allocator);
+    const mixed_report = try sequenceReportOf(a, &mixed, null);
+    try std.testing.expectEqual(@as(f64, 36.36363636363637), deduplicatedPercent(mixed_report));
+    try std.testing.expectEqual(sharePercent(3, 22), levelValue(mixed_report, 0));
+    try std.testing.expectEqual(sharePercent(4, 22), levelValue(mixed_report, 1));
+    try std.testing.expectEqual(sharePercent(7, 22), levelValue(mixed_report, 6));
+
+    var folded = try countsOf(std.testing.allocator, &.{ long ++ "A", "acgtacgtac" ** 5 ++ "TTT", long, "", "" });
+    defer folded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), folded.records.items.len);
+    for ([_]usize{ 50, 55, 56, 60 }) |length| {
+        const lower = ("acgtacgtac" ** 6)[0..length];
+        try std.testing.expectEqual(SequenceKey.of(long), SequenceKey.of(lower));
+    }
+    try std.testing.expect(SequenceKey.of(long[0..49]).hash != SequenceKey.of(long).hash);
+    try std.testing.expectEqual(@as(u64, 3), folded.records.items[0].reads);
+    for ([_][]const u8{ "acgturyswkmbdhvn" ++ "N" ** 40, "ACGTURYSWKMBDHVN", "", "T", "GATTACA" ** 7 }) |sequence| {
+        const length = @min(sequence.len, KEY_LENGTH);
+        var buffer: [KEY_LENGTH]u8 = undefined;
+        var upper: [KEY_LENGTH]u8 = undefined;
+        try std.testing.expectEqualStrings(std.ascii.upperString(upper[0..length], sequence[0..length]), decodeKey(SequenceKey.of(sequence).pack(), &buffer));
+    }
+    try std.testing.expect(!std.mem.eql(u64, &SequenceKey.of("ACGT").pack(), &SequenceKey.of("ACGTA").pack()));
+    try std.testing.expectEqual(@as(f64, 40), deduplicatedPercent(try sequenceReportOf(a, &folded, null)));
+
+    var empty = try countsOf(std.testing.allocator, &.{});
+    defer empty.deinit(std.testing.allocator);
+    const empty_report = try sequenceReportOf(a, &empty, null);
+    try std.testing.expectEqual(@as(f64, 100), deduplicatedPercent(empty_report));
+    try std.testing.expectEqual(std.json.Value.null, empty_report.get("duplication").?.object.get("levels").?.array.items[0].object.get("percentage").?);
+    try std.testing.expectEqual(@as(usize, 0), empty_report.get("overrepresented").?.array.items.len);
+
+    try std.testing.expectEqual(@as(usize, 8), levelBin(9));
+    try std.testing.expectEqual(@as(usize, 9), levelBin(10));
+    try std.testing.expectEqual(@as(usize, 9), levelBin(50));
+    try std.testing.expectEqual(@as(usize, 10), levelBin(51));
+    try std.testing.expectEqual(@as(usize, 14), levelBin(10000));
+    try std.testing.expectEqual(@as(usize, 15), levelBin(10001));
+}
+
+test "[edge] - [qc]: past 100,000 keys new reads count only in the total and the levels are corrected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var counts: SequenceCounts = .{};
+    defer counts.deinit(std.testing.allocator);
+    var buffer: [KEY_LENGTH]u8 = undefined;
+    for (0..KEY_LIMIT) |index| {
+        try counts.reserve(std.testing.allocator);
+        counts.add(.of(indexedKey(&buffer, index)));
+    }
+    try std.testing.expect(counts.limited());
+    try std.testing.expectEqual(@as(u64, KEY_LIMIT), counts.reads_at_limit);
+    try counts.reserve(std.testing.allocator);
+    counts.add(.of(indexedKey(&buffer, KEY_LIMIT)));
+    try std.testing.expectEqual(@as(usize, KEY_LIMIT), counts.records.items.len);
+    try std.testing.expectEqual(@as(u64, KEY_LIMIT + 1), counts.reads);
+    for (0..KEY_LIMIT / 2) |index| {
+        try counts.reserve(std.testing.allocator);
+        counts.add(.of(indexedKey(&buffer, index)));
+    }
+    try std.testing.expectEqual(@as(u64, KEY_LIMIT), counts.reads_at_limit);
+    try std.testing.expectEqual(@as(usize, KEY_LIMIT), counts.records.capacity);
+    try std.testing.expectEqual(@as(usize, 131072), counts.slots.len);
+
+    var probe: SequenceCounts = .{};
+    defer probe.deinit(std.testing.allocator);
+    for (0..KEY_LIMIT) |index| {
+        try probe.reserve(std.testing.allocator);
+        probe.add(.of(indexedKey(&buffer, index)));
+    }
+    for (0..KEY_LIMIT / 2) |index| {
+        try probe.reserve(std.testing.allocator);
+        probe.add(.of(indexedKey(&buffer, index)));
+    }
+    try probe.finish(std.testing.allocator);
+    const report = try sequenceReportOf(arena.allocator(), &probe, null);
+    try std.testing.expectEqual(@as(f64, 70.00002000011865), deduplicatedPercent(report));
+    try std.testing.expectEqual(@as(f64, 40.0000400002373), levelValue(report, 0));
+}
+
+test "[unit] - [qc]: overrepresented keys are above 0.1% of all reads, by count then first appearance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var reads: std.ArrayList([]const u8) = .empty;
+    try reads.appendSlice(a, &.{ "TTTT", "CCCC", "CCCC", "GGGG", "TTTT", "GGGG", "GGGG" });
+    for (0..993) |index| try reads.append(a, try std.fmt.allocPrint(a, "A{d}", .{index}));
+    var counts = try countsOf(std.testing.allocator, reads.items);
+    defer counts.deinit(std.testing.allocator);
+    const rows = (try sequenceReportOf(a, &counts, null)).get("overrepresented").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    for (rows, [_][]const u8{ "GGGG", "TTTT", "CCCC" }) |row, sequence| {
+        try std.testing.expectEqualStrings(sequence, row.object.get("sequence").?.string);
+        try std.testing.expectEqual(std.json.Value.null, row.object.get("possible_source").?);
+    }
+    try std.testing.expectEqual(sharePercent(3, 1000), jsonNumber(rows[0].object.get("percentage").?));
+}
+
+const ADAPTER_1 = "GATCGGAAGAGCTCGTATGCCGTCTTCTGCTTG";
+const ADAPTER_2 = "CAAGCAGAAGACGGCATACGAGCTCTTCCGATCT";
+
+test "[unit] - [qc]: contaminant hits follow FastQC's exact and one-mismatch window rules" {
+    var failed_line: usize = 0;
+    const text = "# comment\n\n  \t \nIllumina Single End Adapter 1\t\t\t" ++ ADAPTER_1 ++ "\r\nthree\tfields\there\n" ++
+        "Illumina Single End Adapter 2\t" ++ "caagcagaagacggcatacgagctcttccgatct" ++ "\t\n";
+    var list = try ContaminantList.parse(std.testing.allocator, text, &failed_line);
+    defer list.deinit();
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try std.testing.expectEqualStrings(ADAPTER_2, list.items[1].forward);
+
+    const Case = struct { key: []const u8, name: ?[]const u8, identity: u32 = 0, length: u32 = 0 };
+    const one = ADAPTER_1[0..15] ++ "A" ++ ADAPTER_1[16..30];
+    const two = ADAPTER_1[0..10] ++ "C" ++ ADAPTER_1[11..20] ++ "A" ++ ADAPTER_1[21..30];
+    const reverse = "CAAGCAGAAGACGGCATACGAGCTCTTCCGATC";
+    const cases = [_]Case{
+        .{ .key = ADAPTER_1[0..7], .name = null },
+        .{ .key = ADAPTER_1[0..8], .name = "Illumina Single End Adapter 1", .identity = 100, .length = 8 },
+        .{ .key = ADAPTER_1[0..19], .name = "Illumina Single End Adapter 1", .identity = 100, .length = 19 },
+        .{ .key = ADAPTER_1[0..20], .name = null },
+        .{ .key = ADAPTER_1[0..21], .name = "Illumina Single End Adapter 1", .identity = 100, .length = 21 },
+        .{ .key = one, .name = "Illumina Single End Adapter 1", .identity = 96, .length = 30 },
+        .{ .key = two, .name = null },
+        .{ .key = reverse, .name = "Illumina Single End Adapter 1", .identity = 100, .length = 33 },
+    };
+    for (cases, 0..) |case, index| {
+        errdefer std.debug.print("case {d}\n", .{index});
+        const hit = list.bestHit(case.key);
+        if (case.name) |name| {
+            try std.testing.expectEqualStrings(name, hit.?.name);
+            try std.testing.expectEqual(case.identity, hit.?.identity);
+            try std.testing.expectEqual(case.length, hit.?.length);
+        } else try std.testing.expectEqual(@as(?Hit, null), hit);
+    }
+
+    try std.testing.expectError(error.InvalidBase, ContaminantList.parse(std.testing.allocator, "ok\tACGT\nbad\tACNT\n", &failed_line));
+    try std.testing.expectEqual(@as(usize, 2), failed_line);
 }
