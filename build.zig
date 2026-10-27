@@ -1,4 +1,6 @@
-//! Build graph for z-fastq.
+//! Build graph for z-fastq. Every step compiles with LLVM, Debug included: with Zig 0.16's
+//! self-hosted x86-64 backend, a Debug build whose target has PCLMUL compiles Zipir's PCLMUL
+//! CRC32 kernel inline, and the result corrupts later state in tests.
 
 const std = @import("std");
 
@@ -79,7 +81,7 @@ pub fn build(b: *std.Build) void {
             .strip = strip,
         });
         module.addOptions("build_options", object_options);
-        break :blk b.addObject(.{ .name = "simd_avx2", .root_module = module });
+        break :blk b.addObject(.{ .name = "simd_avx2", .root_module = module, .use_llvm = true });
     };
 
     const lib_module = b.addModule("z-fastq", .{
@@ -91,6 +93,7 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "z-fastq",
+        .use_llvm = true,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -146,7 +149,7 @@ pub fn build(b: *std.Build) void {
     };
 
     const test_step = b.step("test", "Run unit tests");
-    const source_tests = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
+    const source_tests = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module, .use_llvm = true }));
     test_step.dependOn(&source_tests.step);
     b.step("test-src", "Run the in-file tests of src/").dependOn(&source_tests.step);
     for (suites) |suite| {
@@ -157,7 +160,7 @@ pub fn build(b: *std.Build) void {
             .imports = suite.imports,
         });
         module.addOptions("test_options", test_options);
-        const run = b.addRunArtifact(b.addTest(.{ .root_module = module }));
+        const run = b.addRunArtifact(b.addTest(.{ .root_module = module, .use_llvm = true }));
         if (suite.runs_binary) {
             module.link_libc = true;
             run.step.dependOn(b.getInstallStep());

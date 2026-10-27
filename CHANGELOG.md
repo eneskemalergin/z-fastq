@@ -32,7 +32,9 @@ A `process` command that validates and trims paired reads into two plain or gzip
   - `stats` streams a record larger than the read buffer instead of copying it, so its peak memory no longer grows with read length (772 KiB on every input shape, from up to 1.8 MiB on 300 kb reads), long reads take 5 to 25% less time, and `stats` allocates nothing per record.
   - Paired and interleaved fraction sampling draw each pair before reading it and validate unselected pairs without keeping them: on 300 kb read pairs, peak memory for `sample --paired` falls from 2.3 MiB to 0.8 MiB when few pairs are selected. `check --interleaved` and `deinterleave` read a mate whose partner already failed only far enough to report it.
 - **Library.** `FileSink` writes whole pages and keeps a partial last page buffered until the next write or `flush`.
-- **Build.** `-Dkernel-backend=portable` builds no AVX2 object and selects no kernel at run time; z-fastq's own kernels then use only the instructions of the build target, as Zipir's do.
+- **Build.**
+  - `-Dkernel-backend=portable` builds no AVX2 object and selects no kernel at run time; z-fastq's own kernels then use only the instructions of the build target, as Zipir's do.
+  - Debug builds compile with LLVM, as release builds do. With Zig 0.16's own x86-64 code generator, a Debug build on a CPU with PCLMUL could corrupt state after the gzip CRC32 kernel, and an unrelated test then failed.
 
 ### Fixed
 
