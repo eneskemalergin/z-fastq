@@ -6,11 +6,14 @@ All notable changes to z-fastq will be documented in this file.
 
 ## [0.2.0]
 
-A `process` command that validates paired reads into two plain or gzip outputs with a JSON report, faster record handling in every command, AVX2 kernels selected at run time on CPUs that have them, bounded memory for `stats` and paired sampling on long reads, and stricter handling of standard input and output. Output bytes, JSON documents, and exit classes are unchanged except where a fix below says so.
+A `process` command that validates and trims paired reads into two plain or gzip outputs with a JSON report, faster record handling in every command, AVX2 kernels selected at run time on CPUs that have them, bounded memory for `stats` and paired sampling on long reads, and stricter handling of standard input and output. Output bytes, JSON documents, and exit classes are unchanged except where a fix below says so.
 
 ### Added
 
-- **Commands.** `process` validates two mate files pair by pair, as `check --paired` does, and writes every accepted pair to two new files, plain or gzip (`--gzip`). `--max-pairs N` stops after the first N pairs, and `--report` writes a `z-fastq/process-v1` JSON document with per-mate statistics, FastQC's core quality modules computed as FastQC 0.13.0 computes them, terminal poly-G and poly-A counts, and any failure. The same inputs and options give byte-identical outputs and report.
+- **Commands.** `process` reads two mate files pair by pair and writes them to two new files.
+  - It validates every pair as `check --paired` does and writes the accepted pairs, plain or gzip (`--gzip`). `--max-pairs N` stops after the first N pairs. The same inputs and options give byte-identical outputs and report.
+  - Trimming, each step off unless its options are given: `--adapter1` with `--adapter2` removes adapters and mate overlaps, `--trim-poly-g N` removes 3' poly-G runs, and `--trim-tail-window W` with `--trim-tail-quality Q` removes low-quality 3' ends. The kept bases are those fastp 1.1.0 keeps with the matching options, and trimming uses the same fixed memory at any read length. No pair is dropped: a mate trimmed to nothing is written as an empty record.
+  - `--report` writes a `z-fastq/process-v1` JSON document: per-mate statistics and FastQC's core quality modules, computed as FastQC 0.13.0 computes them, for the reads as read and as written; terminal poly-G and poly-A counts; the reads and bases each trimming step removed; and any failure.
 - **Library.**
   - `FileSink.initStreaming` writes at the file handle's current position, for standard output and pipes.
   - `Stats.ratios` returns each ratio of `StatsResult` as an exact numerator and denominator, so callers can round without floating point.

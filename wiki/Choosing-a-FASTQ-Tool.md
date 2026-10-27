@@ -23,7 +23,7 @@ z-fastq is intentionally narrower than a general sequence manipulation suite. It
 
 ## Use fastp when
 
-[fastp](https://github.com/OpenGene/fastp) is the right category of tool when the job includes short-read QC and preprocessing such as adapter handling, trimming, filtering, deduplication, and reports. z-fastq does not replace those transformations.
+[fastp](https://github.com/OpenGene/fastp) is the right category of tool when the job includes the wider short-read preprocessing set: read filtering, deduplication, base correction, pair merging, and its HTML and JSON reports. z-fastq's `process` covers paired adapter, overlap, poly-G, and 3' quality trimming with fastp 1.1.0's rules, plus FastQC's core quality modules; it does not filter or deduplicate reads.
 
 ## Why keep another focused tool?
 

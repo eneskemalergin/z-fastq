@@ -21,7 +21,7 @@ Follow [Getting started](Getting-Started) for a small end-to-end run. It creates
 - [Understand R1 and R2 matching](Paired-Reads).
 - [Sample records without losing pair synchronization](Sampling).
 - [Convert between two-file and interleaved pairs](Interleaving).
-- [Validate paired reads into new files with a report](Processing).
+- [Validate and trim paired reads into new files with a report](Processing).
 - [Use gzip, pipes, and output streams correctly](Input-and-Output).
 - [Integrate results into a script](Automation).
 - [Compare what z-fastq does with other FASTQ tools](Choosing-a-FASTQ-Tool).
@@ -38,12 +38,12 @@ The CLI currently has seven commands:
 - `sample` selects records or read pairs by fraction or exact count.
 - `interleave` combines two validated mate streams into one stream.
 - `deinterleave` splits one validated interleaved stream into two files.
-- `process` validates two mate files into two new files, plain or gzip, with an optional JSON report.
+- `process` validates and optionally trims two mate files into two new files, plain or gzip, with an optional JSON report.
 
 The reader accepts plain FASTQ, gzip-compressed FASTQ, and explicit standard input. FASTQ-producing commands write four-line records with LF endings: plain FASTQ to standard output, except `deinterleave` and `process`, which write two files; `process --gzip` compresses them.
 
 ## What it is not
 
-z-fastq is not a trimmer, adapter remover, aligner, duplicate remover, or general FASTA/Q Swiss Army knife. It does not repair malformed records silently. It does not support every compression container. Those boundaries are intentional while the core tool is being polished.
+z-fastq is not an aligner, duplicate remover, read filter, or general FASTA/Q Swiss Army knife. `process` trims adapters, mate overlaps, poly-G runs, and low-quality 3' ends, but it does not drop reads. It does not repair malformed records silently. It does not support every compression container. Those boundaries are intentional while the core tool is being polished.
 
 Read [Choosing a FASTQ tool](Choosing-a-FASTQ-Tool) if you are deciding whether z-fastq belongs in a larger preprocessing workflow.

@@ -80,7 +80,7 @@ Use `z-fastq --help` for the complete command and option reference.
 - `sample`: select records or read pairs by fraction or exact count.
 - `interleave`: combine R1 and R2 into a validated interleaved stream.
 - `deinterleave`: split validated interleaved reads into two output files.
-- `process`: validate two mate files into two plain or gzip outputs, with an optional JSON report.
+- `process`: validate and trim two mate files into two plain or gzip outputs, with an optional JSON report.
 
 All commands report errors with non-zero exit status. Validation and parsing failures identify the affected record and source location where available.
 

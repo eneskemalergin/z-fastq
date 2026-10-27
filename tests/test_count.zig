@@ -24,7 +24,7 @@ const EXPECTED_USAGE =
     \\  sample        Select records by deterministic probability or exact count
     \\  interleave    Validate and interleave paired FASTQ inputs
     \\  deinterleave  Validate and separate interleaved paired FASTQ input
-    \\  process       Validate paired FASTQ inputs into two plain or gzip outputs
+    \\  process       Validate and trim paired FASTQ inputs into two plain or gzip outputs
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -53,6 +53,13 @@ const EXPECTED_USAGE =
     \\  --gzip               Write both outputs as gzip
     \\  --max-pairs N        Stop after the first N pairs
     \\  --report PATH        Write a z-fastq/process-v1 JSON report (- for stdout)
+    \\  --adapter1 SEQ       Trim mate 1 adapters and mate overlaps (with --adapter2)
+    \\  --adapter2 SEQ       Trim mate 2 adapters and mate overlaps (with --adapter1)
+    \\  --trim-poly-g N      Trim 3' poly-G runs, scanning at least N bases
+    \\  --trim-tail-window W
+    \\                       Trim the 3' end by a W-base quality window (with quality)
+    \\  --trim-tail-quality Q
+    \\                       Mean Phred quality the 3' window must reach (with window)
     \\
     \\Count usage:
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
@@ -80,7 +87,7 @@ const EXPECTED_USAGE =
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
     \\Process usage:
-    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
+    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 

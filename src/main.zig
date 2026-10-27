@@ -8,6 +8,7 @@ const pairing = @import("pair.zig");
 const sampling = @import("sample.zig");
 const statistics = @import("stats.zig");
 const qc = @import("qc.zig");
+const preprocess = @import("preprocess.zig");
 
 pub const std_options: std.Options = .{ .networking = false };
 
@@ -23,7 +24,7 @@ const USAGE =
     \\  sample        Select records by deterministic probability or exact count
     \\  interleave    Validate and interleave paired FASTQ inputs
     \\  deinterleave  Validate and separate interleaved paired FASTQ input
-    \\  process       Validate paired FASTQ inputs into two plain or gzip outputs
+    \\  process       Validate and trim paired FASTQ inputs into two plain or gzip outputs
     \\
     \\General options:
     \\  -h, --help           Show this help message
@@ -52,6 +53,13 @@ const USAGE =
     \\  --gzip               Write both outputs as gzip
     \\  --max-pairs N        Stop after the first N pairs
     \\  --report PATH        Write a z-fastq/process-v1 JSON report (- for stdout)
+    \\  --adapter1 SEQ       Trim mate 1 adapters and mate overlaps (with --adapter2)
+    \\  --adapter2 SEQ       Trim mate 2 adapters and mate overlaps (with --adapter1)
+    \\  --trim-poly-g N      Trim 3' poly-G runs, scanning at least N bases
+    \\  --trim-tail-window W
+    \\                       Trim the 3' end by a W-base quality window (with quality)
+    \\  --trim-tail-quality Q
+    \\                       Mean Phred quality the 3' window must reach (with window)
     \\
     \\Count usage:
     \\  z-fastq count [--max-line-bytes N] <path|-> [<path|-> ...]
@@ -79,7 +87,7 @@ const USAGE =
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
     \\Process usage:
-    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
+    \\  z-fastq process [--gzip] [--max-pairs N] [--report PATH] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 
@@ -117,6 +125,11 @@ const GivenOptions = struct {
     out2: bool = false,
     report: bool = false,
     max_pairs: bool = false,
+    adapter1: bool = false,
+    adapter2: bool = false,
+    trim_poly_g: bool = false,
+    trim_tail_window: bool = false,
+    trim_tail_quality: bool = false,
 };
 
 fn optionValue(
@@ -129,6 +142,63 @@ fn optionValue(
     if (given.*) argumentError(io, "error: " ++ option ++ " may appear only once\n", 2);
     given.* = true;
     return value;
+}
+
+fn adapterOption(
+    io: std.Io,
+    args: *std.process.Args.Iterator,
+    given: *bool,
+    comptime option: []const u8,
+) []const u8 {
+    const message = std.fmt.comptimePrint("error: {s} must be {d} to {d} bases of A, C, G, and T\n", .{
+        option,
+        preprocess.MIN_ADAPTER_BASES,
+        preprocess.MAX_ADAPTER_BASES,
+    });
+    const value = optionValue(io, args, given, option);
+    if (value.len < preprocess.MIN_ADAPTER_BASES or value.len > preprocess.MAX_ADAPTER_BASES) {
+        argumentError(io, message, 2);
+    }
+    for (value) |base| switch (base) {
+        'A', 'C', 'G', 'T' => {},
+        else => argumentError(io, message, 2),
+    };
+    return value;
+}
+
+fn rangeOption(
+    io: std.Io,
+    args: *std.process.Args.Iterator,
+    given: *bool,
+    comptime T: type,
+    comptime option: []const u8,
+    comptime min: T,
+    comptime max: T,
+) T {
+    const message = std.fmt.comptimePrint("error: {s} must be {d} to {d}\n", .{ option, min, max });
+    const value = sampling.parseDecimal(T, optionValue(io, args, given, option)) catch argumentError(io, message, 2);
+    if (value < min or value > max) argumentError(io, message, 2);
+    return value;
+}
+
+fn processTrimOptions(
+    io: std.Io,
+    adapters: [2]?[]const u8,
+    poly_g: ?u32,
+    tail_window: ?u16,
+    tail_quality: ?u8,
+) preprocess.Options {
+    if ((adapters[0] == null) != (adapters[1] == null)) {
+        argumentError(io, "error: --adapter1 and --adapter2 must be given together\n", 2);
+    }
+    if ((tail_window == null) != (tail_quality == null)) {
+        argumentError(io, "error: --trim-tail-window and --trim-tail-quality must be given together\n", 2);
+    }
+    return .{
+        .adapters = if (adapters[0]) |adapter1| .{ adapter1, adapters[1].? } else null,
+        .poly_g = poly_g,
+        .tail = if (tail_window) |window| .{ .window = window, .quality = tail_quality.? } else null,
+    };
 }
 
 fn printVersionAndExit(io: std.Io) noreturn {
@@ -216,6 +286,10 @@ pub fn main(init: std.process.Init) !void {
     var report_path: ?[]const u8 = null;
     var gzip_output = false;
     var max_pairs: ?u64 = null;
+    var adapters: [2]?[]const u8 = .{ null, null };
+    var trim_poly_g: ?u32 = null;
+    var trim_tail_window: ?u16 = null;
+    var trim_tail_quality: ?u8 = null;
     var given: GivenOptions = .{};
     var positional = std.ArrayList([]const u8).empty;
     defer positional.deinit(gpa);
@@ -356,6 +430,26 @@ pub fn main(init: std.process.Init) !void {
             };
             continue;
         }
+        if (command == .process and std.mem.eql(u8, arg, "--adapter1")) {
+            adapters[0] = adapterOption(io, &args, &given.adapter1, "--adapter1");
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--adapter2")) {
+            adapters[1] = adapterOption(io, &args, &given.adapter2, "--adapter2");
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--trim-poly-g")) {
+            trim_poly_g = rangeOption(io, &args, &given.trim_poly_g, u32, "--trim-poly-g", 1, std.math.maxInt(u32));
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--trim-tail-window")) {
+            trim_tail_window = rangeOption(io, &args, &given.trim_tail_window, u16, "--trim-tail-window", 1, preprocess.MAX_TAIL_WINDOW);
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--trim-tail-quality")) {
+            trim_tail_quality = rangeOption(io, &args, &given.trim_tail_quality, u8, "--trim-tail-quality", 1, preprocess.MAX_TAIL_QUALITY);
+            continue;
+        }
         if (arg.len > 1 and std.mem.startsWith(u8, arg, "-")) {
             std.Io.File.writeStreamingAll(.stderr(), io, "error: unknown ") catch {};
             std.Io.File.writeStreamingAll(.stderr(), io, @tagName(command)) catch {};
@@ -418,6 +512,7 @@ pub fn main(init: std.process.Init) !void {
             .report = report_path,
             .gzip = gzip_output,
             .max_pairs = max_pairs,
+            .trim = processTrimOptions(io, adapters, trim_poly_g, trim_tail_window, trim_tail_quality),
         }),
     };
     std.process.exit(code);
@@ -3863,6 +3958,7 @@ const ProcessOptions = struct {
     report: ?[]const u8,
     gzip: bool,
     max_pairs: ?u64,
+    trim: preprocess.Options,
 };
 
 const ProcessCounts = struct {
@@ -3926,15 +4022,15 @@ fn runProcess(
         }
     };
 
-    var mate_qc = [2]qc.MateQc{ .{}, .{} };
-    defer for (&mate_qc) |*collector| collector.deinit(allocator);
+    var collectors: ProcessCollectors = .{};
+    defer collectors.deinit(allocator);
     var counts: ProcessCounts = .{};
     var failed_output: ?u1 = null;
     const processed = processSources(
         allocator,
         .{ input1.stream(), input2.stream() },
         .{ &outputs[0].writer, &outputs[1].writer },
-        &mate_qc,
+        &collectors,
         &counts,
         options,
     ) catch |err| failure: {
@@ -3943,14 +4039,9 @@ fn runProcess(
     };
 
     var input_failure = processed;
-    var stats = [2]zfastq.Stats{ .{}, .{} };
-    for (&mate_qc, &stats, 0..) |*collector, *mate_stats, index| {
-        collector.finish();
-        mate_stats.* = collector.stats() catch |err| stats: {
-            if (input_failure == null) input_failure = pairCommandFailure(@intCast(index), qcFailure(err));
-            break :stats .{};
-        };
-    }
+    const trims = options.trim.trims();
+    var stats: [2][2]zfastq.Stats = @splat(.{ .{}, .{} });
+    finishCollectors(&collectors.qc, trims, &stats, &input_failure);
 
     var exit_code: u8 = 0;
     if (input_failure) |failure| {
@@ -3979,7 +4070,9 @@ fn runProcess(
         .status_ok = exit_code == 0,
         .counts = counts,
         .stats = &stats,
-        .qc = &mate_qc,
+        .qc = &collectors.qc,
+        .trims = trims,
+        .trimming = &collectors.trimming,
         .input_failure = input_failure,
         .failed_output = if (failed_output) |index| paths[index] else null,
     };
@@ -3992,6 +4085,33 @@ fn runProcess(
     writeProcessReport(&json, report) catch return reportFailed(io, report_path, report_to_stdout, exit_code);
     report_writer.interface.flush() catch return reportFailed(io, report_path, report_to_stdout, exit_code);
     return exit_code;
+}
+
+const ProcessCollectors = struct {
+    qc: [2]qc.MatePopulations = .{ .{}, .{} },
+    trimming: [2]preprocess.MateCounts = .{ .{}, .{} },
+
+    fn deinit(self: *ProcessCollectors, allocator: std.mem.Allocator) void {
+        for (&self.qc) |*populations| populations.deinit(allocator);
+    }
+};
+
+fn finishCollectors(
+    collectors: *[2]qc.MatePopulations,
+    trims: bool,
+    stats: *[2][2]zfastq.Stats,
+    input_failure: *?PairCommandFailure,
+) void {
+    for (collectors, 0..) |*populations, index| {
+        populations.finish();
+        const retained = if (trims) &populations.retained else &populations.raw;
+        for ([_]*const qc.MateQc{ &populations.raw, retained }, stats) |collector, *population_stats| {
+            population_stats[index] = collector.stats() catch |err| stats: {
+                if (input_failure.* == null) input_failure.* = pairCommandFailure(@intCast(index), qcFailure(err));
+                break :stats .{};
+            };
+        }
+    }
 }
 
 fn qcFailure(err: (error{OutOfMemory} || statistics.StatsError)) CommandFailure {
@@ -4078,10 +4198,12 @@ const ProcessPairs = struct {
     validator1: *fastq.AdaptiveRecordValidator,
     validator2: *fastq.AdaptiveRecordValidator,
     writers: [2]*zfastq.Writer,
-    qc: *[2]qc.MateQc,
+    collectors: *ProcessCollectors,
     counts: *ProcessCounts,
     max_pairs: ?u64,
     policy: pairing.NamePolicy,
+    trimmer: preprocess.Trimmer,
+    trim_failure: ?PairCommandFailure = null,
 
     fn atCap(self: *const ProcessPairs) bool {
         const cap = self.max_pairs orelse return false;
@@ -4094,15 +4216,51 @@ const ProcessPairs = struct {
         spans: [2]?[]const u8,
     ) DeinterleaveWriteError!?PairCommandFailure {
         self.counts.read += 1;
-        for (self.qc, records, 0..) |*collector, record, index| {
+        for (&self.collectors.qc, records, 0..) |*collector, record, index| {
             collector.addRead(self.allocator, record.sequence, record.quality) catch |err| {
                 return pairCommandFailure(@intCast(index), qcFailure(err));
             };
+        }
+        if (self.trimmer.options.trims()) {
+            self.emitTrimmed(records, spans) catch |err| switch (err) {
+                error.TrimFailed => return self.trim_failure,
+                error.Output1WriteFailed, error.Output2WriteFailed => |write_error| return write_error,
+            };
+            return null;
         }
         writeCheckedRecord(self.writers[0], records[0], spans[0]) catch return error.Output1WriteFailed;
         writeCheckedRecord(self.writers[1], records[1], spans[1]) catch return error.Output2WriteFailed;
         self.counts.written += 1;
         return null;
+    }
+
+    fn emitTrimmed(
+        self: *ProcessPairs,
+        records: [2]zfastq.Record,
+        spans: [2]?[]const u8,
+    ) (DeinterleaveWriteError || error{TrimFailed})!void {
+        const result = self.trimmer.trimPair(
+            .{ records[0].sequence, records[1].sequence },
+            .{ records[0].quality, records[1].quality },
+        );
+        var trimmed = records;
+        var trimmed_spans = spans;
+        for (&trimmed, &trimmed_spans, result.kept, result.removed, 0..) |*record, *span, kept, removed, index| {
+            self.collectors.trimming[index].add(removed) catch {
+                self.trim_failure = pairCommandFailure(@intCast(index), STATISTICS_LIMIT);
+                return error.TrimFailed;
+            };
+            self.collectors.qc[index].addRetained(self.allocator, record.sequence, record.quality, kept) catch |err| {
+                self.trim_failure = pairCommandFailure(@intCast(index), qcFailure(err));
+                return error.TrimFailed;
+            };
+            if (kept != record.sequence.len) span.* = null;
+            record.sequence = record.sequence[0..kept];
+            record.quality = record.quality[0..kept];
+        }
+        writeCheckedRecord(self.writers[0], trimmed[0], trimmed_spans[0]) catch return error.Output1WriteFailed;
+        writeCheckedRecord(self.writers[1], trimmed[1], trimmed_spans[1]) catch return error.Output2WriteFailed;
+        self.counts.written += 1;
     }
 };
 
@@ -4141,7 +4299,7 @@ fn processSources(
     allocator: std.mem.Allocator,
     sources: [2]*std.Io.Reader,
     writers: [2]*zfastq.Writer,
-    mate_qc: *[2]qc.MateQc,
+    collectors: *ProcessCollectors,
     counts: *ProcessCounts,
     options: ProcessOptions,
 ) DeinterleaveWriteError!?PairCommandFailure {
@@ -4159,10 +4317,11 @@ fn processSources(
         .validator1 = &validator1,
         .validator2 = &validator2,
         .writers = writers,
-        .qc = mate_qc,
+        .collectors = collectors,
         .counts = counts,
         .max_pairs = options.max_pairs,
         .policy = options.pair_name_policy,
+        .trimmer = .init(options.trim),
     };
 
     while (true) {
@@ -4213,8 +4372,10 @@ const ProcessReport = struct {
     options: ProcessOptions,
     status_ok: bool,
     counts: ProcessCounts,
-    stats: *const [2]zfastq.Stats,
-    qc: *const [2]qc.MateQc,
+    stats: *const [2][2]zfastq.Stats,
+    qc: *const [2]qc.MatePopulations,
+    trims: bool,
+    trimming: *const [2]preprocess.MateCounts,
     input_failure: ?PairCommandFailure,
     failed_output: ?[]const u8,
 };
@@ -4233,6 +4394,17 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     try json.write(@tagName(report.options.alphabet));
     try json.objectField("max_line_bytes");
     try json.write(report.options.max_line_bytes);
+    const trim = report.options.trim;
+    try json.objectField("adapter1");
+    try json.write(if (trim.adapters) |adapters| adapters[0] else null);
+    try json.objectField("adapter2");
+    try json.write(if (trim.adapters) |adapters| adapters[1] else null);
+    try json.objectField("trim_poly_g");
+    try json.write(trim.poly_g);
+    try json.objectField("trim_tail_window");
+    try json.write(if (trim.tail) |tail| tail.window else null);
+    try json.objectField("trim_tail_quality");
+    try json.write(if (trim.tail) |tail| tail.quality else null);
     try json.endObject();
 
     try json.objectField("inputs");
@@ -4270,20 +4442,33 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     try json.write(report.counts.written);
     try json.endObject();
     try json.objectField("mates");
-    try json.beginArray();
-    for (report.stats) |*mate_stats| {
-        try json.beginObject();
-        try writeStatsResultFields(json, mate_stats);
-        try json.endObject();
+    try json.beginObject();
+    for ([_][]const u8{ "raw", "retained" }, report.stats) |population, *population_stats| {
+        try json.objectField(population);
+        try json.beginArray();
+        for (population_stats) |*mate_stats| {
+            try json.beginObject();
+            try writeStatsResultFields(json, mate_stats);
+            try json.endObject();
+        }
+        try json.endArray();
     }
-    try json.endArray();
+    try json.endObject();
     try json.objectField("qc");
     try json.beginObject();
-    try json.objectField("raw");
-    try json.beginArray();
-    for (report.qc) |*collector| try collector.writeJson(json);
-    try json.endArray();
+    for ([_][]const u8{ "raw", "retained" }, [_]bool{ false, report.trims }) |population, retained| {
+        try json.objectField(population);
+        try json.beginArray();
+        for (report.qc) |*populations| {
+            try (if (retained) &populations.retained else &populations.raw).writeJson(json);
+        }
+        try json.endArray();
+    }
     try json.endObject();
+    try json.objectField("trimming");
+    try json.beginArray();
+    for (report.trimming) |*mate_counts| try writeTrimCounts(json, trim, mate_counts);
+    try json.endArray();
 
     const failed_input: ?[]const u8 = if (report.input_failure) |failure| switch (failure) {
         .command => |details| report.inputs[details.input_index],
@@ -4304,6 +4489,33 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     }
     try json.endObject();
     try json.writer.writeByte('\n');
+}
+
+fn writeTrimCounts(
+    json: *std.json.Stringify,
+    trim: preprocess.Options,
+    counts: *const preprocess.MateCounts,
+) !void {
+    try json.beginObject();
+    for (std.enums.values(preprocess.Step), counts.steps) |step, step_counts| {
+        const enabled = switch (step) {
+            .quality_tail => trim.tail != null,
+            .poly_g => trim.poly_g != null,
+            .overlap, .adapter => trim.adapters != null,
+        };
+        try json.objectField(@tagName(step));
+        if (!enabled) {
+            try json.write(null);
+            continue;
+        }
+        try json.beginObject();
+        try json.objectField("reads");
+        try json.write(step_counts.reads);
+        try json.objectField("bases");
+        try json.write(step_counts.bases);
+        try json.endObject();
+    }
+    try json.endObject();
 }
 
 fn writeJsonHeader(json: *std.json.Stringify, schema: []const u8) !void {
@@ -6783,41 +6995,46 @@ test "[failure] - [interleave]: a write failure after the first mate keeps only 
 test "[failure] - [process]: a mate 2 write failure keeps mate 1 and counts no written pair" {
     const mate1 = "@pair/1\nA\n+left\n!\n";
     const mate2 = "@pair/2\nT\n+right\n#\n";
-    var source1 = io_layer.SliceSource.init(mate1);
-    var source2 = io_layer.SliceSource.init(mate2);
-    var stream1 = try TestStream.init(source1.byteSource());
-    defer stream1.deinit();
-    var stream2 = try TestStream.init(source2.byteSource());
-    defer stream2.deinit();
-    var sink1 = DeinterleaveTestSink{};
-    var sink2 = DeinterleaveTestSink{ .fail_write = true };
-    var writer1 = zfastq.Writer.init(sink1.byteSink());
-    var writer2 = zfastq.Writer.init(sink2.byteSink());
-    var mate_qc = [2]qc.MateQc{ .{}, .{} };
-    defer for (&mate_qc) |*collector| collector.deinit(std.testing.allocator);
-    var counts: ProcessCounts = .{};
+    const trims = [_]preprocess.Options{ .{}, .{ .adapters = .{ "ACGT", "ACGT" } } };
+    for (trims, 0..) |trim, case| {
+        errdefer std.debug.print("case {d}\n", .{case});
+        var source1 = io_layer.SliceSource.init(mate1);
+        var source2 = io_layer.SliceSource.init(mate2);
+        var stream1 = try TestStream.init(source1.byteSource());
+        defer stream1.deinit();
+        var stream2 = try TestStream.init(source2.byteSource());
+        defer stream2.deinit();
+        var sink1 = DeinterleaveTestSink{};
+        var sink2 = DeinterleaveTestSink{ .fail_write = true };
+        var writer1 = zfastq.Writer.init(sink1.byteSink());
+        var writer2 = zfastq.Writer.init(sink2.byteSink());
+        var collectors: ProcessCollectors = .{};
+        defer collectors.deinit(std.testing.allocator);
+        var counts: ProcessCounts = .{};
 
-    try std.testing.expectError(error.Output2WriteFailed, processSources(
-        std.testing.allocator,
-        .{ &stream1.reader.interface, &stream2.reader.interface },
-        .{ &writer1, &writer2 },
-        &mate_qc,
-        &counts,
-        .{
-            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
-            .alphabet = .iupac,
-            .pair_name_policy = .illumina,
-            .output1 = null,
-            .output2 = null,
-            .report = null,
-            .gzip = false,
-            .max_pairs = null,
-        },
-    ));
-    try std.testing.expectEqualStrings(mate1, sink1.buffer[0..sink1.length]);
-    try std.testing.expectEqual(@as(u64, 1), counts.read);
-    try std.testing.expectEqual(@as(u64, 0), counts.written);
-    try std.testing.expect(!counts.input_complete);
+        try std.testing.expectError(error.Output2WriteFailed, processSources(
+            std.testing.allocator,
+            .{ &stream1.reader.interface, &stream2.reader.interface },
+            .{ &writer1, &writer2 },
+            &collectors,
+            &counts,
+            .{
+                .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+                .alphabet = .iupac,
+                .pair_name_policy = .illumina,
+                .output1 = null,
+                .output2 = null,
+                .report = null,
+                .gzip = false,
+                .max_pairs = null,
+                .trim = trim,
+            },
+        ));
+        try std.testing.expectEqualStrings(mate1, sink1.buffer[0..sink1.length]);
+        try std.testing.expectEqual(@as(u64, 1), counts.read);
+        try std.testing.expectEqual(@as(u64, 0), counts.written);
+        try std.testing.expect(!counts.input_complete);
+    }
 }
 
 test "[failure] - [deinterleave]: names the output whose write failed and writes nothing partial" {

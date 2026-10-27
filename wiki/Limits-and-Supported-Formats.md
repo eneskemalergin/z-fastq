@@ -19,6 +19,8 @@
 - Remote object stores or network paths.
 - Memory-mapped or worker-thread CLI execution.
 - Automatic repair or record recovery after malformed input.
+- Dropping reads in `process`: filters by length, quality, or `N` count, and fastp's removal of empty mates and adapter dimers.
+- fastp's automatic adapter detection and automatic poly-G mode.
 
 These are current boundaries, not promises about the final project. I would rather state them clearly than make a command appear broader than its tested behavior.
 
@@ -38,7 +40,8 @@ Memory follows what a command keeps, and the line limit bounds that:
 
 - `count`, `check`, `stats`, and sampling that selects nothing keep no record bytes: they stream lines of any length, so memory stays at a few MiB.
 - `check --paired` and `check --interleaved` keep each mate's header line while they compare names.
-- Commands that write records (`sample`, `interleave`, `deinterleave`) keep a record that does not fit the read buffer until it is written: up to four lines per input, plus mate 1 for interleaved input.
+- Commands that write records (`sample`, `interleave`, `deinterleave`, `process`) keep a record that does not fit the read buffer until it is written: up to four lines per input, plus mate 1 for interleaved input.
+- `process` also keeps its quality tables, up to 800 KiB per mate for the reads as read and as many again in a trimmed run. Trimming itself uses under 16 KiB, the same at any read length.
 
 With 15 MiB header, sequence, and quality lines, `stats` peaks near 5 MiB, `sample` near 50 MiB, and the pair commands near 100 MiB. Raise `--max-line-bytes` only as far as the data needs, because the worst case grows with it.
 

@@ -46,6 +46,12 @@ z-fastq deinterleave --out1 R1.fastq --out2 R2.fastq interleaved.fastq
 z-fastq process --gzip --out1 clean_R1.fastq.gz --out2 clean_R2.fastq.gz --report sample.json R1.fastq.gz R2.fastq.gz
 ```
 
+With adapters, poly-G, and a 3' quality window, `process` trims each pair by fastp 1.1.0's rules:
+
+```bash
+z-fastq process --adapter1 CTGTCTCTTATACACATCT --adapter2 CTGTCTCTTATACACATCT --trim-poly-g 10 --trim-tail-window 4 --trim-tail-quality 20 --out1 trimmed_R1.fastq --out2 trimmed_R2.fastq R1.fastq.gz R2.fastq.gz
+```
+
 ## Input shapes
 
 ```text

@@ -1,6 +1,8 @@
 //! Per-mate FASTQ quality distributions for `process`, computed as FastQC 0.13.0 computes its core
 //! modules: per-cycle quality and base content, per-read quality and GC, read lengths, and
-//! terminal homopolymer runs.
+//! terminal homopolymer runs. The retained population of a trimmed run counts only the removed
+//! 3' ends per cycle and takes its per-cycle tables as raw minus removed, until raw drops its
+//! tables for a read past the cycle limit; from then on it counts its reads in full.
 
 const std = @import("std");
 const simd = @import("simd.zig");
@@ -35,6 +37,92 @@ const BASE_KIND: [256]BaseKind = table: {
         kinds[std.ascii.toLower(entry[0])] = entry[1];
     }
     break :table kinds;
+};
+
+const ReadFacts = struct {
+    quality_sum: u64 = 0,
+    gc_count: usize = 0,
+};
+
+pub const MatePopulations = struct {
+    raw: MateQc = .{},
+    retained: MateQc = .{},
+    derived: bool = true,
+    retained_cycles: usize = 0,
+    last: ReadFacts = .{},
+
+    pub fn deinit(self: *MatePopulations, allocator: std.mem.Allocator) void {
+        self.raw.deinit(allocator);
+        self.retained.deinit(allocator);
+    }
+
+    pub fn addRead(
+        self: *MatePopulations,
+        allocator: std.mem.Allocator,
+        sequence: []const u8,
+        quality: []const u8,
+    ) (error{OutOfMemory} || statistics.StatsError)!void {
+        if (self.derived and !self.raw.too_long and sequence.len > MAX_CYCLES) self.materialize();
+        self.last = try self.raw.collect(allocator, sequence, quality);
+    }
+
+    pub fn addRetained(
+        self: *MatePopulations,
+        allocator: std.mem.Allocator,
+        sequence: []const u8,
+        quality: []const u8,
+        kept: usize,
+    ) (error{OutOfMemory} || statistics.StatsError)!void {
+        std.debug.assert(kept <= sequence.len and sequence.len == quality.len);
+        if (!self.derived) return self.retained.addRead(allocator, sequence[0..kept], quality[0..kept]);
+        const retained = &self.retained;
+        if (sequence.len > retained.quality.items.len) try retained.growCycles(allocator, sequence.len);
+        var facts = self.last;
+        if (kept < sequence.len) {
+            var removed_sum: u64 = 0;
+            for (
+                sequence[kept..],
+                quality[kept..],
+                retained.quality.items[kept..sequence.len],
+                retained.bases.items[kept..sequence.len],
+            ) |base, byte, *qualities, *bases| {
+                qualities[byte - PHRED_OFFSET] += 1;
+                removed_sum += byte;
+                const kind = BASE_KIND[base];
+                if (kind != .other) bases[@intFromEnum(kind)] += 1;
+            }
+            facts = .{ .quality_sum = facts.quality_sum - removed_sum, .gc_count = gcCountScalar(sequence[0..gcKeptLength(kept)]) };
+        }
+        retained.lengths[kept] += 1;
+        self.retained_cycles = @max(self.retained_cycles, kept);
+        if (kept != 0) retained.addSummary(sequence[0..kept], facts);
+    }
+
+    pub fn finish(self: *MatePopulations) void {
+        if (self.derived) self.materialize();
+        self.raw.finish();
+        self.retained.finish();
+    }
+
+    fn materialize(self: *MatePopulations) void {
+        std.debug.assert(self.derived and !self.raw.too_long);
+        self.raw.finish();
+        const retained = &self.retained;
+        const cycles = self.retained_cycles;
+        std.debug.assert(cycles <= retained.quality.items.len);
+        retained.quality.shrinkRetainingCapacity(cycles);
+        retained.bases.shrinkRetainingCapacity(cycles);
+        for (
+            retained.quality.items,
+            retained.bases.items,
+            self.raw.quality.items[0..cycles],
+            self.raw.bases.items[0..cycles],
+        ) |*qualities, *bases, raw_qualities, raw_bases| {
+            for (qualities, raw_qualities) |*count, total| count.* = total - count.*;
+            for (bases, raw_bases) |*count, total| count.* = total - count.*;
+        }
+        self.derived = false;
+    }
 };
 
 pub const MateQc = struct {
@@ -72,6 +160,15 @@ pub const MateQc = struct {
         sequence: []const u8,
         quality: []const u8,
     ) (error{OutOfMemory} || statistics.StatsError)!void {
+        _ = try self.collect(allocator, sequence, quality);
+    }
+
+    fn collect(
+        self: *MateQc,
+        allocator: std.mem.Allocator,
+        sequence: []const u8,
+        quality: []const u8,
+    ) (error{OutOfMemory} || statistics.StatsError)!ReadFacts {
         std.debug.assert(sequence.len == quality.len);
         if (!self.too_long and sequence.len > MAX_CYCLES) {
             self.finish();
@@ -87,11 +184,17 @@ pub const MateQc = struct {
             for (quality) |byte| quality_sum += byte;
             break :too_long gcCountScalar(sequence[0..gc_length]);
         } else try self.addCycles(allocator, sequence, quality, gc_length, &quality_sum);
-        if (sequence.len == 0) return;
+        const facts: ReadFacts = .{ .quality_sum = quality_sum, .gc_count = gc_count };
+        if (sequence.len != 0) self.addSummary(sequence, facts);
+        return facts;
+    }
 
-        self.read_quality[quality_sum / quality.len - PHRED_OFFSET] += 1;
+    fn addSummary(self: *MateQc, sequence: []const u8, facts: ReadFacts) void {
+        std.debug.assert(sequence.len != 0);
+        const gc_length = gcKeptLength(sequence.len);
+        self.read_quality[facts.quality_sum / sequence.len - PHRED_OFFSET] += 1;
         const weights = self.gc_model.weights(gc_length);
-        const bins = gcBins(gc_length, gc_count);
+        const bins = gcBins(gc_length, facts.gc_count);
         for (bins[0]..bins[1] + 1) |bin| self.gc[bin] += weights[bin];
         self.terminal_g += @intFromBool(endsInRun(sequence, 'G'));
         self.terminal_a += @intFromBool(endsInRun(sequence, 'A'));
@@ -718,6 +821,17 @@ test "[failure] - [qc]: a failed cycle allocation leaves the counts unchanged" {
     try std.testing.expectEqual(@as(usize, 0), mate.quality.items.len);
 }
 
+test "[failure] - [qc]: a failed retained allocation leaves the retained counts unchanged" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    var populations: MatePopulations = .{};
+    defer populations.deinit(failing.allocator());
+    try populations.addRead(failing.allocator(), "ACGT", "IIII");
+    try std.testing.expectError(error.OutOfMemory, populations.addRetained(failing.allocator(), "ACGT", "IIII", 2));
+    try std.testing.expectEqual(@as(u64, 0), populations.retained.lengths[2]);
+    try std.testing.expectEqual(@as(usize, 0), populations.retained_cycles);
+    try std.testing.expectEqual(@as(u64, 1), populations.raw.lengths[4]);
+}
+
 test "[property] - [qc]: vector cycle counts match a scalar count at every tier and lane boundary" {
     const pattern = "ACGTNacgtnRYgc";
     var sequence: [151]u8 = undefined;
@@ -756,5 +870,47 @@ test "[property] - [qc]: statistics from the tables equal Stats.addRecord, also 
         defer mate.deinit(std.testing.allocator);
         mate.finish();
         try std.testing.expectEqualDeep(expected.result(), (try mate.stats()).result());
+    }
+}
+
+test "[property] - [qc]: a retained population derived from raw equals one collected from the kept reads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    var long_sequence: [MAX_CYCLES + 5]u8 = undefined;
+    for (&long_sequence, 0..) |*base, index| base.* = "ACGTGGCAN"[index % 9];
+    const long_quality: [MAX_CYCLES + 5]u8 = @splat('5');
+    const Read = struct { sequence: []const u8, quality: []const u8, kept: usize };
+    const reads = [_]Read{
+        .{ .sequence = "ACGTNNacgtGGGG", .quality = "II#5!IIII?5+#2", .kept = 9 },
+        .{ .sequence = "GGGCCCAT", .quality = "JJJJJJJJ", .kept = 8 },
+        .{ .sequence = "TTTTAAAAGGGGGGGGGGGG", .quality = "IIIIIIIIIIIIIIIIIII#", .kept = 0 },
+        .{ .sequence = "", .quality = "", .kept = 0 },
+        .{ .sequence = "NNNNACGTACGT", .quality = "!!!!IIIIIIII", .kept = 3 },
+        .{ .sequence = &long_sequence, .quality = &long_quality, .kept = 700 },
+        .{ .sequence = "CCCCAAAAAAAAAAAA", .quality = "IIIIIIIIIIIIIIII", .kept = 16 },
+        .{ .sequence = "ACGT", .quality = "IIII", .kept = 1 },
+    };
+    for ([_]usize{ 5, reads.len }) |count| {
+        errdefer std.debug.print("{d} reads\n", .{count});
+        var populations: MatePopulations = .{};
+        defer populations.deinit(allocator);
+        var expected: MateQc = .{};
+        defer expected.deinit(allocator);
+        for (reads[0..count]) |read| {
+            try populations.addRead(allocator, read.sequence, read.quality);
+            try populations.addRetained(allocator, read.sequence, read.quality, read.kept);
+            try expected.addRead(allocator, read.sequence[0..read.kept], read.quality[0..read.kept]);
+        }
+        populations.finish();
+        const want = try reportOf(arena.allocator(), &expected);
+        const got = try reportOf(arena.allocator(), &populations.retained);
+        inline for (.{ "per_base_quality", "per_base_content", "per_base_n", "length_distribution", "per_sequence_quality", "per_sequence_gc", "terminal_runs", "unavailable" }) |module| {
+            errdefer std.debug.print("{s}\n", .{module});
+            const want_text = try std.json.Stringify.valueAlloc(arena.allocator(), want.get(module).?, .{});
+            const got_text = try std.json.Stringify.valueAlloc(arena.allocator(), got.get(module).?, .{});
+            try std.testing.expectEqualStrings(want_text, got_text);
+        }
+        try std.testing.expectEqual(try expected.stats(), try populations.retained.stats());
     }
 }
