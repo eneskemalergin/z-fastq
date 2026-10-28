@@ -54,8 +54,10 @@ const EXPECTED_USAGE =
     \\  --gzip-preset P      Compression preset: fast (default), even, or dense
     \\  --max-pairs N        Stop after the first N pairs
     \\  --report PATH        Write a z-fastq/process-v1 JSON report (- for stdout)
-    \\  --contaminants PATH  Name overrepresented sequences from a FastQC contaminant list
-    \\  --pair-duplication   Report fastp's pair duplication rate (up to 1 GiB of memory)
+    \\  --qc-tables DIR      Write MultiQC-compatible QC tables per mate and population
+    \\  --qc-summary PATH    Write a MultiQC-compatible JSON summary of the run
+    \\  --contaminants PATH  Name overrepresented sequences from a contaminant list
+    \\  --pair-duplication   Report the pair duplication rate (up to 1 GiB of memory)
     \\  --adapter1 SEQ       Trim mate 1 adapters and mate overlaps (with --adapter2)
     \\  --adapter2 SEQ       Trim mate 2 adapters and mate overlaps (with --adapter1)
     \\  --trim-poly-g N      Trim 3' poly-G runs, scanning at least N bases
@@ -95,7 +97,7 @@ const EXPECTED_USAGE =
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
     \\Process usage:
-    \\  z-fastq process [--gzip] [--gzip-preset fast|even|dense] [--max-pairs N] [--report PATH] [--contaminants PATH] [--pair-duplication] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
+    \\  z-fastq process [--gzip] [--gzip-preset fast|even|dense] [--max-pairs N] [--report PATH] [--qc-tables DIR] [--qc-summary PATH] [--contaminants PATH] [--pair-duplication] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 

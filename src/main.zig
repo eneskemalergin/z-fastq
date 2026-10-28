@@ -54,8 +54,10 @@ const USAGE =
     \\  --gzip-preset P      Compression preset: fast (default), even, or dense
     \\  --max-pairs N        Stop after the first N pairs
     \\  --report PATH        Write a z-fastq/process-v1 JSON report (- for stdout)
-    \\  --contaminants PATH  Name overrepresented sequences from a FastQC contaminant list
-    \\  --pair-duplication   Report fastp's pair duplication rate (up to 1 GiB of memory)
+    \\  --qc-tables DIR      Write MultiQC-compatible QC tables per mate and population
+    \\  --qc-summary PATH    Write a MultiQC-compatible JSON summary of the run
+    \\  --contaminants PATH  Name overrepresented sequences from a contaminant list
+    \\  --pair-duplication   Report the pair duplication rate (up to 1 GiB of memory)
     \\  --adapter1 SEQ       Trim mate 1 adapters and mate overlaps (with --adapter2)
     \\  --adapter2 SEQ       Trim mate 2 adapters and mate overlaps (with --adapter1)
     \\  --trim-poly-g N      Trim 3' poly-G runs, scanning at least N bases
@@ -95,7 +97,7 @@ const USAGE =
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
     \\Process usage:
-    \\  z-fastq process [--gzip] [--gzip-preset fast|even|dense] [--max-pairs N] [--report PATH] [--contaminants PATH] [--pair-duplication] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
+    \\  z-fastq process [--gzip] [--gzip-preset fast|even|dense] [--max-pairs N] [--report PATH] [--qc-tables DIR] [--qc-summary PATH] [--contaminants PATH] [--pair-duplication] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 
@@ -132,6 +134,8 @@ const GivenOptions = struct {
     out1: bool = false,
     out2: bool = false,
     report: bool = false,
+    qc_tables: bool = false,
+    qc_summary: bool = false,
     contaminants: bool = false,
     gzip_preset: bool = false,
     max_pairs: bool = false,
@@ -309,6 +313,8 @@ pub fn main(init: std.process.Init) !void {
     var output1: ?[]const u8 = null;
     var output2: ?[]const u8 = null;
     var report_path: ?[]const u8 = null;
+    var qc_tables: ?[]const u8 = null;
+    var qc_summary: ?[]const u8 = null;
     var contaminants_path: ?[]const u8 = null;
     var pair_duplication = false;
     var gzip_output = false;
@@ -450,6 +456,14 @@ pub fn main(init: std.process.Init) !void {
             report_path = optionValue(io, &args, &given.report, "--report");
             continue;
         }
+        if (command == .process and std.mem.eql(u8, arg, "--qc-tables")) {
+            qc_tables = optionValue(io, &args, &given.qc_tables, "--qc-tables");
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--qc-summary")) {
+            qc_summary = optionValue(io, &args, &given.qc_summary, "--qc-summary");
+            continue;
+        }
         if (command == .process and std.mem.eql(u8, arg, "--contaminants")) {
             contaminants_path = optionValue(io, &args, &given.contaminants, "--contaminants");
             continue;
@@ -523,8 +537,14 @@ pub fn main(init: std.process.Init) !void {
         argumentError(io, "error: --gzip-preset requires --gzip\n", 2);
     }
     if (command == .process and report_path == null) {
-        if (contaminants_path != null) argumentError(io, "error: --contaminants requires --report\n", 2);
-        if (pair_duplication) argumentError(io, "error: --pair-duplication requires --report\n", 2);
+        if (contaminants_path != null and qc_tables == null) argumentError(io, "error: --contaminants requires --report or --qc-tables\n", 2);
+        if (pair_duplication and qc_summary == null) argumentError(io, "error: --pair-duplication requires --report or --qc-summary\n", 2);
+    }
+    if (command == .process and qc_summary != null and !pair_duplication) {
+        argumentError(io, "error: --qc-summary requires --pair-duplication\n", 2);
+    }
+    if (command == .process and max_pairs != null and (qc_tables != null or qc_summary != null)) {
+        argumentError(io, "error: --max-pairs cannot be used with --qc-tables or --qc-summary\n", 2);
     }
     const code = switch (command) {
         .count => runCount(io, positional.items, options),
@@ -573,6 +593,9 @@ pub fn main(init: std.process.Init) !void {
             .output1 = output1,
             .output2 = output2,
             .report = report_path,
+            .qc_tables = qc_tables,
+            .qc_summary = qc_summary,
+            .argv = if (qc_summary != null) processArguments(io, gpa, init.minimal.args) else &.{},
             .contaminants = contaminants_path,
             .pair_duplication = pair_duplication,
             .gzip = gzip_output,
@@ -4023,12 +4046,19 @@ const ProcessOptions = struct {
     output1: ?[]const u8,
     output2: ?[]const u8,
     report: ?[]const u8,
+    qc_tables: ?[]const u8 = null,
+    qc_summary: ?[]const u8 = null,
+    argv: []const []const u8 = &.{},
     contaminants: ?[]const u8 = null,
     pair_duplication: bool = false,
     gzip: bool,
     gzip_preset: io_layer.GzipPreset = .fast,
     max_pairs: ?u64,
     trim: preprocess.Options,
+
+    fn collectsQc(self: ProcessOptions) bool {
+        return self.report != null or self.qc_tables != null or self.qc_summary != null;
+    }
 };
 
 const ProcessCounts = struct {
@@ -4045,6 +4075,11 @@ fn runProcess(
     options: ProcessOptions,
 ) u8 {
     const paths = validateProcessArguments(io, inputs, options) orelse return 2;
+    var qc_table_files: QcTables = .{};
+    defer qc_table_files.deinit(io, allocator);
+    if (options.qc_tables) |dir| {
+        if (qc_table_files.plan(io, allocator, dir, inputs, paths, options.trim.changesReads())) |code| return code;
+    }
     const report_to_stdout = if (options.report) |path| namesStdin(path) else false;
     const output_identity: ?FileIdentity = if (report_to_stdout)
         checkedStdoutIdentity(io) catch return 3
@@ -4070,7 +4105,7 @@ fn runProcess(
         if (loadContaminants(io, allocator, path, &contaminants)) |code| return code;
     }
     var pair_duplication: preprocess.PairDuplication = undefined;
-    std.debug.assert(!options.pair_duplication or options.report != null);
+    std.debug.assert(!options.pair_duplication or options.report != null or options.qc_summary != null);
     if (options.pair_duplication) pair_duplication.init(allocator) catch {
         writeStderr(io, OUT_OF_MEMORY_LINE);
         return OUT_OF_MEMORY.exit_code;
@@ -4107,6 +4142,26 @@ fn runProcess(
         }
     };
 
+    var summary_file: ?std.Io.File = null;
+    defer if (summary_file) |file| file.close(io);
+    if (options.qc_summary) |path| {
+        if (createExclusiveOutput(io, path, &summary_file)) |failure| {
+            removeCreatedOutputs(io, &outputs);
+            if (report_file != null) std.Io.Dir.cwd().deleteFile(io, options.report.?) catch {};
+            printCommandFailure(io, path, failure);
+            return failure.exit_code;
+        }
+    }
+
+    if (options.qc_tables != null) {
+        if (qc_table_files.create(io)) |code| {
+            removeCreatedOutputs(io, &outputs);
+            if (report_file != null) std.Io.Dir.cwd().deleteFile(io, options.report.?) catch {};
+            if (summary_file != null) std.Io.Dir.cwd().deleteFile(io, options.qc_summary.?) catch {};
+            return code;
+        }
+    }
+
     var collectors: ProcessCollectors = .{ .pair_duplication = if (options.pair_duplication) &pair_duplication else null };
     defer collectors.deinit(allocator);
     var counts: ProcessCounts = .{};
@@ -4132,7 +4187,7 @@ fn runProcess(
     };
     const changes_reads = options.trim.changesReads();
     var stats: [2][2]zfastq.Stats = @splat(.{ .{}, .{} });
-    if (options.report != null) finishCollectors(allocator, &collectors.qc, changes_reads, &stats, &input_failure);
+    if (options.collectsQc()) finishCollectors(allocator, &collectors.qc, changes_reads, &stats, &input_failure);
 
     var exit_code: u8 = 0;
     if (input_failure) |failure| {
@@ -4152,8 +4207,11 @@ fn runProcess(
         };
     }
 
-    const report_path = options.report orelse return exit_code;
-    const report: ProcessReport = .{
+    if (options.qc_tables != null) {
+        exit_code = qc_table_files.write(io, &collectors.qc, if (contaminants) |*list| list else null, exit_code);
+    }
+
+    var report: ProcessReport = .{
         .inputs = inputs,
         .snapshots = snapshots,
         .outputs = paths,
@@ -4168,9 +4226,15 @@ fn runProcess(
         .inserts = &collectors.inserts,
         .contaminants = if (contaminants) |*list| list else null,
         .pair_duplication = collectors.pair_duplication,
+        .qc_table_files = if (options.qc_tables != null) &qc_table_files else null,
         .input_failure = input_failure,
         .failed_output = if (failed_output) |index| paths[index] else null,
     };
+    if (summary_file) |file| {
+        exit_code = writeSummaryFile(io, file, options.qc_summary.?, report, exit_code);
+        report.status_ok = exit_code == 0;
+    }
+    const report_path = options.report orelse return exit_code;
     var report_buffer: [JSON_OUTPUT_BUFFER_BYTES]u8 = undefined;
     var report_writer = if (report_file) |file|
         file.writerStreaming(io, &report_buffer)
@@ -4214,6 +4278,295 @@ fn finishCollectors(
         }
     }
 }
+
+fn processArguments(io: std.Io, allocator: std.mem.Allocator, raw: std.process.Args) []const []const u8 {
+    var args = std.process.Args.Iterator.initAllocator(raw, allocator) catch argumentError(io, OUT_OF_MEMORY_LINE, 3);
+    var list: std.ArrayList([]const u8) = .empty;
+    while (args.next()) |arg| list.append(allocator, arg) catch argumentError(io, OUT_OF_MEMORY_LINE, 3);
+    return list.items;
+}
+
+fn writeSummaryFile(io: std.Io, file: std.Io.File, path: []const u8, report: ProcessReport, exit_code: u8) u8 {
+    if (exit_code == 0) {
+        var buffer: [JSON_OUTPUT_BUFFER_BYTES]u8 = undefined;
+        var writer = file.writerStreaming(io, &buffer);
+        var json: std.json.Stringify = .{ .writer = &writer.interface, .options = .{ .whitespace = .indent_tab } };
+        const written = if (writeQcSummary(&json, report)) |_| writer.interface.flush() else |err| err;
+        if (written) |_| return 0 else |_| printPathError(io, path, IO_FAILURE.message);
+    }
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    return if (exit_code == 0) IO_FAILURE.exit_code else exit_code;
+}
+
+fn writeQcSummary(json: *std.json.Stringify, report: ProcessReport) !void {
+    try writeJsonHeader(json, "z-fastq/qc-summary-v1");
+    try json.objectField("summary");
+    try json.beginObject();
+    for ([_][]const u8{ "before_filtering", "after_filtering" }, report.stats) |name, *population| {
+        try json.objectField(name);
+        try writeSummaryTotals(json, population);
+    }
+    try json.endObject();
+
+    const trim = report.options.trim;
+    const dropped = &report.filtering.dropped_pairs;
+    try json.objectField("filtering_result");
+    try json.beginObject();
+    try json.objectField("passed_filter_reads");
+    try json.write(report.stats[1][0].reads + report.stats[1][1].reads);
+    const reasons = [_]struct { []const u8, preprocess.Reason }{
+        .{ "low_quality_reads", .low_quality },
+        .{ "too_many_N_reads", .too_many_n },
+        .{ "adapter_dimer_reads", .adapter_dimer },
+        .{ "too_short_reads", .too_short },
+    };
+    for (reasons) |entry| {
+        if (entry[1] == .adapter_dimer and trim.adapters == null) continue;
+        try json.objectField(entry[0]);
+        try json.write(2 * dropped[@intFromEnum(entry[1])]);
+    }
+    try json.objectField("too_long_reads");
+    try json.write(0);
+    try json.endObject();
+
+    if (report.pair_duplication) |pairs| {
+        try json.objectField("duplication");
+        try json.beginObject();
+        try json.objectField("rate");
+        try json.write(pairs.rate());
+        try json.endObject();
+    }
+    if (trim.adapters) |adapters| {
+        try json.objectField("insert_size");
+        try json.beginObject();
+        try json.objectField("peak");
+        try json.write(report.inserts.peak());
+        try json.objectField("unknown");
+        try json.write(report.inserts.unknown());
+        try json.objectField("histogram");
+        try json.beginArray();
+        for (report.inserts.histogram[0..preprocess.INSERT_BINS]) |count| try json.write(count);
+        try json.endArray();
+        try json.endObject();
+
+        var reads: u64 = 0;
+        var bases: u64 = 0;
+        for (report.trimming) |*mate_counts| {
+            reads += mate_counts.adapter_cuts.reads;
+            bases += mate_counts.adapter_cuts.bases;
+        }
+        try json.objectField("adapter_cutting");
+        try json.beginObject();
+        try json.objectField("adapter_trimmed_reads");
+        try json.write(reads);
+        try json.objectField("adapter_trimmed_bases");
+        try json.write(bases);
+        try json.objectField("read1_adapter_sequence");
+        try json.write(adapters[0]);
+        try json.objectField("read2_adapter_sequence");
+        try json.write(adapters[1]);
+        try json.endObject();
+    }
+    for ([_][]const u8{ "before_filtering", "after_filtering" }, [_]bool{ false, report.changes_reads }) |population, retained| {
+        for (report.qc, 1..) |*populations, number| {
+            var name_buffer: [32]u8 = undefined;
+            try json.objectField(std.fmt.bufPrint(&name_buffer, "read{d}_{s}", .{ number, population }) catch unreachable);
+            try populations.writeSummaryRead(json, retained);
+        }
+    }
+    try json.objectField("command");
+    try json.beginWriteRaw();
+    try json.writer.writeByte('"');
+    for (report.options.argv, 0..) |arg, index| {
+        if (index != 0) try json.writer.writeByte(' ');
+        try writeEscapedBytes(json.writer, arg, true);
+    }
+    try json.writer.writeByte('"');
+    json.endWriteRaw();
+    try json.endObject();
+}
+
+fn writeSummaryTotals(json: *std.json.Stringify, mates: *const [2]zfastq.Stats) !void {
+    var reads: u64 = 0;
+    var bases: u64 = 0;
+    var q20: u64 = 0;
+    var q30: u64 = 0;
+    var gc: u64 = 0;
+    for (mates) |*mate_stats| {
+        reads += mate_stats.reads;
+        bases += mate_stats.bases;
+        q20 += mate_stats.q20_bases;
+        q30 += mate_stats.q30_bases;
+        gc += mate_stats.g + mate_stats.c;
+    }
+    const total: f64 = @floatFromInt(bases);
+    try json.beginObject();
+    for ([_][]const u8{ "total_reads", "total_bases", "q20_bases", "q30_bases" }, [_]u64{ reads, bases, q20, q30 }) |name, value| {
+        try json.objectField(name);
+        try json.write(value);
+    }
+    for ([_][]const u8{ "q20_rate", "q30_rate" }, [_]u64{ q20, q30 }) |name, value| {
+        try json.objectField(name);
+        try json.write(if (bases == 0) 0.0 else @as(f64, @floatFromInt(value)) / total);
+    }
+    for ([_][]const u8{ "read1_mean_length", "read2_mean_length" }, mates) |name, *mate_stats| {
+        try json.objectField(name);
+        try json.write(if (mate_stats.reads == 0) 0 else mate_stats.bases / mate_stats.reads);
+    }
+    try json.objectField("gc_content");
+    try json.write(if (bases == 0) 0.0 else @as(f64, @floatFromInt(gc)) / total);
+    try json.endObject();
+}
+
+const QC_TABLE_FILE = "fastqc_data.txt";
+const QC_TABLE_SUFFIXES = [_][]const u8{ ".gz", ".bz2", ".txt", ".fastq", ".fq", ".csfastq", ".sam", ".bam", ".ubam" };
+const QC_TABLE_VERSION = "z-fastq " ++ zfastq.VERSION;
+
+const QcTable = struct {
+    retained: bool,
+    mate: u1,
+    filename: []const u8,
+    path: []u8,
+    file: ?std.Io.File = null,
+    written: bool = false,
+    unavailable: ?[]const u8 = null,
+
+    fn remove(self: *QcTable, io: std.Io) void {
+        const file = self.file orelse return;
+        file.close(io);
+        self.file = null;
+        std.Io.Dir.cwd().deleteFile(io, self.path) catch {};
+    }
+};
+
+const QcTables = struct {
+    files: [4]QcTable = undefined,
+    count: usize = 0,
+
+    fn deinit(self: *QcTables, io: std.Io, allocator: std.mem.Allocator) void {
+        for (self.files[0..self.count]) |*entry| {
+            if (entry.file) |file| file.close(io);
+            allocator.free(entry.path);
+        }
+    }
+
+    fn plan(
+        self: *QcTables,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        dir: []const u8,
+        inputs: []const []const u8,
+        outputs: [2][]const u8,
+        changes_reads: bool,
+    ) ?u8 {
+        const sources = [4][]const u8{ inputs[0], inputs[1], outputs[0], outputs[1] };
+        for (sources[0..if (changes_reads) 4 else 2], 0..) |source, index| {
+            const filename = if (namesStdin(source)) "stdin" else std.fs.path.basename(source);
+            if (std.mem.indexOfAny(u8, filename, "\t\r\n") != null) {
+                printPathError(io, source, "a QC table cannot name a file with a tab or line break");
+                return 2;
+            }
+            var stem = filename;
+            for (QC_TABLE_SUFFIXES) |suffix| {
+                if (std.mem.endsWith(u8, stem, suffix)) stem = stem[0 .. stem.len - suffix.len];
+            }
+            const folder = std.fmt.allocPrint(allocator, "{s}_fastqc", .{stem}) catch return outOfMemory(io);
+            defer allocator.free(folder);
+            const path = std.fs.path.join(allocator, &.{ dir, folder, QC_TABLE_FILE }) catch return outOfMemory(io);
+            for (self.files[0..self.count]) |earlier| {
+                if (!std.mem.eql(u8, earlier.path, path)) continue;
+                printPathError(io, path, "two of the files would share this QC table; give the inputs and outputs different names");
+                allocator.free(path);
+                return 2;
+            }
+            self.files[self.count] = .{ .retained = index >= 2, .mate = @intCast(index % 2), .filename = filename, .path = path };
+            self.count += 1;
+        }
+        return null;
+    }
+
+    fn create(self: *QcTables, io: std.Io) ?u8 {
+        for (self.files[0..self.count]) |*entry| {
+            std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(entry.path).?) catch {
+                printPathError(io, entry.path, "failed to create directory");
+                return self.abandon(io, 3);
+            };
+            if (createExclusiveOutput(io, entry.path, &entry.file)) |failure| {
+                printCommandFailure(io, entry.path, failure);
+                return self.abandon(io, failure.exit_code);
+            }
+        }
+        return null;
+    }
+
+    fn outOfMemory(io: std.Io) u8 {
+        writeStderr(io, OUT_OF_MEMORY_LINE);
+        return OUT_OF_MEMORY.exit_code;
+    }
+
+    fn abandon(self: *QcTables, io: std.Io, exit_code: u8) u8 {
+        for (self.files[0..self.count]) |*entry| entry.remove(io);
+        return exit_code;
+    }
+
+    fn write(
+        self: *QcTables,
+        io: std.Io,
+        collectors: *const [2]qc.MatePopulations,
+        contaminants: ?*const qc.ContaminantList,
+        exit_code: u8,
+    ) u8 {
+        if (exit_code != 0) return self.abandon(io, exit_code);
+        var result = exit_code;
+        for (self.files[0..self.count]) |*entry| {
+            const populations = &collectors[entry.mate];
+            const retained = entry.retained;
+            if (populations.tableUnavailable(retained)) |reason| {
+                entry.unavailable = reason;
+                entry.remove(io);
+                writeStderr(io, "warning: ");
+                writeEscaped(.stderr(), io, entry.path);
+                writeStderr(io, ": not written: ");
+                writeStderr(io, reason);
+                writeStderr(io, "\n");
+                continue;
+            }
+            var buffer: [JSON_OUTPUT_BUFFER_BYTES]u8 = undefined;
+            var writer = entry.file.?.writerStreaming(io, &buffer);
+            const written = if (populations.writeQcTable(&writer.interface, retained, entry.filename, QC_TABLE_VERSION, contaminants)) |_|
+                writer.interface.flush()
+            else |err|
+                err;
+            written catch {
+                printPathError(io, entry.path, IO_FAILURE.message);
+                entry.remove(io);
+                result = @max(result, IO_FAILURE.exit_code);
+                continue;
+            };
+            entry.written = true;
+        }
+        return result;
+    }
+
+    fn writeJson(self: *const QcTables, json: *std.json.Stringify) !void {
+        try json.beginArray();
+        for (self.files[0..self.count]) |entry| {
+            try json.beginObject();
+            try json.objectField("population");
+            try json.write(if (entry.retained) "retained" else "raw");
+            try json.objectField("mate");
+            try json.write(@as(u8, entry.mate) + 1);
+            try json.objectField("path");
+            try writeEscapedJsonString(json, entry.path);
+            try json.objectField("written");
+            try json.write(entry.written);
+            try json.objectField("unavailable");
+            try json.write(entry.unavailable);
+            try json.endObject();
+        }
+        try json.endArray();
+    }
+};
 
 fn loadContaminants(io: std.Io, allocator: std.mem.Allocator, path: []const u8, list: *?qc.ContaminantList) ?u8 {
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(qc.CONTAMINANT_FILE_LIMIT)) catch |err| {
@@ -4291,11 +4644,16 @@ fn validateProcessArguments(
             return null;
         }
     }
+    if (options.qc_summary) |path| if (namesStdin(path)) {
+        writeStderr(io, "error: --qc-summary cannot be standard output\n");
+        return null;
+    };
     const report = options.report orelse "-";
-    if (std.mem.eql(u8, path1, path2) or
-        std.mem.eql(u8, report, path1) or
-        std.mem.eql(u8, report, path2))
-    {
+    var shared = std.mem.eql(u8, path1, path2) or std.mem.eql(u8, report, path1) or std.mem.eql(u8, report, path2);
+    if (options.qc_summary) |summary| {
+        shared = shared or std.mem.eql(u8, summary, path1) or std.mem.eql(u8, summary, path2) or std.mem.eql(u8, summary, report);
+    }
+    if (shared) {
         writeStderr(io, "error: process output paths must differ\n");
         return null;
     }
@@ -4391,8 +4749,8 @@ const ProcessPairs = struct {
             self.trim_failure = pairCommandFailure(0, STATISTICS_LIMIT);
             return error.TrimFailed;
         };
-        for (&self.collectors.trimming, result.removed, 0..) |*counts, removed, index| {
-            counts.add(removed) catch {
+        for (&self.collectors.trimming, 0..) |*counts, index| {
+            counts.add(&result, index) catch {
                 self.trim_failure = pairCommandFailure(@intCast(index), STATISTICS_LIMIT);
                 return error.TrimFailed;
             };
@@ -4473,7 +4831,7 @@ fn processSources(
     counts: *ProcessCounts,
     options: ProcessOptions,
 ) DeinterleaveWriteError!?PairCommandFailure {
-    if (options.report != null and options.trim.changesReads()) {
+    if (options.collectsQc() and options.trim.changesReads()) {
         for (&collectors.qc) |*populations| populations.enableRetained();
     }
     const reader_options: fastq.ReaderOptions = .{ .max_line_bytes = options.max_line_bytes };
@@ -4495,7 +4853,7 @@ fn processSources(
         .max_pairs = options.max_pairs,
         .policy = options.pair_name_policy,
         .trimmer = .init(options.trim),
-        .collect_qc = options.report != null,
+        .collect_qc = options.collectsQc(),
     };
 
     while (true) {
@@ -4554,6 +4912,7 @@ const ProcessReport = struct {
     inserts: *const preprocess.InsertCounts,
     contaminants: ?*const qc.ContaminantList = null,
     pair_duplication: ?*const preprocess.PairDuplication = null,
+    qc_table_files: ?*const QcTables = null,
     input_failure: ?PairCommandFailure,
     failed_output: ?[]const u8,
 };
@@ -4597,6 +4956,10 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     try json.write(report.options.contaminants);
     try json.objectField("pair_duplication");
     try json.write(report.options.pair_duplication);
+    try json.objectField("qc_tables");
+    if (report.options.qc_tables) |dir| try writeEscapedJsonString(json, dir) else try json.write(null);
+    try json.objectField("qc_summary");
+    if (report.options.qc_summary) |path| try writeEscapedJsonString(json, path) else try json.write(null);
     try json.endObject();
 
     try json.objectField("inputs");
@@ -4669,6 +5032,8 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     if (trim.adapters != null) try writeInsertCounts(json, report.inserts) else try json.write(null);
     try json.objectField("pair_duplication");
     if (report.pair_duplication) |pairs| try pairs.writeJson(json) else try json.write(null);
+    try json.objectField("qc_table_files");
+    if (report.qc_table_files) |files| try files.writeJson(json) else try json.write(null);
 
     const failed_input: ?[]const u8 = if (report.input_failure) |failure| switch (failure) {
         .command => |details| report.inputs[details.input_index],

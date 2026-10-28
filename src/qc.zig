@@ -11,7 +11,11 @@
 //! count only toward stored keys and the total. A key is kept as 50 five-bit codes, the low five
 //! bits of each IUPAC letter, which are distinct and nonzero. Overrepresented ties keep
 //! first-appearance order, and Possible Source comes from a FastQC contaminant list matched by
-//! FastQC's rules.
+//! FastQC's rules. A population also writes as a FastQC 0.13.0 fastqc_data.txt: the same tables
+//! in FastQC's text layout and Java number format, each module graded pass, warn, or fail by
+//! FastQC's rules at its default limits, without Kmer Content. Basic Statistics names the
+//! Sanger / Illumina 1.9 encoding, the only one z-fastq reads. As a read section of fastp 1.1.0's
+//! JSON it writes fastp's totals and per-cycle mean quality and base content curves.
 
 const std = @import("std");
 const fastq = @import("fastq.zig");
@@ -200,12 +204,38 @@ pub const MatePopulations = struct {
     }
 
     pub fn writeJson(self: *const MatePopulations, json: *std.json.Stringify, retained: bool, contaminants: ?*const ContaminantList) !void {
-        const view: PopulationView = .{
+        try self.population(retained).writeJson(json, self.view(retained, contaminants));
+    }
+
+    pub fn tableUnavailable(self: *const MatePopulations, retained: bool) ?[]const u8 {
+        return if (self.population(retained).too_long) TOO_LONG else null;
+    }
+
+    pub fn writeQcTable(
+        self: *const MatePopulations,
+        out: *std.Io.Writer,
+        retained: bool,
+        filename: []const u8,
+        version: []const u8,
+        contaminants: ?*const ContaminantList,
+    ) !void {
+        try self.population(retained).writeQcTable(out, filename, version, self.view(retained, contaminants));
+    }
+
+    pub fn writeSummaryRead(self: *const MatePopulations, json: *std.json.Stringify, retained: bool) !void {
+        try self.population(retained).writeSummaryRead(json);
+    }
+
+    fn population(self: *const MatePopulations, retained: bool) *const MateQc {
+        return if (retained) &self.retained else &self.raw;
+    }
+
+    fn view(self: *const MatePopulations, retained: bool, contaminants: ?*const ContaminantList) PopulationView {
+        return .{
             .counts = if (retained) &self.retained_sequences else &self.raw_sequences,
             .tiles = if (retained) &self.retained_tiles else &self.raw_tiles,
             .contaminants = contaminants,
         };
-        try (if (retained) &self.retained else &self.raw).writeJson(json, view);
     }
 
     fn materialize(self: *MatePopulations) void {
@@ -427,35 +457,60 @@ pub const MateQc = struct {
         try json.endArray();
         try json.objectField("rows");
         try json.beginArray();
-        var reads: u64 = 0;
-        for (self.lengths) |count| reads += count;
-        const longest = std.mem.lastIndexOfNone(u64, &self.lengths, &.{0}) orelse 0;
-        if (reads != 0 and longest > ADAPTER_LENGTH) {
-            const total: f64 = @floatFromInt(reads);
-            var running: [ADAPTER_COUNT]u64 = @splat(0);
-            var position: usize = 0;
-            var groups = Groups.init(longest - ADAPTER_LENGTH + 1);
-            while (groups.next()) |group| {
-                var sums: [ADAPTER_COUNT]f64 = @splat(0);
-                while (position < group.last) : (position += 1) {
-                    for (&running, &sums, &self.adapter_starts) |*count, *sum, *starts| {
-                        count.* += starts[position];
-                        sum.* += @as(f64, @floatFromInt(count.*)) * 100.0 / total;
-                    }
-                }
-                const width: f64 = @floatFromInt(group.last - group.first);
-                try json.beginObject();
-                try json.objectField("position");
-                try writeRangeLabel(json, group.first + 1, group.last);
-                try json.objectField("values");
-                try json.beginArray();
-                for (sums) |sum| try json.write(sum / width);
-                try json.endArray();
-                try json.endObject();
-            }
+        var rows = self.adapterRows();
+        while (rows.next()) |row| {
+            try json.beginObject();
+            try json.objectField("position");
+            try writeRangeLabel(json, row.group.first + 1, row.group.last);
+            try json.objectField("values");
+            try json.beginArray();
+            for (row.values) |value| try json.write(value);
+            try json.endArray();
+            try json.endObject();
         }
         try json.endArray();
         try json.endObject();
+    }
+
+    const AdapterRow = struct {
+        group: Group,
+        values: [ADAPTER_COUNT]f64,
+    };
+
+    const AdapterRows = struct {
+        mate: *const MateQc,
+        groups: ?Groups,
+        total: f64,
+        running: [ADAPTER_COUNT]u64 = @splat(0),
+        position: usize = 0,
+
+        fn next(self: *AdapterRows) ?AdapterRow {
+            const groups = if (self.groups) |*groups| groups else return null;
+            const group = groups.next() orelse return null;
+            var sums: [ADAPTER_COUNT]f64 = @splat(0);
+            while (self.position < group.last) : (self.position += 1) {
+                for (&self.running, &sums, &self.mate.adapter_starts) |*count, *sum, *starts| {
+                    count.* += starts[self.position];
+                    sum.* += @as(f64, @floatFromInt(count.*)) * 100.0 / self.total;
+                }
+            }
+            const width: f64 = @floatFromInt(group.last - group.first);
+            var row: AdapterRow = .{ .group = group, .values = undefined };
+            for (&row.values, sums) |*value, sum| value.* = sum / width;
+            return row;
+        }
+    };
+
+    fn adapterRows(self: *const MateQc) AdapterRows {
+        var reads: u64 = 0;
+        for (self.lengths) |count| reads += count;
+        const longest = self.longestRead();
+        const groups: ?Groups = if (reads != 0 and longest > ADAPTER_LENGTH) .init(longest - ADAPTER_LENGTH + 1) else null;
+        return .{ .mate = self, .groups = groups, .total = @floatFromInt(reads) };
+    }
+
+    fn longestRead(self: *const MateQc) usize {
+        return std.mem.lastIndexOfNone(u64, &self.lengths, &.{0}) orelse 0;
     }
 
     fn writeBaseQuality(self: *const MateQc, json: *std.json.Stringify, groups: Groups) !void {
@@ -533,57 +588,94 @@ pub const MateQc = struct {
         try json.beginArray();
         var iterator = groups;
         while (iterator.next()) |group| {
-            const pooled = self.pooledBases(group);
-            const total = pooled[@intFromEnum(BaseKind.a)] + pooled[@intFromEnum(BaseKind.c)] +
-                pooled[@intFromEnum(BaseKind.g)] + pooled[@intFromEnum(BaseKind.t)];
             try json.beginObject();
             try writeGroupLabel(json, group);
-            for ([_]struct { []const u8, BaseKind }{ .{ "g", .g }, .{ "a", .a }, .{ "t", .t }, .{ "c", .c } }) |entry| {
-                try json.objectField(entry[0]);
-                try json.write(percentOf(pooled[@intFromEnum(entry[1])], total));
+            for (CONTENT_NAMES, self.groupContent(group)) |name, percent| {
+                try json.objectField(name);
+                try json.write(percent);
             }
             try json.endObject();
         }
         try json.endArray();
     }
 
+    const CONTENT_ORDER = [_]BaseKind{ .g, .a, .t, .c };
+    const CONTENT_NAMES = [_][]const u8{ "g", "a", "t", "c" };
+
+    fn groupContent(self: *const MateQc, group: Group) [CONTENT_ORDER.len]?f64 {
+        const pooled = self.pooledBases(group);
+        const total = pooled[@intFromEnum(BaseKind.a)] + pooled[@intFromEnum(BaseKind.c)] +
+            pooled[@intFromEnum(BaseKind.g)] + pooled[@intFromEnum(BaseKind.t)];
+        var percents: [CONTENT_ORDER.len]?f64 = undefined;
+        for (&percents, CONTENT_ORDER) |*percent, kind| percent.* = percentOf(pooled[@intFromEnum(kind)], total);
+        return percents;
+    }
+
     fn writeBaseN(self: *const MateQc, json: *std.json.Stringify, groups: Groups) !void {
         try json.beginArray();
         var iterator = groups;
         while (iterator.next()) |group| {
-            const pooled = self.pooledBases(group);
-            const total = self.pooledReads(group);
             try json.beginObject();
             try writeGroupLabel(json, group);
             try json.objectField("n");
-            try json.write(percentOf(pooled[@intFromEnum(BaseKind.n)], total));
+            try json.write(self.groupN(group));
             try json.endObject();
         }
         try json.endArray();
     }
 
+    fn groupN(self: *const MateQc, group: Group) ?f64 {
+        return percentOf(self.pooledBases(group)[@intFromEnum(BaseKind.n)], self.pooledReads(group));
+    }
+
     fn writeLengths(self: *const MateQc, json: *std.json.Stringify) !void {
         try json.beginArray();
-        const first = std.mem.indexOfNone(u64, &self.lengths, &.{0}) orelse 0;
-        const last = std.mem.lastIndexOfNone(u64, &self.lengths, &.{0}) orelse 0;
-        const low = first -| 1;
-        const high = last + 1;
-        const size = lengthBinSize(high - low);
-        var start = low / size * size;
-        while (start <= high) : (start += size) {
-            const end = @min(start + size - 1, high);
-            var count: u64 = 0;
-            for (start..@min(end, MAX_CYCLES) + 1) |length| count += self.lengths[length];
-            const edge = start == low / size * size or start + size > high;
-            if (edge and count == 0) continue;
+        var bins = self.lengthBins();
+        while (bins.next()) |bin| {
             try json.beginObject();
             try json.objectField("length");
-            try writeRangeLabel(json, start, if (size == 1) start else end);
+            try writeRangeLabel(json, bin.first, bin.last);
             try json.objectField("count");
-            try json.write(count);
+            try json.write(bin.count);
             try json.endObject();
         }
         try json.endArray();
+    }
+
+    const LengthBin = struct {
+        first: usize,
+        last: usize,
+        count: u64,
+    };
+
+    const LengthBins = struct {
+        lengths: *const [MAX_CYCLES + 1]u64,
+        low_start: usize,
+        high: usize,
+        size: usize,
+        start: usize,
+
+        fn next(self: *LengthBins) ?LengthBin {
+            while (self.start <= self.high) {
+                const start = self.start;
+                self.start += self.size;
+                const end = @min(start + self.size - 1, self.high);
+                var count: u64 = 0;
+                for (start..@min(end, MAX_CYCLES) + 1) |length| count += self.lengths[length];
+                const edge = start == self.low_start or start + self.size > self.high;
+                if (edge and count == 0) continue;
+                return .{ .first = start, .last = if (self.size == 1) start else end, .count = count };
+            }
+            return null;
+        }
+    };
+
+    fn lengthBins(self: *const MateQc) LengthBins {
+        const first = std.mem.indexOfNone(u64, &self.lengths, &.{0}) orelse 0;
+        const low = first -| 1;
+        const high = self.longestRead() + 1;
+        const size = lengthBinSize(high - low);
+        return .{ .lengths = &self.lengths, .low_start = low / size * size, .high = high, .size = size, .start = low / size * size };
     }
 
     fn writeReadQuality(self: *const MateQc, json: *std.json.Stringify) !void {
@@ -601,7 +693,380 @@ pub const MateQc = struct {
         }
         try json.endArray();
     }
+
+    fn writeSummaryRead(self: *const MateQc, json: *std.json.Stringify) !void {
+        std.debug.assert(self.pending_reads == 0);
+        const totals = try self.stats();
+        try json.beginObject();
+        for ([_][]const u8{ "total_reads", "total_bases", "q20_bases", "q30_bases" }, [_]u64{ totals.reads, totals.bases, totals.q20_bases, totals.q30_bases }) |name, value| {
+            try json.objectField(name);
+            try json.write(value);
+        }
+        if (!self.too_long) {
+            const cycles = self.quality.items[0..self.longestRead()];
+            var q40_bases: u64 = 0;
+            for (cycles) |counts| {
+                for (counts[Q40_SCORE..]) |count| q40_bases += count;
+            }
+            try json.objectField("q40_bases");
+            try json.write(q40_bases);
+            try json.objectField("total_cycles");
+            try json.write(cycles.len);
+            try json.objectField("quality_curves");
+            try json.beginObject();
+            try json.objectField("mean");
+            try json.beginArray();
+            for (cycles) |counts| {
+                var reads: u64 = 0;
+                var scores: u64 = 0;
+                for (counts, 0..) |count, score| {
+                    reads += count;
+                    scores += count * score;
+                }
+                try json.write(@as(f64, @floatFromInt(scores)) / @as(f64, @floatFromInt(reads)));
+            }
+            try json.endArray();
+            try json.endObject();
+            try json.objectField("content_curves");
+            try json.beginObject();
+            for ([_][]const u8{ "A", "T", "C", "G", "N", "GC" }, [_][]const BaseKind{ &.{.a}, &.{.t}, &.{.c}, &.{.g}, &.{.n}, &.{ .g, .c } }) |name, kinds| {
+                try json.objectField(name);
+                try json.beginArray();
+                for (cycles, self.bases.items[0..cycles.len]) |qualities, bases| {
+                    var reads: u64 = 0;
+                    for (qualities) |count| reads += count;
+                    var matched: u64 = 0;
+                    for (kinds) |kind| matched += bases[@intFromEnum(kind)];
+                    try json.write(@as(f64, @floatFromInt(matched)) / @as(f64, @floatFromInt(reads)));
+                }
+                try json.endArray();
+            }
+            try json.endObject();
+        }
+        try json.endObject();
+    }
+
+    fn writeQcTable(self: *const MateQc, out: *std.Io.Writer, filename: []const u8, version: []const u8, sequences: PopulationView) !void {
+        std.debug.assert(self.pending_reads == 0 and !self.too_long);
+        const groups = Groups.init(self.quality.items.len);
+        try out.print("##FastQC\t{s}\n", .{version});
+        try self.writeBasicStatistics(out, filename);
+        if (self.quality.items.len != 0) try self.writeTableBaseQuality(out, groups);
+        if (sequences.tiles.unavailable() == null) try sequences.tiles.writeTable(out);
+        if (std.mem.indexOfNone(u64, &self.read_quality, &.{0}) != null) try self.writeTableReadQuality(out);
+        try self.writeTableBaseContent(out, groups);
+        try self.writeTableGc(out);
+        try self.writeTableBaseN(out, groups);
+        try self.writeTableLengths(out);
+        try sequences.counts.writeTableDuplication(out);
+        try sequences.counts.writeTableOverrepresented(out, sequences.contaminants);
+        try self.writeTableAdapters(out);
+    }
+
+    fn writeBasicStatistics(self: *const MateQc, out: *std.Io.Writer, filename: []const u8) !void {
+        const totals = try self.tableStats();
+        try beginModule(out, "Basic Statistics", .pass, "Measure\tValue");
+        const file_type = if (totals.reads == 0) "null" else "Conventional base calls";
+        try out.print("Filename\t{s}\nFile type\t{s}\nEncoding\tSanger / Illumina 1.9\n", .{ filename, file_type });
+        var buffer: [LENGTH_TEXT_BYTES]u8 = undefined;
+        try out.print("Total Sequences\t{d}\nTotal Bases\t{s}\n", .{ totals.reads, formatLength(&buffer, totals.bases) });
+        if (totals.min_length == totals.max_length)
+            try out.print("Sequence length\t{d}\n", .{totals.min_length})
+        else
+            try out.print("Sequence length\t{d}-{d}\n", .{ totals.min_length, totals.max_length });
+        const counted: u128 = totals.a + totals.c + totals.g + totals.t;
+        try out.print("Mean Length\t{d}\nMedian Length\t{d}\n%GC\t{d}\n", .{
+            if (totals.reads == 0) 0 else totals.bases / totals.reads,
+            self.medianLength(),
+            if (counted == 0) 0 else (@as(u128, totals.g) + totals.c) * 100 / counted,
+        });
+        try endModule(out);
+    }
+
+    fn medianLength(self: *const MateQc) usize {
+        var reads: u64 = 0;
+        for (self.lengths) |count| reads += count;
+        var seen: u64 = 0;
+        for (self.lengths, 0..) |count, length| {
+            if (seen + count > reads / 2) return length;
+            seen += count;
+        }
+        return 0;
+    }
+
+    fn writeTableBaseQuality(self: *const MateQc, out: *std.Io.Writer, groups: Groups) !void {
+        var grade: Grade = .pass;
+        var scan = groups;
+        while (scan.next()) |group| {
+            const lower = self.groupPercentile(group, 25) orelse continue;
+            const median = self.groupPercentile(group, 50).?;
+            grade = grade.worst(.below(lower, QUALITY_LOWER_WARN, QUALITY_LOWER_FAIL));
+            grade = grade.worst(.below(median, QUALITY_MEDIAN_WARN, QUALITY_MEDIAN_FAIL));
+        }
+        try beginModule(out, "Per base sequence quality", grade, "Base\tMean\tMedian\tLower Quartile\tUpper Quartile\t10th Percentile\t90th Percentile");
+        var rows = groups;
+        while (rows.next()) |group| {
+            try writeLabel(out, group.first + 1, group.last);
+            try writeCell(out, self.groupMean(group));
+            for ([_]u7{ 50, 25, 75, 10, 90 }) |percent| try writeCell(out, self.groupPercentile(group, percent));
+            try out.writeByte('\n');
+        }
+        try endModule(out);
+    }
+
+    fn writeTableReadQuality(self: *const MateQc, out: *std.Io.Writer) !void {
+        var mode: usize = 0;
+        var most: u64 = 0;
+        for (self.read_quality, 0..) |count, score| {
+            if (count <= most) continue;
+            most = count;
+            mode = score;
+        }
+        try beginModule(out, "Per sequence quality scores", .atMost(@floatFromInt(mode), READ_QUALITY_WARN, READ_QUALITY_FAIL), "Quality\tCount");
+        if (std.mem.indexOfNone(u64, &self.read_quality, &.{0})) |lowest| {
+            const highest = std.mem.lastIndexOfNone(u64, &self.read_quality, &.{0}).?;
+            for (lowest..highest + 1) |score| try writeCountRow(out, score, self.read_quality[score]);
+        }
+        try endModule(out);
+    }
+
+    fn writeTableBaseContent(self: *const MateQc, out: *std.Io.Writer, groups: Groups) !void {
+        const g, const a, const t, const c = .{ 0, 1, 2, 3 };
+        var grade: Grade = .pass;
+        var scan = groups;
+        while (scan.next()) |group| {
+            const percents = self.groupContent(group);
+            const at = if (percents[a] != null and percents[t] != null) @abs(percents[a].? - percents[t].?) else 0;
+            const gc = if (percents[g] != null and percents[c] != null) @abs(percents[g].? - percents[c].?) else 0;
+            grade = grade.worst(.above(@max(at, gc), CONTENT_WARN, CONTENT_FAIL));
+        }
+        try beginModule(out, "Per base sequence content", grade, "Base\tG\tA\tT\tC");
+        var rows = groups;
+        while (rows.next()) |group| {
+            try writeLabel(out, group.first + 1, group.last);
+            for (self.groupContent(group)) |percent| try writeCell(out, percent);
+            try out.writeByte('\n');
+        }
+        try endModule(out);
+    }
+
+    fn writeTableGc(self: *const MateQc, out: *std.Io.Writer) !void {
+        try beginModule(out, "Per sequence GC content", .above(gcDeviation(&self.gc), GC_WARN, GC_FAIL), "GC Content\tCount");
+        for (self.gc, 0..) |count, bin| {
+            try out.print("{d}", .{bin});
+            try writeCell(out, count);
+            try out.writeByte('\n');
+        }
+        try endModule(out);
+    }
+
+    fn writeTableBaseN(self: *const MateQc, out: *std.Io.Writer, groups: Groups) !void {
+        var grade: Grade = .pass;
+        var scan = groups;
+        while (scan.next()) |group| grade = grade.worst(.above(self.groupN(group) orelse 0, N_WARN, N_FAIL));
+        try beginModule(out, "Per base N content", grade, "Base\tN-Count");
+        var rows = groups;
+        while (rows.next()) |group| {
+            try writeLabel(out, group.first + 1, group.last);
+            try writeCell(out, self.groupN(group));
+            try out.writeByte('\n');
+        }
+        try endModule(out);
+    }
+
+    fn writeTableLengths(self: *const MateQc, out: *std.Io.Writer) !void {
+        var lengths: usize = 0;
+        for (self.lengths) |count| lengths += @intFromBool(count != 0);
+        const grade: Grade = if (self.lengths[0] != 0) .fail else if (lengths > 1) .warn else .pass;
+        try beginModule(out, "Sequence Length Distribution", grade, "Length\tCount");
+        var bins = self.lengthBins();
+        while (bins.next()) |bin| {
+            try writeLabel(out, bin.first, bin.last);
+            try writeCell(out, @floatFromInt(bin.count));
+            try out.writeByte('\n');
+        }
+        try endModule(out);
+    }
+
+    fn writeTableAdapters(self: *const MateQc, out: *std.Io.Writer) !void {
+        var rows = self.adapterRows();
+        if (rows.groups == null) {
+            try beginModule(out, "Adapter Content", .warn, null);
+            return endModule(out);
+        }
+        var grade: Grade = .pass;
+        var scan = rows;
+        while (scan.next()) |row| {
+            for (row.values) |value| grade = grade.worst(.above(value, ADAPTER_WARN, ADAPTER_FAIL));
+        }
+        try beginModule(out, "Adapter Content", grade, ADAPTER_HEADER);
+        while (rows.next()) |row| {
+            try writeLabel(out, row.group.first + 1, row.group.last);
+            for (row.values) |value| try writeCell(out, value);
+            try out.writeByte('\n');
+        }
+        try endModule(out);
+    }
 };
+
+const Q40_SCORE = 40;
+const QUALITY_LOWER_WARN = 10;
+const QUALITY_LOWER_FAIL = 5;
+const QUALITY_MEDIAN_WARN = 25;
+const QUALITY_MEDIAN_FAIL = 20;
+const TILE_WARN = 5;
+const TILE_FAIL = 10;
+const READ_QUALITY_WARN = 27;
+const READ_QUALITY_FAIL = 20;
+const CONTENT_WARN = 10;
+const CONTENT_FAIL = 20;
+const GC_WARN = 15;
+const GC_FAIL = 30;
+const N_WARN = 5;
+const N_FAIL = 20;
+const DUPLICATION_WARN = 70;
+const DUPLICATION_FAIL = 50;
+const OVERREPRESENTED_FAIL = 1;
+const ADAPTER_WARN = 5;
+const ADAPTER_FAIL = 10;
+
+const ADAPTER_HEADER = header: {
+    var columns: []const u8 = "Position";
+    for (ADAPTERS) |adapter| columns = columns ++ "\t" ++ adapter.name;
+    break :header columns;
+};
+
+const Grade = enum {
+    pass,
+    warn,
+    fail,
+
+    fn above(value: f64, warn: f64, fail: f64) Grade {
+        return if (value > fail) .fail else if (value > warn) .warn else .pass;
+    }
+
+    fn below(value: f64, warn: f64, fail: f64) Grade {
+        return if (value < fail) .fail else if (value < warn) .warn else .pass;
+    }
+
+    fn atMost(value: f64, warn: f64, fail: f64) Grade {
+        return if (value <= fail) .fail else if (value <= warn) .warn else .pass;
+    }
+
+    fn worst(self: Grade, other: Grade) Grade {
+        return @enumFromInt(@max(@intFromEnum(self), @intFromEnum(other)));
+    }
+};
+
+fn beginModule(out: *std.Io.Writer, name: []const u8, grade: Grade, header: ?[]const u8) !void {
+    try out.print(">>{s}\t{t}\n", .{ name, grade });
+    if (header) |columns| try out.print("#{s}\n", .{columns});
+}
+
+fn endModule(out: *std.Io.Writer) !void {
+    try out.writeAll(">>END_MODULE\n");
+}
+
+fn writeLabel(out: *std.Io.Writer, first: usize, last: usize) !void {
+    var buffer: [48]u8 = undefined;
+    try out.writeAll(rangeLabel(&buffer, first, last));
+}
+
+fn writeCell(out: *std.Io.Writer, value: ?f64) !void {
+    var buffer: [JAVA_DOUBLE_BYTES]u8 = undefined;
+    try out.writeByte('\t');
+    try out.writeAll(javaDouble(&buffer, value orelse std.math.nan(f64)));
+}
+
+fn writeCountRow(out: *std.Io.Writer, label: usize, count: u64) !void {
+    try out.print("{d}", .{label});
+    try writeCell(out, @floatFromInt(count));
+    try out.writeByte('\n');
+}
+
+const JAVA_DOUBLE_BYTES = std.fmt.float.min_buffer_size;
+const LENGTH_TEXT_BYTES = JAVA_DOUBLE_BYTES + 4;
+
+fn javaDouble(buffer: *[JAVA_DOUBLE_BYTES]u8, value: f64) []const u8 {
+    if (std.math.isNan(value)) return "NaN";
+    if (std.math.isInf(value)) return if (value > 0) "Infinity" else "-Infinity";
+    const magnitude = @abs(value);
+    if (magnitude == 0 or (magnitude >= 1e-3 and magnitude < 1e7)) {
+        const text = std.fmt.float.render(buffer, value, .{ .mode = .decimal }) catch unreachable;
+        if (std.mem.indexOfScalar(u8, text, '.') != null) return text;
+        buffer[text.len..][0..2].* = ".0".*;
+        return buffer[0 .. text.len + 2];
+    }
+    var scientific: [JAVA_DOUBLE_BYTES]u8 = undefined;
+    const text = std.fmt.float.render(&scientific, value, .{}) catch unreachable;
+    const exponent = std.mem.indexOfScalar(u8, text, 'e').?;
+    const fraction = if (std.mem.indexOfScalar(u8, text[0..exponent], '.') == null) ".0" else "";
+    return std.fmt.bufPrint(buffer, "{s}{s}E{s}", .{ text[0..exponent], fraction, text[exponent + 1 ..] }) catch unreachable;
+}
+
+fn formatLength(buffer: *[LENGTH_TEXT_BYTES]u8, bases: u64) []const u8 {
+    var length: f64 = @floatFromInt(bases);
+    var unit: []const u8 = " bp";
+    for ([_]struct { f64, []const u8 }{ .{ 1e9, " Gbp" }, .{ 1e6, " Mbp" }, .{ 1e3, " kbp" } }) |scale| {
+        if (length < scale[0]) continue;
+        length /= scale[0];
+        unit = scale[1];
+        break;
+    }
+    var digits: [JAVA_DOUBLE_BYTES]u8 = undefined;
+    const text = javaDouble(&digits, length);
+    var last: usize = 0;
+    for (text, 0..) |char, index| {
+        last = index;
+        if (char == '.') break;
+    }
+    if (last + 1 < text.len and text[last + 1] != '0') {
+        last += 1;
+    } else if (last > 0 and text[last] == '.') {
+        last -= 1;
+    }
+    return std.fmt.bufPrint(buffer, "{s}{s}", .{ text[0 .. last + 1], unit }) catch unreachable;
+}
+
+fn gcDeviation(gc: *const [GC_BINS]f64) f64 {
+    var first_mode: usize = 0;
+    var highest: f64 = 0;
+    var total: f64 = 0;
+    for (gc, 0..) |count, bin| {
+        total += count;
+        if (count <= highest) continue;
+        highest = count;
+        first_mode = bin;
+    }
+    const floor = gc[first_mode] - gc[first_mode] / 10.0;
+    var mode_sum: f64 = 0;
+    var mode_bins: f64 = 0;
+    var bin = first_mode;
+    const fell_off_top = while (bin < GC_BINS) : (bin += 1) {
+        if (!(gc[bin] > floor)) break false;
+        mode_sum += @floatFromInt(bin);
+        mode_bins += 1;
+    } else true;
+    bin = first_mode;
+    const fell_off_bottom = while (bin > 0) {
+        bin -= 1;
+        if (!(gc[bin] > floor)) break false;
+        mode_sum += @floatFromInt(bin);
+        mode_bins += 1;
+    } else true;
+    const mode: f64 = if (fell_off_top or fell_off_bottom) @floatFromInt(first_mode) else mode_sum / mode_bins;
+    var variance: f64 = 0;
+    for (gc, 0..) |count, index| variance += std.math.pow(f64, @as(f64, @floatFromInt(index)) - mode, 2) * count;
+    const deviation = @sqrt(variance / (total - 1));
+    const scale = 1.0 / @sqrt(2 * std.math.pi * deviation * deviation);
+    var difference: f64 = 0;
+    for (gc, 0..) |count, index| {
+        const offset = @as(f64, @floatFromInt(index)) - mode;
+        const density = scale * std.math.pow(f64, std.math.e, 0 - std.math.pow(f64, offset, 2) / (2 * deviation * deviation));
+        difference += @abs(density * total - count);
+    }
+    return difference / total * 100;
+}
 
 fn countCycleBases(comptime lanes: comptime_int, pending: *PendingBases, sequence: []const u8, gc_length: usize) usize {
     var gc_count: usize = 0;
@@ -818,11 +1283,14 @@ fn writeGroupLabel(json: *std.json.Stringify, group: Group) !void {
 
 fn writeRangeLabel(json: *std.json.Stringify, first: usize, last: usize) !void {
     var buffer: [48]u8 = undefined;
-    const label = if (first == last)
-        std.fmt.bufPrint(&buffer, "{d}", .{first}) catch unreachable
+    try json.write(rangeLabel(&buffer, first, last));
+}
+
+fn rangeLabel(buffer: *[48]u8, first: usize, last: usize) []const u8 {
+    return if (first == last)
+        std.fmt.bufPrint(buffer, "{d}", .{first}) catch unreachable
     else
-        std.fmt.bufPrint(&buffer, "{d}-{d}", .{ first, last }) catch unreachable;
-    try json.write(label);
+        std.fmt.bufPrint(buffer, "{d}-{d}", .{ first, last }) catch unreachable;
 }
 
 fn gcKeptLength(length: usize) usize {
@@ -1103,7 +1571,7 @@ const SequenceCounts = struct {
         try json.objectField("reads_at_limit");
         try json.write(self.reads_at_limit);
         try json.objectField("total_deduplicated_percentage");
-        try json.write(if (levels.total == 0) 100.0 else levels.deduplicated / levels.total * 100.0);
+        try json.write(deduplicatedPercentage(levels));
         try json.objectField("levels");
         try json.beginArray();
         for (LEVEL_LABELS, levels.bins) |label, bin| {
@@ -1111,11 +1579,34 @@ const SequenceCounts = struct {
             try json.objectField("level");
             try json.write(label);
             try json.objectField("percentage");
-            if (levels.total == 0) try json.write(null) else try json.write(bin / levels.total * 100.0);
+            try json.write(levelPercentage(levels, bin));
             try json.endObject();
         }
         try json.endArray();
         try json.endObject();
+    }
+
+    fn writeTableDuplication(self: *const SequenceCounts, out: *std.Io.Writer) !void {
+        const levels = self.levels.?;
+        const deduplicated = deduplicatedPercentage(levels);
+        try beginModule(out, "Sequence Duplication Levels", .below(deduplicated, DUPLICATION_WARN, DUPLICATION_FAIL), null);
+        try out.writeAll("#Total Deduplicated Percentage");
+        try writeCell(out, deduplicated);
+        try out.writeAll("\n#Duplication Level\tPercentage of total\n");
+        for (LEVEL_LABELS, levels.bins) |label, bin| {
+            try out.writeAll(label);
+            try writeCell(out, levelPercentage(levels, bin));
+            try out.writeByte('\n');
+        }
+        try endModule(out);
+    }
+
+    fn deduplicatedPercentage(levels: Levels) f64 {
+        return if (levels.total == 0) 100.0 else levels.deduplicated / levels.total * 100.0;
+    }
+
+    fn levelPercentage(levels: Levels, bin: f64) ?f64 {
+        return if (levels.total == 0) null else bin / levels.total * 100.0;
     }
 
     fn percentage(self: *const SequenceCounts, reads: u64) f64 {
@@ -1128,8 +1619,7 @@ const SequenceCounts = struct {
         return first > second or (first == second and a < b);
     }
 
-    fn writeOverrepresented(self: *const SequenceCounts, json: *std.json.Stringify, contaminants: ?*const ContaminantList) !void {
-        var rows: [OVERREPRESENTED_MAX]u32 = undefined;
+    fn overrepresentedRows(self: *const SequenceCounts, rows: *[OVERREPRESENTED_MAX]u32) []u32 {
         var row_count: usize = 0;
         for (self.records.items, 0..) |record, index| {
             if (!(self.percentage(record.reads) > OVERREPRESENTED_PERCENT)) continue;
@@ -1137,8 +1627,13 @@ const SequenceCounts = struct {
             row_count += 1;
         }
         std.sort.pdq(u32, rows[0..row_count], self, moreReads);
+        return rows[0..row_count];
+    }
+
+    fn writeOverrepresented(self: *const SequenceCounts, json: *std.json.Stringify, contaminants: ?*const ContaminantList) !void {
+        var rows: [OVERREPRESENTED_MAX]u32 = undefined;
         try json.beginArray();
-        for (rows[0..row_count]) |index| {
+        for (self.overrepresentedRows(&rows)) |index| {
             const record = self.records.items[index];
             var buffer: [KEY_LENGTH]u8 = undefined;
             const key = decodeKey(record.words, &buffer);
@@ -1164,6 +1659,29 @@ const SequenceCounts = struct {
             try json.endObject();
         }
         try json.endArray();
+    }
+
+    fn writeTableOverrepresented(self: *const SequenceCounts, out: *std.Io.Writer, contaminants: ?*const ContaminantList) !void {
+        var rows: [OVERREPRESENTED_MAX]u32 = undefined;
+        const found = self.overrepresentedRows(&rows);
+        const grade: Grade = if (found.len == 0)
+            .pass
+        else if (self.percentage(self.records.items[found[0]].reads) > OVERREPRESENTED_FAIL)
+            .fail
+        else
+            .warn;
+        try beginModule(out, "Overrepresented sequences", grade, if (found.len == 0) null else "Sequence\tCount\tPercentage\tPossible Source");
+        for (found) |index| {
+            const record = self.records.items[index];
+            var buffer: [KEY_LENGTH]u8 = undefined;
+            const key = decodeKey(record.words, &buffer);
+            try out.print("{s}\t{d}", .{ key, record.reads });
+            try writeCell(out, @round(self.percentage(record.reads) * 100) / 100);
+            if (if (contaminants) |list| list.bestHit(key) else null) |hit| {
+                try out.print("\t{s} ({d}% over {d}bp)\n", .{ hit.name, hit.identity, hit.length });
+            } else try out.writeAll("\tNo Hit\n");
+        }
+        try endModule(out);
     }
 };
 
@@ -1569,49 +2087,104 @@ const TileQuality = struct {
 
     fn writeJson(self: *const TileQuality, json: *std.json.Stringify) !void {
         if (self.unavailable() != null) return json.write(null);
-        var order: [TILE_LIMIT + 1]u16 = undefined;
-        const sorted = order[0..self.tiles.items.len];
-        for (sorted, 0..) |*entry, index| entry.* = @intCast(index);
-        std.sort.pdq(u16, sorted, self, lessNumber);
-        const groups = Groups.init(self.longest);
-        var counts: [MAX_CYCLES]u64 = undefined;
-        var averages: [MAX_CYCLES]f64 = @splat(0);
-        for (sorted) |entry| {
-            const tile = &self.tiles.items[entry];
-            positionCounts(tile, &counts);
-            var iterator = groups;
-            var index: usize = 0;
-            while (iterator.next()) |group| : (index += 1) averages[index] += mean(tile, group, &counts);
-        }
-        const tile_count: f64 = @floatFromInt(sorted.len);
+        const table: TileTable = .init(self);
         try json.beginObject();
         try json.objectField("positions");
         try json.beginArray();
-        var labels = groups;
-        var group_count: usize = 0;
-        while (labels.next()) |group| : (group_count += 1) {
-            averages[group_count] /= tile_count;
-            try writeRangeLabel(json, group.first + 1, group.last);
-        }
+        var labels = table.groups;
+        while (labels.next()) |group| try writeRangeLabel(json, group.first + 1, group.last);
         try json.endArray();
         try json.objectField("tiles");
         try json.beginArray();
-        for (sorted) |entry| {
-            const tile = &self.tiles.items[entry];
-            positionCounts(tile, &counts);
+        var deviations: [MAX_CYCLES]f64 = undefined;
+        for (0..table.count) |rank| {
             try json.beginObject();
             try json.objectField("tile");
-            try json.write(tile.number);
+            try json.write(table.deviations(rank, &deviations));
             try json.objectField("deviations");
             try json.beginArray();
-            var iterator = groups;
-            var index: usize = 0;
-            while (iterator.next()) |group| : (index += 1) try json.write(mean(tile, group, &counts) - averages[index]);
+            for (deviations[0..table.group_count]) |deviation| try json.write(deviation);
             try json.endArray();
             try json.endObject();
         }
         try json.endArray();
         try json.endObject();
+    }
+
+    fn writeTable(self: *const TileQuality, out: *std.Io.Writer) !void {
+        const table: TileTable = .init(self);
+        try beginModule(out, "Per tile sequence quality", .above(table.maxDeviation(), TILE_WARN, TILE_FAIL), "Tile\tBase\tMean");
+        var deviations: [MAX_CYCLES]f64 = undefined;
+        for (0..table.count) |rank| {
+            const tile = table.deviations(rank, &deviations);
+            var labels = table.groups;
+            var index: usize = 0;
+            while (labels.next()) |group| : (index += 1) {
+                try out.print("{d}\t", .{tile});
+                try writeLabel(out, group.first + 1, group.last);
+                try writeCell(out, deviations[index]);
+                try out.writeByte('\n');
+            }
+        }
+        try endModule(out);
+    }
+};
+
+const TileTable = struct {
+    quality: *const TileQuality,
+    order: [TILE_LIMIT + 1]u16,
+    count: usize,
+    groups: Groups,
+    group_count: usize,
+    averages: [MAX_CYCLES]f64,
+
+    fn init(quality: *const TileQuality) TileTable {
+        std.debug.assert(quality.unavailable() == null);
+        var table: TileTable = .{
+            .quality = quality,
+            .order = undefined,
+            .count = quality.tiles.items.len,
+            .groups = .init(quality.longest),
+            .group_count = 0,
+            .averages = @splat(0),
+        };
+        const sorted = table.order[0..table.count];
+        for (sorted, 0..) |*entry, index| entry.* = @intCast(index);
+        std.sort.pdq(u16, sorted, quality, TileQuality.lessNumber);
+        var counts: [MAX_CYCLES]u64 = undefined;
+        for (sorted) |entry| {
+            const tile = &quality.tiles.items[entry];
+            TileQuality.positionCounts(tile, &counts);
+            var iterator = table.groups;
+            var index: usize = 0;
+            while (iterator.next()) |group| : (index += 1) table.averages[index] += TileQuality.mean(tile, group, &counts);
+            table.group_count = index;
+        }
+        const tile_count: f64 = @floatFromInt(table.count);
+        for (table.averages[0..table.group_count]) |*average| average.* /= tile_count;
+        return table;
+    }
+
+    fn deviations(self: *const TileTable, rank: usize, out: *[MAX_CYCLES]f64) i32 {
+        const tile = &self.quality.tiles.items[self.order[rank]];
+        var counts: [MAX_CYCLES]u64 = undefined;
+        TileQuality.positionCounts(tile, &counts);
+        var iterator = self.groups;
+        var index: usize = 0;
+        while (iterator.next()) |group| : (index += 1) out[index] = TileQuality.mean(tile, group, &counts) - self.averages[index];
+        return tile.number;
+    }
+
+    fn maxDeviation(self: *const TileTable) f64 {
+        var largest: f64 = 0;
+        var deviations_buffer: [MAX_CYCLES]f64 = undefined;
+        for (0..self.count) |rank| {
+            _ = self.deviations(rank, &deviations_buffer);
+            for (deviations_buffer[0..self.group_count]) |deviation| {
+                if (@abs(deviation) > largest) largest = @abs(deviation);
+            }
+        }
+        return largest;
     }
 };
 
@@ -1698,6 +2271,52 @@ test "[property] - [qc]: FastQC's probe P1 gives FastQC's values in every module
     for (report.get("per_sequence_gc").?.array.items, gc) |value, want| {
         try std.testing.expectEqual(want, numberOf(value).?);
     }
+}
+
+test "[property] - [qc]: FastQC data for probe P1 grades and summarizes it as FastQC-Rust does" {
+    const allocator = std.testing.allocator;
+    var populations: MatePopulations = .{};
+    defer populations.deinit(allocator);
+    for (PROBE_P1) |read| try populations.addRead(allocator, "@r", read[0], read[1]);
+    try populations.finish(allocator);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try populations.writeQcTable(&output.writer, false, "p1.fastq", "z-fastq test", null);
+
+    var kept: std.Io.Writer.Allocating = .init(allocator);
+    defer kept.deinit();
+    var basic = false;
+    var lines = std.mem.splitScalar(u8, output.written(), '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, line, ">>END_MODULE")) {
+            basic = false;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, ">>Basic")) basic = true;
+        if (basic or std.mem.startsWith(u8, line, ">>") or std.mem.startsWith(u8, line, "##")) try kept.writer.print("{s}\n", .{line});
+    }
+    try std.testing.expectEqualStrings("##FastQC\tz-fastq test\n" ++
+        ">>Basic Statistics\tpass\n#Measure\tValue\nFilename\tp1.fastq\nFile type\tConventional base calls\n" ++
+        "Encoding\tSanger / Illumina 1.9\nTotal Sequences\t4\nTotal Bases\t27 bp\nSequence length\t0-12\n" ++
+        "Mean Length\t6\nMedian Length\t8\n%GC\t61\n" ++
+        ">>Per base sequence quality\tpass\n>>Per sequence quality scores\tfail\n>>Per base sequence content\tfail\n" ++
+        ">>Per sequence GC content\tfail\n>>Per base N content\tfail\n>>Sequence Length Distribution\tfail\n" ++
+        ">>Sequence Duplication Levels\tpass\n>>Overrepresented sequences\tfail\n>>Adapter Content\twarn\n", kept.written());
+}
+
+test "[unit] - [qc]: doubles print as Java prints them and base totals as FastQC shortens them" {
+    var buffer: [JAVA_DOUBLE_BYTES]u8 = undefined;
+    for ([_]struct { f64, []const u8 }{
+        .{ 0, "0.0" },                                 .{ -0.0, "-0.0" },                    .{ 1, "1.0" },
+        .{ 31.398000000000003, "31.398000000000003" }, .{ 0.001, "0.001" },                  .{ 9.99e-4, "9.99E-4" },
+        .{ 9999999.5, "9999999.5" },                   .{ 1e7, "1.0E7" },                    .{ 12345678, "1.2345678E7" },
+        .{ std.math.nan(f64), "NaN" },                 .{ -std.math.inf(f64), "-Infinity" },
+    }) |case| try std.testing.expectEqualStrings(case[1], javaDouble(&buffer, case[0]));
+    var text: [LENGTH_TEXT_BYTES]u8 = undefined;
+    for ([_]struct { u64, []const u8 }{
+        .{ 0, "0 bp" },          .{ 999, "999 bp" },          .{ 14_300, "14.3 kbp" },         .{ 14_350, "14.3 kbp" },
+        .{ 2_000_000, "2 Mbp" }, .{ 1_050_000_000, "1 Gbp" }, .{ 15_600_000_000, "15.6 Gbp" },
+    }) |case| try std.testing.expectEqualStrings(case[1], formatLength(&text, case[0]));
 }
 
 test "[edge] - [qc]: percentiles need more than 100 reads and take the first score at the rank" {

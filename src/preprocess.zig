@@ -7,7 +7,10 @@
 //! or adapter base equals. The block kernel, the reverse complement, and the low-quality and N
 //! count use the inline vector width only, with no AVX2 object for builds whose target lacks
 //! AVX2: each costs a small share of a trimmed or filtered run at every read length. Insert sizes
-//! follow fastp's overlap rule. The pair duplication estimate is fastp's: the bases of mate 1, then
+//! follow fastp's overlap rule. Adapter cuts also count as fastp counts them: an overlap trim
+//! counts both mates and the bases each lost, a sequence match counts its mate and the bases
+//! removed, or the matched adapter length when the match starts before the read. The pair
+//! duplication estimate is fastp's: the bases of mate 1, then
 //! mate 2, hash to one position in each of two 2^32-bit arrays, and a pair whose two positions are
 //! both set already counts as a duplicate, hash collisions included. Only the set positions are
 //! kept, per 65,536-bit block as a sorted list of offsets or, past 4,096 of them, as a bitmap, so
@@ -542,6 +545,7 @@ pub const Result = struct {
     overlap: ?Overlap = null,
     overlap_lengths: ?[2]usize = null,
     adapter_cut: [2]bool = .{ false, false },
+    adapter_bases: [2]usize = .{ 0, 0 },
 
     fn cut(self: *Result, mate: usize, step: Step, kept: usize) void {
         std.debug.assert(kept <= self.kept[mate]);
@@ -557,13 +561,17 @@ pub const StepCounts = struct {
 
 pub const MateCounts = struct {
     steps: [STEP_COUNT]StepCounts = @splat(.{}),
+    adapter_cuts: StepCounts = .{},
 
-    pub fn add(self: *MateCounts, removed: [STEP_COUNT]usize) error{Overflow}!void {
-        for (&self.steps, removed) |*counts, bases| {
+    pub fn add(self: *MateCounts, result: *const Result, mate: usize) error{Overflow}!void {
+        for (&self.steps, result.removed[mate]) |*counts, bases| {
             if (bases == 0) continue;
             counts.reads = try std.math.add(u64, counts.reads, 1);
             counts.bases = try std.math.add(u64, counts.bases, bases);
         }
+        if (!result.adapter_cut[mate]) return;
+        self.adapter_cuts.reads = try std.math.add(u64, self.adapter_cuts.reads, 1);
+        self.adapter_cuts.bases = try std.math.add(u64, self.adapter_cuts.bases, result.adapter_bases[mate]);
     }
 };
 
@@ -596,16 +604,20 @@ pub const Trimmer = struct {
         result.overlap = findOverlap(&windows[0], reads[1]);
         if (result.overlap) |overlap| if (overlap.offset < 0) {
             for (0..2) |mate| {
-                result.cut(mate, .overlap, @min(result.kept[mate], overlap.length));
+                const before = result.kept[mate];
+                result.cut(mate, .overlap, @min(before, overlap.length));
                 result.adapter_cut[mate] = true;
+                result.adapter_bases[mate] = before - result.kept[mate];
             }
             return result;
         };
         for (0..2) |mate| {
             const splats = self.adapter_splats[mate][0..adapters[mate].len];
-            if (adapterKept(&windows[mate], adapters[mate], splats)) |kept| {
+            if (adapterStart(&windows[mate], adapters[mate], splats)) |start| {
+                const kept: usize = @intCast(@max(start, 0));
                 result.cut(mate, .adapter, kept);
                 result.adapter_cut[mate] = true;
+                result.adapter_bases[mate] = if (start < 0) adapters[mate].len - @abs(start) else reads[mate].len - kept;
             }
         }
         return result;
@@ -706,23 +718,21 @@ fn findOverlap(window1: *Window, read2: []const u8) ?Overlap {
     return null;
 }
 
-fn adapterKept(window: *Window, adapter: []const u8, splats: []const @Vector(LANES, u8)) ?usize {
+fn adapterStart(window: *Window, adapter: []const u8, splats: []const @Vector(LANES, u8)) ?isize {
     const read = window.source;
     const read_len: isize = @intCast(read.len);
     const first: isize = if (adapter.len >= 16) -4 else if (adapter.len >= 12) -3 else if (adapter.len >= 8) -2 else 0;
     const rule: AdapterRule = .{ .read_len = read.len, .adapter_len = adapter.len };
-    if (firstAccepted(LANES, rule, window, splats, first, read_len - ADAPTER_MATCH_REQUIRE)) |found| {
-        return @intCast(@max(found, 0));
-    }
+    if (firstAccepted(LANES, rule, window, splats, first, read_len - ADAPTER_MATCH_REQUIRE)) |found| return found;
     if (read.len > ADAPTER_MATCH_REQUIRE + 1) {
         const longest = @min(read.len - 1, adapter.len);
         const length = longestGapMatch(read, adapter, longest);
-        if (length != 0) return if (length == longest) 0 else read.len - 1 - length;
+        if (length != 0) return if (length == longest) 0 else @intCast(read.len - 1 - length);
     }
     if (read.len > ADAPTER_MATCH_REQUIRE) {
         const longest = @min(read.len, adapter.len - 1);
         const length = longestGapMatch(adapter, read, longest);
-        if (length != 0) return if (length == longest) 0 else read.len - length;
+        if (length != 0) return if (length == longest) 0 else @intCast(read.len - length);
     }
     return null;
 }
@@ -1077,6 +1087,33 @@ test "[unit] - [preprocess]: insert sizes follow fastp's overlap formula and its
     try std.testing.expectEqual(@as(u64, 0), no_adapters.pairs);
     const emptied = insertOf(.{ .adapters = options.adapters, .tail = .{ .window = 4, .quality = 20 } }, fragment[0..40], "ACGT");
     try std.testing.expectEqual(@as(u64, 0), emptied.pairs);
+}
+
+test "[unit] - [preprocess]: adapter cuts count each cut mate and the adapter bases fastp counts" {
+    const adapter = "CTGTCTCTTATACACATCT";
+    const trimmer: Trimmer = .init(.{ .adapters = .{ adapter, adapter } });
+    const quality = "I" ** 100;
+
+    const early = adapter[2..] ++ "GATTACAGATTACA";
+    const other = "TTGCAGGCATCCGATACCGATTAGCCATGG";
+    const sequence_cut = trimmer.trimPair(.{ early, other }, .{ quality[0..early.len], quality[0..other.len] });
+    var counts: [2]MateCounts = .{ .{}, .{} };
+    for (&counts, 0..) |*mate_counts, mate| try mate_counts.add(&sequence_cut, mate);
+    try std.testing.expectEqual(@as(usize, 0), sequence_cut.kept[0]);
+    try std.testing.expectEqual(@as(u64, early.len), counts[0].steps[@intFromEnum(Step.adapter)].bases);
+    try std.testing.expectEqual(StepCounts{ .reads = 1, .bases = adapter.len - 2 }, counts[0].adapter_cuts);
+    try std.testing.expectEqual(StepCounts{}, counts[1].adapter_cuts);
+
+    const insert = "ACCTTAATGGGCGTGGACGTCTCTTGCTTGGAGGCTGGTGTGCAC";
+    const tail = "AAAGCGGCACTTGTGAAGTG";
+    const read2 = reverseComplementOf(insert) ++ tail;
+    const overlap_cut = trimmer.trimPair(.{ insert[0..40], read2[0..50] }, .{ quality[0..40], quality[0..50] });
+    counts = .{ .{}, .{} };
+    for (&counts, 0..) |*mate_counts, mate| try mate_counts.add(&overlap_cut, mate);
+    try std.testing.expectEqual([2]bool{ true, true }, overlap_cut.adapter_cut);
+    try std.testing.expectEqual(StepCounts{}, counts[0].steps[@intFromEnum(Step.overlap)]);
+    try std.testing.expectEqual(StepCounts{ .reads = 1, .bases = 0 }, counts[0].adapter_cuts);
+    try std.testing.expectEqual(StepCounts{ .reads = 1, .bases = 10 }, counts[1].adapter_cuts);
 }
 
 test "[unit] - [preprocess]: the insert peak takes the lowest tied size and the median the lower middle" {

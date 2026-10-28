@@ -253,6 +253,9 @@ test "[cli] - [process]: invalid invocations fail before any input is read or ou
     try writeInputs(&tmp, R1, R2);
     const gz1 = try cli.tempPath(allocator, &tmp.sub_path, "out1.fastq.gz");
     const gz2 = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq.gz");
+    const tables = try cli.tempPath(allocator, &tmp.sub_path, "qc");
+    const same_name = try cli.tempPath(allocator, &tmp.sub_path, "kept/r1.fastq");
+    const shared_table = try std.fmt.allocPrint(allocator, "error: {s}/r1_fastqc/fastqc_data.txt: two of the files would share this QC table; give the inputs and outputs different names\n", .{tables});
 
     const Case = struct { args: []const []const u8, exit_code: u8 = 2, stderr: []const u8 };
     const cases = [_]Case{
@@ -289,8 +292,14 @@ test "[cli] - [process]: invalid invocations fail before any input is read or ou
         .{ .args = &.{ "process", "--max-low-quality-percent", "101", p.r1, p.r2 }, .stderr = "error: --max-low-quality-percent must be 0 to 100\n" },
         .{ .args = &.{ "process", "--low-quality", "15", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --low-quality and --max-low-quality-percent must be given together\n" },
         .{ .args = &.{ "process", "--max-n", "5", "--max-n", "5", p.r1, p.r2 }, .stderr = "error: --max-n may appear only once\n" },
-        .{ .args = &.{ "process", "--contaminants", p.r1, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --contaminants requires --report\n" },
-        .{ .args = &.{ "process", "--pair-duplication", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --pair-duplication requires --report\n" },
+        .{ .args = &.{ "process", "--contaminants", p.r1, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --contaminants requires --report or --qc-tables\n" },
+        .{ .args = &.{ "process", "--qc-tables", p.out1, "--qc-tables", p.out1, p.r1, p.r2 }, .stderr = "error: --qc-tables may appear only once\n" },
+        .{ .args = &.{ "process", "--pair-duplication", "--qc-summary", "-", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --qc-summary cannot be standard output\n" },
+        .{ .args = &.{ "process", "--pair-duplication", "--qc-summary", p.out1, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: process output paths must differ\n" },
+        .{ .args = &.{ "process", "--qc-summary", p.report, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --qc-summary requires --pair-duplication\n" },
+        .{ .args = &.{ "process", "--max-pairs", "1", "--qc-tables", tables, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --max-pairs cannot be used with --qc-tables or --qc-summary\n" },
+        .{ .args = &.{ "process", "--min-length", "1", "--qc-tables", tables, "--out1", same_name, "--out2", p.out2, p.r1, p.r2 }, .stderr = shared_table },
+        .{ .args = &.{ "process", "--pair-duplication", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --pair-duplication requires --report or --qc-summary\n" },
         .{ .args = &.{ "process", "--gzip-preset", "even", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --gzip-preset requires --gzip\n" },
         .{ .args = &.{ "process", "--gzip", "--gzip-preset", "level9", "--out1", gz1, "--out2", gz2, p.r1, p.r2 }, .stderr = "error: --gzip-preset must be fast, even, or dense\n" },
         .{ .args = &.{ "process", "--gzip", "--gzip-preset", "fast", "--gzip-preset", "fast", "--out1", gz1, "--out2", gz2, p.r1, p.r2 }, .stderr = "error: --gzip-preset may appear only once\n" },
@@ -299,8 +308,90 @@ test "[cli] - [process]: invalid invocations fail before any input is read or ou
         errdefer std.debug.print("case {d}\n", .{index});
         const result = try cli.runWith(allocator, case.args, .{ .stdin = .stalled });
         try cli.expectResult(result, case.exit_code, "", case.stderr);
-        for ([_][]const u8{ p.out1, p.out2, gz1, gz2, p.report }) |path| try std.testing.expect(!pathExists(path));
+        for ([_][]const u8{ p.out1, p.out2, gz1, gz2, p.report, tables }) |path| try std.testing.expect(!pathExists(path));
     }
+}
+
+test "[cli] - [process]: QC tables are named per mate and population by the table folder rule" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const p = try Paths.init(allocator, &tmp);
+    try writeInputs(&tmp, R1, R2);
+    const dir = try cli.tempPath(allocator, &tmp.sub_path, "qc");
+    const gz1 = try cli.tempPath(allocator, &tmp.sub_path, "kept_1.fastq.gz");
+    const gz2 = try cli.tempPath(allocator, &tmp.sub_path, "kept_2.fastq.gz");
+    const args = [_][]const u8{ "process", "--gzip", "--min-length", "1", "--qc-tables", dir, "--report", p.report, "--out1", gz1, "--out2", gz2, p.r1, p.r2 };
+    try cli.expectResult(try cli.run(allocator, &args), 0, "", "");
+
+    const report = try parseReport(allocator, try readPath(allocator, p.report));
+    const listed = report.get("qc_table_files").?.array.items;
+    const Expected = struct { stem: []const u8, filename: []const u8, population: []const u8, mate: u64 };
+    const expected = [_]Expected{
+        .{ .stem = "r1", .filename = "r1.fastq", .population = "raw", .mate = 1 },
+        .{ .stem = "r2", .filename = "r2.fastq", .population = "raw", .mate = 2 },
+        .{ .stem = "kept_1", .filename = "kept_1.fastq.gz", .population = "retained", .mate = 1 },
+        .{ .stem = "kept_2", .filename = "kept_2.fastq.gz", .population = "retained", .mate = 2 },
+    };
+    try std.testing.expectEqual(expected.len, listed.len);
+    for (expected, listed) |want, entry| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}_fastqc/fastqc_data.txt", .{ dir, want.stem });
+        try std.testing.expectEqualStrings(path, entry.object.get("path").?.string);
+        try std.testing.expectEqualStrings(want.population, entry.object.get("population").?.string);
+        try cli.expectJsonInteger(entry.object.get("mate"), want.mate);
+        try std.testing.expect(entry.object.get("written").?.bool);
+        const text = try readPath(allocator, path);
+        try std.testing.expect(std.mem.startsWith(u8, text, "##FastQC\tz-fastq "));
+        try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(allocator, "\nFilename\t{s}\n", .{want.filename})) != null);
+        try std.testing.expect(std.mem.endsWith(u8, text, ">>Adapter Content\twarn\n>>END_MODULE\n"));
+    }
+
+    for ([_][]const u8{ gz1, gz2, p.report }) |path| try std.Io.Dir.cwd().deleteFile(std.testing.io, path);
+    const existing = listed[0].object.get("path").?.string;
+    const message = try std.fmt.allocPrint(allocator, "error: {s}: output path already exists\n", .{existing});
+    try cli.expectResult(try cli.run(allocator, &args), 3, "", message);
+    for ([_][]const u8{ gz1, gz2, p.report }) |path| try std.testing.expect(!pathExists(path));
+    try std.testing.expect(pathExists(existing));
+
+    const unchanged = try cli.tempPath(allocator, &tmp.sub_path, "unchanged");
+    const plain_args = [_][]const u8{ "process", "--qc-tables", unchanged, "--report", p.report, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 };
+    try cli.expectResult(try cli.run(allocator, &plain_args), 0, "", "");
+    const plain = try parseReport(allocator, try readPath(allocator, p.report));
+    try std.testing.expectEqual(@as(usize, 2), plain.get("qc_table_files").?.array.items.len);
+    try std.testing.expect(!pathExists(try std.fmt.allocPrint(allocator, "{s}/out1_fastqc", .{unchanged})));
+}
+
+test "[cli] - [process]: the QC summary carries its fields from the same measurements" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const p = try Paths.init(allocator, &tmp);
+    try writeInputs(&tmp, R1, R2);
+    const fastp = try cli.tempPath(allocator, &tmp.sub_path, "sample.fastp.json");
+    const args = [_][]const u8{ "process", "--adapter1", RF1, "--adapter2", RF2, "--max-n", "1", "--pair-duplication", "--qc-summary", fastp, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 };
+    try cli.expectResult(try cli.run(allocator, &args), 0, "", "");
+
+    const bytes = try readPath(allocator, fastp);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"before_filtering\": {") != null);
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{});
+    const root = value.object;
+    try std.testing.expectEqualStrings("z-fastq/qc-summary-v1", root.get("schema").?.string);
+    const summary = root.get("summary").?.object;
+    try cli.expectJsonInteger(summary.get("before_filtering").?.object.get("total_reads"), 4);
+    try cli.expectJsonInteger(summary.get("after_filtering").?.object.get("total_reads"), 2);
+    try cli.expectJsonInteger(summary.get("before_filtering").?.object.get("read1_mean_length"), 4);
+    const filtering = root.get("filtering_result").?.object;
+    try cli.expectJsonInteger(filtering.get("passed_filter_reads"), 2);
+    try cli.expectJsonInteger(filtering.get("too_many_N_reads"), 2);
+    try cli.expectJsonInteger(root.get("adapter_cutting").?.object.get("adapter_trimmed_reads"), 0);
+    try std.testing.expect(root.get("duplication").?.object.get("rate") != null);
+    const mean = root.get("read2_before_filtering").?.object.get("quality_curves").?.object.get("mean").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), mean.len);
+    try std.testing.expect(std.mem.indexOf(u8, root.get("command").?.string, " process --adapter1 ") != null);
 }
 
 test "[cli] - [process]: an existing output fails and removes the outputs this run created" {
