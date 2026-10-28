@@ -19,19 +19,19 @@ flowchart TB
 
 ## What is measured
 
-| Module | What it shows |
-| --- | --- |
-| Per-base quality | quality percentiles at each cycle |
-| Per-base content | the share of A, C, G, and T at each cycle |
-| Per-base N | the share of `N` at each cycle |
-| Length distribution | how many reads have each length |
-| Per-sequence quality | how many reads have each mean quality |
-| Per-sequence GC | how many reads have each GC percentage |
-| Terminal runs | reads ending in at least 10 `G` or 10 `A` |
-| Adapter content | where common adapters start in the reads |
-| Duplication levels | how often each read sequence repeats |
-| Overrepresented sequences | sequences above 0.1% of reads |
-| Per-tile quality | each flow-cell tile's quality against the mean |
+| Module                    | What it shows                                  |
+| ------------------------- | ---------------------------------------------- |
+| Per-base quality          | quality percentiles at each cycle              |
+| Per-base content          | the share of A, C, G, and T at each cycle      |
+| Per-base N                | the share of `N` at each cycle                 |
+| Length distribution       | how many reads have each length                |
+| Per-sequence quality      | how many reads have each mean quality          |
+| Per-sequence GC           | how many reads have each GC percentage         |
+| Terminal runs             | reads ending in at least 10 `G` or 10 `A`      |
+| Adapter content           | where common adapters start in the reads       |
+| Duplication levels        | how often each read sequence repeats           |
+| Overrepresented sequences | sequences above 0.1% of reads                  |
+| Per-tile quality          | each flow-cell tile's quality against the mean |
 
 Long reads are grouped into ranges of cycles, as FastQC groups them, so a 150-base read gives about 40 rows rather than 150. Per-cycle modules cover reads up to 1024 bases; a mate with a longer read reports them as unavailable, with the reason, while the other modules keep working.
 
@@ -43,11 +43,11 @@ The reads are searched for FastQC's six 12-base adapters: Illumina Universal, Il
 
 Each read is keyed by its first 50 bases, in uppercase. The first 100,000 distinct keys are counted exactly; later reads with a new key count only toward the total, and the duplication levels are corrected for them as FastQC corrects them. A sequence above 0.1% of all reads is overrepresented.
 
-`--contaminants PATH` names the likely source of each overrepresented sequence from a contaminant list in FastQC's format: a name, tabs, and a sequence per line. Give it the list your QC setup already uses; z-fastq ships none, so without it no source is named.
+`--contaminants PATH` names the likely source of each overrepresented sequence from a contaminant list in FastQC's format: a name, one or more tabs, and a sequence per line, with `#` lines and blank lines skipped. Give it the list your QC setup already uses; z-fastq ships none, so without it no source is named. A list over 1 MiB fails with status `4`, a sequence with a base other than A, C, G, or T with status `2`, and an unreadable file with status `3`, before any output is created.
 
 ### Per-tile quality
 
-On Illumina headers (`instrument:run:flowcell:lane:tile:x:y`), the tile is the fifth field. Each tile's mean quality per group of cycles is compared with the average over all tiles, so a dark or bubbled tile stands out. The first 10,000 reads count, then every tenth. Without tile numbers, or with more than 2,500 tiles, the module is unavailable and says why.
+The tile is read from the header split at `:`: the fifth field when the first counted read has 7 or more fields, as Illumina's `instrument:run:flowcell:lane:tile:x:y` does, or the third when it has 5 or 6. Each tile's mean quality per group of cycles is compared with the average over all tiles, so a dark or bubbled tile stands out. The first 10,000 reads with a quality string count, then every tenth. The module is unavailable, and says why, when a header has no valid tile number, with more than 2,500 tiles, or when a counted read is longer than 1024 bases.
 
 ### Insert sizes
 
@@ -87,7 +87,11 @@ qc/trimmed_R1_fastqc/fastqc_data.txt
 qc/trimmed_R2_fastqc/fastqc_data.txt
 ```
 
-The folder name is the file name without `.gz`, `.fastq`, `.fq`, and similar endings, plus `_fastqc`. Two files that would share a folder, such as an input and an output with the same name, are refused before anything starts.
+The folder name is the file name with `.gz`, `.bz2`, `.txt`, `.fastq`, `.fq`, `.csfastq`, `.sam`, `.bam`, and `.ubam` removed in that order, plus `_fastqc`; standard input is named `stdin`. Folders are created as needed.
+
+- Two files that would share a folder, such as an input and an output with the same name, are refused before anything starts (status `2`), and so is a file name with a tab or line break.
+- An existing `fastqc_data.txt` fails with `output path already exists` (status `3`) before any read is processed, and the outputs created by the run are removed.
+- A mate with a read longer than 1024 bases has no per-cycle tables, so its table is not written: a warning names it, the run still succeeds, and the report lists the reason.
 
 > [!TIP]
 > MultiQC names a sample after the file name, with endings such as `.gz`, `.fastq`, `.trimmed`, and `.clean` removed, and keeps only one of two samples with the same name. Name the outputs so they stay distinct: `trimmed_R1.fastq.gz` works beside `R1.fastq.gz`, while `R1.trimmed.fastq.gz` would hide one of them.

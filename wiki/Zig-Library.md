@@ -14,17 +14,17 @@ It is registered from `src/root.zig` and targets Zig 0.16.0 on Linux x86-64.
 
 ## What it exports
 
-| Name | For |
-| --- | --- |
-| `Record`, `OwnedRecord`, `toOwned` | records, borrowed and owned |
-| `Reader`, `RecordOffsets`, `ParseError` | reading records from a byte source |
-| `Writer` and its errors | writing four-line records |
-| `LintCode`, `codeTag`, `Alphabet`, `ValidationOptions` | validation rules and codes |
-| `SemanticField`, `SemanticError`, `validateRecord` | checking one record |
-| `Stats`, `StatsResult`, `StatsError`, `QualityError`, `decodePhred33` | statistics |
-| `io.ByteSource`, `io.ByteSink`, and adapters | plain, file, writer, and gzip I/O |
-| `count_scan` | counting records without allocating |
-| `limits`, `VERSION` | default sizes and the version string |
+| Name                                                                  | For                                  |
+| --------------------------------------------------------------------- | ------------------------------------ |
+| `Record`, `OwnedRecord`, `toOwned`                                    | records, borrowed and owned          |
+| `Reader`, `RecordOffsets`, `ParseError`, `ReaderError`                | reading records from a byte source   |
+| `Writer` and its errors                                               | writing four-line records            |
+| `LintCode`, `codeTag`, `Alphabet`, `ValidationOptions`                | validation rules and codes           |
+| `SemanticField`, `SemanticError`, `validateRecord`                    | checking one record                  |
+| `Stats`, `StatsResult`, `StatsError`, `QualityError`, `decodePhred33` | statistics                           |
+| `io.ByteSource`, `io.ByteSink`, and adapters                          | plain, file, writer, and gzip I/O    |
+| `count_scan`                                                          | counting records without allocating  |
+| `limits`, `VERSION`                                                   | default sizes and the version string |
 
 Option parsing, pair-name matching, sampling, JSON output, and `process` are part of the command line, not of the library.
 
@@ -42,7 +42,7 @@ A record's `id` is the first space- or tab-separated word of its `header`, in th
 
 ## Writing
 
-`Writer` writes four-line records with LF endings. It refuses a record with unequal sequence and quality lengths, invalid header or field bytes, embedded line breaks, or a field ending in a carriage return before writing any of it. The output is complete only after `flush`, and the sink it writes to must outlive it.
+`Writer` writes four-line records with LF endings. It refuses a record before writing any of it when the sequence and quality lengths differ, the header is empty or starts with a space or tab, or a field holds a line break or ends in a carriage return. The output is complete only after `flush`, and the sink it writes to must outlive it.
 
 ## Validation and statistics
 

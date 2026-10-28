@@ -97,7 +97,7 @@ def adapter_trimming(out, theme):
     label(ax, 76, 0.95, "cut where the adapter starts", t, color=t["ink2"])
     ax.add_patch(FancyArrowPatch((-4, -0.2), (40, -0.2), arrowstyle="-|>", mutation_scale=10,
                                  color=t["muted"], linewidth=1.0, linestyle=(0, (2, 2))))
-    label(ax, 42, -0.28, "the search starts 4 bases before the read", t, color=t["muted"])
+    label(ax, 42, -0.28, "the search starts up to 4 bases before the read", t, color=t["muted"])
 
     handles = [Rectangle((0, 0), 1, 1, facecolor=t["insert"]), Rectangle((0, 0), 1, 1, facecolor=t["adapter"])]
     fig.legend(handles, ["insert", "adapter"], loc="lower center", ncol=2, frameon=False, fontsize=9,

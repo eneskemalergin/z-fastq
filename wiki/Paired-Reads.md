@@ -11,10 +11,10 @@ z-fastq check --paired R1.fastq.gz R2.fastq.gz
 z-fastq check --interleaved interleaved.fastq.gz
 ```
 
-Each mate is first validated as a record ([Validation](Validation)), then the two names are compared. In an interleaved file the first two records form the first pair, the next two the second, and so on; an odd last record has no mate.
+Each mate is first validated as a record ([Validation](Validation)), then the two names are compared. In an interleaved file the first two records form the first pair, the next two the second, and so on.
 
 - `P001`: the mates' names do not match.
-- `P002`: one input has more records than the other.
+- `P002`: a mate is missing: one file has more records than the other, or an interleaved file ends on an odd record.
 
 A record error comes before a pair error at the same place. Messages give the pair number, counted from 0, and shorten very long names.
 
@@ -22,14 +22,14 @@ A record error comes before a pair error at the same place. Messages give the pa
 
 Sequencers mark the mate in the read name in one of two ways: a `/1` or `/2` at the end of the name, or a second word such as `1:N:0:1` (Illumina's Casava format). The default policy, `--pair-names illumina`, understands both:
 
-| R1 header | R2 header | Pair? |
-| --- | --- | --- |
-| `@read42/1` | `@read42/2` | yes |
-| `@read42 1:N:0:1` | `@read42 2:N:0:1` | yes |
-| `@read42` | `@read42` | yes |
-| `@read42/2` | `@read42/1` | no, mates reversed |
-| `@read42/1` | `@read42` | no, marker on one side only |
-| `@read42/3` | `@read42/4` | no, `/3` is part of the name |
+| R1 header         | R2 header         | Pair?                        |
+| ----------------- | ----------------- | ---------------------------- |
+| `@read42/1`       | `@read42/2`       | yes                          |
+| `@read42 1:N:0:1` | `@read42 2:N:0:1` | yes                          |
+| `@read42`         | `@read42`         | yes                          |
+| `@read42/2`       | `@read42/1`       | no, mates reversed           |
+| `@read42/1`       | `@read42`         | no, marker on one side only  |
+| `@read42/3`       | `@read42/4`       | no, `/3` is part of the name |
 
 Step by step:
 

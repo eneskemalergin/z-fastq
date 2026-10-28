@@ -34,14 +34,14 @@ The default, `--alphabet iupac`, accepts the IUPAC nucleotide letters in either 
 
 `check` reports the first failure with a code, the record number and the byte offset in the decompressed stream (both counted from 0), and the line within the record (counted from 1).
 
-| Code | Problem |
-| --- | --- |
-| `S001` | the plus line does not start with `+` |
-| `S002` | a sequence letter is outside the alphabet |
+| Code   | Problem                                              |
+| ------ | ---------------------------------------------------- |
+| `S001` | the plus line does not start with `+`                |
+| `S002` | a sequence letter is outside the alphabet            |
 | `S003` | the header does not start with `@` and an identifier |
-| `S004` | the file ends inside a record |
-| `S005` | the sequence and quality lengths differ |
-| `S006` | a quality byte is outside Phred+33 |
+| `S004` | the file ends inside a record                        |
+| `S005` | the sequence and quality lengths differ              |
+| `S006` | a quality byte is outside Phred+33                   |
 
 Pair checks add two more codes, `P001` and `P002`, described in [Paired reads](Paired-Reads#check-pairs).
 

@@ -25,6 +25,8 @@ It prints one number per input, in the order given. `count` checks that every re
 z-fastq stats reads.fastq.gz
 ```
 
+Each result starts with an `input` line naming the file, followed by these fields.
+
 **Reads and bases.** `reads` counts records and `bases` counts sequence letters. `min_length`, `max_length`, and `mean_length` describe read lengths. An empty record still counts as a read, so the two can tell different stories.
 
 **Composition.** `a`, `c`, `g`, `t`, and `n` count each base, upper or lower case, and `other_bases` counts any other letter. GC is measured only among the four definite bases, because z-fastq does not guess what an ambiguous base would have been:

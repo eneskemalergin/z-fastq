@@ -1,6 +1,6 @@
 # Installation
 
-z-fastq is built from source with Zig. The build needs nothing beyond Zig itself: no C compiler, no NASM, no system zlib, and release builds are static.
+z-fastq is built from source with Zig. The build needs nothing beyond Zig itself: no C compiler, no NASM, and no system zlib, and the release build below is fully static.
 
 **You need**
 

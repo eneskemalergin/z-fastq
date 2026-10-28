@@ -20,14 +20,14 @@ A command reads standard input at most once. A pipe can be read only once, so ot
 
 Results, JSON, and FASTQ go to standard output; messages go to standard error. FASTQ is always written as four lines per record with LF endings.
 
-| Command | Reads | Writes |
-| --- | --- | --- |
-| `count`, `stats`, `check` | one or more inputs | standard output |
-| `check --paired`, `sample --paired` | two inputs | standard output |
-| `check --interleaved`, `sample --interleaved` | one input | standard output |
-| `interleave` | two inputs | standard output |
-| `deinterleave` | one input | two new files |
-| `process` | two inputs | two new files, plain or gzip |
+| Command                                       | Reads              | Writes                       |
+| --------------------------------------------- | ------------------ | ---------------------------- |
+| `count`, `stats`, `check`                     | one or more inputs | standard output              |
+| `check --paired`, `sample --paired`           | two inputs         | standard output              |
+| `check --interleaved`, `sample --interleaved` | one input          | standard output              |
+| `interleave`                                  | two inputs         | standard output              |
+| `deinterleave`                                | one input          | two new files                |
+| `process`                                     | two inputs         | two new files, plain or gzip |
 
 Only `process --gzip` writes gzip; for the other commands, pipe the output to `gzip`. New output files are never overwritten: an existing path fails before anything is written.
 

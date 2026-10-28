@@ -4,20 +4,20 @@ This page maps the code, the tests, and the wiki onto each other, so a change to
 
 ## Source map
 
-| File | Holds |
-| --- | --- |
-| `src/main.zig` | the command line: options, commands, output, and messages |
-| `src/root.zig` | the library's exports and version |
-| `src/fastq.zig` | records, the reader and writer, and validation |
-| `src/count_scan.zig` | the record counter |
-| `src/stats.zig` | statistics |
-| `src/sample.zig` | sampling |
-| `src/pair.zig` | pair-name matching |
-| `src/preprocess.zig` | trimming, filtering, inserts, and pair duplication |
-| `src/qc.zig` | the QC modules and the QC table writer |
-| `src/simd.zig` | vector kernels and their run-time selection |
-| `src/io.zig` | byte sources and sinks, limits, and gzip |
-| `tests/` | command-line and library tests, one file per command or part |
+| File                 | Holds                                                        |
+| -------------------- | ------------------------------------------------------------ |
+| `src/main.zig`       | the command line: options, commands, output, and messages    |
+| `src/root.zig`       | the library's exports and version                            |
+| `src/fastq.zig`      | records, the reader and writer, and validation               |
+| `src/count_scan.zig` | the record counter                                           |
+| `src/stats.zig`      | statistics                                                   |
+| `src/sample.zig`     | sampling                                                     |
+| `src/pair.zig`       | pair-name matching                                           |
+| `src/preprocess.zig` | trimming, filtering, inserts, and pair duplication           |
+| `src/qc.zig`         | the QC modules and the QC table writer                       |
+| `src/simd.zig`       | vector kernels and their run-time selection                  |
+| `src/io.zig`         | byte sources and sinks, limits, and gzip                     |
+| `tests/`             | command-line and library tests, one file per command or part |
 
 ## Before changing documented behavior
 
@@ -63,12 +63,20 @@ Every figure on a page follows the same pattern: a centred `<picture>` with a da
 ```html
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/NAME-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="assets/NAME-light.png">
-    <img alt="What the figure shows." src="assets/NAME-light.png" width="680">
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="assets/NAME-dark.png"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="assets/NAME-light.png"
+    />
+    <img alt="What the figure shows." src="assets/NAME-light.png" width="680" />
   </picture>
 </p>
-<p align="center"><sub><b>Figure 1.</b> One or two sentences on what to see.</sub></p>
+<p align="center">
+  <sub><b>Figure 1.</b> One or two sentences on what to see.</sub>
+</p>
 ```
 
 ## Related pages

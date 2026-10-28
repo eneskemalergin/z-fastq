@@ -50,11 +50,11 @@ The trims run in this order on every pair, each only when its options are given.
 </p>
 <p align="center"><sub><b>Figure 2.</b> Quality-tail trimming with a 4-base window and Q = 20. Windows are tried from the 3' end; the first whose mean reaches Q is marked, and the read keeps everything up to that window's first base.</sub></p>
 
-A read no longer than W is emptied, and a read with no passing window keeps one base. When either mate ends up empty, the pair is not trimmed further and is dropped.
+W is 1 to 1000 and Q is 1 to 30, given together. A read no longer than W is emptied, and a read with no passing window keeps one base. When either mate ends up empty, the pair is not trimmed further and is dropped.
 
 ### Poly-G
 
-`--trim-poly-g N` removes the run of `G` that two-colour instruments write when the signal ends. Bases are scanned from the 3' end; the scan stops after more than 5 other bases, or, from the Nth base on, when other bases exceed one in eight. If at least N bases were scanned, the read is cut before the leftmost `G` seen. A shorter run can still go when the scan carries past it: with N = 10, a read ending in nine `G` loses them.
+`--trim-poly-g N` removes the run of `G` that two-colour instruments write when the signal ends; N is at least 1. Bases are scanned from the 3' end; the scan stops after more than 5 other bases, or, from the Nth base on, when other bases exceed one in eight. If at least N bases were scanned, the read is cut before the leftmost `G` seen. A shorter run can still go when the scan carries past it: with N = 10, a read ending in nine `G` loses them.
 
 ### Adapters
 
@@ -70,7 +70,7 @@ A read no longer than W is emptied, and a read with no passing window keeps one 
 <p align="center"><sub><b>Figure 3.</b> The two ways adapters are found. Top: the insert is shorter than the reads, so each read runs into the adapter, and the overlap between the mates shows where the insert ends. Bottom: without an overlap, each mate is searched for its own adapter.</sub></p>
 
 1. **By overlap.** Mate 1 is compared with the reverse complement of mate 2 at each offset in turn. The first offset where the overlap has at most 5 mismatches in its first 50 positions, and no more than one per 5 bases, wins; more than 30 bases must overlap. When mate 2 then starts before mate 1, the insert is shorter than the reads, and both mates are cut to the overlap.
-2. **By sequence.** Otherwise each mate is searched for its own adapter: a full copy, or at least 5 bases of its start at the read's 3' end, with one mismatch per 8 bases. The search begins 4 bases before the read, so a read that starts with the tail of an adapter is emptied. If nothing is found, a copy with one inserted or deleted base is tried. Like fastp, this last test compares the adapter with the start of the read, so it can also cut near the 3' end where no adapter is present.
+2. **By sequence.** Otherwise each mate is searched for its own adapter: a full copy, or at least 5 bases of its start at the read's 3' end, with one mismatch per 8 bases. For an adapter of 16 bases or more the search begins 4 bases before the read (3 for 12 to 15 bases, 2 for 8 to 11), so a read that starts with the tail of an adapter is emptied. If nothing is found, a copy with one inserted or deleted base is tried. Like fastp, this last test compares the adapter with the start of the read, so it can also cut near the 3' end where no adapter is present.
 
 Adapters are 4 to 128 uppercase bases of `A`, `C`, `G`, and `T`. Comparisons are exact bytes: a lowercase base never matches.
 
@@ -78,12 +78,12 @@ Adapters are 4 to 128 uppercase bases of `A`, `C`, `G`, and `T`. Comparisons are
 
 Each read is checked after trimming, and a pair is written only when both mates pass. A read fails on the first check below that applies.
 
-| Check | A read fails when | Range |
-| --- | --- | --- |
-| always, with any trim or filter | no bases are left | |
+| Check                                         | A read fails when                 | Range                 |
+| --------------------------------------------- | --------------------------------- | --------------------- |
+| always, with any trim or filter               | no bases are left                 |                       |
 | `--low-quality Q --max-low-quality-percent P` | more than P% of bases are below Q | Q 0 to 93, P 0 to 100 |
-| `--max-n N` | more than N uppercase `N` | 0 to 50 |
-| `--min-length N` | fewer than N bases | 0 to 4,294,967,295 |
+| `--max-n N`                                   | more than N uppercase `N`         | 0 to 50               |
+| `--min-length N`                              | fewer than N bases                | 0 to 4,294,967,295    |
 
 - With adapters, a pair whose adapter or overlap step cut a mate and left both mates at 2 bases or fewer is an adapter dimer, and is dropped.
 - A pair is dropped whole. Its reason is the worse of its mates' reasons, in the order adapter dimer, low quality, too short, too many `N`.

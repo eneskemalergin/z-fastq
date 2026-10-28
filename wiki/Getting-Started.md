@@ -47,10 +47,10 @@ z-fastq recognizes gzip by its first bytes rather than by the `.gz` name, and re
 ## 5. Take a sample
 
 ```bash
-z-fastq sample --fraction 0.5 --seed 42 reads.fastq > sample.fastq
+z-fastq sample --fraction 0.5 --seed 3 reads.fastq > sample.fastq
 ```
 
-Run it twice: the same seed and input give the same records. [Sampling](Sampling) also covers exact counts and pairs.
+With seed 3 it keeps one of the two records. Run it again: the same seed and input always give the same records. [Sampling](Sampling) also covers exact counts and pairs.
 
 ## Where next
 

@@ -41,7 +41,7 @@ Each input may be plain, gzip, or `-` for standard input, with at most one `-`. 
     <img alt="Wall time and peak memory of other interleaving tools relative to z-fastq, plain and gzip input." src="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/layout/results/figures/interleave-overview-light.png" width="760">
   </picture>
 </p>
-<p align="center"><sub><b>Figure 2.</b> Interleaving: time and peak memory relative to z-fastq. A few tools are faster on plain input, and several of them also write broken pairs with exit status 0. The <a href="https://github.com/eneskemalergin/z-fastq/blob/main/bench/layout/README.md">layout benchmark</a> has the details and the same figure for deinterleaving.</sub></p>
+<p align="center"><sub><b>Figure 2.</b> Interleaving: time and peak memory relative to z-fastq. fqkit is faster on plain input, but it, seqtk, SeqFu, and fqtools also write output from broken pairs with exit status 0. The <a href="https://github.com/eneskemalergin/z-fastq/blob/main/bench/layout/README.md">layout benchmark</a> has the details and the same figure for deinterleaving.</sub></p>
 
 ## Related pages
 

@@ -24,17 +24,59 @@ The report records what was asked, what was read, what was done, and what was me
   "schema": "z-fastq/process-v1",
   "tool": { "name": "z-fastq", "version": "0.1.0" },
   "byte_strings": "escaped-bytes-v1",
-  "options": { "gzip": false, "max_pairs": null, "adapter1": "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA", "min_length": 15, "pair_duplication": true },
-  "inputs": [ { "path": "R1.fastq.gz", "size": 183592, "mtime_ns": 1792773758730546172 } ],
+  "options": {
+    "gzip": false,
+    "max_pairs": null,
+    "adapter1": "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA",
+    "min_length": 15,
+    "pair_duplication": true
+  },
+  "inputs": [
+    { "path": "R1.fastq.gz", "size": 183592, "mtime_ns": 1792773758730546172 }
+  ],
   "status": "ok",
   "input_complete": true,
   "pairs": { "read": 1662, "written": 1662, "dropped": 0 },
-  "mates": { "raw": [ { "reads": 1662, "bases": 240771, "mean_length": 144.8682, "gc_fraction": 0.5051, "q30_fraction": 0.8906 } ] },
-  "trimming": [ { "quality_tail": null, "poly_g": null, "overlap": { "reads": 0, "bases": 0 }, "adapter": { "reads": 4, "bases": 22 } } ],
-  "filtering": { "dropped_pairs": { "too_many_n": 0, "too_short": 0, "low_quality": 0, "adapter_dimer": 0 } },
-  "inserts": { "pairs": 1662, "overlapping": 616, "unknown": 1046, "peak": 200, "median": 195 },
+  "mates": {
+    "raw": [
+      {
+        "reads": 1662,
+        "bases": 240771,
+        "mean_length": 144.8682,
+        "gc_fraction": 0.5051,
+        "q30_fraction": 0.8906
+      }
+    ]
+  },
+  "trimming": [
+    {
+      "quality_tail": null,
+      "poly_g": null,
+      "overlap": { "reads": 0, "bases": 0 },
+      "adapter": { "reads": 4, "bases": 22 }
+    }
+  ],
+  "filtering": {
+    "dropped_pairs": {
+      "too_many_n": 0,
+      "too_short": 0,
+      "low_quality": 0,
+      "adapter_dimer": 0
+    }
+  },
+  "inserts": {
+    "pairs": 1662,
+    "overlapping": 616,
+    "unknown": 1046,
+    "peak": 200,
+    "median": 195
+  },
   "pair_duplication": { "pairs": 1662, "duplicates": 0, "rate": 0 },
-  "qc": { "raw": [ { "per_base_quality": [ { "base": "1", "mean": 29.5156, "median": 30 } ] } ] },
+  "qc": {
+    "raw": [
+      { "per_base_quality": [{ "base": "1", "mean": 29.5156, "median": 30 }] }
+    ]
+  },
   "error": null
 }
 ```
@@ -66,24 +108,24 @@ Lists and objects are cut to their first entries; a real report holds both mates
 
 **`qc`** has `raw` and `retained`, each a list of mate 1 then mate 2. Each mate holds one entry per module; cycle positions and groups, such as `10-14`, count from 1.
 
-| Module | Each entry holds |
-| --- | --- |
-| `per_base_quality` | `base`, `mean`, `median`, quartiles, 10th and 90th percentiles |
-| `per_base_content` | `base`, and `g`, `a`, `t`, `c` in percent |
-| `per_base_n` | `base`, and `n` in percent |
-| `length_distribution` | `length`, `count` |
-| `per_sequence_quality` | `quality`, `count` |
-| `per_sequence_gc` | 101 counts, for GC 0 to 100% |
-| `terminal_runs` | `min_length` (10), `g`, `a` |
-| `adapter_content` | `adapters`, and `rows` of `position` and `values` |
-| `duplication` | totals and 16 `levels` |
-| `overrepresented` | `sequence`, `count`, `percentage`, `possible_source` |
-| `per_tile_quality` | `positions`, and `tiles` of `tile` and `deviations` |
+| Module                 | Each entry holds                                               |
+| ---------------------- | -------------------------------------------------------------- |
+| `per_base_quality`     | `base`, `mean`, `median`, quartiles, 10th and 90th percentiles |
+| `per_base_content`     | `base`, and `g`, `a`, `t`, `c` in percent                      |
+| `per_base_n`           | `base`, and `n` in percent                                     |
+| `length_distribution`  | `length`, `count`                                              |
+| `per_sequence_quality` | `quality`, `count`                                             |
+| `per_sequence_gc`      | 101 counts, for GC 0 to 100%                                   |
+| `terminal_runs`        | `min_length` (10), `g`, `a`                                    |
+| `adapter_content`      | `adapters`, and `rows` of `position` and `values`              |
+| `duplication`          | totals and 16 `levels`                                         |
+| `overrepresented`      | `sequence`, `count`, `percentage`, `possible_source`           |
+| `per_tile_quality`     | `positions`, and `tiles` of `tile` and `deviations`            |
 
 A few need more than a field name:
 
 - **Percentiles** in `per_base_quality` (`lower_quartile`, `upper_quartile`, `percentile_10`, `percentile_90`, and `median`) need more than 100 reads at a cycle, and are `null` otherwise.
-- **`duplication`** holds `reads`, `stored_sequences`, `reads_at_limit` (the reads counted when the last key was stored), `total_deduplicated_percentage`, and `levels` from `1` to `>10k+`, each with its `percentage`.
+- **`duplication`** holds `reads`, `stored_sequences`, `reads_at_limit` (the reads counted when the last key was stored), `total_deduplicated_percentage`, and 16 `levels`, each a `level` label from `1` to `>10k+` and its `percentage`.
 - **`possible_source`** is `null`, or the best contaminant match as `name`, `identity` in percent, and `length` in bases.
 - **`per_tile_unavailable`** and **`unavailable`** give the reason when per-tile quality, or every per-cycle module because of a read longer than 1024 bases, is `null`.
 
@@ -103,24 +145,39 @@ The QC summary keeps the field names of fastp's JSON report, so tools that read 
 {
   "schema": "z-fastq/qc-summary-v1",
   "summary": {
-    "before_filtering": { "total_reads": 3324, "total_bases": 481385, "q20_rate": 0.9085, "q30_rate": 0.8297, "read1_mean_length": 144, "read2_mean_length": 144, "gc_content": 0.5063 }
+    "before_filtering": {
+      "total_reads": 3324,
+      "total_bases": 481385,
+      "q20_rate": 0.9085,
+      "q30_rate": 0.8297,
+      "read1_mean_length": 144,
+      "read2_mean_length": 144,
+      "gc_content": 0.5063
+    }
   },
-  "filtering_result": { "passed_filter_reads": 3324, "low_quality_reads": 0, "too_many_N_reads": 0, "adapter_dimer_reads": 0, "too_short_reads": 0, "too_long_reads": 0 },
+  "filtering_result": {
+    "passed_filter_reads": 3324,
+    "low_quality_reads": 0,
+    "too_many_N_reads": 0,
+    "adapter_dimer_reads": 0,
+    "too_short_reads": 0,
+    "too_long_reads": 0
+  },
   "duplication": { "rate": 0 }
 }
 ```
 
 </details>
 
-| Section | Holds |
-| --- | --- |
-| `summary` | totals before and after filtering: reads, bases, Q20 and Q30, mean lengths, GC |
-| `filtering_result` | reads that passed, and reads dropped by reason |
-| `duplication` | the pair duplication rate |
-| `insert_size` | the insert peak, unknown inserts, and histogram (adapters only) |
-| `adapter_cutting` | adapter-trimmed reads and bases, and the adapters (adapters only) |
-| `read1_before_filtering` and three more | per-mate totals, and quality and base content per cycle |
-| `command` | the z-fastq command line |
+| Section                                 | Holds                                                                          |
+| --------------------------------------- | ------------------------------------------------------------------------------ |
+| `summary`                               | totals before and after filtering: reads, bases, Q20 and Q30, mean lengths, GC |
+| `filtering_result`                      | reads that passed, and reads dropped by reason                                 |
+| `duplication`                           | the pair duplication rate                                                      |
+| `insert_size`                           | the insert peak, unknown inserts, and histogram (adapters only)                |
+| `adapter_cutting`                       | adapter-trimmed reads and bases, and the adapters (adapters only)              |
+| `read1_before_filtering` and three more | per-mate totals, and quality and base content per cycle                        |
+| `command`                               | the z-fastq command line                                                       |
 
 Everything named `before_filtering` describes the raw reads, and everything named `after_filtering` the reads written. Totals cover both mates; dropped pairs count both their reads, so the filter counts are twice the report's pair counts. An overlap trim counts both mates as adapter-trimmed, and a match that starts before the read counts the adapter bases it matched, as fastp counts them.
 
