@@ -39,7 +39,7 @@ The trims run in this order on every pair, each only when its options are given.
 
 ### Quality tail
 
-`--trim-tail-window W --trim-tail-quality Q` looks at windows of W bases, starting at the 3' end and moving toward the 5' end, and stops at the first window whose mean quality is at least Q (Figure 2). The read keeps everything up to that window's first base; trailing `N` bases are then removed.
+`--trim-tail-window W --trim-tail-quality Q` looks at windows of W bases, starting at the 3' end and moving toward the 5' end, and stops at the first window whose mean quality is at least Q (Figure 2). If the final window already passes, the full read is kept. Otherwise, the read is cut after the first base of the passing window. Trailing `N` bases are then removed. Reads no longer than the window are trimmed to zero bases.
 
 <p align="center">
   <picture>

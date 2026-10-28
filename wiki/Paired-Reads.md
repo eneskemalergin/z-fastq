@@ -16,7 +16,7 @@ Each mate is first validated as a record ([Validation](Validation)), then the tw
 - `P001`: the mates' names do not match.
 - `P002`: a mate is missing: one file has more records than the other, or an interleaved file ends on an odd record.
 
-A record error comes before a pair error at the same place. Messages give the pair number, counted from 0, and shorten very long names.
+Structural record errors are detected while reading. Missing-mate detection precedes semantic validation, so an orphan record can report `P002` even if its bases are invalid. When both mates are present, record validation precedes name matching. Messages give the pair number, counted from 0, and shorten very long names.
 
 ## How names are matched
 

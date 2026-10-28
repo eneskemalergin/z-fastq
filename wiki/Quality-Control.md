@@ -69,7 +69,7 @@ where $`\ell_1`$ and $`\ell_2`$ are the mate lengths. Pairs with no overlap, or 
 
 ## MultiQC-compatible outputs
 
-Two options write the same measurements in formats [MultiQC](https://multiqc.info) already reads, so a workflow can show z-fastq's QC beside its other steps. Both are written only when the run succeeds, after the FASTQ outputs and before the report. Neither can be combined with `--max-pairs`, since their formats cannot say that only part of a file was read.
+Two options write the same measurements in formats [MultiQC](https://multiqc.info) already reads, so a workflow can show z-fastq's QC beside its other steps. Both are written after the FASTQ outputs and before the native report. If writing any requested QC output or the native report fails, this run's QC tables and summary are removed. This is cleanup after failure, not an atomic multi-file transaction; earlier FASTQ output remains available. Neither can be combined with `--max-pairs`, since their formats cannot say that only part of a file was read.
 
 ### QC tables
 
@@ -106,13 +106,13 @@ z-fastq process --adapter1 AGATCGGAAGAGCACACGTCTGAACTCCAGTCA --adapter2 AGATCGGA
   --out1 trimmed_R1.fastq.gz --out2 trimmed_R2.fastq.gz --gzip R1.fastq.gz R2.fastq.gz
 ```
 
-`--qc-summary PATH` writes one JSON file per run in the layout of fastp's JSON report, which MultiQC's fastp module reads: read and base totals before and after filtering, Q20 and Q30 rates, GC, the filter counts, the duplication rate, insert sizes, adapter-trimmed reads and bases, and per-cycle quality and base content. It needs `--pair-duplication`, so the duplication rate its readers expect is always there. MultiQC names the sample after the file, so `sample.json` shows as `sample`.
+`--qc-summary PATH` writes one JSON file per run in the layout of fastp's JSON report, which MultiQC's fastp module reads: read and base totals before and after filtering, Q20 and Q30 rates, GC, the filter counts, the duplication rate, insert sizes, adapter-trimmed reads and bases, and per-cycle quality and base content. Add `--pair-duplication` to include the duplication rate. Without it, the summary omits the `duplication` section and avoids memory growth from pair-duplication tracking; all other summary measurements remain available. MultiQC names the sample after the file, so `sample.json` shows as `sample`.
 
 The values describe what z-fastq did with the options you gave; they match fastp's report when the run uses fastp's settings ([Processing](Processing#filtering)). The fields, and what fastp writes that this file leaves out, are in [Report reference](Report-Reference#qc-summary).
 
 ## Limits and differences
 
-- Quality is read as Phred+33 only. FastQC guesses the encoding and would read a file whose qualities never go below `@` as Phred+64.
+- Quality is read as Phred+33 only. Java FastQC 0.13.0 can warn about possible Phred+64 without changing its reported Sanger / Illumina 1.9 encoding; a high minimum quality alone does not imply that FastQC switched decoding.
 - Module statuses use FastQC's default limits and cannot be changed.
 - In Adapter Content, a 12-base read that matches counts even before any longer read, as FastQC-Rust counts it; Java FastQC skips it.
 - IUPAC codes other than `N` count as none of A, C, G, T, or N. fastp groups them with other bases, so GC and base content differ from fastp's only for reads that carry them.

@@ -136,6 +136,8 @@ A few need more than a field name:
 
 ## QC summary
 
+The `duplication` section is present only when `--pair-duplication` is requested; its absence means duplication was not measured, not that the rate was zero.
+
 The QC summary keeps the field names of fastp's JSON report, so tools that read that report, MultiQC among them, can read this file. Its `schema` is `z-fastq/qc-summary-v1`. It is indented with tabs, which MultiQC needs to recognize it.
 
 <details>
