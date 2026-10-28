@@ -296,7 +296,6 @@ test "[cli] - [process]: invalid invocations fail before any input is read or ou
         .{ .args = &.{ "process", "--qc-tables", p.out1, "--qc-tables", p.out1, p.r1, p.r2 }, .stderr = "error: --qc-tables may appear only once\n" },
         .{ .args = &.{ "process", "--pair-duplication", "--qc-summary", "-", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --qc-summary cannot be standard output\n" },
         .{ .args = &.{ "process", "--pair-duplication", "--qc-summary", p.out1, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: process output paths must differ\n" },
-        .{ .args = &.{ "process", "--qc-summary", p.report, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --qc-summary requires --pair-duplication\n" },
         .{ .args = &.{ "process", "--max-pairs", "1", "--qc-tables", tables, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --max-pairs cannot be used with --qc-tables or --qc-summary\n" },
         .{ .args = &.{ "process", "--min-length", "1", "--qc-tables", tables, "--out1", same_name, "--out2", p.out2, p.r1, p.r2 }, .stderr = shared_table },
         .{ .args = &.{ "process", "--pair-duplication", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --pair-duplication requires --report or --qc-summary\n" },

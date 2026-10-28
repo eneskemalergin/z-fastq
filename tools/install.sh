@@ -84,51 +84,95 @@ validate_settings() {
     esac
 }
 
-cleanup() {
-    if [[ -n "$ACTIVE_STAGE" && -d "$ACTIVE_STAGE" ]]; then
-        case "$ACTIVE_STAGE" in
-            "$LOCAL_DIR"/stage/*)
-                if [[ -f "$ACTIVE_STAGE/.z-fastq-tool" ]]; then
-                    rm -rf -- "$ACTIVE_STAGE"
-                fi
-                ;;
-        esac
-    fi
+# NUL-delimited find records preserve spaces and newlines in generated paths.
+declare -A GENERATED_IDS=() GENERATED_CONTENT=()
 
-    if [[ -n "$ACTIVE_WORK" && -d "$ACTIVE_WORK" ]]; then
-        case "$ACTIVE_WORK" in
-            /var/tmp/z-fastq-tools.*)
-                if [[ "$KEEP_TOOL_WORK" == 1 ]]; then
-                    echo "keep: $ACTIVE_WORK"
-                else
-                    rm -rf -- "$ACTIVE_WORK"
+record_generated() {
+    local path id content
+    GENERATED_IDS=()
+    GENERATED_CONTENT=()
+    [[ -n "$ACTIVE_WORK" && -d "$ACTIVE_WORK" && ! -L "$ACTIVE_WORK" ]] || return 0
+    while IFS= read -r -d '' path && IFS= read -r -d '' id && IFS= read -r -d '' content; do
+        GENERATED_IDS["$path"]="$id"
+        GENERATED_CONTENT["$path"]="$content"
+    done < <(find -P "$ACTIVE_WORK" -printf '%p\0%y:%D:%i\0%s:%T@\0')
+}
+
+cleanup() {
+    local path id content parent i
+    local -A parents=()
+    local -a files=() dirs=()
+    [[ -n "$ACTIVE_WORK" && ( -e "$ACTIVE_WORK" || -L "$ACTIVE_WORK" ) ]] || return 0
+    if [[ "$KEEP_TOOL_WORK" == 1 || -L "$ACTIVE_WORK" ]]; then
+        echo "keep: $ACTIVE_WORK"
+        return
+    fi
+    # find visits parents first and never follows directory symlinks. Require
+    # each parent to retain its recorded identity before considering children.
+    while IFS= read -r -d '' path && IFS= read -r -d '' id && IFS= read -r -d '' content; do
+        [[ "${GENERATED_IDS[$path]-}" == "$id" ]] || continue
+        parent="${path%/*}"
+        [[ "$path" == "$ACTIVE_WORK" || "${parents[$parent]-}" == 1 ]] || continue
+        case "$id" in
+            d:*) parents["$path"]=1; dirs+=("$path") ;;
+            f:*|l:*)
+                [[ "${GENERATED_CONTENT[$path]-}" == "$content" ]] || continue
+                files+=("$path")
+                if (( ${#files[@]} == 128 )); then
+                    rm -- "${files[@]}" || true
+                    files=()
                 fi
                 ;;
         esac
+    done < <(find -P "$ACTIVE_WORK" -printf '%p\0%y:%D:%i\0%s:%T@\0')
+    if (( ${#files[@]} )); then rm -- "${files[@]}" || true; fi
+    files=()
+    for ((i=${#dirs[@]}-1; i>=0; i--)); do
+        files+=("${dirs[i]}")
+        if (( ${#files[@]} == 128 )); then
+            rmdir -- "${files[@]}" 2>/dev/null || true
+            files=()
+        fi
+    done
+    if (( ${#files[@]} )); then rmdir -- "${files[@]}" 2>/dev/null || true; fi
+    if [[ -e "$ACTIVE_WORK" || -L "$ACTIVE_WORK" ]]; then
+        echo "keep: $ACTIVE_WORK: unregistered, changed, or unremovable files remain" >&2
     fi
 }
-trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+fi
 
 finish_work() {
-    local work="$ACTIVE_WORK"
+    cleanup
     ACTIVE_WORK=""
-    [[ -n "$work" && -d "$work" ]] || return
+    ACTIVE_STAGE=""
+    GENERATED_IDS=()
+    GENERATED_CONTENT=()
+}
 
-    case "$work" in
-        /var/tmp/z-fastq-tools.*)
-            if [[ "$KEEP_TOOL_WORK" == 1 ]]; then
-                echo "keep: $work"
-            else
-                rm -rf -- "$work"
-            fi
-            ;;
-        *)
-            echo "warning: keep unexpected work path: $work" >&2
-            ;;
+cleanup_smoke() {
+    local dir="$1" name
+    local -a files=()
+    case "$dir" in
+        /var/tmp/z-fastq-wrapper-smoke.*|/var/tmp/z-fastq-peer-smoke.*) ;;
+        *) echo "error: invalid smoke cleanup path: $dir" >&2; return 1 ;;
     esac
+    [[ ! -L "$dir" ]] || { echo "keep: $dir: replaced smoke directory" >&2; return 1; }
+    for name in basic_valid.fastq.gz needletail.stats helicase.stats needletail-gzip.stats helicase-gzip.stats \
+        rasusa.fastq interleaved.fastq fasten.fastq basic.fastq.gz sample.fastq source-r1.fastq source-r2.fastq \
+        r1.fastq r2.fastq fastp.fastq fastp.json fastp.html reformat.fastq repaired-r1.fastq repaired-r2.fastq; do
+        files+=("$dir/$name")
+    done
+    rm -f -- "${files[@]}"
+    if [[ -d "$dir/fastqc-out" && ! -L "$dir/fastqc-out" ]]; then
+        rm -f -- "$dir/fastqc-out/basic_valid_fastqc.html" "$dir/fastqc-out/basic_valid_fastqc.zip"
+        rmdir -- "$dir/fastqc-out" 2>/dev/null || true
+    fi
+    rmdir -- "$dir" 2>/dev/null || { echo "keep: $dir: unexpected smoke outputs remain" >&2; return 1; }
 }
 
 check_platform() {
@@ -259,7 +303,7 @@ install_report_packages() {
 }
 
 install_venv() {
-    if [[ ! -e "$VENV_DIR" ]]; then
+    if [[ ! -e "$VENV_DIR" && ! -L "$VENV_DIR" ]]; then
         require_command uv
         require_command python3
 
@@ -274,11 +318,11 @@ install_venv() {
             --no-cache \
             --python "$python_path" \
             "$VENV_DIR"; then
-            rm -rf -- "$VENV_DIR"
+            echo "keep: $VENV_DIR: incomplete environment; inspect before retrying" >&2
             return 1
         fi
         if ! check_venv_root; then
-            rm -rf -- "$VENV_DIR"
+            echo "keep: $VENV_DIR: incomplete environment; inspect before retrying" >&2
             return 1
         fi
     else
@@ -395,10 +439,10 @@ check_wrapper_smoke() {
     local helicase="$2"
     local fixture="$ROOT_DIR/tests/data/synthetic/basic_valid.fastq"
     local smoke_dir
-    smoke_dir="$(mktemp -d /var/tmp/z-fastq-wrapper-smoke.XXXXXX)"
+    smoke_dir="$(mktemp -d /var/tmp/z-fastq-wrapper-smoke.XXXXXX)" || return
 
     (
-        trap 'rm -rf -- "$smoke_dir"' EXIT
+        trap 'cleanup_smoke "$smoke_dir"' EXIT
         local gzip_fixture="$smoke_dir/basic_valid.fastq.gz"
         local needletail_stats="$smoke_dir/needletail.stats"
         local helicase_stats="$smoke_dir/helicase.stats"
@@ -446,13 +490,13 @@ check_wrappers() {
     echo "ok: wrappers (Needletail $NEEDLETAIL_VERSION, Helicase $HELICASE_VERSION)"
 }
 
-remove_stale_stages() {
+report_stale_stages() {
     local name="$1"
     local candidate
     while IFS= read -r -d '' candidate; do
         if [[ -f "$candidate/.z-fastq-tool" ]] &&
             [[ "$(<"$candidate/.z-fastq-tool")" == "$name" ]]; then
-            rm -rf -- "$candidate"
+            echo "keep: $candidate: earlier installation or stage"
         else
             echo "warning: keep unmarked stage path: $candidate" >&2
         fi
@@ -491,7 +535,7 @@ write_wrapper_receipt() {
     } >"$receipt"
 }
 
-remove_old_installs() {
+report_old_installs() {
     local name="$1"
     local current="$2"
     local directory="$INSTALLS_DIR/$name"
@@ -502,7 +546,7 @@ remove_old_installs() {
         fi
         if [[ -f "$candidate/.z-fastq-tool" ]] &&
             [[ "$(<"$candidate/.z-fastq-tool")" == "$name" ]]; then
-            rm -rf -- "$candidate"
+            echo "keep: $candidate: earlier installation or stage"
         else
             echo "warning: keep unmarked install path: $candidate" >&2
         fi
@@ -526,11 +570,13 @@ install_wrappers() {
     require_command install
 
     mkdir -p "$LOCAL_DIR/stage" "$WRAPPER_INSTALLS_DIR" "$BIN_DIR"
-    remove_stale_stages wrappers
-    ACTIVE_WORK="$(mktemp -d /var/tmp/z-fastq-tools.XXXXXX)"
-    ACTIVE_STAGE="$(mktemp -d "$LOCAL_DIR/stage/wrappers.XXXXXX")"
+    report_stale_stages wrappers
+    ACTIVE_WORK="$(mktemp -d /var/tmp/z-fastq-tools.XXXXXX)" || return
+    ACTIVE_STAGE="$ACTIVE_WORK/stage"
+    mkdir -- "$ACTIVE_STAGE"
     printf 'wrappers\n' >"$ACTIVE_STAGE/.z-fastq-tool"
     mkdir -p "$ACTIVE_STAGE/bin"
+    record_generated
 
     echo "build: wrappers (Needletail $NEEDLETAIL_VERSION, Helicase $HELICASE_VERSION)"
     env \
@@ -552,6 +598,7 @@ install_wrappers() {
         "$ACTIVE_WORK/cargo-target/release/helicase-adapter" \
         "$ACTIVE_STAGE/bin/helicase-adapter"
     write_wrapper_receipt "$ACTIVE_STAGE/receipt.tsv"
+    record_generated
 
     check_version_line "$ACTIVE_STAGE/bin/needletail-adapter" needletail "$NEEDLETAIL_VERSION"
     check_version_line "$ACTIVE_STAGE/bin/helicase-adapter" helicase "$HELICASE_VERSION"
@@ -564,7 +611,11 @@ install_wrappers() {
     local install_id
     install_id="install-$(date -u +%Y%m%dT%H%M%SZ)-$$"
     local published="$WRAPPER_INSTALLS_DIR/$install_id"
-    mv -- "$ACTIVE_STAGE" "$published"
+    # Staging may be on another filesystem; leave source removal to cleanup.
+    cp -a -- "$ACTIVE_STAGE" "$published" || {
+        echo "keep: $published: incomplete installation copy" >&2
+        return 1
+    }
     ACTIVE_STAGE=""
 
     switch_relative_link "$WRAPPER_CURRENT" "installs/wrappers/$install_id"
@@ -574,7 +625,7 @@ install_wrappers() {
     switch_relative_link \
         "$BIN_DIR/helicase-adapter" \
         '../.local/wrappers-current/bin/helicase-adapter'
-    remove_old_installs wrappers "$published"
+    report_old_installs wrappers "$published"
 
     check_wrappers
     finish_work
@@ -816,10 +867,10 @@ check_peer_smoke() {
     local fixture="$ROOT_DIR/tests/data/synthetic/basic_valid.fastq"
     local short_fixture="$ROOT_DIR/tests/data/synthetic/acgtn_valid.fastq"
     local smoke_dir
-    smoke_dir="$(mktemp -d /var/tmp/z-fastq-peer-smoke.XXXXXX)"
+    smoke_dir="$(mktemp -d /var/tmp/z-fastq-peer-smoke.XXXXXX)" || return
 
     (
-        trap 'rm -rf -- "$smoke_dir"' EXIT
+        trap 'cleanup_smoke "$smoke_dir"' EXIT
         local output
         case "$name" in
             seqtk)
@@ -948,14 +999,13 @@ check_peer_smoke() {
                 mkdir -p "$smoke_dir/fastqc-out"
                 "$fastqc_bin" \
                     --outdir "$smoke_dir/fastqc-out" \
-                    --extract \
                     -t 1 \
                     -q \
                     "$fixture" >/dev/null 2>&1 || return
                 [[ -s "$smoke_dir/fastqc-out/basic_valid_fastqc.html" ]] || return
                 [[ -s "$smoke_dir/fastqc-out/basic_valid_fastqc.zip" ]] || return
-                grep -Fqx 'Total Sequences	5' \
-                    "$smoke_dir/fastqc-out/basic_valid_fastqc/fastqc_data.txt" || return
+                unzip -p "$smoke_dir/fastqc-out/basic_valid_fastqc.zip" basic_valid_fastqc/fastqc_data.txt | \
+                    grep -Fx $'Total Sequences\t5' >/dev/null || return
                 ;;
         esac
     ) || {
@@ -967,6 +1017,7 @@ check_peer_smoke() {
 check_peer_at() {
     local name="$1"
     local root="$2"
+    if [[ "$name" == fastqc || "$name" == fastqc-rust ]]; then require_command unzip; fi
     if [[ "$name" == bbtools || "$name" == fastqc ]]; then
         require_command java
         if [[ "$name" == fastqc ]]; then
@@ -1321,8 +1372,8 @@ build_bbtools() {
     tar -xzf "$archive" -C "$ACTIVE_WORK"
 
     mkdir -p "$stage/runtime"
-    cp -a "$source/current" "$stage/runtime/current"
-    find "$stage/runtime/current" -type f -name '*.java' -delete
+    mkdir -p "$stage/runtime/current"
+    (cd "$source/current" && tar --exclude='*.java' -cf - .) | tar -xf - -C "$stage/runtime/current"
     mkdir -p "$stage/runtime/resources"
     install -m 644 "$source/networks/bbmerge.bbnet.gz" "$stage/runtime/resources/bbmerge.bbnet.gz"
     for script in bbversion.sh reformat.sh repair.sh javasetup.sh memdetect.sh; do
@@ -1458,23 +1509,30 @@ install_peer() {
 
     local installs="$INSTALLS_DIR/$name"
     mkdir -p "$LOCAL_DIR/stage" "$installs" "$BIN_DIR"
-    remove_stale_stages "$name"
-    ACTIVE_WORK="$(mktemp -d /var/tmp/z-fastq-tools.XXXXXX)"
-    ACTIVE_STAGE="$(mktemp -d "$LOCAL_DIR/stage/$name.XXXXXX")"
+    report_stale_stages "$name"
+    ACTIVE_WORK="$(mktemp -d /var/tmp/z-fastq-tools.XXXXXX)" || return
+    ACTIVE_STAGE="$ACTIVE_WORK/stage"
+    mkdir -- "$ACTIVE_STAGE"
     printf '%s\n' "$name" >"$ACTIVE_STAGE/.z-fastq-tool"
     mkdir -p "$ACTIVE_STAGE/bin"
+    record_generated
 
     echo "install: $name $(peer_version "$name")"
     BUILD_DESCRIPTION=""
     build_peer "$name" "$ACTIVE_STAGE"
     strip_peer "$name" "$ACTIVE_STAGE"
     write_peer_receipt "$name" "$ACTIVE_STAGE/receipt.tsv" "$BUILD_DESCRIPTION"
+    record_generated
     check_peer_at "$name" "$ACTIVE_STAGE" || return
 
     local install_id
     install_id="install-$(date -u +%Y%m%dT%H%M%SZ)-$$"
     local published="$installs/$install_id"
-    mv -- "$ACTIVE_STAGE" "$published"
+    # Staging may be on another filesystem; leave source removal to cleanup.
+    cp -a -- "$ACTIVE_STAGE" "$published" || {
+        echo "keep: $published: incomplete installation copy" >&2
+        return 1
+    }
     ACTIVE_STAGE=""
 
     switch_relative_link "$(peer_current_link "$name")" "installs/$name/$install_id"
@@ -1484,7 +1542,7 @@ install_peer() {
             "$BIN_DIR/$binary" \
             "../.local/$name-current/bin/$binary"
     done
-    remove_old_installs "$name" "$published"
+    report_old_installs "$name" "$published"
     check_peer "$name"
     finish_work
 }
@@ -1602,6 +1660,8 @@ is_named_target() {
         *) is_peer_name "$1" ;;
     esac
 }
+
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
 case "${1:-}" in
     "")

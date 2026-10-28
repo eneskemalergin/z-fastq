@@ -540,9 +540,6 @@ pub fn main(init: std.process.Init) !void {
         if (contaminants_path != null and qc_tables == null) argumentError(io, "error: --contaminants requires --report or --qc-tables\n", 2);
         if (pair_duplication and qc_summary == null) argumentError(io, "error: --pair-duplication requires --report or --qc-summary\n", 2);
     }
-    if (command == .process and qc_summary != null and !pair_duplication) {
-        argumentError(io, "error: --qc-summary requires --pair-duplication\n", 2);
-    }
     if (command == .process and max_pairs != null and (qc_tables != null or qc_summary != null)) {
         argumentError(io, "error: --max-pairs cannot be used with --qc-tables or --qc-summary\n", 2);
     }
@@ -4188,6 +4185,9 @@ fn runProcess(
     const changes_reads = options.trim.changesReads();
     var stats: [2][2]zfastq.Stats = @splat(.{ .{}, .{} });
     if (options.collectsQc()) finishCollectors(&collectors.qc, changes_reads, &stats, &input_failure);
+    if (contaminants) |*list| {
+        for (&collectors.qc) |*populations| populations.prepareSources(list);
+    }
 
     var exit_code: u8 = 0;
     if (input_failure) |failure| {
@@ -4233,6 +4233,7 @@ fn runProcess(
     };
     if (summary_file) |file| {
         exit_code = writeSummaryFile(io, file, options.qc_summary.?, &report, exit_code);
+        if (exit_code != 0) exit_code = qc_table_files.abandon(io, exit_code);
         report.status_ok = exit_code == 0;
     }
     const report_path = options.report orelse return exit_code;
@@ -4242,8 +4243,8 @@ fn runProcess(
     else
         std.Io.File.stdout().writerStreaming(io, &report_buffer);
     var json: std.json.Stringify = .{ .writer = &report_writer.interface };
-    writeProcessReport(&json, report) catch return reportFailed(io, report_path, report_to_stdout, exit_code);
-    report_writer.interface.flush() catch return reportFailed(io, report_path, report_to_stdout, exit_code);
+    writeProcessReport(&json, report) catch return reportFailed(io, report_path, report_to_stdout, exit_code, &qc_table_files, options.qc_summary);
+    report_writer.interface.flush() catch return reportFailed(io, report_path, report_to_stdout, exit_code, &qc_table_files, options.qc_summary);
     return exit_code;
 }
 
@@ -4268,7 +4269,11 @@ fn finishCollectors(
     for (collectors, 0..) |*populations, index| {
         populations.finish();
         const retained = if (changes_reads) &populations.retained else &populations.raw;
-        for ([_]*const qc.MateQc{ &populations.raw, retained }, stats) |collector, *population_stats| {
+        for ([_]*const qc.MateQc{ &populations.raw, retained }, stats, 0..) |collector, *population_stats, population| {
+            if (population == 1 and !changes_reads) {
+                population_stats[index] = stats[0][index];
+                continue;
+            }
             population_stats[index] = collector.stats() catch |err| stats: {
                 if (input_failure.* == null) input_failure.* = pairCommandFailure(@intCast(index), qcFailure(err));
                 break :stats .{};
@@ -4603,7 +4608,9 @@ fn qcFailure(err: (error{OutOfMemory} || statistics.StatsError)) CommandFailure 
     };
 }
 
-fn reportFailed(io: std.Io, path: []const u8, to_stdout: bool, exit_code: u8) u8 {
+fn reportFailed(io: std.Io, path: []const u8, to_stdout: bool, exit_code: u8, tables: *QcTables, summary: ?[]const u8) u8 {
+    _ = tables.abandon(io, exit_code);
+    if (summary) |summary_path| std.Io.Dir.cwd().deleteFile(io, summary_path) catch {};
     if (to_stdout) return stdoutFailed(io, exit_code);
     printPathError(io, path, IO_FAILURE.message);
     return @max(exit_code, IO_FAILURE.exit_code);
@@ -4831,6 +4838,12 @@ fn processSources(
     counts: *ProcessCounts,
     options: ProcessOptions,
 ) DeinterleaveWriteError!?PairCommandFailure {
+    if (options.qc_summary != null and options.report == null and options.qc_tables == null) {
+        for (&collectors.qc) |*populations| {
+            populations.raw.detailed = false;
+            populations.retained.detailed = false;
+        }
+    }
     if (options.collectsQc() and options.trim.changesReads()) {
         for (&collectors.qc) |*populations| populations.enableRetained();
     }

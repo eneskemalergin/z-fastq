@@ -114,13 +114,17 @@ pub const MatePopulations = struct {
         quality: []const u8,
     ) (error{OutOfMemory} || statistics.StatsError)!void {
         if (self.derived and !self.raw.too_long and sequence.len > MAX_CYCLES) self.materialize();
-        const key: SequenceKey = .of(sequence);
-        try self.raw_sequences.reserve(allocator);
-        self.raw_sequences.prefetch(key);
+        const key: SequenceKey = if (self.raw.detailed) .of(sequence) else .{};
+        if (self.raw.detailed) {
+            try self.raw_sequences.reserve(allocator);
+            self.raw_sequences.prefetch(key);
+        }
         self.last = try self.raw.collect(allocator, sequence, quality);
-        self.raw_sequences.add(key);
-        try self.raw_tiles.add(allocator, header, quality);
-        if (self.retained_enabled) {
+        if (self.raw.detailed) {
+            self.raw_sequences.add(key);
+            try self.raw_tiles.add(allocator, header, quality);
+        }
+        if (self.retained_enabled and self.raw.detailed) {
             self.last_key = key;
             self.retained_sequences.prefetch(key);
         }
@@ -136,29 +140,31 @@ pub const MatePopulations = struct {
     ) (error{OutOfMemory} || statistics.StatsError)!void {
         std.debug.assert(kept <= sequence.len and sequence.len == quality.len);
         std.debug.assert(self.retained_enabled);
-        const key = if (kept >= @min(sequence.len, KEY_LENGTH)) self.last_key else SequenceKey.of(sequence[0..kept]);
-        try self.retained_sequences.reserve(allocator);
-        try self.retained_tiles.add(allocator, header, quality[0..kept]);
+        const key = if (!self.raw.detailed) SequenceKey{} else if (kept >= @min(sequence.len, KEY_LENGTH)) self.last_key else SequenceKey.of(sequence[0..kept]);
+        if (self.raw.detailed) {
+            try self.retained_sequences.reserve(allocator);
+            try self.retained_tiles.add(allocator, header, quality[0..kept]);
+        }
         if (!self.derived) {
             try self.retained.addRead(allocator, sequence[0..kept], quality[0..kept]);
-            self.retained_sequences.add(key);
+            if (self.raw.detailed) self.retained_sequences.add(key);
             return;
         }
         const retained = &self.retained;
         if (sequence.len > retained.quality.items.len) try retained.growCycles(allocator, sequence.len);
-        self.retained_sequences.add(key);
+        if (self.raw.detailed) self.retained_sequences.add(key);
         var facts = self.last;
         if (kept < sequence.len) {
             const removed_sum = try self.removeCycles(allocator, sequence, quality, kept);
             facts.quality_sum -= removed_sum;
-            facts.gc_count = gcCountScalar(sequence[0..gcKeptLength(kept)]);
+            if (self.raw.detailed) facts.gc_count = gcCountScalar(sequence[0..gcKeptLength(kept)]);
         }
         retained.lengths[kept] += 1;
         self.retained_cycles = @max(self.retained_cycles, kept);
-        for (facts.adapter_starts, &retained.adapter_starts) |start, *starts| {
+        if (self.raw.detailed) for (facts.adapter_starts, &retained.adapter_starts) |start, *starts| {
             if (start != NO_MATCH and start + ADAPTER_LENGTH <= kept) starts[start] += 1;
-        }
-        if (kept != 0) retained.addSummary(sequence[0..kept], facts);
+        };
+        if (self.raw.detailed and kept != 0) retained.addSummary(sequence[0..kept], facts);
     }
 
     pub fn dropRetained(
@@ -199,8 +205,19 @@ pub const MatePopulations = struct {
         if (self.derived) self.materialize();
         self.raw.finish();
         self.retained.finish();
-        self.raw_sequences.finish();
-        if (self.retained_enabled) self.retained_sequences.finish();
+        if (self.raw.detailed) {
+            self.raw_sequences.finish();
+            self.raw_tiles.finish();
+            if (self.retained_enabled) {
+                self.retained_sequences.finish();
+                self.retained_tiles.finish();
+            }
+        }
+    }
+
+    pub fn prepareSources(self: *MatePopulations, contaminants: *const ContaminantList) void {
+        self.raw_sequences.prepareSources(contaminants);
+        if (self.retained_enabled) self.retained_sequences.prepareSources(contaminants);
     }
 
     pub fn writeJson(self: *const MatePopulations, json: *std.json.Stringify, retained: bool, contaminants: ?*const ContaminantList) !void {
@@ -260,6 +277,8 @@ pub const MatePopulations = struct {
 };
 
 pub const MateQc = struct {
+    // Summary output consumes cycle counts and totals, but no FastQC modules.
+    detailed: bool = true,
     quality: std.ArrayList(QualityCounts) = .empty,
     bases: std.ArrayList(BaseCounts) = .empty,
     pending_bases: PendingBases = @splat(@splat(0)),
@@ -312,21 +331,34 @@ pub const MateQc = struct {
             self.quality.clearAndFree(allocator);
             self.bases.clearAndFree(allocator);
         }
-        if (self.too_long) try self.long_stats.addRecord(.{ .header = "", .id = "", .sequence = sequence, .plus = "", .quality = quality });
-        const gc_length = gcKeptLength(sequence.len);
+        if (self.too_long) {
+            const previous_quality = self.long_stats.quality_sum;
+            const previous_c = self.long_stats.c;
+            const previous_g = self.long_stats.g;
+            try self.long_stats.addRecord(.{ .header = "", .id = "", .sequence = sequence, .plus = "", .quality = quality });
+            if (!self.detailed) return .{};
+            // Stats already counted this read. Subtract the excluded tail to
+            // recover FastQC's truncated-prefix GC count.
+            const gc_length = gcKeptLength(sequence.len);
+            const gc_total = (self.long_stats.c - previous_c) + (self.long_stats.g - previous_g);
+            const facts: ReadFacts = .{
+                .quality_sum = try std.math.add(u64, self.long_stats.quality_sum - previous_quality, try std.math.mul(u64, PHRED_OFFSET, quality.len)),
+                .gc_count = @as(usize, @intCast(gc_total)) - gcCountScalar(sequence[gc_length..]),
+            };
+            if (sequence.len != 0) self.addSummary(sequence, facts);
+            return facts;
+        }
+        const gc_length = if (self.detailed) gcKeptLength(sequence.len) else 0;
         var quality_sum: u64 = 0;
-        const gc_count = if (self.too_long) too_long: {
-            for (quality) |byte| quality_sum += byte;
-            break :too_long gcCountScalar(sequence[0..gc_length]);
-        } else try self.addCycles(allocator, sequence, quality, gc_length, &quality_sum);
+        const gc_count = try self.addCycles(allocator, sequence, quality, gc_length, &quality_sum);
         var facts: ReadFacts = .{ .quality_sum = quality_sum, .gc_count = gc_count };
-        if (!self.too_long) {
+        if (self.detailed and !self.too_long) {
             facts.adapter_starts = firstAdapterMatches(sequence);
             for (facts.adapter_starts, &self.adapter_starts) |start, *starts| {
                 if (start != NO_MATCH) starts[start] += 1;
             }
         }
-        if (sequence.len != 0) self.addSummary(sequence, facts);
+        if (self.detailed and sequence.len != 0) self.addSummary(sequence, facts);
         return facts;
     }
 
@@ -1460,6 +1492,9 @@ const SequenceCounts = struct {
     reads: u64 = 0,
     reads_at_limit: u64 = 0,
     levels: ?Levels = null,
+    overrepresented_count: usize = 0,
+    source_list: ?*const ContaminantList = null,
+    source_count: usize = 0,
 
     const Record = struct {
         words: PackedKey,
@@ -1558,6 +1593,7 @@ const SequenceCounts = struct {
             start = end;
         }
         self.levels = levels;
+        self.finishOverrepresented();
     }
 
     fn writeDuplication(self: *const SequenceCounts, json: *std.json.Stringify) !void {
@@ -1612,27 +1648,57 @@ const SequenceCounts = struct {
         return @as(f64, @floatFromInt(reads)) / @as(f64, @floatFromInt(self.reads)) * 100.0;
     }
 
-    fn moreReads(self: *const SequenceCounts, a: u32, b: u32) bool {
+    fn moreReads(self: *const SequenceCounts, a: u64, b: u64) bool {
         const first = self.records.items[a].reads;
         const second = self.records.items[b].reads;
         return first > second or (first == second and a < b);
     }
 
-    fn overrepresentedRows(self: *const SequenceCounts, rows: *[OVERREPRESENTED_MAX]u32) []u32 {
+    fn finishOverrepresented(self: *SequenceCounts) void {
+        // Duplication levels are finalized; the lookup slots can now hold row indices.
         var row_count: usize = 0;
         for (self.records.items, 0..) |record, index| {
             if (!(self.percentage(record.reads) > OVERREPRESENTED_PERCENT)) continue;
-            rows[row_count] = @intCast(index);
+            self.slots[row_count] = index;
             row_count += 1;
         }
-        std.sort.pdq(u32, rows[0..row_count], self, moreReads);
-        return rows[0..row_count];
+        std.debug.assert(row_count <= OVERREPRESENTED_MAX);
+        std.sort.pdq(u64, self.slots[0..row_count], self, moreReads);
+        self.overrepresented_count = row_count;
+    }
+
+    fn overrepresentedRows(self: *const SequenceCounts) []const u64 {
+        std.debug.assert(self.levels != null);
+        return self.slots[0..self.overrepresented_count];
+    }
+
+    fn sourceStorage(self: *const SequenceCounts) []?Hit {
+        comptime std.debug.assert(@sizeOf(?Hit) % @sizeOf(u64) == 0 and @alignOf(?Hit) <= @alignOf(u64));
+        const slots_per_hit = @sizeOf(?Hit) / @sizeOf(u64);
+        const remaining = self.slots[self.overrepresented_count..];
+        return std.mem.bytesAsSlice(?Hit, std.mem.sliceAsBytes(remaining[0 .. remaining.len / slots_per_hit * slots_per_hit]));
+    }
+
+    fn prepareSources(self: *SequenceCounts, contaminants: *const ContaminantList) void {
+        // Cache only what fits after the finalized row indices; no allocation is needed.
+        const storage = self.sourceStorage();
+        self.source_count = @min(storage.len, self.overrepresented_count);
+        self.source_list = contaminants;
+        for (self.overrepresentedRows()[0..self.source_count], storage[0..self.source_count]) |index, *hit| {
+            var buffer: [KEY_LENGTH]u8 = undefined;
+            hit.* = contaminants.bestHit(decodeKey(self.records.items[index].words, &buffer));
+        }
+    }
+
+    fn sourceHit(self: *const SequenceCounts, rank: usize, key: []const u8, contaminants: ?*const ContaminantList) ?Hit {
+        const list = contaminants orelse return null;
+        if (self.source_list == list and rank < self.source_count) return self.sourceStorage()[rank];
+        return list.bestHit(key);
     }
 
     fn writeOverrepresented(self: *const SequenceCounts, json: *std.json.Stringify, contaminants: ?*const ContaminantList) !void {
-        var rows: [OVERREPRESENTED_MAX]u32 = undefined;
         try json.beginArray();
-        for (self.overrepresentedRows(&rows)) |index| {
+        for (self.overrepresentedRows(), 0..) |index, rank| {
             const record = self.records.items[index];
             var buffer: [KEY_LENGTH]u8 = undefined;
             const key = decodeKey(record.words, &buffer);
@@ -1644,7 +1710,7 @@ const SequenceCounts = struct {
             try json.objectField("percentage");
             try json.write(self.percentage(record.reads));
             try json.objectField("possible_source");
-            const hit = if (contaminants) |list| list.bestHit(key) else null;
+            const hit = self.sourceHit(rank, key, contaminants);
             if (hit) |found| {
                 try json.beginObject();
                 try json.objectField("name");
@@ -1661,8 +1727,7 @@ const SequenceCounts = struct {
     }
 
     fn writeTableOverrepresented(self: *const SequenceCounts, out: *std.Io.Writer, contaminants: ?*const ContaminantList) !void {
-        var rows: [OVERREPRESENTED_MAX]u32 = undefined;
-        const found = self.overrepresentedRows(&rows);
+        const found = self.overrepresentedRows();
         const grade: Grade = if (found.len == 0)
             .pass
         else if (self.percentage(self.records.items[found[0]].reads) > OVERREPRESENTED_FAIL)
@@ -1670,13 +1735,13 @@ const SequenceCounts = struct {
         else
             .warn;
         try beginModule(out, "Overrepresented sequences", grade, if (found.len == 0) null else "Sequence\tCount\tPercentage\tPossible Source");
-        for (found) |index| {
+        for (found, 0..) |index, rank| {
             const record = self.records.items[index];
             var buffer: [KEY_LENGTH]u8 = undefined;
             const key = decodeKey(record.words, &buffer);
             try out.print("{s}\t{d}", .{ key, record.reads });
             try writeCell(out, @round(self.percentage(record.reads) * 100) / 100);
-            if (if (contaminants) |list| list.bestHit(key) else null) |hit| {
+            if (self.sourceHit(rank, key, contaminants)) |hit| {
                 try out.print("\t{s} ({d}% over {d}bp)\n", .{ hit.name, hit.identity, hit.length });
             } else try out.writeAll("\tNo Hit\n");
         }
@@ -1894,6 +1959,7 @@ const TileQuality = struct {
     longest: usize = 0,
     field: ?u3 = null,
     stopped: ?[]const u8 = null,
+    finalized: ?TileTable = null,
 
     const Tile = struct {
         number: i32,
@@ -2084,9 +2150,20 @@ const TileQuality = struct {
         return self.tiles.items[a].number < self.tiles.items[b].number;
     }
 
+    fn finish(self: *TileQuality) void {
+        if (self.finalized == null and self.unavailable() == null) self.finalized = .init(self);
+    }
+
+    fn finalizedTable(self: *const TileQuality, scratch: *TileTable) *const TileTable {
+        if (self.finalized) |*cached| return cached;
+        scratch.* = .init(self);
+        return scratch;
+    }
+
     fn writeJson(self: *const TileQuality, json: *std.json.Stringify) !void {
         if (self.unavailable() != null) return json.write(null);
-        const table: TileTable = .init(self);
+        var scratch: TileTable = undefined;
+        const table = self.finalizedTable(&scratch);
         try json.beginObject();
         try json.objectField("positions");
         try json.beginArray();
@@ -2099,7 +2176,7 @@ const TileQuality = struct {
         for (0..table.count) |rank| {
             try json.beginObject();
             try json.objectField("tile");
-            try json.write(table.deviations(rank, &deviations));
+            try json.write(table.deviations(self, rank, &deviations));
             try json.objectField("deviations");
             try json.beginArray();
             for (deviations[0..table.group_count]) |deviation| try json.write(deviation);
@@ -2111,11 +2188,12 @@ const TileQuality = struct {
     }
 
     fn writeTable(self: *const TileQuality, out: *std.Io.Writer) !void {
-        const table: TileTable = .init(self);
+        var scratch: TileTable = undefined;
+        const table = self.finalizedTable(&scratch);
         try beginModule(out, "Per tile sequence quality", .above(table.maxDeviation(), TILE_WARN, TILE_FAIL), "Tile\tBase\tMean");
         var deviations: [MAX_CYCLES]f64 = undefined;
         for (0..table.count) |rank| {
-            const tile = table.deviations(rank, &deviations);
+            const tile = table.deviations(self, rank, &deviations);
             var labels = table.groups;
             var index: usize = 0;
             while (labels.next()) |group| : (index += 1) {
@@ -2130,17 +2208,16 @@ const TileQuality = struct {
 };
 
 const TileTable = struct {
-    quality: *const TileQuality,
     order: [TILE_LIMIT + 1]u16,
     count: usize,
     groups: Groups,
     group_count: usize,
-    averages: [MAX_CYCLES]f64,
+    averages: [GROUP_COUNT_LIMIT]f64,
+    max_deviation: f64 = 0,
 
     fn init(quality: *const TileQuality) TileTable {
         std.debug.assert(quality.unavailable() == null);
         var table: TileTable = .{
-            .quality = quality,
             .order = undefined,
             .count = quality.tiles.items.len,
             .groups = .init(quality.longest),
@@ -2151,21 +2228,31 @@ const TileTable = struct {
         for (sorted, 0..) |*entry, index| entry.* = @intCast(index);
         std.sort.pdq(u16, sorted, quality, TileQuality.lessNumber);
         var counts: [MAX_CYCLES]u64 = undefined;
+        var minima: [GROUP_COUNT_LIMIT]f64 = @splat(std.math.inf(f64));
+        var maxima: [GROUP_COUNT_LIMIT]f64 = @splat(-std.math.inf(f64));
         for (sorted) |entry| {
             const tile = &quality.tiles.items[entry];
             TileQuality.positionCounts(tile, &counts);
             var iterator = table.groups;
             var index: usize = 0;
-            while (iterator.next()) |group| : (index += 1) table.averages[index] += TileQuality.mean(tile, group, &counts);
+            while (iterator.next()) |group| : (index += 1) {
+                const mean = TileQuality.mean(tile, group, &counts);
+                table.averages[index] += mean;
+                minima[index] = @min(minima[index], mean);
+                maxima[index] = @max(maxima[index], mean);
+            }
             table.group_count = index;
         }
         const tile_count: f64 = @floatFromInt(table.count);
-        for (table.averages[0..table.group_count]) |*average| average.* /= tile_count;
+        for (table.averages[0..table.group_count], 0..) |*average, index| {
+            average.* /= tile_count;
+            table.max_deviation = @max(table.max_deviation, @max(@abs(minima[index] - average.*), @abs(maxima[index] - average.*)));
+        }
         return table;
     }
 
-    fn deviations(self: *const TileTable, rank: usize, out: *[MAX_CYCLES]f64) i32 {
-        const tile = &self.quality.tiles.items[self.order[rank]];
+    fn deviations(self: *const TileTable, quality: *const TileQuality, rank: usize, out: *[MAX_CYCLES]f64) i32 {
+        const tile = &quality.tiles.items[self.order[rank]];
         var counts: [MAX_CYCLES]u64 = undefined;
         TileQuality.positionCounts(tile, &counts);
         var iterator = self.groups;
@@ -2175,15 +2262,7 @@ const TileTable = struct {
     }
 
     fn maxDeviation(self: *const TileTable) f64 {
-        var largest: f64 = 0;
-        var deviations_buffer: [MAX_CYCLES]f64 = undefined;
-        for (0..self.count) |rank| {
-            _ = self.deviations(rank, &deviations_buffer);
-            for (deviations_buffer[0..self.group_count]) |deviation| {
-                if (@abs(deviation) > largest) largest = @abs(deviation);
-            }
-        }
-        return largest;
+        return self.max_deviation;
     }
 };
 

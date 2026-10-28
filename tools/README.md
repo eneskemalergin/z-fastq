@@ -14,6 +14,10 @@ tools/install.sh --list
 
 The scripts prepare the tools needed by local comparison workflows. They do not change the shell or install system packages.
 
+Builds and staging use a fresh directory under `/var/tmp`. Cleanup records generated paths and removes unchanged recorded files with `rm`, then empty directories with `rmdir`. Changed or unexpected files, including partial build outputs created after the last recording, remain at the printed path for inspection. `KEEP_TOOL_WORK=1` retains the build directory. Older installations, earlier staging directories, and incomplete Python environments are retained; the installer does not remove them automatically.
+
+Smoke checks remove their explicitly named outputs. FastQC data is checked directly inside its ZIP without extracting the report tree.
+
 ## Current tools
 
 The table lists the pinned comparison tools and the retained Linux x86-64 size of each pinned version. Compiled-tool values are exact byte lengths of the stripped executable linked from `tools/bin/`. The BBTools value is the sum of regular files in its retained runtime tree because BBTools is a Java class tree rather than one executable. The FastQC value is the same kind of sum because FastQC is a Java distribution with a Python launcher rather than one executable. Versions are defined by `tools/versions.sh`.
