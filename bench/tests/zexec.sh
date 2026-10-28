@@ -79,6 +79,24 @@ awk -F'\t' 'NF != 6 || $0 ~ /[^0-9\t]/ { exit 1 }' "$work/usage" || fail '-r lin
 [[ "$(awk -F'\t' 'NR == 4 { print $5 }' "$work/usage")" == 15 ]] || fail '-r did not record SIGTERM'
 expect 127 'open /nonexistent/usage: NOENT' -- -r /nonexistent/usage -- /usr/bin/true
 
+# -m makes a directory before the run; -u files and then -D directories go
+# after it, and a directory left with an unnamed file fails the run with 126.
+"$x" -r "$work/usage2" -m "$work/d.@RUN@" -u "$work/d.@RUN@/a" -D "$work/d.@RUN@" -- /usr/bin/bash -c 'printf x >"$0/a"' "$work/d.@RUN@"
+[[ -z "$(ls "$work" | grep '^d\.')" ]] || fail '-m, -u, -D left the directory behind'
+expect 126 'rmdir' -- -r "$work/usage2" -m "$work/e" -u "$work/e/a" -D "$work/e" -- /usr/bin/bash -c 'printf x >"$0/a"; printf y >"$0/b"' "$work/e"
+[[ -f "$work/e/b" ]] || fail 'the unnamed file was removed'
+rm -f -- "$work/e/b"
+rmdir -- "$work/e"
+"$x" -r "$work/usage2" -D "$work/never-made" -- /usr/bin/true || fail '-D failed on a directory the run never made'
+expect 127 'mkdir' -- -r "$work/usage2" -m /nonexistent/dir -- /usr/bin/true
+expect 127 '-D needs -r' -- -D "$work/x" -- /usr/bin/true
+
+# -c pins the program to the CPUs listed.
+cpus() { "$x" -c "$1" -- /usr/bin/awk '/^Cpus_allowed_list/ { print $2 }' /proc/self/status; }
+[[ "$(cpus 0)" == 0 ]] || fail "-c 0 pinned to $(cpus 0)"
+[[ "$(cpus 0,1)" == 0-1 ]] || fail "-c 0,1 pinned to $(cpus 0,1)"
+expect 127 'bad CPU list' -- -c x -- /usr/bin/true
+
 # Every failure exits 127 with one line naming the failed step.
 expect 127 'usage:' --
 expect 127 'usage:' -- -i "$work/in.fq"
@@ -90,4 +108,4 @@ expect 127 'exec /nonexistent/prog: NOENT' -- -- /nonexistent/prog
 expect 127 'open /nonexistent/in: NOENT' -- -i /nonexistent/in -- /usr/bin/true
 expect 127 'open /nonexistent/dir/out: NOENT' -- -o /nonexistent/dir/out -- /usr/bin/true
 expect 127 'exec' -- -- "$work/in.fq"
-printf 'pass: arguments, stdin, stdout, truncate, @RUN@, environment, exit status, closed stdin, long and many arguments, -r usage lines and status, failures\n'
+printf 'pass: arguments, stdin, stdout, truncate, @RUN@, environment, exit status, closed stdin, long and many arguments, -r usage lines and status, -m and -D directories, -c CPUs, failures\n'

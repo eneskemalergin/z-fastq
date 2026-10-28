@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Check the benchmark core without timing anything: syntax, help, declaration
-# validation, the batch-reuse rule, the lane identity, case parameters, and the
-# per-CPU timing lock.
+# validation, the batch-reuse rule, the lane identity, case parameters, cores
+# per lane, output directories, and the per-CPU timing lock.
 # Runs in seconds on the corpus already cut under bench/data.
 set -euo pipefail
 export LC_ALL=C
@@ -134,6 +134,54 @@ input real illumina-drr1001190 small interleaved'
     exit 0
 ) || fail 'case-parameter checks'
 expect_invalid 'command seqtk "{bin} size -n {nope} {in}"' 'uses {nope}, which no param line declares'
+
+# Cores per lane: CPUs on distinct physical cores, the CPU set in the batch
+# identity, and the declaration checks.
+feature ''
+# shellcheck disable=SC2034,SC2154  # read by the sourced core's functions
+(
+    BASH_ARGV0="$work/feat/run.sh"
+    source "$work/feat/run.sh" __probe
+    set2="$(cpu_set 2)"
+    [[ "$(tr ',' '\n' <<<"$set2" | wc -l)" == 2 ]] || fail "cpu_set 2 gave $set2"
+    for c in ${set2//,/ }; do
+        first="$(<"/sys/devices/system/cpu/cpu$c/topology/thread_siblings_list")"
+        [[ "${first%%[,-]*}" == "$c" ]] || fail "cpu_set picked CPU $c, a second thread of its core"
+    done
+    [[ -z "$(cpu_set 100000)" ]] || fail 'cpu_set gave CPUs for more cores than the machine has'
+    [[ "$(cpu_set 1 count)" -ge 2 ]] || fail 'cpu_set count is below 2'
+    ZEXEC_ID=Z BATCH_CPUS="$set2"
+    batch_meta file IN 3 1
+    [[ "$META" == *$'\n'"cpu $set2"$'\n'* ]] || fail 'the CPU set is not in the batch identity'
+    exit 0
+) || fail 'cores checks'
+expect_invalid 'lane fastp partial "{bin} -w 2 {in}" cores=two' 'cores=two is not a positive count'
+expect_invalid 'lane fastp partial "{bin} -w 2 {in}" of=nosuch' 'of=nosuch names no declared lane'
+expect_invalid 'lane fastp partial "{bin} -o {stem}.d {in}" outdir=.d' 'defines no outdir_entries'
+
+# An output directory goes file by file: its named entries, then the
+# directory; a file nobody named stops the removal and stays.
+feature 'lane fastp partial "{bin} -o {stem}.d {in}" outdir=.d
+facts piped
+outdir_entries() { printf "a\\nsub/b\\nsub/\\n"; }'
+# shellcheck disable=SC2034,SC2154  # read by the sourced core's functions
+(
+    BASH_ARGV0="$work/feat/run.sh"
+    source "$work/feat/run.sh" __probe
+    [[ "$(outdir_of fastp file)" == .d && -z "$(outdir_of z-fastq file)" ]] || fail 'outdir_of named the wrong lanes'
+    d="$work/od"
+    mkdir -p -- "$d/sub"
+    : >"$d/a"; : >"$d/sub/b"
+    clear_outdir "$d" fastp file IN || fail 'clear_outdir failed on named entries'
+    [[ ! -e "$d" ]] || fail 'clear_outdir left the directory'
+    mkdir -- "$d"
+    : >"$d/a"; : >"$d/extra"
+    clear_outdir "$d" fastp file IN && fail 'clear_outdir removed a directory holding an unnamed file'
+    [[ -f "$d/extra" ]] || fail 'clear_outdir removed an unnamed file'
+    rm -f -- "$d/extra"
+    rmdir -- "$d"
+    exit 0
+) || fail 'output directory checks'
 
 # Only one timing run at a time on a CPU.
 cpu="${BENCH_CPU:-3}"

@@ -1,6 +1,6 @@
 """Benchmark figures, light and dark SVG, from the flat files bench.sh writes.
 
-    plot.py REPORT_DIR FIGURE_DIR HEADLINE_TIER SCALING_SOURCES MAIN_FAMILIES [FAMILY:PARAM,...]
+    plot.py REPORT_DIR FIGURE_DIR HEADLINE_TIER SCALING_SOURCES MAIN_FAMILIES [FAMILY:PARAM,...] [SECTIONS]
 
 REPORT_DIR holds summary.tsv, style.tsv, cases.tsv, and edges.tsv. Every figure
 is written twice per theme: an SVG for development and the PNG the README
@@ -10,7 +10,14 @@ isocost-style overview against z-fastq; wall time, peak RSS, and minor page
 faults by kind of input (one row per format, one bar group per declared shape
 group); and throughput and peak RSS against input size for the scaling
 sources. Each FAMILY:PARAM adds wall time and peak RSS against the value of
-the case parameter PARAM.
+the case parameter PARAM. A tool's thread variants (style.tsv: cores above
+1, `of` naming the tool) show in the overview as their mean marks only, joined
+to the tool's in thread order.
+
+SECTIONS draws related main families together, one column per family:
+"slug:Title=family/Column,family/Column|..." gives per section SLUG-overview,
+SLUG-speed, SLUG-memory, and SLUG-scaling, rows by input format; a family in a
+section gets no figures of its own.
 """
 
 import csv
@@ -98,7 +105,7 @@ def count_axis(axis, unit="", dense=False):
 
 
 class Figures:
-    def __init__(self, report, out, headline, scaling, mains, lines=""):
+    def __init__(self, report, out, headline, scaling, mains, lines="", sections=""):
         self.report = Path(report)
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
@@ -106,9 +113,17 @@ class Figures:
         self.scaling = scaling.split()
         self.mains = mains.split(",")
         self.lines = [tuple(x.split(":", 1)) for x in lines.split(",") if x]
+        self.sections = []
+        for spec in filter(None, sections.split("|")):
+            head, cols = spec.split("=", 1)
+            slug, title = head.split(":", 1)
+            self.sections.append((slug, title, [tuple(c.split("/", 1)) for c in cols.split(",")]))
         # The feature's phrases: the wrong-answer legend and the past tense of its job.
         self.words = dict(line.split("\t", 1) for line in (self.report / "words.tsv").read_text().splitlines())
         self.style = {r["lane"]: r for r in read(self.report / "style.tsv")}
+        for name, r in self.style.items():
+            r["cores"] = int(r.get("cores") or 1)
+            r["of"] = r.get("of") or name
         self.order = sorted(self.style, key=lambda n: int(self.style[n]["order"]))
         self.cases = {(r["family"], r["case"]): r for r in read(self.report / "cases.tsv")}
         # Dots mark the input behind each value: a circle for a real run, one marker per synthetic shape.
@@ -398,17 +413,18 @@ class Figures:
             extent.append((gx, gy))
             st = self.style[lane]
             color = st[theme]
-            if lane != SUBJECT:
+            variant = st["of"] != lane
+            if lane != SUBJECT and not variant:
                 ax.plot(np.exp(lx), np.exp(ly), MARKERS[st["shape"]], markersize=4.5, linestyle="none", alpha=0.35,
                         markerfacecolor=color, markeredgecolor="none", zorder=2)
                 extent += list(zip(np.exp(lx), np.exp(ly)))
-            if n >= 2 and lane != SUBJECT:
+            if n >= 2 and lane != SUBJECT and not variant:
                 q = t95(n - 1) / math.sqrt(n)
                 hx, hy = q * lx.std(ddof=1), q * ly.std(ddof=1)
                 ax.errorbar(gx, gy, xerr=[[gx - gx * math.exp(-hx)], [gx * math.exp(hx) - gx]],
                             yerr=[[gy - gy * math.exp(-hy)], [gy * math.exp(hy) - gy]], fmt="none", ecolor=color,
                             elinewidth=1.1, capsize=2.5, capthick=1.1, alpha=0.9, zorder=3)
-            if n >= 4 and lane != SUBJECT:
+            if n >= 4 and lane != SUBJECT and not variant:
                 cov = np.cov(np.vstack([lx, ly]))
                 vals, vecs = np.linalg.eigh(cov)
                 if vals.min() > 1e-12:
@@ -421,6 +437,12 @@ class Figures:
                     ax.plot(ex, ey, color=color, linewidth=0.8, alpha=0.55, zorder=1.3)
                     extent += [(ex.min(), ey.min()), (ex.max(), ey.max())]
             self.mark(ax, lane, gx, gy, theme, label=False)
+        # Each tool's path through its thread counts, from its own mark.
+        for lane in self.order:
+            path = sorted((self.style[n]["cores"], points[n]) for n in points if self.style[n]["of"] == lane)
+            if len(path) > 1:
+                ax.plot([q[1][0] for q in path], [q[1][1] for q in path], color=self.style[lane][theme], linewidth=1.0,
+                        alpha=0.8, zorder=2.4)
         xs, ys = [p[0] for p in extent], [p[1] for p in extent]
         lo_x, hi_x = min(xs) / 1.35, max(xs) * 1.35
         lo_y, hi_y = min(ys) / 1.35, max(ys) * 1.35
@@ -473,6 +495,10 @@ class Figures:
             if lane not in points:
                 continue
             text = self.style[lane]["label"].replace("_", " ")
+            base = self.style[lane]["of"]
+            # A thread variant is named by its option alone (-w 16); its tool's mark carries the name.
+            if base != lane and base in self.style:
+                text = text.replace(self.style[base]["label"].replace("_", " "), "", 1).strip()
             w, h = 5.4 * len(text) + 2, 11
             x, y = centers[lane]
             for dx, dy in ((9, 4), (9, -h - 4), (-w - 9, 4), (-w - 9, -h - 4), (-w / 2, 10), (-w / 2, -h - 10), (9, -h / 2), (-w - 9, -h / 2)):
@@ -490,6 +516,156 @@ class Figures:
         count_axis(ax.yaxis, "x", dense=hi_y / lo_y < 12)
         ax.set_xlabel("wall time relative to z-fastq, log scale", color=t["ink2"], fontsize=9)
         ax.set_ylabel("peak RSS relative to z-fastq, log scale", color=t["ink2"], fontsize=9)
+
+    # ---- sections: related families side by side ----------------------------
+
+    def section_formats(self, cols):
+        return [f for f in ("plain", "gzip") if any(self.tier_cases(fam, f) for fam, _ in cols)]
+
+    def overview_data(self, family, fmt):
+        """Per lane, (time, memory) over z-fastq's for each headline input of FAMILY in FMT."""
+        data = {}
+        cases = self.tier_cases(family, fmt)
+        for info in cases:
+            ref_t = self.value(family, info["case"], SUBJECT, "speed")
+            ref_m = self.value(family, info["case"], SUBJECT, "memory")
+            for lane in self.rows[(family, info["case"])]:
+                lt, lm = self.value(family, info["case"], lane, "speed"), self.value(family, info["case"], lane, "memory")
+                if lt and lm and ref_t and ref_m:
+                    data.setdefault(lane, []).append((lt / ref_t, lm / ref_m))
+        return data, len(cases)
+
+    def section_overview(self, slug, title, cols, theme):
+        fmts = self.section_formats(cols)
+        if not fmts:
+            return False
+        t = THEMES[theme]
+        fig, axes = self.frame(theme, len(fmts), len(cols), width=5.0 * len(cols) + 0.6, height=4.7 * len(fmts) + 0.4)
+        shown = []
+        self.front_drawn = False
+        for r, fmt in enumerate(fmts):
+            for c, (family, name) in enumerate(cols):
+                ax = axes[r, c]
+                data, n = self.overview_data(family, fmt)
+                if not data:
+                    ax.set_axis_off()
+                    continue
+                self.isocost(ax, data, theme)
+                ax.set_title(f"{name}, {fmt} input, {n} input{'s' if n != 1 else ''}", loc="left", fontsize=10, color=t["ink"],
+                             fontweight="bold", pad=8)
+                shown += [x for x in data if x not in shown]
+        self.finish(fig, f"{slug}-overview", theme, f"{title}: time and memory relative to z-fastq",
+                    f"Large marks: geometric mean over the {self.headline}-tier inputs; faint marks: single inputs; whiskers: 95% "
+                    "interval of the mean; ellipse: where about half the inputs fall. A tool's thread counts are joined by a line "
+                    "from its one-thread mark. Dashed curves: equal cost C = (time + memory) / 2."
+                    + (" Solid line: tools nothing beats on both." if self.front_drawn else ""),
+                    handles=self.mark_handles([x for x in self.order if x in shown], theme), ncol=min(len(shown), 6))
+        return True
+
+    def section_bars(self, slug, title, cols, metric, theme):
+        spec = METRICS[metric]
+        fmts = self.section_formats(cols)
+        panels = [(fmt, family, name) for fmt in fmts for family, name in cols]
+        lanes_of = {}
+        for fmt, family, _ in panels:
+            lanes_of[(fmt, family)] = [x for x in self.order if any(self.value(family, i["case"], x, metric) for i in self.tier_cases(family, fmt))]
+        if not any(lanes_of.values()):
+            return False
+        t = THEMES[theme]
+        widest = max(len(self.groups(fam, fmt)) * (0.2 * len(lanes_of[(fmt, fam)]) + 0.5) for fmt, fam, _ in panels)
+        fig, axes = self.frame(theme, len(fmts), len(cols), width=len(cols) * max(4.6, widest + 0.6) + 0.8,
+                               height=3.4 * len(fmts) + 0.4, grid="y")
+        shown = []
+        for r, fmt in enumerate(fmts):
+            for c, (family, name) in enumerate(cols):
+                ax = axes[r, c]
+                lanes = lanes_of[(fmt, family)]
+                groups = self.groups(family, fmt)
+                if not lanes or not groups:
+                    ax.set_axis_off()
+                    continue
+                self.group_bars(ax, groups, lanes, lambda case, x, f=family: self.value(f, case["case"], x, metric), theme)
+                ax.set_title(f"{name}, {fmt} input", loc="left", fontsize=10, color=t["ink"], fontweight="bold", pad=8)
+                if c == 0:
+                    ax.set_ylabel(f"{spec['axis']}, log scale", fontsize=9, color=t["ink2"])
+                shown += [x for x in lanes if x not in shown]
+        # One scale for every panel, so jobs and formats compare at a glance.
+        live = [ax for ax in axes.flat if ax.axison]
+        lo, hi = min(ax.get_ylim()[0] for ax in live), max(ax.get_ylim()[1] for ax in live)
+        for ax in live:
+            ax.set_ylim(lo, hi)
+        self.finish(fig, f"{slug}-{metric}", theme, f"{title}: {spec['title'].lower()} by kind of input",
+                    f"Lower is better. {self.headline.capitalize()} tier, about {self.words['size']} of FASTQ per input. Bars: "
+                    "geometric mean over the inputs of a group (dots, each the median of its timed repeats), whiskers their range. "
+                    f"Boxes: multiple of z-fastq (dashed line). {CLASS_NOTE}",
+                    handles=self.bar_handles([x for x in self.order if x in shown], theme), ncol=min(len(shown), 6),
+                    keys=self.dot_keys(theme, cols[0][0]))
+        return True
+
+    def section_scaling(self, slug, title, cols, theme):
+        """Rows: formats; columns: per family, throughput then peak RSS against input size; one line per lane."""
+        src = next((x for x in self.scaling if any(i["source"] == x and i["family"] == cols[0][0] for i in self.cases.values())), None)
+        if not src:
+            return False
+        grid = {}
+        for (fam, case), lanes in self.rows.items():
+            info = self.cases.get((fam, case))
+            if not info or info["source"] != src or fam not in [f for f, _ in cols]:
+                continue
+            mib = int(info["bytes"]) / 2**20
+            for lane in lanes:
+                tv, m = self.value(fam, case, lane, "speed"), self.value(fam, case, lane, "memory")
+                if tv:
+                    grid.setdefault((fam, info["format"], "speed"), {}).setdefault(lane, []).append((mib, mib / (tv / 1e3)))
+                if m:
+                    grid.setdefault((fam, info["format"], "memory"), {}).setdefault(lane, []).append((mib, m))
+        fmts = [f for f in ("plain", "gzip") if any(len(v.get(SUBJECT, [])) > 1 for (_, ff, _), v in grid.items() if ff == f)]
+        if not fmts:
+            return False
+        t = THEMES[theme]
+        panels = [(fam, name, metric) for fam, name in cols for metric in ("speed", "memory")]
+        fig, axes = self.frame(theme, len(fmts), len(panels), width=3.3 * len(panels) + 0.8, height=2.8 * len(fmts) + 0.4)
+        sizes = [(1, "1 MiB"), (10, "10 MiB"), (100, "100 MiB"), (1024, "1 GiB")]
+        xs = [q[0] for v in grid.values() for pts in v.values() for q in pts]
+        sizes = [x for x in sizes if x[0] <= max(xs) * 1.5]
+        shown = []
+        for r, fmt in enumerate(fmts):
+            for c, (fam, name, metric) in enumerate(panels):
+                ax = axes[r, c]
+                ax.set_xscale("log")
+                ax.set_yscale("log")
+                series = grid.get((fam, fmt, metric), {})
+                for lane in self.order:
+                    if len(series.get(lane, [])) < 2:
+                        continue
+                    pts = sorted(series[lane])
+                    st = self.style[lane]
+                    ax.plot([q[0] for q in pts], [q[1] for q in pts], color=st[theme], linestyle=(0, (4, 2)) if st["class"] == "partial" else "-",
+                            linewidth=2.2 if st["class"] == "subject" else 1.2, zorder=3 if lane == SUBJECT else 2)
+                    for q in pts:
+                        self.mark(ax, lane, q[0], q[1], theme, size=4.5, label=False)
+                    if lane not in shown:
+                        shown.append(lane)
+                ax.xaxis.set_major_locator(FixedLocator([v for v, _ in sizes]))
+                ax.xaxis.set_major_formatter(FixedFormatter([n for _, n in sizes]))
+                ax.xaxis.set_minor_locator(NullLocator())
+                ax.tick_params(axis="x", labelsize=7.5)
+                count_axis(ax.yaxis)
+                ax.margins(y=0.12)
+                if r == 0:
+                    ax.set_title(f"{name}: {'throughput' if metric == 'speed' else 'peak memory'}", fontsize=9.5, color=t["ink"], pad=6,
+                                 fontweight="bold")
+                if r == len(fmts) - 1:
+                    ax.set_xlabel("FASTQ size, log scale", fontsize=8.5, color=t["ink2"])
+                unit = "MiB/s" if metric == "speed" else "peak RSS (MiB)"
+                ax.set_ylabel(f"{fmt} input\n{unit}, log scale" if c == 0 else f"{unit}, log scale", fontsize=8.5, color=t["ink2"])
+        label = next(i["label"] for i in self.cases.values() if i["source"] == src).split(": ", 1)[-1]
+        self.finish(fig, f"{slug}-scaling", theme, f"{title}: throughput and peak memory by input size",
+                    f"Throughput: higher is better, MiB of FASTQ per second of wall time; at 1 MiB, starting the process dominates. "
+                    f"Peak memory: lower is better. The {src} shape ({label}); each point is the median of its runs; the tools at one "
+                    "thread. Dashed: partial structure check.",
+                    handles=self.mark_handles([x for x in self.order if x in shown], theme), ncol=min(len(shown), 6))
+        return True
 
     # ---- scaling ------------------------------------------------------------
 
@@ -687,7 +863,15 @@ class Figures:
         edges = self.report / "edges.tsv"
         if edges.exists():
             self.edges(edges, theme)
+        grouped = {fam for _, _, cols in self.sections for fam, _ in cols}
+        for slug, title, cols in self.sections:
+            self.section_overview(slug, title, cols, theme)
+            for metric in ("speed", "memory"):
+                self.section_bars(slug, title, cols, metric, theme)
+            self.section_scaling(slug, title, cols, theme)
         for family in self.mains:
+            if family in grouped:
+                continue
             if any(f == family for f, _ in self.rows):
                 self.overview(family, theme)
                 for metric in METRICS:
@@ -703,4 +887,4 @@ class Figures:
 
 
 if __name__ == "__main__":
-    Figures(*sys.argv[1:7]).run()
+    Figures(*sys.argv[1:8]).run()
