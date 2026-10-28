@@ -315,7 +315,7 @@ reference_one() {
     dir="$(mktemp -d "/var/tmp/bench-$FEATURE-ref.XXXXXX")" stem="$dir/o"
     if [[ "$fam" == qc-tables ]]; then
         mkdir -- "$stem.qc"
-        $(STEM="$stem" lane_cmd fastqc-rust "$paths" qc-tables) >/dev/null 2>"$dir/err" || { log reference FAIL "fastqc-rust on ${p[0]}: $(head -c 300 "$dir/err")"; rm -f -- "$dir/err"; clear_outdir "$stem.qc" fastqc-rust qc-tables "$paths"; rmdir -- "$dir"; return 0; }
+        $(STEM="$stem" lane_cmd fastqc-rust "$paths" qc-tables) >/dev/null 2>"$dir/err" || { log reference FAIL "fastqc-rust on ${p[0]}: $(head -c 300 "$dir/err")"; rm -f -- "$dir/err"; clear_outdir "$stem.qc" fastqc-rust qc-tables "$paths"; rmdir -- "$dir"; return 1; }
         local m out=""
         for m in 0 1; do
             table_of fastqc-rust "$stem.qc" "${p[$m]}" >"$REF_DIR/$(ref_name "${p[$m]}").txt"
@@ -324,7 +324,7 @@ reference_one() {
         clear_outdir "$stem.qc" fastqc-rust qc-tables "$paths"
         printf '%s\t%s\t%s%s\n' "$fam" "${p[0]}" "${p[1]}" "$out"
     else
-        $(STEM="$stem" lane_cmd fastp "$paths" "$fam") >/dev/null 2>"$dir/err" || { log reference FAIL "fastp on ${p[0]}: $(head -c 300 "$dir/err")"; rm -f -- "$dir"/*; rmdir -- "$dir"; return 0; }
+        $(STEM="$stem" lane_cmd fastp "$paths" "$fam") >/dev/null 2>"$dir/err" || { log reference FAIL "fastp on ${p[0]}: $(head -c 300 "$dir/err")"; rm -f -- "$dir/err" "$stem"_1.fq "$stem"_2.fq "$stem.json" "$stem.html"; rmdir -- "$dir"; return 1; }
         local s1 s2 swd json="$REF_DIR/$fam-$(ref_name "${p[0]}").json"
         s1="$(read_sums "${stem}_1.fq" sorted)" s2="$(read_sums "${stem}_2.fq" sorted)"
         swd="$(awk 'NR % 4 == 2 && /[SWDswd]/ { n++ } END { print n + 0 }' "${p[1]}")"
@@ -337,7 +337,7 @@ reference_one() {
 feature_prepare() {
     mkdir -p -- "$REF_DIR"
     # Two at a time: fastp holds 1.1 GiB and the record sort 256 MiB per job.
-    BENCH_JOBS=2 cached_step reference "$(lane_id fastp trim-truseq; lane_id fastp trim-nextera; lane_id fastqc-rust qc-tables; reference_jobs | cut -f2 | tr ' ' '\n' | sort -u | xargs stat -L -c '%n %s:%Y:%i'
+    BENCH_JOBS=2 cached_step reference "$(lane_id fastp trim-truseq; lane_id fastp trim-nextera; lane_id fastqc-rust qc-tables; reference_jobs | cut -f2 | tr ' ' '\n' | sort -u | TZ=UTC xargs stat -L -c "%n $FILE_ID_FORMAT"
         declare -f reference_one read_sums table_of table_norm fastqc_stem | cksum)" reference_jobs reference_one "$REFERENCE"
     awk -F'\t' '($1 ~ /^trim-/) && $6 > 0 { printf "%s: %d mate 2 reads with S, W, or D; fastp 1.4.0 is not a reference there\n", $2, $6 }' "$REFERENCE" |
         while IFS= read -r line; do log reference WARN "$line"; done
@@ -515,7 +515,7 @@ process_findings() {
     for name in "${LANES[@]}"; do [[ "$name" == z-fastq || -v "LANE_OF[$name]" ]] || others=$((others + 1)); done
     awk -F'\t' -v others="$others" 'FILENAME ~ /checks.tsv$/ { if ($1 == "z-fastq") { if ($3 == "pass") zp++; else zf++ } next }
         FNR > 1 && $6 != "policy" { if ($4 == "z-fastq") { if ($6 != "right") zbad++ } else if ($3 ~ /^reject/ && ($6 == "wrong" || $6 == "crash")) bad[$4] = 1 }
-        END { line = zf ? sprintf("- **Right answers:** z-fastq gave wrong output on %d of %d checked inputs", zf, zp + zf) : sprintf("- **Right answers:** z-fastq wrote the right copies, fastp'"'"'s records, and FastQC'"'"'s tables on all %d checked inputs", zp)
+        END { line = (zp + zf == 0) ? "- **Right answers:** z-fastq has no current validation results" : zf ? sprintf("- **Right answers:** z-fastq gave wrong output on %d of %d checked inputs", zf, zp + zf) : sprintf("- **Right answers:** z-fastq wrote the right copies, fastp'"'"'s records, and FastQC'"'"'s tables on all %d checked inputs", zp)
               line = line (zbad ? "." : " and rejected every broken pair and record.")
               k = 0; for (b in bad) k++
               if (k) line = line sprintf(" %d of the %d other tools write output from a broken pair or record with exit 0.", k, others)

@@ -773,6 +773,36 @@ test "[cli] - [process]: the report counts inserts from the mate overlap and ada
 
 const SE_ADAPTER_1 = "GATCGGAAGAGCTCGTATGCCGTCTTCTGCTTG";
 
+test "[cli] - [process]: contaminant paths use escaped byte strings" {
+    const cases = [_][2][]const u8{
+        .{ "\xff.tsv", "\\xFF.tsv" },
+        .{ "list.tsv", "list.tsv" },
+        .{ "slash\\\".tsv", "slash\\\\\".tsv" },
+        .{ "tab\tline\n.tsv", "tab\\x09line\\x0A.tsv" },
+        .{ "\xc3\xa9.tsv", "\\xC3\\xA9.tsv" },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const paths = try Paths.init(allocator, &tmp);
+        try writeInputs(&tmp, R1, R2);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = case[0], .data = "adapter\tACGTACGT\n" });
+        const contaminants = try cli.tempPath(allocator, &tmp.sub_path, case[0]);
+        const expected = try cli.tempPath(allocator, &tmp.sub_path, case[1]);
+        const result = try cli.run(allocator, &.{ "process", "--report", "-", "--contaminants", contaminants, "--out1", paths.out1, "--out2", paths.out2, paths.r1, paths.r2 });
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expectEqualStrings("", result.stderr);
+        const report = try parseReport(allocator, result.stdout);
+        try cli.expectJsonString(report.get("byte_strings"), "escaped-bytes-v1");
+        try cli.expectJsonString(report.get("options").?.object.get("contaminants"), expected);
+        try std.testing.expectEqualStrings(R1, try readPath(allocator, paths.out1));
+        try std.testing.expectEqualStrings(R2, try readPath(allocator, paths.out2));
+    }
+}
+
 test "[cli] - [process]: the report counts duplicated, overrepresented, and duplicate pairs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -819,6 +849,7 @@ test "[cli] - [process]: the report counts duplicated, overrepresented, and dupl
     const plain = try cli.run(allocator, &.{ "process", "--report", "-", "--out1", plain1, "--out2", plain2, p.r1, p.r2 });
     try std.testing.expectEqual(@as(u8, 0), plain.exit_code);
     const plain_report = try parseReport(allocator, plain.stdout);
+    try std.testing.expectEqual(std.json.Value.null, plain_report.get("options").?.object.get("contaminants").?);
     try std.testing.expectEqual(std.json.Value.null, plain_report.get("pair_duplication").?);
     const plain_rows = plain_report.get("qc").?.object.get("raw").?.array.items[0].object.get("overrepresented").?.array.items;
     try std.testing.expectEqual(std.json.Value.null, plain_rows[0].object.get("possible_source").?);

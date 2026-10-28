@@ -4207,8 +4207,9 @@ fn runProcess(
         };
     }
 
+    var failed_qc_output: ?[]const u8 = null;
     if (options.qc_tables != null) {
-        exit_code = qc_table_files.write(io, &collectors.qc, if (contaminants) |*list| list else null, exit_code);
+        exit_code = qc_table_files.write(io, &collectors.qc, if (contaminants) |*list| list else null, exit_code, &failed_qc_output);
     }
 
     var report: ProcessReport = .{
@@ -4228,10 +4229,10 @@ fn runProcess(
         .pair_duplication = collectors.pair_duplication,
         .qc_table_files = if (options.qc_tables != null) &qc_table_files else null,
         .input_failure = input_failure,
-        .failed_output = if (failed_output) |index| paths[index] else null,
+        .failed_output = if (failed_output) |index| paths[index] else failed_qc_output,
     };
     if (summary_file) |file| {
-        exit_code = writeSummaryFile(io, file, options.qc_summary.?, report, exit_code);
+        exit_code = writeSummaryFile(io, file, options.qc_summary.?, &report, exit_code);
         report.status_ok = exit_code == 0;
     }
     const report_path = options.report orelse return exit_code;
@@ -4283,13 +4284,15 @@ fn processArguments(io: std.Io, allocator: std.mem.Allocator, raw: std.process.A
     return list.items;
 }
 
-fn writeSummaryFile(io: std.Io, file: std.Io.File, path: []const u8, report: ProcessReport, exit_code: u8) u8 {
+fn writeSummaryFile(io: std.Io, file: std.Io.File, path: []const u8, report: *ProcessReport, exit_code: u8) u8 {
     if (exit_code == 0) {
         var buffer: [JSON_OUTPUT_BUFFER_BYTES]u8 = undefined;
         var writer = file.writerStreaming(io, &buffer);
         var json: std.json.Stringify = .{ .writer = &writer.interface, .options = .{ .whitespace = .indent_tab } };
-        const written = if (writeQcSummary(&json, report)) |_| writer.interface.flush() else |err| err;
+        const written = if (writeQcSummary(&json, report.*)) |_| writer.interface.flush() else |err| err;
         if (written) |_| return 0 else |_| printPathError(io, path, IO_FAILURE.message);
+        report.failed_output = path;
+        report.status_ok = false;
     }
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
     return if (exit_code == 0) IO_FAILURE.exit_code else exit_code;
@@ -4429,6 +4432,7 @@ const QcTable = struct {
     unavailable: ?[]const u8 = null,
 
     fn remove(self: *QcTable, io: std.Io) void {
+        self.written = false;
         const file = self.file orelse return;
         file.close(io);
         self.file = null;
@@ -4512,9 +4516,9 @@ const QcTables = struct {
         collectors: *const [2]qc.MatePopulations,
         contaminants: ?*const qc.ContaminantList,
         exit_code: u8,
+        failed_path: *?[]const u8,
     ) u8 {
         if (exit_code != 0) return self.abandon(io, exit_code);
-        var result = exit_code;
         for (self.files[0..self.count]) |*entry| {
             const populations = &collectors[entry.mate];
             const retained = entry.retained;
@@ -4536,13 +4540,12 @@ const QcTables = struct {
                 err;
             written catch {
                 printPathError(io, entry.path, IO_FAILURE.message);
-                entry.remove(io);
-                result = @max(result, IO_FAILURE.exit_code);
-                continue;
+                failed_path.* = entry.path;
+                return self.abandon(io, IO_FAILURE.exit_code);
             };
             entry.written = true;
         }
-        return result;
+        return exit_code;
     }
 
     fn writeJson(self: *const QcTables, json: *std.json.Stringify) !void {
@@ -4950,7 +4953,7 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     try json.objectField("max_low_quality_percent");
     try json.write(if (trim.low_quality) |low_quality| low_quality.percent else null);
     try json.objectField("contaminants");
-    try json.write(report.options.contaminants);
+    if (report.options.contaminants) |path| try writeEscapedJsonString(json, path) else try json.write(null);
     try json.objectField("pair_duplication");
     try json.write(report.options.pair_duplication);
     try json.objectField("qc_tables");
@@ -7635,6 +7638,111 @@ test "[failure] - [process]: a mate 2 write failure keeps mate 1 and counts no w
         try std.testing.expectEqual(@as(u64, 1), counts.read);
         try std.testing.expectEqual(@as(u64, 0), counts.written);
         try std.testing.expect(!counts.input_complete);
+    }
+}
+
+test "[failure] - [process]: QC table completion cleans failed sets and preserves successful sets" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = struct { failed: ?usize, previous: u8 = 0, long_mate: bool = false };
+    for ([_]Case{ .{ .failed = 0 }, .{ .failed = 1 }, .{ .failed = 3 }, .{ .failed = null, .previous = 4 }, .{ .failed = null }, .{ .failed = null, .long_mate = true } }) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "unrelated.txt", .data = "keep" });
+        var tables: QcTables = .{};
+        defer tables.deinit(io, allocator);
+        var collectors: [2]qc.MatePopulations = .{ .{}, .{} };
+        defer for (&collectors) |*collector| collector.deinit(allocator);
+        for (&collectors, 0..) |*collector, mate| {
+            const sequence = if (case.long_mate and mate == 1) "A" ** 1025 else "ACGT";
+            const quality = if (case.long_mate and mate == 1) "I" ** 1025 else "IIII";
+            collector.enableRetained();
+            try collector.addRead(allocator, "r", sequence, quality);
+            try collector.addRetained(allocator, "r", sequence, quality, sequence.len);
+            collector.finish();
+        }
+        for (0..4) |index| {
+            const name = try std.fmt.allocPrint(allocator, "table{d}.txt", .{index});
+            defer allocator.free(name);
+            const path = try testTempPath(allocator, &tmp.sub_path, name);
+            tables.files[index] = .{ .retained = index >= 2, .mate = @intCast(index % 2), .filename = "reads.fq", .path = path };
+            tables.count += 1;
+            try std.testing.expectEqual(@as(?CommandFailure, null), createExclusiveOutput(io, path, &tables.files[index].file));
+        }
+        if (case.failed) |index| {
+            tables.files[index].file.?.close(io);
+            tables.files[index].file = try std.Io.Dir.cwd().openFile(io, tables.files[index].path, .{});
+        }
+        const expected: u8 = if (case.previous != 0) case.previous else if (case.failed != null) 3 else 0;
+        var failed_path: ?[]const u8 = null;
+        try std.testing.expectEqual(expected, tables.write(io, &collectors, null, case.previous, &failed_path));
+        if (case.failed) |index| {
+            try std.testing.expectEqualStrings(tables.files[index].path, failed_path.?);
+        } else try std.testing.expect(failed_path == null);
+        for (tables.files[0..tables.count]) |entry| {
+            if (expected == 0 and !(case.long_mate and entry.mate == 1)) {
+                try std.testing.expect(entry.written and entry.file != null);
+                try std.Io.Dir.cwd().access(io, entry.path, .{});
+                continue;
+            }
+            try std.testing.expect(!entry.written);
+            try std.testing.expect(entry.file == null);
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, entry.path, .{}));
+        }
+        try tmp.dir.access(io, "unrelated.txt", .{});
+    }
+}
+
+test "[failure] - [process]: summary write failures retain their path and preserve earlier errors" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]usize{ 0, 512 }) |length| {
+        for ([_]u8{ 0, 4 }) |previous| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try testTempPath(allocator, &tmp.sub_path, "summary.json");
+            defer allocator.free(path);
+            try tmp.dir.writeFile(io, .{ .sub_path = "summary.json", .data = "" });
+            const file = try tmp.dir.openFile(io, "summary.json", .{});
+            defer file.close(io);
+            var collectors: ProcessCollectors = .{};
+            defer collectors.deinit(allocator);
+            for (&collectors.qc) |*population| {
+                if (length != 0) try population.addRead(allocator, "r", ("A" ** 512)[0..length], ("I" ** 512)[0..length]);
+            }
+            var stats: [2][2]zfastq.Stats = @splat(.{ .{}, .{} });
+            var failure: ?PairCommandFailure = if (previous == 0) null else pairCommandFailure(0, LINE_LIMIT);
+            finishCollectors(&collectors.qc, false, &stats, &failure);
+            var report: ProcessReport = .{
+                .inputs = &.{ "r1.fq", "r2.fq" },
+                .snapshots = .{ null, null },
+                .outputs = .{ "out1.fq", "out2.fq" },
+                .options = .{ .max_line_bytes = 1024, .alphabet = .iupac, .pair_name_policy = .illumina, .output1 = null, .output2 = null, .report = "-", .qc_summary = path, .gzip = false, .max_pairs = null, .trim = .{} },
+                .status_ok = previous == 0,
+                .counts = .{},
+                .stats = &stats,
+                .qc = &collectors.qc,
+                .changes_reads = false,
+                .trimming = &collectors.trimming,
+                .filtering = &collectors.filtering,
+                .inserts = &collectors.inserts,
+                .input_failure = failure,
+                .failed_output = null,
+            };
+            try std.testing.expectEqual(if (previous == 0) @as(u8, 3) else previous, writeSummaryFile(io, file, path, &report, previous));
+            var output: std.Io.Writer.Allocating = .init(allocator);
+            defer output.deinit();
+            var json: std.json.Stringify = .{ .writer = &output.writer };
+            try writeProcessReport(&json, report);
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, output.written(), .{});
+            defer parsed.deinit();
+            const document = parsed.value.object;
+            try std.testing.expectEqualStrings("error", document.get("status").?.string);
+            try std.testing.expectEqualStrings(if (previous == 0) "io_error" else "line_limit", document.get("error").?.object.get("code").?.string);
+            if (previous == 0) {
+                try std.testing.expectEqualStrings(path, document.get("failed_output").?.string);
+            } else try std.testing.expect(document.get("failed_output").? == .null);
+        }
     }
 }
 

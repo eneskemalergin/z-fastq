@@ -292,11 +292,14 @@ run_end() { # exit status
 }
 
 # --- identities -----------------------------------------------------------
-# File facts identify binaries and inputs (size, mtime, inode); no hashing.
-fileid() { stat -L -c '%s:%Y:%i' -- "$@" | paste -sd, -; }
+# File facts include nanosecond mtime so same-size rewrites within a second
+# invalidate cached checks and timings. UTC keeps identities independent of TZ.
+FILE_ID_FORMAT='%s:%y:%i'
+fileid() { TZ=UTC stat -L -c "$FILE_ID_FORMAT" -- "$@" | paste -sd, -; }
 lane_bin() { printf '%s\n' "${REG_PATH[$1]}"; }
 # Lane identities are read once per run by cache_lane_ids; until then, stat.
 declare -A LANE_IDS=()
+CHECK_ID=""
 # A lane's identity is its binary (size, mtime, inode) and the cksum of its
 # declared command, so a rebuilt tool or a changed command line re-checks and
 # re-times, and nothing else does.
@@ -308,6 +311,24 @@ cache_lane_ids() {
     for name in "${LANES[@]}"; do
         for fam in "" verify "${FAMILIES[@]}"; do LANE_IDS[$name|$fam]="$(lane_id_now "$name" "$fam")"; done
     done
+    # Verdicts also depend on checker code, declared expectations, and the
+    # reference results. Keep that identity out of the timing metadata.
+    CHECK_ID="$(check_id)"
+}
+check_id() {
+    {
+        cksum "$BENCH/lib/bench.sh" "$FEATURE_DIR/run.sh"
+        declare -f fact
+        printf '%s\n' "$EXPECT" "$AGREE_LANE" "$AGREE_FIELD"
+        all_cases
+        verify_cases
+        [[ -z "$AGREE_LANE" ]] || lane_id "$AGREE_LANE"
+        [[ -z "${SUBSET_CHECKER:-}" ]] || fileid "$SUBSET"
+        if [[ -n "${REFERENCE:-}" && -f "$REFERENCE" ]]; then
+            fileid "$REFERENCE"
+            cksum "$REFERENCE"
+        fi
+    } | cksum | cut -d' ' -f1
 }
 
 # Expands a command template: {zfastq}, {bin}, {in} (space-separated paths
@@ -331,12 +352,12 @@ lane_cmd() { expand "$(lane_tmpl "$1" "${3:-}")" "$1" "$2" "${4:--}"; } # name i
 # z-fastq's command with another build in its place, for ab.
 build_cmd() { local t; t="$(lane_tmpl z-fastq "${3:-}")"; expand "${t//\{zfastq\}/$1}" z-fastq "$2" "${4:--}"; } # bin paths [family] [params]
 # The key of one check: lane, lane identity (with the case parameters when
-# the case has any), form, and input identity.
+# the case has any), form, input identity, and verification identity.
 status_key() { # lane family form input-id params
     local id="${LANE_IDS[$1|$2]:-}" params="${5:--}"
     [[ -n "$id" ]] || id="$(lane_id_now "$1" "$2")"
     [[ "$params" == - ]] || id+="@$params"
-    printf '%s|%s|%s|%s\n' "$1" "$id" "$3" "$4"
+    printf '%s|%s|%s|%s|check=%s\n' "$1" "$id" "$3" "$4" "$CHECK_ID"
 }
 
 # --- cases and truth --------------------------------------------------------
@@ -501,7 +522,13 @@ run_init() {
     [[ -S "${XDG_RUNTIME_DIR:-/run/user/$uid}/bus" && -r "$ctl" && "$(<"$ctl")" == *cpu*memory* ]] ||
         issue stop "user systemd scope cannot apply cpu and memory limits"
     [[ -x "$ZEXEC" && ! "$BENCH/lib/zexec.zig" -nt "$ZEXEC" ]] || issue note "zexec missing or stale; the mode rebuilds it"
-    [[ -x "$ZFASTQ" ]] || issue stop "z-fastq not built: zig build -Dstatic=true -Doptimize=ReleaseFast"
+    if [[ ! -x "$ZFASTQ" ]]; then
+        if [[ "$ZFASTQ" == "$ZFASTQ_DEFAULT" ]]; then
+            issue note "z-fastq is not built; the mode builds static ReleaseFast"
+        else
+            issue stop "ZFASTQ is not executable: $ZFASTQ"
+        fi
+    fi
     [[ -z "$(find "$REPO/src" "$REPO/build.zig" "$REPO/build.zig.zon" -newer "$ZFASTQ" -print -quit 2>/dev/null)" ]] ||
         issue note "z-fastq is older than its source; the mode rebuilds it"
     # shellcheck disable=SC1091
@@ -554,11 +581,8 @@ ensure_builds() {
         built+=" subset"
         zig build-exe "$BENCH/lib/subset.zig" -OReleaseFast -fstrip -fsingle-threaded -target x86_64-linux-none -femit-bin="$SUBSET"
     fi
-    if [[ "$ZFASTQ" == "$ZFASTQ_DEFAULT" && -n "$(find "$REPO/src" "$REPO/build.zig" "$REPO/build.zig.zon" -newer "$ZFASTQ" -print -quit 2>/dev/null)" ]]; then
-        log build RUN "z-fastq (static ReleaseFast)"
-        built+=" z-fastq"
-        (cd "$REPO" && zig build -Dstatic=true -Doptimize=ReleaseFast)
-    fi
+    build_subject
+    [[ "$ZFASTQ" != "$ZFASTQ_DEFAULT" ]] || built+=" z-fastq"
     # The source revision of each default binary, one line per build: the
     # check above leaves no source newer than the binary.
     local zid
@@ -576,6 +600,13 @@ ensure_builds() {
         install -m 755 "$CACHE/cargo-target-native/release/needletail-adapter" "$CACHE/cargo-target-native/release/helicase-adapter" "$out/"
     fi
     if [[ -n "$built" ]]; then log build DONE "built:$built"; else log build SKIP "z-fastq, zexec, and adapters are current"; fi
+}
+build_subject() {
+    [[ "$ZFASTQ" == "$ZFASTQ_DEFAULT" ]] || return 0
+    # A newer binary may be Debug or ReleaseSafe. Let Zig check the requested
+    # build options and reuse its own cache instead of inferring them from mtime.
+    log build RUN "z-fastq (static ReleaseFast)"
+    (cd "$REPO" && zig build -Dstatic=true -Doptimize=ReleaseFast)
 }
 
 # --- checks -----------------------------------------------------------------
@@ -595,13 +626,15 @@ reject_code() {
 # fact with the case's variables, read from the calling check_one's locals.
 fact_of() { LANE="$name" FAMILY="$fam" IN="$paths" TRUTH="$truth" PARAMS="$params" fact; }
 check_one() { # lane form fam id fmt paths want bytes params truth
-    local name="$1" form="$2" fam="$3" paths="$6" want="$7" params="${9:--}" truth="${10:-$7}" out rc=0 value cmd input=- status=fail diff=""
-    out="$(mktemp "/var/tmp/bench-$FEATURE.XXXXXX")"
+    local name="$1" form="$2" fam="$3" paths="$6" want="$7" params="${9:--}" truth="${10:-$7}" out work rc=0 checker_rc=0 value cmd input=- status=fail diff=""
+    work="$(mktemp -d "/var/tmp/bench-$FEATURE.XXXXXX")"
+    out="$work/check"
     [[ "$form" == stdin ]] || input="$paths"
     if ((FACT_PIPE)) && uses_stem "$name" "$fam"; then
         # A lane that names its outputs from a stem writes new regular files
         # (it may refuse an existing path), read by fact once it has ended.
         local -a sfx
+        local s
         local outs="${LANE_OUTS[$name]:-}"
         read -r -a sfx <<<"${outs//,/ }"
         local stem="$out.o" o1="" o2="" od="" dsfx
@@ -611,17 +644,19 @@ check_one() { # lane form fam id fmt paths want bytes params truth
         [[ -z "$dsfx" ]] || { od="$stem$dsfx"; mkdir -- "$od"; }
         cmd="$(STEM="$stem" lane_cmd "$name" "$input" "$fam" "$params")"
         if [[ "$form" == stdin ]]; then $cmd <"$paths" >/dev/null 2>"$out.err" || rc=$?; else $cmd >/dev/null 2>"$out.err" || rc=$?; fi
+        set +e
         if ((rc == 0)); then
-            value="$(OUT1="$o1" OUT2="$o2" OUTDIR="$od" fact_of </dev/null | paste -sd';' -)"
+            value="$(set -e; OUT1="$o1" OUT2="$o2" OUTDIR="$od" fact_of </dev/null | paste -sd';' -)"
         else
-            value="$(RC="$rc" ERR="$out.err" fact_of </dev/null | paste -sd';' -)"
+            value="$(set -e; RC="$rc" ERR="$out.err" fact_of </dev/null | paste -sd';' -)"
         fi
+        checker_rc=$?
+        set -e
         if [[ -n "$od" ]] && ! clear_outdir "$od" "$name" "$fam" "$paths"; then
             value="wrong: unnamed file in $(basename -- "$od")" rc=0
             log check WARN "$name left files in $od; remove them by hand"
         fi
-        # Every file under the stem, also one a tool named its own way.
-        rm -f -- "$o1" "$o2" "${stem:?}"*
+        for s in "${sfx[@]}"; do rm -f -- "$stem$s"; done
     elif ((FACT_PIPE)); then
         local tmpl o1="" o2="" w1 w2 fpid
         tmpl="$(lane_tmpl "$name" "$fam")"
@@ -629,33 +664,48 @@ check_one() { # lane form fam id fmt paths want bytes params truth
         [[ "$tmpl" != *"{out2}"* ]] || { o2="$out.2"; mkfifo -- "$o2"; }
         cmd="$(OUT1="$o1" OUT2="$o2" lane_cmd "$name" "$input" "$fam" "$params")"
         if [[ -n "$o1" ]]; then
-            OUT1="$o1" OUT2="$o2" fact_of </dev/null >"$out.fact" 2>>"$out.err" &
+            (set -e; OUT1="$o1" OUT2="$o2" fact_of </dev/null) >"$out.fact" 2>>"$out.err" &
             fpid=$!
             exec {w1}>"$o1"
             [[ -z "$o2" ]] || exec {w2}>"$o2"
             if [[ "$form" == stdin ]]; then $cmd <"$paths" >/dev/null 2>"$out.err" || rc=$?; else $cmd >/dev/null 2>"$out.err" || rc=$?; fi
             exec {w1}>&-
             [[ -z "$o2" ]] || exec {w2}>&-
-            wait "$fpid" || true
+            wait "$fpid" || checker_rc=$?
         else
             local -a st
             set +e
-            if [[ "$form" == stdin ]]; then $cmd <"$paths" 2>"$out.err" | fact_of >"$out.fact"; else $cmd 2>"$out.err" | fact_of >"$out.fact"; fi
+            if [[ "$form" == stdin ]]; then $cmd <"$paths" 2>"$out.err" | (set -e; fact_of) >"$out.fact"; else $cmd 2>"$out.err" | (set -e; fact_of) >"$out.fact"; fi
             st=("${PIPESTATUS[@]}")
             set -e
             rc="${st[0]}"
+            checker_rc="${st[1]}"
         fi
         value="$(paste -sd';' - <"$out.fact")"
         # A lane that failed is judged by its exit and stderr alone.
-        ((rc == 0)) || value="$(RC="$rc" ERR="$out.err" fact_of </dev/null | paste -sd';' -)"
+        if ((rc != 0)); then
+            set +e
+            value="$(set -e; RC="$rc" ERR="$out.err" fact_of </dev/null | paste -sd';' -)"
+            checker_rc=$?
+            set -e
+        fi
         rm -f -- "$out.fact" "$o1" "$o2"
     else
         cmd="$(lane_cmd "$name" "$input" "$fam" "$params")"
         if [[ "$form" == stdin ]]; then $cmd <"$paths" >"$out" 2>"$out.err" || rc=$?; else $cmd >"$out" 2>"$out.err" || rc=$?; fi
-        value="$(RC="$rc" ERR="$out.err" fact_of <"$out" | paste -sd';' -)"
+        set +e
+        value="$(set -e; RC="$rc" ERR="$out.err" fact_of <"$out" | paste -sd';' -)"
+        checker_rc=$?
+        set -e
     fi
     rm -f -- "$out" "$out.err"
-    if [[ -n "$EXPECT" ]]; then
+    if ! rmdir -- "$work"; then
+        log check WARN "unexpected outputs remain in $work"
+        checker_rc=1
+    fi
+    if ((checker_rc != 0)); then
+        value="checker failed (exit $checker_rc)"
+    elif [[ -n "$EXPECT" ]]; then
         # A verdict is the first fact; the rest are facts the report reads.
         [[ "$rc" != 0 || "${value%%;*}" != "$want" ]] || status=pass
     elif [[ -z "$AGREE_LANE" ]]; then
@@ -670,6 +720,7 @@ check_one() { # lane form fam id fmt paths want bytes params truth
         [[ -z "$diff" ]] || value="$diff"
     fi
     printf '%s\t%s\t%s\t%s\t%s\n' "$(status_key "$name" "$fam" "$form" "$(fileid $paths)" "$params")" "$status" "$rc" "$value" "${paths//$REPO\//}"
+    ((checker_rc == 0))
 }
 # FIELD VALUE [TOLERANCE] facts joined by ";", one block per file with "--"
 # between files. Prints the first field of GOT that differs from WANT by more
@@ -762,7 +813,7 @@ check_jobs() { # agree | lanes
                 printf '%s\tfile\t%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\n' "$AGREE_LANE" "$fam" "$id" "$fmt" "$paths" "$truth" "$bytes" "$truth"
             continue
         fi
-        form=file
+        form="file"
         [[ "$fam" == verify || "${FAM_STDIN[$fam]}" == 0 ]] || form=stdin
         want=""
         lanes_of "$fam" "$tier"
@@ -779,16 +830,19 @@ check_jobs() { # agree | lanes
 # Calls FUNCTION LINE for every line on stdin, BENCH_JOBS at a time, each in
 # a background subshell of this shell, so a job costs no new script start.
 pool() { # function
-    local line running=0
+    local line first=0 result=0 pid
+    local pids=()
     while IFS= read -r line; do
-        if ((running >= BENCH_JOBS)); then
-            wait -n || true
-            running=$((running - 1))
+        [[ -n "$line" ]] || continue
+        if ((${#pids[@]} - first >= BENCH_JOBS)); then
+            wait "${pids[$first]}" || result=1
+            first=$((first + 1))
         fi
-        "$1" "$line" &
-        running=$((running + 1))
+        (set -e; "$1" "$line") &
+        pids+=("$!")
     done
-    wait || true
+    for pid in "${pids[@]:first}"; do wait "$pid" || result=1; done
+    return "$result"
 }
 check_line() { local f; IFS=$'\t' read -r -a f <<<"$1"; check_one "${f[@]}"; }
 # A feature's own cached step: JOBS (a function printing one job line each)
@@ -804,7 +858,11 @@ cached_step() { # name key jobs-function run-function out
     jobs="$("$3")"
     n="$(grep -c . <<<"$jobs" || true)"
     log "$name" RUN "$n jobs, $BENCH_JOBS at a time"
+    set +e
     pool "$4" <<<"$jobs" >"$out.part"
+    local worker_rc=$?
+    set -e
+    ((worker_rc == 0)) || { log "$name" FAIL "a worker failed; the previous results and key are unchanged"; return 1; }
     mv -- "$out.part" "$out"
     printf '%s\n' "$key" >"$RESULTS/$name.key"
     log "$name" DONE "$n jobs, $(wc -l <"$out") results  $(duration $((SECONDS - t0)))"
@@ -825,10 +883,14 @@ dispatch_checks() { # job lines on stdin
     log check RUN "$n lane and input pairs, $BENCH_JOBS at a time"
     local before=0 got
     [[ ! -f "$CHECKS" ]] || before="$(wc -l <"$CHECKS")"
+    set +e
     pool check_line <<<"$jobs" >>"$CHECKS"
+    local worker_rc=$?
+    set -e
+    ((worker_rc == 0)) || die "a verification worker failed; see the log above"
     # A check that died (an error in a fact, a missing tool) writes no row.
     got=$(($(wc -l <"$CHECKS") - before))
-    ((got == n)) || log check FAIL "$((n - got)) of $n checks wrote no result; their errors are in the log above"
+    ((got == n)) || die "$((n - got)) of $n checks wrote no result; their errors are in the log above"
 }
 
 # --- edge cases -------------------------------------------------------------
@@ -911,29 +973,39 @@ edge_path() {
     if declare -F edge_input >/dev/null; then edge_input "$1"; return; fi
     if [[ -f "$EDGES/$1.fq" ]]; then printf '%s\n' "$EDGES/$1.fq"; else printf '%s\n' "$EDGES/$1.fq.gz"; fi
 }
+# Each lane uses the first selected edge family it belongs to, or its own
+# command when it belongs to none of them.
+edge_lane_family() {
+    local fam search="${EDGE_FAMS:-${FAMILIES[*]}}"
+    for fam in $search; do
+        [[ " ${FAM_LANES[$fam]} " != *" $1 "* ]] || { printf '%s\n' "$fam"; return; }
+    done
+}
+edge_key() {
+    local name edge
+    {
+        printf 'check %s\n' "$CHECK_ID"
+        edge_list
+        for name in "${LANES[@]}"; do printf '%s %s\n' "$name" "$(lane_id "$name" "$(edge_lane_family "$name")")"; done
+        [[ "$EDGE_PARAMS" == - ]] || printf 'params %s\n' "$EDGE_PARAMS"
+        if declare -F edge_family >/dev/null; then lane_keys; declare -f edge_family edge_input | cksum; fi
+        edge_list | while IFS=$'\t' read -r edge _; do
+            local paths
+            local -a inputs
+            paths="$(edge_path "$edge")"
+            read -r -a inputs <<<"$paths"
+            fileid "${inputs[@]}"
+        done
+    }
+}
 # Cell text: the count when right, "reject" when refused, "wrong: V" when a
 # count differs, "refused" when a valid input was rejected, "crash" when the
 # lane died by a signal.
 run_edges() {
     [[ -n "$EDGE_SET" ]] || return 0
     make_edges
-    local out="$RESULTS/edges.tsv" name edge expected label path value rc cell key fam efam
-    declare -A edge_fam=()
-    # Each lane runs with the command of the first edge family it is in, or
-    # with its own command when edge families are named and it is in none;
-    # with none named, the first family it is in.
-    local search
-    for name in "${LANES[@]}"; do
-        efam="" search="$EDGE_FAMS"
-        [[ -n "$search" ]] || search="${FAMILIES[*]}"
-        for fam in $search; do [[ " ${FAM_LANES[$fam]} " != *" $name "* ]] || { efam="$fam"; break; }; done
-        edge_fam[$name]="$efam"
-    done
-    # Cached while every lane's command and every edge file is unchanged.
-    key="$(for name in "${LANES[@]}"; do printf '%s %s\n' "$name" "$(lane_id "$name" "${edge_fam[$name]}")"; done
-        [[ "$EDGE_PARAMS" == - ]] || printf 'params %s\n' "$EDGE_PARAMS"
-        if declare -F edge_family >/dev/null; then lane_keys; declare -f edge_family edge_input | cksum; fi
-        edge_list | while IFS=$'\t' read -r edge _; do fileid $(edge_path "$edge"); done)"
+    local out="$RESULTS/edges.tsv" name edge expected label path value rc cell key fam
+    key="$(edge_key)"
     STAGE=edges
     if [[ -f "$out" && "$(cat "$RESULTS/edges.key" 2>/dev/null)" == "$key" ]]; then
         log edges CACHE "$(edge_list | wc -l) rows, every lane unchanged"
@@ -947,7 +1019,7 @@ run_edges() {
         # A thread variant parses as its base tool does.
         [[ ! -v "LANE_OF[$name]" ]] || continue
         while IFS=$'\t' read -r edge expected label; do
-            fam="${edge_fam[$name]}"
+            fam="$(edge_lane_family "$name")"
             if declare -F edge_family >/dev/null; then
                 fam="$(edge_family "$edge")"
                 if [[ " ${FAM_LANES[$fam]} " != *" $name "* ]]; then printf '%s\t%s\t-\n' "$name" "$edge" >>"$out"; continue; fi
@@ -1089,7 +1161,7 @@ clear_outdir() { # dir lane family paths
 # Timed runs of a lane that writes named files write them under OUT_DIR with
 # zexec's @RUN@ token in the stem, so every run writes new files, and zexec
 # removes them when the run ends.
-OUT_DIR="/var/tmp/bench-outputs"
+OUT_DIR=""
 declare -A UNLINKS=()
 # Appends one timed command (NAME=command) to SPECS, with the lane's output
 # files set up and their -u options in UNLINKS[NAME]; NAME is the batch's name
@@ -1099,7 +1171,7 @@ timed_spec() { # name lane input family params [bin]
     local name="$1" lane="$2" stem="" s cmd
     UNLINKS[$name]=""
     if uses_stem "$lane" "$4"; then
-        mkdir -p -- "$OUT_DIR"
+        [[ -n "$OUT_DIR" ]] || OUT_DIR="$(mktemp -d /var/tmp/bench-outputs.XXXXXX)"
         stem="$OUT_DIR/$FEATURE-$name-@RUN@"
         local outs="${LANE_OUTS[$lane]:-}"
         for s in ${outs//,/ }; do UNLINKS[$name]+=" -u $stem$s"; done
@@ -1134,43 +1206,41 @@ cpu_set() { # n [count]
     ((start >= 0 && start + $1 <= ${#cpus[@]})) || start=0
     printf '%s\n' "${cpus[@]:start:$1}" | paste -sd, -
 }
+# Select the verified lanes, CPU set, and metadata used by both timing and
+# reporting. A report must satisfy the same reuse rules as a new timing run.
+BATCH_LANES=() BATCH_RUNS="" BATCH_WARM=""
+plan_batch() { # family paths tier kind params
+    local fam="$1" paths="$2" tier="$3" kind="$4" params="$5" name form inid
+    form="file"
+    [[ "${FAM_STDIN[$fam]}" == 0 ]] || form=stdin
+    BATCH_LANES=() META="" BATCH_FAM="$fam" BATCH_CPUS=""
+    inid="$(fileid $paths)"
+    local ncores=1 most c
+    most="$(cpu_set 1000000 count)"
+    for name in $(lanes_at "$fam" "$tier"); do
+        [[ "${CHECK_STATUS[$(status_key "$name" "$fam" "$form" "$inid" "$params")]:-}" == pass ]] || continue
+        c="${LANE_CORES[$name]:-1}"
+        ((c <= BENCH_MAX_CORES && c <= most)) || continue
+        BATCH_LANES+=("$name")
+        ((c <= ncores)) || ncores=$c
+    done
+    ((${#BATCH_LANES[@]})) || return 0
+    read -r BATCH_RUNS BATCH_WARM <<<"$(batch_settings "$tier" "$kind")"
+    ((ncores == 1)) || BATCH_CPUS="$(cpu_set "$ncores")"
+    batch_meta "$form" "$inid" "$BATCH_RUNS" "$BATCH_WARM" "${BATCH_LANES[@]}"
+    [[ "$params" == - ]] || META+="params $params"$'\n'
+}
 # Times every passing lane of one case in one zebrac batch, unless a cached
 # batch can stand for it.
 run_batch() { # fam id fmt paths truth bytes src tier kind params
-    local fam="$1" id="$2" fmt="$3" paths="$4" tier="$8" kind="$9" params="${10}" name form key runs warm cmds=()
-    form=file
+    local fam="$1" id="$2" paths="$4" tier="$8" kind="$9" params="${10}" name form=file
     [[ "${FAM_STDIN[$fam]}" == 0 ]] || form=stdin
-    local timed=() inid
-    inid="$(fileid $paths)"
-    for name in $(lanes_at "$fam" "$tier"); do
-        [[ "${CHECK_STATUS[$(status_key "$name" "$fam" "$form" "$inid" "$params")]:-}" == pass ]] || continue
-        timed+=("$name")
-    done
-    if ((${#timed[@]} == 0)); then
-        log time SKIP "${PROGRESS:-} $fam $id: no lane passed its check"
+    plan_batch "$fam" "$paths" "$tier" "$kind" "$params"
+    if ((${#BATCH_LANES[@]} == 0)); then
+        log time SKIP "${PROGRESS:-} $fam $id: no verified lane within the CPU allowance"
         return 0
     fi
-    read -r runs warm <<<"$(batch_settings "$tier" "$kind")"
-    local bkey dir prefix="$RESULTS/batches/$fam-${id//:/-}-" ncores=1 most
-    BATCH_FAM="$fam" BATCH_CPUS=""
-    # The batch holds as many cores as its largest lane; a lane above
-    # BENCH_MAX_CORES, or above the machine's cores, is left out of it.
-    most="$(cpu_set 1000000 count)"
-    local kept=()
-    for name in "${timed[@]}"; do
-        local c="${LANE_CORES[$name]:-1}"
-        if ((c > BENCH_MAX_CORES || c > most)); then
-            log time SKIP "${PROGRESS:-} $fam $id: ${REG_LABEL[$name]} needs $c cores (BENCH_MAX_CORES=$BENCH_MAX_CORES, $most on this machine)"
-            continue
-        fi
-        kept+=("$name")
-        ((c <= ncores)) || ncores=$c
-    done
-    timed=("${kept[@]}")
-    ((${#timed[@]})) || return 0
-    ((ncores == 1)) || BATCH_CPUS="$(cpu_set "$ncores")"
-    batch_meta "$form" "$inid" "$runs" "$warm" "${timed[@]}"
-    [[ "$params" == - ]] || META+="params $params"$'\n'
+    local bkey dir prefix="$RESULTS/batches/$fam-${id//:/-}-"
     # The family's own batch, else any batch with the same identity: the same
     # commands on the same input time the same work, whatever family asked.
     if [[ -z "${RETIME:-}" ]] && { find_batch "$prefix" || find_batch "$RESULTS/batches/"; }; then
@@ -1181,10 +1251,11 @@ run_batch() { # fam id fmt paths truth bytes src tier kind params
     fi
     bkey="$(printf '%s' "$META" | cksum | cut -d' ' -f1)"
     dir="$prefix$bkey"
+    [[ ! -e "$dir" ]] || dir="$(mktemp -d "$dir.XXXXXX")"
     printf '%s\t%s\t%s\n' "$fam" "$id" "$dir" >>"$RESULTS/current.tsv.part"
     SPECS=()
-    for name in "${timed[@]}"; do timed_spec "$name" "$name" "$([[ "$form" == stdin ]] && echo - || echo "$paths")" "$fam" "$params"; done
-    time_lanes "$dir" "$form" "$paths" "$runs" "$warm" "$fam" "$id" "${SPECS[@]}"
+    for name in "${BATCH_LANES[@]}"; do timed_spec "$name" "$name" "$([[ "$form" == stdin ]] && echo - || echo "$paths")" "$fam" "$params"; done
+    time_lanes "$dir" "$form" "$paths" "$BATCH_RUNS" "$BATCH_WARM" "$fam" "$id" "${SPECS[@]}"
     N_TIMED=$((N_TIMED + 1))
     BATCH_CPUS=""
 }
@@ -1232,8 +1303,10 @@ time_lanes() { # dir form paths runs warm fam id name=command...
         die "zebrac failed for $fam $id: $(head -c 400 "$dir/zebrac.err")"
     for fd in "${locks[@]}"; do exec {fd}>&-; done
     read -r load1 _ </proc/loadavg
-    # Output files a run left behind (zexec removes each run's own).
-    rm -f -- "${OUT_DIR:?}/$FEATURE"-*
+    if [[ -n "$OUT_DIR" ]]; then
+        rmdir -- "$OUT_DIR" || die "unexpected benchmark outputs remain in $OUT_DIR"
+        OUT_DIR=""
+    fi
     # Each lane's zexec file must hold warmups + runs lines, every status 0.
     for name in "${names[@]}"; do
         lines="$(wc -l <"$dir/$name.tsv")"
@@ -1309,30 +1382,25 @@ run_timing() { # [case id pattern] [family]
     PROGRESS="" ETA_TEXT=""
     mv -- "$RESULTS/current.tsv.part" "$RESULTS/current.tsv"
 }
-# The batch of every declared case, lanes declared for its tier only, so a
-# report never needs a timing run: the batch the last timing run chose for
-# it (current.tsv), else the newest of its own. A batch timed for another
-# family's case shows under this case's family and id.
+# Report only current, verified lanes from batches whose metadata matches
+# the declared case. Old batches remain available for unchanged work.
 collect() {
     printf '%s\n' "$SUMMARY_HEAD"
-    local declared fam id fmt paths truth bytes src tier kind params newest
-    declare -A chosen=()
-    if [[ -f "$RESULTS/current.tsv" ]]; then
-        while IFS=$'\t' read -r fam id newest; do chosen[$fam|$id]="$newest/summary.tsv"; done <"$RESULTS/current.tsv"
-    fi
+    load_checks
+    cache_lane_ids
+    ZEXEC_ID="$(fileid "$ZEXEC")"
+    local declared fam id fmt paths truth bytes src tier kind params count=0
     while IFS=$'\t' read -r fam id fmt paths truth bytes src tier kind params; do
-        declared=" $(lanes_at "$fam" "$tier" | tr '\n' ' ')"
-        newest="${chosen[$fam|$id]:-}"
-        if [[ ! -f "$newest" ]]; then
-            newest=""
-            local f
-            for f in "$RESULTS/batches/$fam-${id//:/-}-"*/summary.tsv; do
-                [[ -f "$f" && (-z "$newest" || "$f" -nt "$newest") ]] && newest="$f"
-            done
+        plan_batch "$fam" "$paths" "$tier" "$kind" "$params"
+        if ((${#BATCH_LANES[@]} == 0)) || ! { find_batch "$RESULTS/batches/$fam-${id//:/-}-" || find_batch "$RESULTS/batches/"; }; then
+            log report SKIP "$fam $id: no batch with current checks, inputs, commands, and settings"
+            continue
         fi
-        [[ -n "$newest" ]] || continue
-        awk -F'\t' -v d="$declared" -v fam="$fam" -v id="$id" -v OFS='\t' 'index(d, " " $3 " ") { $1 = fam; $2 = id; print }' "$newest"
+        declared=" ${BATCH_LANES[*]} "
+        awk -F'\t' -v d="$declared" -v fam="$fam" -v id="$id" -v OFS='\t' 'index(d, " " $3 " ") { $1 = fam; $2 = id; print }' "$BATCH/summary.tsv"
+        count=$((count + 1))
     done < <(cases)
+    ((count > 0))
 }
 
 # --- report -----------------------------------------------------------------
@@ -1750,14 +1818,14 @@ probes() { # lane -> "N of M", over the edge set's probe rows
     awk -F'\t' -v l="$1" -v rows=" $(probe_rows | tr '\n' ' ')" '$1 == l && index(rows, " " $2 " ") { n++; if ($3 ~ /^reject/) r++ } END { printf "%d of %d", r, n }' "$RESULTS/edges.tsv"
 }
 # Appends each case's input identity (every path's fileid, joined by ",") as
-# a tenth column, from one stat call for all the files instead of one each.
+# the final column, from one stat call for all the files instead of one each.
 with_input_ids() {
     local rows
     rows="$(cat)"
     [[ -n "$rows" ]] || return 0
     awk -F'\t' 'FNR == NR { id[$1] = $2; next }
         { n = split($4, p, " "); s = ""; for (i = 1; i <= n; i++) s = s (i > 1 ? "," : "") id[p[i]]; print $0 "\t" s }' \
-        <(cut -f4 <<<"$rows" | tr ' ' '\n' | sort -u | xargs -d '\n' stat -L -c $'%n\t%s:%Y:%i') - <<<"$rows"
+        <(cut -f4 <<<"$rows" | tr ' ' '\n' | sort -u | TZ=UTC xargs -d '\n' stat -L -c $'%n\t'"$FILE_ID_FORMAT") - <<<"$rows"
 }
 # The lanes of FAMILY at TIER, as a space-separated list cached per family and tier.
 declare -A LANES_AT=()
@@ -1788,7 +1856,8 @@ correctness_sentence() {
         if [[ "$name" == z-fastq ]]; then
             local t top=""
             for t in tiny xsmall small medium large; do verify_cases | cut -f8 | grep -qx "$t" && top="${TIER_SIZE[$t]}"; done
-            if ((VERIFY)); then zf="z-fastq returned ${WORD[right]} on all $pass inputs: every corpus file and synthetic shape on disk, ${TIER_SIZE[tiny]} to $top, plain and gzip."
+            if ((pass + fail == 0)); then zf="z-fastq has no current validation results."
+            elif ((VERIFY)); then zf="z-fastq returned ${WORD[right]} on all $pass inputs: every corpus file and synthetic shape on disk, ${TIER_SIZE[tiny]} to $top, plain and gzip."
             else zf="z-fastq returned ${WORD[right]} on all $pass inputs it was given."; fi
             ((fail == 0)) || zf="z-fastq was wrong on $fail of $((pass + fail)) inputs."
             continue
@@ -2098,7 +2167,12 @@ report() {
     local figures="$RESULTS/figures" stamp key f
     mkdir -p -- "$REPORT_DIR" "$figures"
     [[ -d "$RESULTS/batches" ]] || die "no timing run yet: run.sh release"
-    collect >"$REPORT_DIR/summary.tsv"
+    collect >"$REPORT_DIR/summary.tsv.part" || die "no verified current timing batches; run.sh release is required before reporting"
+    if [[ -n "$EDGE_SET" ]]; then
+        [[ -f "$RESULTS/edges.tsv" && -f "$RESULTS/edges.key" && "$(<"$RESULTS/edges.key")" == "$(edge_key)" ]] ||
+            die "edge checks are missing or stale; run.sh check is required before reporting"
+    fi
+    mv -- "$REPORT_DIR/summary.tsv.part" "$REPORT_DIR/summary.tsv"
     style_tsv >"$REPORT_DIR/style.tsv"
     cases_tsv >"$REPORT_DIR/cases.tsv"
     edges_tsv >"$REPORT_DIR/edges.tsv"
@@ -2386,7 +2460,7 @@ bench/$FEATURE/run.sh MODE: $JOB
                  only new lane and input pairs run (cached in results/checks.tsv)
   release        check, time every case not yet cached, then report; a repeat with
                  nothing new takes seconds, a rebuilt z-fastq re-times every case
-  report         README.md and figures from cached results only; never times
+  report         README.md and figures from current verified batches; never times
   peer           z-fastq against each quick-check case's rival (results/picks.tsv,
                  written by report): rival references are timed once and cached,
                  z-fastq is re-timed only when rebuilt (results/peer.txt);
@@ -2400,7 +2474,7 @@ bench/$FEATURE/run.sh MODE: $JOB
 
 Timing modes (check, release, peer, ab) hold one machine-wide lock. Results
 and caches live in bench/$FEATURE/results/ and bench/cache/; both are ignored
-by git and reused, never deleted by these modes. RETIME=1 forces new batches;
+by git and reused. RETIME=1 writes fresh release batches and preserves old ones;
 CASES=REGEX keeps only the case ids it matches (paired:tiny for a smoke run).
 USAGE
 }
