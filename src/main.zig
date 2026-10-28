@@ -4187,7 +4187,7 @@ fn runProcess(
     };
     const changes_reads = options.trim.changesReads();
     var stats: [2][2]zfastq.Stats = @splat(.{ .{}, .{} });
-    if (options.collectsQc()) finishCollectors(allocator, &collectors.qc, changes_reads, &stats, &input_failure);
+    if (options.collectsQc()) finishCollectors(&collectors.qc, changes_reads, &stats, &input_failure);
 
     var exit_code: u8 = 0;
     if (input_failure) |failure| {
@@ -4259,16 +4259,13 @@ const ProcessCollectors = struct {
 };
 
 fn finishCollectors(
-    allocator: std.mem.Allocator,
     collectors: *[2]qc.MatePopulations,
     changes_reads: bool,
     stats: *[2][2]zfastq.Stats,
     input_failure: *?PairCommandFailure,
 ) void {
     for (collectors, 0..) |*populations, index| {
-        populations.finish(allocator) catch {
-            if (input_failure.* == null) input_failure.* = pairCommandFailure(@intCast(index), OUT_OF_MEMORY);
-        };
+        populations.finish();
         const retained = if (changes_reads) &populations.retained else &populations.raw;
         for ([_]*const qc.MateQc{ &populations.raw, retained }, stats) |collector, *population_stats| {
             population_stats[index] = collector.stats() catch |err| stats: {
@@ -7641,6 +7638,89 @@ test "[failure] - [process]: a mate 2 write failure keeps mate 1 and counts no w
     }
 }
 
+test "[failure] - [process]: exhausted allocation permits QC finalization and complete reports" {
+    const input1 = "@a/1\nACGT\n+\nIIII\n@b/1\nTT\n+\nII\n@c/1\nACGT\n+\nIIII\n";
+    const input2 = "@a/2\nACGT\n+\nIIII\n@b/2\nTT\n+\nII\n@c/2\nACGT\n+\nIIII\n";
+    for ([_]bool{ false, true }) |changes_reads| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const allocator = failing.allocator();
+        var collectors: ProcessCollectors = .{};
+        defer collectors.deinit(allocator);
+        var sources = [2]std.Io.Reader{ .fixed(input1), .fixed(input2) };
+        var buffers: [2][256]u8 = undefined;
+        var sinks = [2]io_layer.SliceSink{ .init(&buffers[0]), .init(&buffers[1]) };
+        var writers = [2]zfastq.Writer{ .init(sinks[0].byteSink()), .init(sinks[1].byteSink()) };
+        const options: ProcessOptions = .{
+            .max_line_bytes = zfastq.limits.DEFAULT_MAX_LINE_BYTES,
+            .alphabet = .iupac,
+            .pair_name_policy = .illumina,
+            .output1 = "out1.fq",
+            .output2 = "out2.fq",
+            .report = "-",
+            .gzip = false,
+            .max_pairs = null,
+            .trim = if (changes_reads) .{ .min_length = 4 } else .{},
+        };
+        var counts: ProcessCounts = .{};
+        try std.testing.expectEqual(@as(?PairCommandFailure, null), try processSources(
+            allocator,
+            .{ &sources[0], &sources[1] },
+            .{ &writers[0], &writers[1] },
+            &collectors,
+            &counts,
+            options,
+        ));
+        failing.fail_index = failing.alloc_index;
+        const allocated = failing.allocated_bytes;
+        for ([_]bool{ false, true }) |previous_failure| {
+            var failure: ?PairCommandFailure = if (previous_failure) pairCommandFailure(1, OUT_OF_MEMORY) else null;
+            var stats: [2][2]zfastq.Stats = @splat(.{ .{}, .{} });
+            finishCollectors(&collectors.qc, changes_reads, &stats, &failure);
+            var storage: [64 * 1024]u8 = undefined;
+            var output: std.Io.Writer = .fixed(&storage);
+            var json: std.json.Stringify = .{ .writer = &output };
+            try writeProcessReport(&json, .{
+                .inputs = &.{ "in1.fq", "in2.fq" },
+                .snapshots = .{ null, null },
+                .outputs = .{ "out1.fq", "out2.fq" },
+                .options = options,
+                .status_ok = failure == null,
+                .counts = counts,
+                .stats = &stats,
+                .qc = &collectors.qc,
+                .changes_reads = changes_reads,
+                .trimming = &collectors.trimming,
+                .filtering = &collectors.filtering,
+                .inserts = &collectors.inserts,
+                .input_failure = failure,
+                .failed_output = null,
+            });
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.buffered(), .{});
+            defer parsed.deinit();
+            const report = parsed.value.object;
+            try std.testing.expectEqualStrings(if (previous_failure) "error" else "ok", report.get("status").?.string);
+            if (previous_failure) {
+                try std.testing.expectEqual(@as(u8, 3), failure.?.exitCode());
+                try std.testing.expectEqualStrings("out_of_memory", report.get("error").?.object.get("code").?.string);
+                try std.testing.expectEqualStrings("in2.fq", report.get("failed_input").?.string);
+            } else try std.testing.expect(report.get("error").? == .null);
+            for ([_][]const u8{ "raw", "retained" }, 0..) |population, index| {
+                const expected_reads: i64 = if (index == 1 and changes_reads) 2 else 3;
+                for (report.get("qc").?.object.get(population).?.array.items) |mate| {
+                    const duplication = mate.object.get("duplication").?.object;
+                    try std.testing.expectEqual(expected_reads, duplication.get("reads").?.integer);
+                    try std.testing.expectEqual(@as(usize, 16), duplication.get("levels").?.array.items.len);
+                    const overrepresented = mate.object.get("overrepresented").?.array.items;
+                    try std.testing.expectEqualStrings("ACGT", overrepresented[0].object.get("sequence").?.string);
+                    try std.testing.expectEqual(@as(i64, 2), overrepresented[0].object.get("count").?.integer);
+                }
+            }
+        }
+        try std.testing.expectEqual(allocated, failing.allocated_bytes);
+        try std.testing.expect(!failing.has_induced_failure);
+    }
+}
+
 test "[property] - [process]: trimmed, dropped, and long pairs release every allocation" {
     const allocator = std.testing.allocator;
     const Pair = struct { name: []const u8, length: usize, quality: u8 = 'I', kept: bool };
@@ -7715,7 +7795,7 @@ test "[property] - [process]: trimmed, dropped, and long pairs release every all
     try std.testing.expectEqual(@as(u64, 1), collectors.filtering.dropped_pairs[@intFromEnum(preprocess.Reason.low_quality)]);
     var stats: [2][2]zfastq.Stats = @splat(.{ .{}, .{} });
     var failure: ?PairCommandFailure = null;
-    finishCollectors(allocator, &collectors.qc, true, &stats, &failure);
+    finishCollectors(&collectors.qc, true, &stats, &failure);
     try std.testing.expectEqual(@as(?PairCommandFailure, null), failure);
     for (stats[0], stats[1]) |raw, retained| {
         try std.testing.expectEqual(@as(u64, 5), raw.reads);

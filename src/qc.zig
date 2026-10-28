@@ -195,12 +195,12 @@ pub const MatePopulations = struct {
         return removed_sum;
     }
 
-    pub fn finish(self: *MatePopulations, allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    pub fn finish(self: *MatePopulations) void {
         if (self.derived) self.materialize();
         self.raw.finish();
         self.retained.finish();
-        try self.raw_sequences.finish(allocator);
-        if (self.retained_enabled) try self.retained_sequences.finish(allocator);
+        self.raw_sequences.finish();
+        if (self.retained_enabled) self.retained_sequences.finish();
     }
 
     pub fn writeJson(self: *const MatePopulations, json: *std.json.Stringify, retained: bool, contaminants: ?*const ContaminantList) !void {
@@ -1539,10 +1539,9 @@ const SequenceCounts = struct {
         self.reads_at_limit = reads;
     }
 
-    fn finish(self: *SequenceCounts, allocator: std.mem.Allocator) error{OutOfMemory}!void {
+    fn finish(self: *SequenceCounts) void {
         if (self.levels != null) return;
-        const counts = try allocator.alloc(u64, self.records.items.len);
-        defer allocator.free(counts);
+        const counts = self.slots[0..self.records.items.len];
         for (self.records.items, counts) |record, *count| count.* = record.reads;
         std.sort.pdq(u64, counts, {}, std.sort.asc(u64));
         var levels: Levels = .{ .bins = @splat(0), .deduplicated = 0, .total = 0 };
@@ -2200,7 +2199,7 @@ fn collect(allocator: std.mem.Allocator, reads: []const TestRead) !MateQc {
 fn reportOf(arena: std.mem.Allocator, mate: *MateQc) !std.json.ObjectMap {
     mate.finish();
     var sequences: SequenceCounts = .{};
-    try sequences.finish(arena);
+    sequences.finish();
     var output: std.Io.Writer.Allocating = .init(arena);
     var json: std.json.Stringify = .{ .writer = &output.writer };
     const tiles: TileQuality = .{};
@@ -2278,7 +2277,7 @@ test "[property] - [qc]: FastQC data for probe P1 grades and summarizes it as Fa
     var populations: MatePopulations = .{};
     defer populations.deinit(allocator);
     for (PROBE_P1) |read| try populations.addRead(allocator, "@r", read[0], read[1]);
-    try populations.finish(allocator);
+    populations.finish();
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     try populations.writeQcTable(&output.writer, false, "p1.fastq", "z-fastq test", null);
@@ -2524,8 +2523,8 @@ test "[property] - [qc]: a retained population derived from raw equals one colle
             try populations.addRetained(allocator, "A00123:8:HFLKW:1:1101:1:2 1:N:0:ACGT", read.sequence, read.quality, read.kept);
             try expected.addRead(allocator, "A00123:8:HFLKW:1:1101:1:2 1:N:0:ACGT", read.sequence[0..read.kept], read.quality[0..read.kept]);
         }
-        try populations.finish(allocator);
-        try expected.finish(allocator);
+        populations.finish();
+        expected.finish();
         const want = try populationReportOf(arena.allocator(), &expected, false);
         const got = try populationReportOf(arena.allocator(), &populations, true);
         inline for (.{ "per_base_quality", "per_base_content", "per_base_n", "length_distribution", "per_sequence_quality", "per_sequence_gc", "terminal_runs", "adapter_content", "duplication", "overrepresented", "per_tile_quality", "per_tile_unavailable", "unavailable" }) |module| {
@@ -2648,7 +2647,7 @@ fn countsOf(allocator: std.mem.Allocator, reads: []const []const u8) !SequenceCo
         try counts.reserve(allocator);
         counts.add(.of(read));
     }
-    try counts.finish(allocator);
+    counts.finish();
     return counts;
 }
 
@@ -2780,7 +2779,7 @@ test "[edge] - [qc]: past 100,000 keys new reads count only in the total and the
         try probe.reserve(std.testing.allocator);
         probe.add(.of(indexedKey(&buffer, index)));
     }
-    try probe.finish(std.testing.allocator);
+    probe.finish();
     const report = try sequenceReportOf(arena.allocator(), &probe, null);
     try std.testing.expectEqual(@as(f64, 70.00002000011865), deduplicatedPercent(report));
     try std.testing.expectEqual(@as(f64, 40.0000400002373), levelValue(report, 0));
