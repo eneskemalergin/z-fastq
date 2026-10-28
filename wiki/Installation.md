@@ -1,16 +1,14 @@
 # Installation
 
-## Supported build
+z-fastq is built from source with Zig. The build needs nothing beyond Zig itself: no C compiler, no NASM, no system zlib, and release builds are static.
 
-The supported build is:
+**You need**
 
-- Linux x86-64.
-- Zig `0.16.0`.
-- Network access for the first build, which downloads the pinned Zipir package.
+- Linux on x86-64.
+- [Zig](https://ziglang.org/download/) 0.16.0.
+- Network access for the first build, which downloads z-fastq's one package dependency, [zipir](https://github.com/eneskemalergin/zipir) 0.2.1. Later builds reuse it.
 
-Release builds are static. gzip input is decoded by [Zipir](https://github.com/eneskemalergin/zipir), a Zig package that `build.zig.zon` pins to its `v0.2.1` release archive and package hash. The build needs no NASM, C compiler, or system zlib.
-
-## Build a release binary
+## Build
 
 From the repository root:
 
@@ -19,48 +17,36 @@ zig build -Dstatic=true -Doptimize=ReleaseFast
 ./zig-out/bin/z-fastq --version
 ```
 
-The current version prints:
+The second line prints `z-fastq 0.1.0`.
 
-```text
-z-fastq 0.1.0
-```
+- `-Doptimize=ReleaseSafe` keeps Zig's safety checks in the release build.
+- A plain `zig build` gives a debug build, for working on the code.
 
-For a safety-checked static build, use `ReleaseSafe`:
+The binary stays in `zig-out/bin/`; there is no package-manager install yet. Copy or link it into a directory on your `PATH` to call it as `z-fastq`.
 
-```bash
-zig build -Dstatic=true -Doptimize=ReleaseSafe
-```
+## Faster code on newer CPUs
 
-Use `Debug` while changing the project:
+The release binary runs on any x86-64 CPU and switches to faster code where the CPU allows: PCLMUL and SSE4.1 for the gzip checksum, and AVX2 for line search, validation, and base and quality counting on records of 1 KiB or more. The output is identical either way.
 
-```bash
-zig build
-```
-
-## Run-time kernel selection
-
-The release binary is compiled for generic x86-64. By default some kernels are picked at run time for the CPU the binary runs on: gzip CRC-32 uses PCLMUL and SSE4.1 when available, and newline search, record validation, and base and quality counting on records of 1 KiB or more use AVX2 when available. To build without run-time selection, using only the instructions of the build target:
+<details>
+<summary>Build without run-time selection</summary>
 
 ```bash
 zig build -Dstatic=true -Doptimize=ReleaseFast -Dkernel-backend=portable
 ```
 
-The default is `-Dkernel-backend=dispatch`. This does not change the supported target or the output; the test suite passes with both settings.
+This build uses only the instructions of its target CPU. The default is `-Dkernel-backend=dispatch`, and the tests pass with both.
 
-## Run the tests
+</details>
+
+## Check the build
 
 ```bash
 zig build test --summary all
 ```
 
-The test step covers the parser, writer, count scanner, statistics, validation, sampling, paired operations, and installed CLI behavior.
+## Related pages
 
-## Use the binary from the build tree
-
-The project does not install a system-wide command. Run the binary from the build output:
-
-```bash
-./zig-out/bin/z-fastq stats reads.fastq
-```
-
-If you want `z-fastq` on your `PATH`, copy or link `zig-out/bin/z-fastq` into a directory you manage. The project does not provide a package-manager install path yet.
+- [Getting started](Getting-Started): a first run, command by command.
+- [Troubleshooting](Troubleshooting): when the build or the binary does not behave.
+- [For contributors](For-Contributors): the full set of test runs.

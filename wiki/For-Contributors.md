@@ -1,35 +1,33 @@
 # For contributors
 
-This page is for contributors who update public documentation alongside the source. Keep each user-facing instruction on the one page that documents it (listed below), and use this map to find the code and tests behind a documented behavior.
+This page maps the code, the tests, and the wiki onto each other, so a change to one can find the others.
 
 ## Source map
 
-```text
-src/main.zig       CLI parsing, commands, output, and diagnostics
-src/root.zig       public Zig exports and version
-src/fastq.zig      records, parser, writer, and validation
-src/count_scan.zig specialized count scanner
-src/stats.zig      aggregate statistics
-src/sample.zig     CLI-only sampling grammars and selectors
-src/pair.zig       CLI-only paired-name parsing and matching
-src/io.zig         byte sources, sinks, limits, and the Zipir gzip adapter
-tests/              parser, CLI, pair, sample, and output behavior tests
-wiki/               public user documentation
-```
+| File | Holds |
+| --- | --- |
+| `src/main.zig` | the command line: options, commands, output, and messages |
+| `src/root.zig` | the library's exports and version |
+| `src/fastq.zig` | records, the reader and writer, and validation |
+| `src/count_scan.zig` | the record counter |
+| `src/stats.zig` | statistics |
+| `src/sample.zig` | sampling |
+| `src/pair.zig` | pair-name matching |
+| `src/preprocess.zig` | trimming, filtering, inserts, and pair duplication |
+| `src/qc.zig` | the QC modules and the QC table writer |
+| `src/simd.zig` | vector kernels and their run-time selection |
+| `src/io.zig` | byte sources and sinks, limits, and gzip |
+| `tests/` | command-line and library tests, one file per command or part |
 
-## Before changing a documented behavior
+## Before changing documented behavior
 
-1. Find the source file that implements the behavior and its callers.
-2. Read the focused tests that establish the current behavior.
-3. Classify the claim as observed, inferred, proposed, or unknown.
-4. Update the page that documents the behavior only when the user-facing behavior changes.
-5. Re-read the page and the diff before reporting completion.
+1. Find the code and the tests behind the behavior.
+2. Change the code and the tests together.
+3. Update the one wiki page that owns the behavior, and link to it rather than repeat it elsewhere. The [Home](Home) page groups the pages by what they own.
 
-The page should explain why a user needs the behavior, not just restate a function name.
+## Tests
 
-## Verification
-
-Run the required checks from the repository root with Zig 0.16.0 on Linux x86-64. gzip decoding comes from the pinned Zipir package, so no NASM is needed. Debug runs with both kernel backends, then static ReleaseSafe, then static ReleaseFast:
+Run these from the repository root, one after another, with Zig 0.16.0 on Linux x86-64:
 
 ```bash
 zig fmt --check src tests build.zig
@@ -39,19 +37,41 @@ zig build test -Dstatic=true -Doptimize=ReleaseSafe --summary all
 zig build test -Dstatic=true -Doptimize=ReleaseFast --summary all
 ```
 
-While working on one area, `zig build test-<suite>` runs a single test binary: `test-src` for the in-file tests of `src/`, or a file in `tests/` without its `test_` prefix, such as `test-reader`. `zig build -l` lists them. The four commands above remain the required checks.
+`zig build test-<suite>` runs one test binary while you work: `test-src` for the tests inside `src/`, or a file in `tests/` without its `test_` prefix, such as `test-reader`. `zig build -l` lists them.
 
-Each test command installs its selected CLI before running the command tests. Run variants sequentially in one checkout because the CLI tests share `zig-out/bin/z-fastq`; parallel variants need separate checkouts. The checks use inline and tracked synthetic fixtures without corpus downloads or peer tools. CLI tests need `pidfd_open`, `/proc`, FIFOs, and hard and symbolic links; a missing facility is a setup failure.
+- The runs share `zig-out/bin/z-fastq`, so run them in sequence; parallel runs need separate checkouts.
+- The tests use small tracked files only, no downloads or other tools. They need `pidfd_open`, `/proc`, FIFOs, and hard and symbolic links.
+- No test is expected to skip; investigate any skip.
+- Debug builds target the host CPU; the release runs target generic x86-64 and are the ones that test the run-time AVX2 kernels against their scalar versions. A timing is never proof of correct output.
 
-Optional CPU instructions and timing or RSS thresholds are not test prerequisites. The suite has no expected skips: every test in each of the four runs above must pass. Investigate any skip. Zipir's own CI tests its portable kernels and a baseline-CPU build; the portable Debug run here checks that z-fastq's output does not depend on the kernel choice. Debug builds target the host CPU, so on a host with AVX2 they use AVX2 inline; the release runs target generic x86-64 and are the ones that test the AVX2 kernels selected at run time against their scalar references. Do not use a timing result as proof of correct output.
+## Benchmarks
 
-## Which page documents what
+`bench/` compares z-fastq with other tools on the data listed in [References](References). Each suite has a README with its method, findings, and figures; `tools/` installs the pinned tools they need.
 
-- The command pages document user-facing syntax and workflow examples.
-- [Input and output](Input-and-Output) documents stream and format behavior.
-- [Automation](Automation) documents exit classes and machine output guidance.
-- [Limits and supported formats](Limits-and-Supported-Formats) documents current limits.
-- [Paired reads](Paired-Reads) documents name normalization and pair errors.
-- [Zig library](Zig-Library) documents the public module.
+## Wiki figures
 
-Link to that page instead of repeating a detailed rule in every recipe or FAQ answer.
+The schematics in `wiki/assets` come from one script:
+
+```bash
+tools/venv/bin/python tools/wiki_figures.py
+```
+
+It writes a light and a dark PNG of each figure, plus an SVG for editing; the PNGs are tracked and the SVGs are ignored by git. Benchmark figures are not copied: pages link to them on `main`, so a committed bench rerun updates the wiki by itself.
+
+Every figure on a page follows the same pattern: a centred `<picture>` with a dark source, a light source, and a light fallback image with alt text, then a small numbered legend:
+
+```html
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/NAME-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/NAME-light.png">
+    <img alt="What the figure shows." src="assets/NAME-light.png" width="680">
+  </picture>
+</p>
+<p align="center"><sub><b>Figure 1.</b> One or two sentences on what to see.</sub></p>
+```
+
+## Related pages
+
+- [References](References): the tools and data the benchmarks use.
+- [Zig library](Zig-Library): the public module.

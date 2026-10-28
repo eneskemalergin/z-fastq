@@ -1,76 +1,50 @@
 # Paired reads
 
-z-fastq treats R1 and R2 as one logical unit whenever it samples, checks, interleaves, or deinterleaves paired data. A pair is either one record from each input file or two consecutive records in an interleaved input.
+Paired-end sequencing reads each DNA fragment from both ends, giving two reads per fragment: mate 1 and mate 2, usually stored in two files, R1 and R2. Everything downstream assumes the files stay in step, record for record. z-fastq treats a pair as one unit everywhere: it never keeps, drops, or moves one mate without the other.
 
-## Validate two mate files
+A pair is one record from each of two files, or two neighbouring records in one interleaved file ([Interleaving](Interleaving)).
+
+## Check pairs
 
 ```bash
 z-fastq check --paired R1.fastq.gz R2.fastq.gz
+z-fastq check --interleaved interleaved.fastq.gz
 ```
 
-The command reads the two inputs in lockstep. It validates both records before comparing their names. If one input ends first, the command reports a pair-count mismatch.
+Each mate is first validated as a record ([Validation](Validation)), then the two names are compared. In an interleaved file the first two records form the first pair, the next two the second, and so on; an odd last record has no mate.
 
-## Validate an interleaved pair stream
+- `P001`: the mates' names do not match.
+- `P002`: one input has more records than the other.
 
-```bash
-z-fastq check --interleaved reads.interleaved.fastq
-```
+A record error comes before a pair error at the same place. Messages give the pair number, counted from 0, and shorten very long names.
 
-Records are grouped as `(record 0, record 1)`, `(record 2, record 3)`, and so on. The first record in each group is R1. An odd final record has no mate.
+## How names are matched
 
-## Default name policy
+Sequencers mark the mate in the read name in one of two ways: a `/1` or `/2` at the end of the name, or a second word such as `1:N:0:1` (Illumina's Casava format). The default policy, `--pair-names illumina`, understands both:
 
-The default `illumina` policy handles the common forms used by Illumina and SRA-style FASTQ files. It compares a normalized identifier while leaving descriptive fields alone.
+| R1 header | R2 header | Pair? |
+| --- | --- | --- |
+| `@read42/1` | `@read42/2` | yes |
+| `@read42 1:N:0:1` | `@read42 2:N:0:1` | yes |
+| `@read42` | `@read42` | yes |
+| `@read42/2` | `@read42/1` | no, mates reversed |
+| `@read42/1` | `@read42` | no, marker on one side only |
+| `@read42/3` | `@read42/4` | no, `/3` is part of the name |
 
-The policy:
+Step by step:
 
-1. Takes the first whitespace-delimited token from each header.
-2. Removes a terminal `/1` or `/2` marker from that token.
-3. Checks a leading `1:` or `2:` marker in the next token when present.
-4. Checks a terminal `/1` or `/2` marker in that next token when present.
-5. Requires the normalized identifiers to match.
-6. When both headers carry markers, requires R1 to be mate 1 and R2 to be mate 2. Reversed markers are rejected.
+1. Take the first word of each header, and drop a final `/1` or `/2` from it.
+2. Read a mate marker from the second word, if there is one: a leading `1:` or `2:`, or a final `/1` or `/2`.
+3. The identifiers left must be equal and not empty.
+4. If both headers carry markers, mate 1 must say 1 and mate 2 must say 2, and markers within one header must agree. A marker on one side only is a mismatch.
 
-These headers match under the default policy:
+Anything after the marker word is ignored. So `@read42 1:N:0/3` and `@read42 2:N:0/4` do pair: their first words agree, and their second words say 1 and 2.
 
-```text
-@read42/1
-@read42/2
-```
+**`--pair-names exact`** is the strict alternative: the whole first word must match byte for byte, and nothing is removed.
 
-These headers also match:
+## Related pages
 
-```text
-@read42 1:N:0:1
-@read42 2:N:0:1
-```
-
-Multiple recognized markers in one header must agree. A marker present on only one side is rejected. If neither header has a recognized marker, equal normalized identifiers are accepted. Fields after the recognized mate token are opaque.
-
-Only `/1` and `/2` are mate markers. Other suffixes are part of the name: `@read42/3` and `@read42/4` do not match, while `@read42 1:N:0/3` and `@read42 2:N:0/4` match because their first tokens agree and the second tokens carry `1:` and `2:`. An empty identifier never matches, so `@/1` and `@/2` fail with `P001`; the diagnostic shows `normalized_id` with length 0.
-
-## Exact name policy
-
-Use `exact` when the complete first token must match byte for byte:
-
-```bash
-z-fastq check --paired --pair-names exact R1.fastq R2.fastq
-```
-
-This policy does not remove `/1` or `/2` and does not interpret a second token.
-
-## Pair errors
-
-- `P001`: Names do not match under the selected policy.
-- `P002`: The pair inputs contain different numbers of records.
-
-Pair diagnostics identify the zero-based pair index. Long header values are bounded in diagnostic output so an unusual name cannot create an unbounded error message.
-
-## Where the pair unit matters
-
-- `check --paired` compares two files.
-- `check --interleaved` compares adjacent records.
-- `sample --paired` selects both mates or neither mate and writes an interleaved stream.
-- `sample --interleaved` preserves the same pair layout.
-- `interleave` writes each validated pair as R1 then R2.
-- `deinterleave` sends alternating records to R1 and R2.
+- [Sampling](Sampling#pairs): subsets that keep both mates or neither.
+- [Interleaving](Interleaving): between two files and one interleaved file.
+- [Processing paired reads](Processing): every pair is validated before it is trimmed.
+- [Troubleshooting](Troubleshooting#pair-names-do-not-match): when names do not match.

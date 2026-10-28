@@ -6,9 +6,8 @@
 
 - [Installation](Installation)
 - [Getting started](Getting-Started)
-- [Command cheat sheet](Command-Cheat-Sheet)
 
-**Use z-fastq**
+**Use it**
 
 - [Counting and statistics](Counting-and-Statistics)
 - [Validation](Validation)
@@ -16,21 +15,25 @@
 - [Sampling](Sampling)
 - [Interleaving](Interleaving)
 - [Processing paired reads](Processing)
+- [Quality control](Quality-Control)
 
-**Understand behavior**
+**Look things up**
 
+- [Command cheat sheet](Command-Cheat-Sheet)
+- [Report reference](Report-Reference)
 - [Input and output](Input-and-Output)
 - [Automation](Automation)
 - [Limits and supported formats](Limits-and-Supported-Formats)
+
+**Decide and solve**
+
 - [Choosing a FASTQ tool](Choosing-a-FASTQ-Tool)
-
-**Solve a problem**
-
 - [Recipes](Recipes)
 - [Troubleshooting](Troubleshooting)
 - [FAQ](FAQ)
+- [References](References)
 
-**Contribute**
+**Build on it**
 
 - [Zig library](Zig-Library)
 - [For contributors](For-Contributors)

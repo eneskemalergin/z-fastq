@@ -1,66 +1,58 @@
 # Limits and supported formats
 
-## Supported today
+I would rather state the edges clearly than let a command look broader than what has been tested. These are today's boundaries, not promises about the final project.
 
-- Linux x86-64 builds.
-- Plain four-line FASTQ input.
-- gzip-compressed FASTQ input, including concatenated gzip members.
-- gzip output from `process` (`--gzip`).
-- Explicit standard input with `-`.
-- Phred+33 quality bytes from ASCII 33 through 126.
-- IUPAC sequence validation, or the narrower ACGTN policy.
+## Supported
 
-## Not supported today
+- Linux on x86-64.
+- Four-line FASTQ, plain or gzip, including concatenated gzip members; standard input as `-`.
+- Phred+33 qualities, ASCII 33 to 126.
+- IUPAC or ACGTN sequence letters.
+- gzip output from `process --gzip`.
 
-- FASTA input.
-- Wrapped sequence or quality lines.
+## Not supported
+
+- FASTA, and wrapped sequence or quality lines.
+- BGZF, ZIP, tar, bzip2, xz, and zstd.
 - gzip output from commands other than `process`.
-- BGZF, ZIP, tar, bzip2, xz, and zstd containers.
-- Remote object stores or network paths.
-- Memory-mapped or worker-thread CLI execution.
-- Automatic repair or record recovery after malformed input.
-- fastp's average-quality, maximum-length, and low-complexity filters, and writing the surviving mate of a dropped pair.
-- fastp's automatic adapter detection and automatic poly-G mode.
+- Remote paths and object stores.
+- Several threads per command.
+- Repairing or skipping malformed records.
+- From fastp: automatic adapter detection, automatic poly-G mode, and the average-quality, maximum-length, and low-complexity filters; writing the surviving mate of a dropped pair.
 
-These are current boundaries, not promises about the final project. I would rather state them clearly than make a command appear broader than its tested behavior.
+## Line length
 
-## Logical line limit
-
-The default maximum logical line length is 16 MiB. Override it per command:
+The longest line accepted is 16 MiB by default. Raise it per command when a file really has longer lines, as long-read files can:
 
 ```bash
 z-fastq check --max-line-bytes 33554432 reads.fastq
 ```
 
-The limit applies to the line content, not the LF terminator. Raising it allows longer single-line fields; it does not enable wrapped FASTQ.
+The limit counts the line's content, not its line ending. Raising it does not allow wrapped records.
 
-## Memory and the line limit
+## Memory
 
-Memory follows what a command keeps, and the line limit bounds that:
+What a command keeps decides its memory, and the line limit bounds it.
 
-- `count`, `check`, `stats`, and sampling that selects nothing keep no record bytes: they stream lines of any length, so memory stays at a few MiB.
-- `check --paired` and `check --interleaved` keep each mate's header line while they compare names.
-- Commands that write records (`sample`, `interleave`, `deinterleave`, `process`) keep a record that does not fit the read buffer until it is written: up to four lines per input, plus mate 1 for interleaved input.
-- `process` also keeps its quality tables, up to 800 KiB per mate for the reads as read and as many again in a trimmed or filtered run, plus 48 KiB of adapter counters per mate and population, and up to 5 MB per mate and population for the 100,000 sequence keys behind duplication and overrepresented sequences; without `--report` none of these tables is kept. Trimming itself uses under 16 KiB, the same at any read length. `--pair-duplication` adds about 10 bytes per pair, at most 1 GiB. Per-tile quality keeps 8 bytes per tile and cycle for each mate and population: about 0.7 MB for 600 tiles of 151-base reads, at most 21 MB at the 2,501-tile, 1,024-cycle limits, and 16 more bytes per cycle for a tile only once it has counted 16.7 million reads.
+| Command | Keeps |
+| --- | --- |
+| `count`, `check`, `stats` | no record bytes: a few MiB at any line length |
+| `check --paired`, `check --interleaved` | each mate's header, to compare names |
+| `sample`, `interleave`, `deinterleave` | a record too large for the read buffer, until it is written |
+| `sample --count K` | about 4 bytes per chosen record |
+| `process` | the same, plus the QC tables below when QC is requested |
 
-With 15 MiB header, sequence, and quality lines, `stats` peaks near 5 MiB, `sample` near 50 MiB, and the pair commands near 100 MiB. Raise `--max-line-bytes` only as far as the data needs, because the worst case grows with it.
+With 15 MiB lines, `stats` peaks near 5 MiB, `sample` near 50 MiB, and the pair commands near 100 MiB, so raise `--max-line-bytes` only as far as the data needs.
 
-## gzip limits
+When `process` measures QC, per mate and per population (raw and retained) it keeps up to 800 KiB of quality tables, 48 KiB of adapter counters, up to 5 MB for the 100,000 sequence keys behind duplication, and 8 bytes per tile and cycle for per-tile quality: about 0.7 MB for 600 tiles of 151-base reads, at most 21 MB. `--pair-duplication` adds about 10 bytes per pair, at most 1 GiB. Trimming itself uses under 16 KiB at any read length.
 
-- An optional gzip header field (file name, comment, or extra field) may be at most 64 KiB; a longer one fails with an I/O error. `gzip -dc` accepts it.
-- Bytes after the last gzip member fail, including zero padding that `gzip -dc` accepts.
+## gzip
 
-## Location semantics
+- A gzip header field (file name, comment, or extra field) may be at most 64 KiB.
+- Bytes after the last gzip member are an error, even zero padding that `gzip -dc` accepts.
 
-Validation locations use:
+## Related pages
 
-- A zero-based record index.
-- A zero-based byte offset in the decompressed FASTQ stream.
-- A one-based line number within the record.
-
-For gzip input, the byte offset is not a compressed-file offset. It points into the decoded FASTQ stream that the parser sees.
-
-## Record shape
-
-The current parser expects one header line, one sequence line, one plus line, and one quality line per record. The sequence and quality fields must have equal byte lengths. Empty fields are valid when both are empty.
-
+- [Input and output](Input-and-Output): how gzip and standard input are read.
+- [Choosing a FASTQ tool](Choosing-a-FASTQ-Tool): tools that cover what z-fastq does not.
+- [Troubleshooting](Troubleshooting#a-line-is-too-long): raising the line limit.

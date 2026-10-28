@@ -1,6 +1,6 @@
 # Recipes
 
-These are short workflow patterns. Each command keeps its documented exit status and output behavior.
+Short patterns for everyday jobs. Each keeps the exit status and output behavior described on the linked pages.
 
 ## Count several lanes
 
@@ -8,62 +8,48 @@ These are short workflow patterns. Each command keeps its documented exit status
 z-fastq count lane1.fastq.gz lane2.fastq.gz lane3.fastq.gz
 ```
 
-The output has one count per successful input, in argument order.
+One count per input, in order.
 
-## Stop a workflow when validation fails
-
-```bash
-if z-fastq check --paired R1.fastq.gz R2.fastq.gz; then
-    z-fastq stats --json R1.fastq.gz > R1.stats.json
-else
-    echo "paired input failed validation" >&2
-    exit 1
-fi
-```
-
-Use `--pair-names exact` when the default Illumina-style normalization is too permissive for your workflow.
-
-## Produce an interleaved gzip stream
+## Stop when the pairs are broken
 
 ```bash
-z-fastq interleave R1.fastq.gz R2.fastq.gz | gzip > reads.interleaved.fastq.gz
+z-fastq check --paired R1.fastq.gz R2.fastq.gz || { echo "pairs failed validation" >&2; exit 1; }
+z-fastq stats --json R1.fastq.gz > R1.stats.json
 ```
 
-The external `gzip` process compresses the output. z-fastq validates each pair before writing it.
-
-## Sample a pair without breaking synchronization
+## Make an interleaved gzip file
 
 ```bash
-z-fastq sample --paired --fraction 0.05 --seed 2025 R1.fastq R2.fastq \
-    > sample.interleaved.fastq
+z-fastq interleave R1.fastq.gz R2.fastq.gz | gzip > interleaved.fastq.gz
 ```
 
-The result is interleaved R1-then-R2 output. It is not two separate output files.
-
-## Use exact-count sampling safely
+## Take a paired subset as two files
 
 ```bash
-temporary_sample="sample.fastq.tmp"
-if z-fastq sample --count 10000 --seed 2025 reads.fastq > "$temporary_sample"; then
-    mv "$temporary_sample" sample.fastq
-else
-    rm -f "$temporary_sample"
-    exit 1
-fi
+z-fastq sample --paired --fraction 0.05 --seed 2025 R1.fastq.gz R2.fastq.gz \
+  | z-fastq deinterleave --out1 sub_R1.fastq --out2 sub_R2.fastq -
 ```
 
-Exact-count mode needs a regular file and two passes. The temporary path prevents a late input failure from replacing the previous sample.
+`sample --paired` writes one interleaved stream; `deinterleave` splits it again.
 
-## Keep data and diagnostics separate
+## Trim, filter, and report for MultiQC
 
 ```bash
-z-fastq stats --json reads.fastq > stats.json 2> stats.err
-status=$?
-if [ "$status" -ne 0 ]; then
-    cat stats.err >&2
-    exit "$status"
-fi
+z-fastq process --gzip \
+  --adapter1 AGATCGGAAGAGCACACGTCTGAACTCCAGTCA --adapter2 AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT \
+  --low-quality 15 --max-low-quality-percent 40 --max-n 5 --min-length 15 \
+  --pair-duplication --qc-tables qc --qc-summary sample.json \
+  --out1 trimmed_R1.fastq.gz --out2 trimmed_R2.fastq.gz R1.fastq.gz R2.fastq.gz
+multiqc qc sample.json
 ```
 
-This matters for JSON and for commands that write FASTQ to standard output.
+These are fastp's default filters; see [Processing](Processing) and [Quality control](Quality-Control).
 
+## Replace a file only on success
+
+Write to a temporary path and move it after a zero exit status; [Automation](Automation#partial-output) shows the pattern and why it matters.
+
+## Related pages
+
+- [Automation](Automation): exit statuses and partial output, which every recipe relies on.
+- [Command cheat sheet](Command-Cheat-Sheet): every option the recipes use.
