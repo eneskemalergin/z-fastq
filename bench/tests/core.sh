@@ -48,6 +48,7 @@ fail() {
 # Syntax of every script and of plot.py.
 for f in "$bench"/lib/bench.sh "$bench"/lib/summary.sh "$bench"/*/run.sh; do bash -n "$f" || fail "syntax: $f"; done
 python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$bench/lib/plot.py" || fail 'syntax: plot.py'
+python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$bench/lib/summary.py" || fail 'syntax: summary.py'
 
 # A scratch feature over the real core, data, and cache.
 mkdir -p -- "$work/feat"
@@ -176,6 +177,9 @@ feature ''
     [[ "$(check_id)" == "$a" ]] || fail 'editing report code changed the check key'
     helper() { printf 'b\n'; }
     [[ "$(check_id)" != "$a" ]] || fail 'editing a helper of fact kept the check key'
+    # A word verdict code shares with a report function does not pull it in.
+    fact() { printf 'report readme\n'; }
+    [[ "$(verdict_code fact)" != *"report ()"* && "$(verdict_code fact)" != *"readme ()"* ]] || fail 'verdict code followed a report function'
     exit 0
 ) || fail 'identity checks'
 

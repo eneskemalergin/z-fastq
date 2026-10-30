@@ -367,7 +367,7 @@ verdict_code() { # root function names...
         [[ -z "${seen[$f]:-}" ]] || continue
         seen[$f]=1
         for w in $(declare -f "$f" | tr -c 'A-Za-z0-9_\n' ' '); do
-            [[ -n "${defined[$w]:-}" && -z "${seen[$w]:-}" && "$VERDICT_SKIP" != *" $w "* ]] && queue+=("$w")
+            [[ -n "${defined[$w]:-}" && -z "${seen[$w]:-}" && "$VERDICT_SKIP" != *" $w "* && "$REPORT_FUNCS" != *" $w "* ]] && queue+=("$w")
         done
     done
     for f in $(printf '%s\n' "${!seen[@]}" | sort); do declare -f "$f"; done
@@ -1573,7 +1573,11 @@ collect() {
 }
 
 # --- report -----------------------------------------------------------------
+# The functions summary.sh defines are report code: the check and edge keys
+# never follow them (verdict_code), whatever words verdict code shares with them.
+REPORT_FUNCS="$(compgen -A function | sort)"
 source "$BENCH/lib/summary.sh"
+REPORT_FUNCS=" $(comm -13 <(printf '%s\n' "$REPORT_FUNCS") <(compgen -A function | sort) | tr '\n' ' ')"
 
 # --- quick checks: picks, peer, ab ------------------------------------------
 # The machine a cached reference was timed on: a reference from another host,
@@ -1949,6 +1953,8 @@ bench/$FEATURE/run.sh MODE: $JOB
   release        check, time every case not yet cached, then report; a repeat with
                  nothing new takes seconds, a rebuilt z-fastq re-times every case
   report         README.md and figures from current verified batches; never times
+  summary        bench/README.md and bench/summary/ from every feature's report
+                 tables; never checks or times
   peer           z-fastq against each quick-check case's rival (results/picks.tsv,
                  written by report): rival references are timed once and cached,
                  z-fastq is re-timed only when rebuilt (results/peer.txt);
@@ -1970,6 +1976,8 @@ USAGE
 }
 bench_main() {
     local mode="${1:-}"
+    # The summary reads every feature's report tables; it checks and times nothing.
+    if [[ "$mode" == summary ]]; then summary_report; return 0; fi
     if [[ "$mode" == __bounded ]]; then
         [[ "$EXECUTION" == bounded && -n "${INVOCATION_ID:-}" && "${BENCH_BOUNDED:-}" == 1 ]] || die "internal mode needs a bounded service"
         shift

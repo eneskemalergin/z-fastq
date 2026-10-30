@@ -440,10 +440,6 @@ kinds_table() { # spec [extra-headers function]
         done
     } | mdtable
 }
-# Per lane, "N of M": the malformed edge inputs it rejects, over every one in the set.
-rejects_all() { # lane
-    awk -F'\t' -v l="$1" 'FNR == NR { if ($2 ~ /^reject/) want[$1] = 1; next } $1 == l && ($2 in want) { n++; if ($3 ~ /^reject/) r++ } END { printf "%d of %d", r, n }' <(edge_list) "$RESULTS/edges.tsv"
-}
 probes() { # lane -> "N of M", over the edge set's probe rows
     awk -F'\t' -v l="$1" -v rows=" $(probe_rows | tr '\n' ' ')" '$1 == l && index(rows, " " $2 " ") { n++; if ($3 ~ /^reject/) r++ } END { printf "%d of %d", r, n }' "$RESULTS/edges.tsv"
 }
@@ -826,3 +822,203 @@ report() {
     log report DONE "${FEATURE_DIR#"$REPO"/}/README.md, $(ls "$figures"/*.png | wc -l) figures"
 }
 
+
+# --- summary across features ------------------------------------------------
+# bench/README.md and bench/summary/: three questions answered from every
+# feature's report tables, never from timing. The jobs in Figure 1, in order:
+# feature, its families (pooled when several), and the job's name.
+SUMMARY_JOBS="count|file|Count records
+stats|file|Aggregate statistics
+check|single|Validate a file
+check|paired|Validate a pair
+sample|fraction|Sample by fraction
+sample|exact|Sample by count
+sample|paired-fraction|Sample pairs by fraction
+layout|interleave|Interleave a pair
+layout|deinterleave|Deinterleave a pair
+process|trim-truseq,trim-nextera|Trim a pair
+process|qc-tables|QC tables for a pair"
+SUMMARY_DIR="$BENCH/summary"
+SUMMARY_TABLES="$CACHE/summary"
+
+# Per job: z-fastq's own time and memory on the plain headline inputs, then
+# the fastest complete tool and the fastest partial one at one thread, each
+# as a multiple of z-fastq's, the geometric mean of the ratios within each
+# batch. Columns: job, inputs, z-fastq wall s, z-fastq MiB, complete label,
+# its time x, its memory x, partial label, its time x, its memory x.
+summary_jobs() {
+    local feat fams job dir
+    printf 'job\tinputs\tz_wall_s\tz_mib\tcomplete\tc_time\tc_mem\tpartial\tp_time\tp_mem\n'
+    while IFS='|' read -r feat fams job; do
+        dir="$BENCH/$feat/results/report"
+        [[ -f "$dir/summary.tsv" ]] || continue
+        awk -F'\t' -v fams=",$fams," -v job="$job" -v tier="$HEADLINE" '
+            FILENAME ~ /cases.tsv$/ { if (FNR > 1 && index(fams, "," $1 ",") && $5 == tier && $3 == "plain" && $6 != "many") want[$1, $2] = 1; next }
+            FILENAME ~ /style.tsv$/ { if (FNR > 1) { label[$1] = $2; cls[$1] = $3; variant[$1] = ($10 != "" && $10 != $1) } next }
+            FNR == 1 || !(($1, $2) in want) { next }
+            { w[$1, $2, $3] = $5; m[$1, $2, $3] = $8; lanes[$3] = 1; cs[$1, $2] = 1 }
+            END {
+                n = zw = zm = 0
+                for (c in cs) { split(c, q, SUBSEP); if ((q[1], q[2], "z-fastq") in w) { n++; zw += log(w[q[1], q[2], "z-fastq"]); zm += log(m[q[1], q[2], "z-fastq"]) } }
+                if (!n) exit
+                for (l in lanes) { if (l == "z-fastq" || variant[l]) continue; k = st = sm = 0
+                    for (c in cs) { split(c, q, SUBSEP); if (!((q[1], q[2], l) in w) || !((q[1], q[2], "z-fastq") in w)) continue
+                        k++; st += log(w[q[1], q[2], l] / w[q[1], q[2], "z-fastq"]); sm += log(m[q[1], q[2], l] / m[q[1], q[2], "z-fastq"]) }
+                    if (!k) continue
+                    t = exp(st / k); r = exp(sm / k); g = (cls[l] == "complete") ? "c" : "p"
+                    if (!(g in bt) || t < bt[g]) { bt[g] = t; bm[g] = r; bl[g] = label[l] } }
+                printf "%s\t%d\t%.3f\t%.2f\t%s\t%s\t%s\t%s\t%s\t%s\n", job, n, exp(zw / n) / 1e9, exp(zm / n) / 1024,
+                    ("c" in bl ? bl["c"] : "-"), ("c" in bt ? sprintf("%.2f", bt["c"]) : "-"), ("c" in bm ? sprintf("%.2f", bm["c"]) : "-"),
+                    ("p" in bl ? bl["p"] : "-"), ("p" in bt ? sprintf("%.2f", bt["p"]) : "-"), ("p" in bm ? sprintf("%.2f", bm["p"]) : "-")
+            }' "$dir/cases.tsv" "$dir/style.tsv" "$dir/summary.tsv"
+    done <<<"$SUMMARY_JOBS"
+}
+# Per tool across every feature: of the edge cases that must be rejected and
+# that the tool has a job for, how many it rejected, passed with exit 0, and
+# crashed on; z-fastq first, then by the share rejected. Columns: tool, given,
+# rejected, passed, crashed, features.
+summary_broken() {
+    local feat
+    printf 'tool\tgiven\trejected\tpassed\tcrashed\tfeatures\n'
+    for feat in count stats check sample layout process; do
+        [[ -f "$BENCH/$feat/results/report/edges.tsv" ]] || continue
+        awk -F'\t' -v feat="$feat" 'FNR > 1 && $3 ~ /^reject/ && $5 != "-" && $6 != "policy" { print $4 "\t" $6 "\t" feat }' "$BENCH/$feat/results/report/edges.tsv"
+    done | awk -F'\t' '{ g[$1]++; if ($2 == "right") r[$1]++; else if ($2 == "crash") c[$1]++; else p[$1]++
+                         if (!index(" " fs[$1] " ", " " $3 " ")) fs[$1] = fs[$1] (fs[$1] == "" ? "" : " ") $3 }
+        END { for (t in g) printf "%s\t%d\t%d\t%d\t%d\t%s\n", t, g[t], r[t] + 0, p[t] + 0, c[t] + 0, fs[t] }' |
+        awk -F'\t' -v OFS='\t' '{ print ($1 == "z-fastq" ? 0 : 1), $3 / $2, tolower($1), $0 }' | sort -t$'\t' -k1,1n -k2,2gr -k3,3 | cut -f4-
+}
+# The jobs with thread counts: each tool at each count on the plain headline
+# inputs, z-fastq on one core. Columns: job, tool, threads, wall s, CPU s,
+# peak MiB (geometric means over the inputs).
+SUMMARY_THREADS="process|trim-truseq,trim-nextera|Trim a pair
+process|qc-tables|QC tables for a pair"
+summary_threads() {
+    local feat fams job dir
+    printf 'job\ttool\tthreads\twall_s\tcpu_s\tmib\n'
+    while IFS='|' read -r feat fams job; do
+        dir="$BENCH/$feat/results/report"
+        [[ -f "$dir/summary.tsv" ]] || continue
+        awk -F'\t' -v fams=",$fams," -v job="$job" -v tier="$HEADLINE" '
+            FILENAME ~ /cases.tsv$/ { if (FNR > 1 && index(fams, "," $1 ",") && $5 == tier && $3 == "plain" && $6 != "many") want[$1, $2] = 1; next }
+            FILENAME ~ /style.tsv$/ { if (FNR > 1) { ord[$1] = $7 + 0; cores[$1] = ($9 > 0 ? $9 : 1); of[$1] = ($10 == "" ? $1 : $10); label[$1] = $2 } next }
+            FNR == 1 || !(($1, $2) in want) || $11 <= 0 { next }
+            { k = $3; n[k]++; w[k] += log($5 / 1e9); c[k] += log($11 / 1e6); m[k] += log($8 / 1024) }
+            END { for (l in n) printf "%d\t%d\t%s\t%s\t%d\t%.3f\t%.3f\t%.1f\n", ord[of[l]], cores[l], job, label[of[l]], cores[l], exp(w[l] / n[l]), exp(c[l] / n[l]), exp(m[l] / n[l]) }
+        ' "$dir/cases.tsv" "$dir/style.tsv" "$dir/summary.tsv" | sort -t$'\t' -k1,1n -k2,2n | cut -f3-
+    done <<<"$SUMMARY_THREADS"
+}
+# One line per tool label across the features: its colors and marker.
+summary_style() {
+    printf 'tool\tlight\tdark\tshape\n'
+    cat "$BENCH"/*/results/report/style.tsv 2>/dev/null | awk -F'\t' '$1 != "lane" && !($2 in seen) { seen[$2] = 1; print $2 "\t" $4 "\t" $5 "\t" $6 }'
+}
+# The figures, then bench/README.md. Reads only report tables; never times.
+# Its name is no plain word, so the verdict code that says "summary" never reaches it.
+summary_report() {
+    STAGE=summary
+    mkdir -p -- "$SUMMARY_TABLES" "$SUMMARY_DIR"
+    summary_jobs >"$SUMMARY_TABLES/jobs.tsv"
+    summary_broken >"$SUMMARY_TABLES/broken.tsv"
+    summary_threads >"$SUMMARY_TABLES/threads.tsv"
+    summary_style >"$SUMMARY_TABLES/style.tsv"
+    "$REPO/tools/venv/bin/python" -I "$BENCH/lib/summary.py" "$SUMMARY_TABLES" "$SUMMARY_DIR"
+    summary_readme >"$BENCH/README.md.part"
+    mv -- "$BENCH/README.md.part" "$BENCH/README.md"
+    summary_main_readme
+    log summary DONE "bench/README.md, $(ls "$SUMMARY_DIR"/*.png | wc -l) figures"
+}
+summary_picture() { # stem alt
+    printf '<p align="center">\n  <picture>\n    <source media="(prefers-color-scheme: dark)" srcset="summary/%s-dark.png">\n    <source media="(prefers-color-scheme: light)" srcset="summary/%s-light.png">\n    <img src="summary/%s-light.png" alt="%s" width="100%%">\n  </picture>\n</p>\n\n' "$1" "$1" "$1" "$2"
+}
+summary_readme() {
+    local t="$SUMMARY_TABLES" feat
+    printf '<!-- markdownlint-disable MD013 MD033 MD041 -->\n\n# Benchmarks\n\n'
+    printf 'How z-fastq compares with the tools people use for the same FASTQ jobs, at a glance. Each feature report below holds the detail: every input, format, and size, the edge cases, scaling, and the commands.\n\n'
+    summary_picture 01-jobs "Each job: the fastest complete and partial tools as multiples of z-fastq's time and memory"
+    {
+        printf 'Job\tz-fastq time\tz-fastq memory\tComplete tool\tIts time\tIts memory\tPartial tool\tIts time\tIts memory\n'
+        printf 'l\tr\tr\tl\tr\tr\tl\tr\tr\n'
+        awk -F'\t' 'function s(x) { return x >= 1 ? sprintf("%.2f s", x) : sprintf("%.0f ms", x * 1000) }
+            function m(x) { return x == "-" ? "-" : sprintf("%.2fx", x) }
+            NR > 1 { printf "%s\t%s\t%.2f MiB\t%s\t%s\t%s\t%s\t%s\t%s\n", $1, s($3), $4, $5, m($6), m($7), $8, m($9), m($10) }' "$t/jobs.tsv"
+    } | mdtable
+    printf '\n- A *complete* tool does the whole job z-fastq does, checks included; a *partial* one does part of it (fewer checks, or no reads written). Partial tools are shown, never ranked with complete ones.\n'
+    printf -- '- Times and memory: z-fastq'"'"'s own, then each tool'"'"'s as a multiple of z-fastq'"'"'s; geometric means over the 1 GiB plain inputs, every tool on one CPU.\n\n'
+    printf '## How the numbers are taken\n\n'
+    printf 'Every tool'"'"'s output is checked against an independent truth before any timing; a tool is timed only on the inputs it got right. Each case runs every tool in one batch, on one pinned CPU each (threaded variants on as many physical cores as threads), with the input in the page cache. Wall time comes from the runner, peak memory and CPU time from the kernel for the tool alone. Peak RSS can lag the true peak by up to about 0.5 MiB, so smaller memory differences are inconclusive.\n\n'
+    printf '## Broken input\n\n'
+    summary_picture 02-broken "Of the malformed inputs each tool was given, how many it rejected"
+    {
+        printf 'Tool\tGiven\tRejected\tPassed on, exit 0\tCrashed\n'
+        printf 'l\tr\tr\tr\tr\n'
+        awk -F'\t' 'NR > 1 { print $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 }' "$t/broken.tsv"
+    } | mdtable
+    printf '\nA tool that passes a broken record on with exit 0 leaves a script no way to tell; z-fastq stops with the record, byte offset, and rule it broke.\n\n'
+    printf '## One core against many\n\n'
+    summary_picture 03-threads "Wall time of the other tools by thread count against z-fastq on one core"
+    {
+        printf 'Job\tTool\t1 thread\t2\t4\t8\t16\n'
+        printf 'l\tl\tr\tr\tr\tr\tr\n'
+        awk -F'\t' 'NR > 1 { k = $1 SUBSEP $2; if (!(k in seen)) { seen[k] = 1; order[++n] = k } w[k, $3] = sprintf("%.2f s", $4) }
+            END { for (i = 1; i <= n; i++) { split(order[i], q, SUBSEP); line = q[1] "\t" q[2]
+                    for (j = 0; j < 5; j++) { c = 2 ^ j; line = line "\t" (((order[i], c) in w) ? w[order[i], c] : "-") }
+                    print line } }' "$t/threads.tsv"
+    } | mdtable
+    printf '\nWall time on the 1 GiB plain inputs; z-fastq runs on one core. The process report gives CPU time at each count.\n\n'
+    summary_picture 04-threads-memory "The threaded runs on time against memory, relative to z-fastq on one core"
+    {
+        printf 'Job\tTool\t1 thread\t2\t4\t8\t16\n'
+        printf 'l\tl\tr\tr\tr\tr\tr\n'
+        awk -F'\t' 'NR > 1 { k = $1 SUBSEP $2; if (!(k in seen)) { seen[k] = 1; order[++n] = k } v[k, $3] = sprintf("%.1f MiB", $6) }
+            END { for (i = 1; i <= n; i++) { split(order[i], q, SUBSEP); line = q[1] "\t" q[2]
+                    for (j = 0; j < 5; j++) { c = 2 ^ j; line = line "\t" (((order[i], c) in v) ? v[order[i], c] : "-") }
+                    print line } }' "$t/threads.tsv"
+    } | mdtable
+    printf '\nPeak memory of the same runs. Threads buy the other tools wall time, never memory: at the thread count where a tool first matches z-fastq'"'"'s time, it still holds many times z-fastq'"'"'s memory.\n\n'
+    printf '## Where z-fastq is not fastest\n\n'
+    awk -F'\t' 'NR > 1 { if ($9 != "-" && $9 + 0 < 1) printf "- **%s:** %s (partial) takes %.2fx z-fastq'"'"'s time, with %.1fx its memory.\n", $1, $8, $9, $10
+                         if ($6 != "-" && $6 + 0 < 1) printf "- **%s:** %s takes %.2fx z-fastq'"'"'s time, with %.1fx its memory.\n", $1, $5, $6, $7 }' "$t/jobs.tsv"
+    awk -F'\t' 'NR > 1 { if ($2 == "z-fastq") { z[$1] = $4; zc[$1] = $5; next } if (!(($1, $2) in hit) && ($1 in z) && $4 + 0 < z[$1]) { hit[$1, $2] = 1
+                         printf "- **%s:** %s at %d threads takes %.2fx z-fastq'"'"'s time on one core, for %.1fx its CPU time.\n", $1, $2, $3, $4 / z[$1], $5 / zc[$1] } }' "$t/threads.tsv"
+    printf '\n## Feature reports\n\n'
+    for feat in count stats check sample layout process; do
+        [[ -f "$BENCH/$feat/README.md" ]] || continue
+        printf -- '- [%s](%s/README.md): %s; timed %s, z-fastq %s.\n' "$feat" "$feat" "$(sed -n '3s/^# //p' "$BENCH/$feat/README.md")" \
+            "$(RESULTS="$BENCH/$feat/results" last_release)" "$(RESULTS="$BENCH/$feat/results" zfastq_label)"
+    done
+    printf '\n## Limits\n\n'
+    printf -- '- One CPU per tool in every comparison except the threads figure; a tool built for many cores may do better with them.\n'
+    printf -- '- The real-run groups are uneven: three short fixed-length runs, one variable-length run, one synthetic shape per job.\n'
+    printf -- '- Copying a pair (the process report'"'"'s first part) is the cost floor of `process`, not a job of its own, so it is not in the job figure.\n\n'
+    printf '## Reproduce\n\n```bash\nbench/process/run.sh release    # one feature: checks, timing, its README (each feature has its own run.sh)\nbench/process/run.sh summary    # this page, from every feature'"'"'s report tables\n```\n'
+}
+# The main README's benchmark part, between its two marker lines: Figure 1 and
+# one row per job, so the numbers there are the summary's. Other lines stay.
+SUMMARY_BEGIN="<!-- bench summary: generated by bench/FEATURE/run.sh summary -->"
+SUMMARY_END="<!-- bench summary end -->"
+summary_main_readme() {
+    local readme="$REPO/README.md" part
+    grep -qxF "$SUMMARY_BEGIN" "$readme" && grep -qxF "$SUMMARY_END" "$readme" || return 0
+    part="$(mktemp "$BENCH/README.part.XXXXXX")"
+    {
+        printf '<p align="center">\n  <a href="bench/README.md">\n    <picture>\n      <source media="(prefers-color-scheme: dark)" srcset="bench/summary/01-jobs-dark.png">\n      <source media="(prefers-color-scheme: light)" srcset="bench/summary/01-jobs-light.png">\n      <img src="bench/summary/01-jobs-light.png" alt="Each job: the fastest other tools as multiples of z-fastq'"'"'s wall time and peak memory" width="100%%">\n    </picture>\n  </a>\n</p>\n\n'
+        {
+            printf 'Job\tz-fastq time\tz-fastq memory\tOther tool\tIts time\tIts memory\n'
+            printf 'l\tr\tr\tl\tr\tr\n'
+            # The fastest tool that does the whole job; where none does, the fastest partial one, marked *.
+            awk -F'\t' 'function s(x) { return x >= 1 ? sprintf("%.2f s", x) : sprintf("%.0f ms", x * 1000) }
+                NR > 1 { if ($5 != "-") { tool = $5; t = $6; m = $7 } else { tool = $8 "*"; t = $9; m = $10 }
+                         printf "%s\t%s\t%.2f MiB\t%s\t%.1fx\t%.1fx\n", $1, s($3), $4, tool, t, m }' "$SUMMARY_TABLES/jobs.tsv"
+        } | mdtable
+        printf '\nOn 1 GiB plain inputs, every tool on one CPU; the other tool is the fastest that does the whole job, its time and memory as multiples of z-fastq'"'"'s; \\* marks a job no other tool does whole, with the fastest that does part of it. On the malformed records and pairs of the edge cases, z-fastq stopped on %s; [the benchmark summary](bench/README.md) has the method, every tool, threads, and the cases where another tool is faster.\n' \
+            "$(awk -F'\t' '$1 == "z-fastq" { printf "%s of %s", $3, $2 }' "$SUMMARY_TABLES/broken.tsv")"
+    } >"$part.body"
+    awk -v begin="$SUMMARY_BEGIN" -v end="$SUMMARY_END" -v body="$part.body" '
+        $0 == begin { print; print ""; while ((getline line < body) > 0) print line; print ""; skip = 1; next }
+        $0 == end { skip = 0 }
+        !skip' "$readme" >"$part"
+    # Written into the file in place, so it keeps its mode.
+    cat -- "$part" >"$readme"
+    rm -f -- "$part" "$part.body"
+}
