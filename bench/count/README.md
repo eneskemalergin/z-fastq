@@ -3,8 +3,8 @@
 # Counting records
 > <sub>`z-fastq count` against 5 other counters, on 7 real sequencing runs and 5 synthetic shapes, plain and gzip. A tool is timed only where its count was right; time and memory come from the same run, on one CPU.</sub>
 
-- `z-fastq`: *0.1.0 at 90e46b4*
-- `machine`: *Ryzen 9 3950X, Linux 7.2.11; one CPU per run*
+- `z-fastq`: *0.1.0 at 246bbb1*
+- `machine`: *Ryzen 9 3950X, Linux 7.2.12; one CPU per run*
 - `runner`: *zebrac 0.6.2 with zexec*
 - `data`:
   - **Real**: *7 public sequencing runs, 1 GiB each, pooled in the bars by the kind of reads they hold*
@@ -17,13 +17,13 @@
     - `variable`: *50 to 150 bp, annotated plus line*
     - `longread`: *nanopore headers, rare 300 kb reads*
     - `long`: *300 kb sequence lines*
-- `date`: *2026-10-25*
+- `date`: *2026-10-28*
 
 ## Findings
 
 - **Right answers:** z-fastq returned the right count on all 218 checked inputs and rejected every malformed edge case. 4 of the 5 other tools print a wrong count or crash on at least one.
-- **Speed:** Needletail, the fastest other full-check tool, takes 1.38x z-fastq's time on plain input and 1.14x on gzip.
-- **Memory:** every other tool peaks at 2.8x to 20x z-fastq's 0.75 MiB.
+- **Speed:** Needletail, the fastest other full-check tool, takes 1.37x z-fastq's time on plain input and 1.14x on gzip.
+- **Memory:** every other tool peaks at 2.3x to 14x z-fastq's 0.93 MiB.
 - **Where z-fastq is not fastest:** on no kind of input; it is the fastest tool on every kind of input (geometric mean over the group), plain and gzip.
 - **Wrong on valid input, exit 0:** two gzip members: Helicase (printed 2).
 
@@ -71,7 +71,7 @@ z-fastq returned the right count on all 218 inputs: every corpus file and synthe
 </details>
 
 ## Speed and memory
-> <sub>The real runs and synthetic shapes at the medium tier, about 1 GiB of FASTQ each, pooled into kinds of input. Every tool runs on one CPU with the file in the page cache.</sub>
+> <sub>The real runs and synthetic shapes at the medium tier, about 1 GiB of FASTQ each, pooled into kinds of input. Every tool runs on one CPU, with the file in the page cache.</sub>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-overview-dark.png">
@@ -79,16 +79,16 @@ z-fastq returned the right count on all 218 inputs: every corpus file and synthe
   <img src="results/figures/file-overview-light.png" alt="Time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
-z-fastq itself takes 141.0 ms and 0.75 MiB per plain input, 1397.2 ms and 0.75 MiB per gzip input (geometric means over 12 inputs each); the table gives every tool as a multiple of that.
+z-fastq itself takes 147.0 ms and 0.81 MiB per plain input, 1484.5 ms and 1.06 MiB per gzip input (geometric means over 12 inputs each); the table gives every tool as a multiple of that.
 
 | Tool       | Plain time | Plain memory | Gzip time | Gzip memory |
 | ---------- | ---------: | -----------: | --------: | ----------: |
 | z-fastq    |      1.00x |        1.00x |     1.00x |       1.00x |
-| Needletail |      1.38x |        2.78x |     1.14x |       3.12x |
-| Helicase   |      1.24x |        3.43x |     1.05x |       3.58x |
-| SeqFu      |      2.10x |        6.42x |     2.09x |      19.81x |
-| seqtk      |      2.31x |        3.43x |     1.24x |       3.39x |
-| fqtools    |     23.90x |        4.34x |     3.33x |       4.98x |
+| Needletail |      1.37x |        2.57x |     1.14x |       2.25x |
+| Helicase   |      1.22x |        3.19x |     1.04x |       2.51x |
+| SeqFu      |      2.10x |        5.86x |     2.07x |      14.06x |
+| seqtk      |      2.32x |        3.17x |     1.25x |       2.47x |
+| fqtools    |     23.77x |        4.03x |     3.29x |       3.54x |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/file-speed-dark.png">
@@ -128,8 +128,8 @@ z-fastq itself takes 141.0 ms and 0.75 MiB per plain input, 1397.2 ms and 0.75 M
   <img src="results/figures/file-scaling-memory-light.png" alt="Peak memory by input size" width="100%">
 </picture>
 
-At 1 GiB, z-fastq counts 5.7 to 10.7 GiB/s on plain input and 0.4 to 0.8 GiB/s on gzip input. Faster on a single shape there, as throughput over z-fastq's: Helicase on gzip dense (1.01x).
-z-fastq peaks at 0.75 MiB at every size and shape. Memory that grows with the input: Needletail by 1.5x on plain longread; Helicase by 1.3x on gzip longread; seqtk by 1.4x on plain longread.
+At 1 GiB, z-fastq counts 4.8 to 9.6 GiB/s on plain input and 0.4 to 0.8 GiB/s on gzip input. Faster on a single shape there, as throughput over z-fastq's: Helicase on gzip dense (1.03x).
+z-fastq peaks at 0.81 to 1.06 MiB across sizes and shapes. Memory that grows with the input: Needletail by 1.5x on plain longread; Helicase by 1.3x on plain longread; seqtk by 1.4x on plain longread.
 
 > [!NOTE]
 > fqtools is timed at the medium tier only: it is slow enough that sweeping sizes with it would take most of the run. Every tool is held to one CPU, so a tool that starts threads (SeqFu starts 8 by default) gains nothing from them here; its CPU time equals its wall time. Lines rise with size because each tool's fixed start cost spreads over more data; SeqFu has the largest start cost, so its line rises the most.
@@ -145,34 +145,34 @@ Each tool's time and peak memory reading the file from a pipe, as a multiple of 
 
 | Tool       | Plain time | Plain memory | Gzip time | Gzip memory |
 | ---------- | ---------: | -----------: | --------: | ----------: |
-| z-fastq    |      1.07x |        1.00x |     1.03x |       1.00x |
-| Needletail |      1.05x |        1.03x |     1.03x |       1.00x |
-| Helicase   |      1.05x |        0.89x |     1.03x |       0.86x |
-| SeqFu      |      1.04x |        0.99x |     1.03x |       0.98x |
-| seqtk      |      1.09x |        1.03x |     1.04x |       1.04x |
+| z-fastq    |      0.95x |        1.00x |     0.92x |       1.00x |
+| Needletail |      0.95x |        0.99x |     0.93x |       0.98x |
+| Helicase   |      0.94x |        0.90x |     0.93x |       0.86x |
+| SeqFu      |      0.94x |        1.04x |     0.91x |       0.99x |
+| seqtk      |      0.94x |        1.01x |     0.93x |       1.00x |
 
 ### Many files
 
 Every xsmall corpus file in one call.
 
-Counting all 11 xsmall corpus files (110 MiB) in one call, z-fastq takes 16.9 ms on plain input and 175.5 ms on gzip, at 0.75 MiB peak. SeqFu, the only other tool that counts many files in one call, takes 2.7x and 2.7x as long with 7x and 103x the memory.
+Counting all 11 xsmall corpus files (110 MiB) in one call, z-fastq takes 18.0 ms on plain input and 175.0 ms on gzip, at 0.81 MiB peak. SeqFu, the only other tool that counts many files in one call, takes 2.6x and 2.7x as long with 7x and 73x the memory.
 
 ## Reproducibility
 
 <details><summary>How it was measured</summary>
 
-Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. The kernel reports peak memory in 256 KiB steps, so values closer than that are equal. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Generated by `bench/count/run.sh release` on 2026-10-25.
+Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. The kernel reports peak memory in 256 KiB steps, so values closer than that are equal. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Generated by `bench/count/run.sh release` on 2026-10-28.
 
 </details>
 
 <details><summary>Identity</summary>
 
-- `z-fastq`: *0.1.0 at 90e46b4*
+- `z-fastq`: *0.1.0 at 246bbb1*
 - `zebrac`: *0.6.2*
-- `zexec`: *12616 bytes, static, no libc*
-- `kernel`: *7.2.11-200.fc44.x86_64*
+- `zexec`: *15000 bytes, static, no libc*
+- `kernel`: *7.2.12-200.fc44.x86_64*
 - `cpu`: *AMD Ryzen 9 3950X 16-Core Processor*
-- `load at batch start`: *1.53 to 7.26*
+- `load at batch start`: *2.17 to 5.24*
 
 </details>
 
@@ -191,14 +191,14 @@ Every tool runs through `zexec -r` inside one zebrac batch per case, held to one
 
 Picked from these results: per group and format, the case where z-fastq leads its fastest full-check rival by the least. `run.sh peer` times z-fastq against a cached reference of the rival on each; `run.sh ab REV` times two z-fastq builds on each.
 
-- `Long reads, plain`: *PromethION, 30 to 153 kb*; rival Needletail at 1.03x z-fastq's time
-- `Short, fixed length, plain`: *NovaSeq, Casava headers*; rival Needletail at 1.40x z-fastq's time
-- `Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival Needletail at 1.44x z-fastq's time
-- `Synthetic, plain`: *longread: nanopore headers, rare 300 kb reads*; rival Needletail at 1.08x z-fastq's time
+- `Long reads, plain`: *PromethION, 30 to 153 kb*; rival Needletail at 0.97x z-fastq's time
+- `Short, fixed length, plain`: *NovaSeq, 150 bp*; rival Needletail at 1.41x z-fastq's time
+- `Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival Needletail at 1.45x z-fastq's time
+- `Synthetic, plain`: *longread: nanopore headers, rare 300 kb reads*; rival Needletail at 1.03x z-fastq's time
 - `Long reads, gzip`: *PromethION, 30 to 153 kb*; rival Needletail at 1.06x z-fastq's time
-- `Short, fixed length, gzip`: *NovaSeq, 150 bp*; rival Needletail at 1.10x z-fastq's time
-- `Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival Needletail at 1.16x z-fastq's time
-- `Synthetic, gzip`: *longread: nanopore headers, rare 300 kb reads*; rival Needletail at 1.04x z-fastq's time
+- `Short, fixed length, gzip`: *NovaSeq, Casava headers*; rival Needletail at 1.14x z-fastq's time
+- `Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival Needletail at 1.15x z-fastq's time
+- `Synthetic, gzip`: *longread: nanopore headers, rare 300 kb reads*; rival Needletail at 1.06x z-fastq's time
 
 </details>
 
@@ -206,11 +206,11 @@ Picked from these results: per group and format, the case where z-fastq leads it
 
 | Tool       | Instructions per byte | Instructions per cycle | Cache misses per MiB | Branch misses per MiB |
 | ---------- | --------------------: | ---------------------: | -------------------: | --------------------: |
-| z-fastq    |                  0.52 |                   3.61 |                 1168 |                   112 |
-| Needletail |                  0.68 |                   2.52 |                  423 |                   389 |
-| Helicase   |                  0.80 |                   3.12 |                 1171 |                   232 |
-| SeqFu      |                  1.35 |                   2.46 |                  555 |                  1241 |
-| seqtk      |                  1.55 |                   2.48 |                 3124 |                  1454 |
-| fqtools    |                 36.57 |                   3.44 |                  977 |                  2800 |
+| z-fastq    |                  0.51 |                   3.57 |                 1105 |                   118 |
+| Needletail |                  0.68 |                   2.55 |                  430 |                   390 |
+| Helicase   |                  0.80 |                   3.24 |                 1119 |                   233 |
+| SeqFu      |                  1.35 |                   2.43 |                  548 |                  1264 |
+| seqtk      |                  1.55 |                   2.45 |                 3092 |                  1480 |
+| fqtools    |                 36.57 |                   3.46 |                 1088 |                  2860 |
 
 </details>

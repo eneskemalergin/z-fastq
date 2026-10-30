@@ -3,8 +3,8 @@
 # Validating FASTQ files
 > <sub>`z-fastq check` against 3 other validators, on 7 real sequencing runs and 5 synthetic shapes, plain and gzip. A tool is timed only where it accepted the valid input; time and memory come from the same run, on one CPU.</sub>
 
-- `z-fastq`: *0.1.0 at 90e46b4*
-- `machine`: *Ryzen 9 3950X, Linux 7.2.11; one CPU per run*
+- `z-fastq`: *0.1.0 at 246bbb1*
+- `machine`: *Ryzen 9 3950X, Linux 7.2.12; one CPU per run*
 - `runner`: *zebrac 0.6.2 with zexec*
 - `data`:
   - **Real**: *7 public sequencing runs, 1 GiB each, pooled in the bars by the kind of reads they hold*
@@ -17,13 +17,13 @@
     - `variable`: *50 to 150 bp, annotated plus line*
     - `longread`: *nanopore headers, rare 300 kb reads*
     - `long`: *300 kb sequence lines*
-- `date`: *2026-10-25*
+- `date`: *2026-10-29*
 
 ## Findings
 
 - **Right answers:** z-fastq returned the right verdict on all 228 checked inputs and rejected every malformed edge case. 2 of the 3 other tools print a wrong verdict or crash on at least one.
-- **Speed:** fq, the fastest other full-check tool, takes 3.49x z-fastq's time on plain input and 2.28x on gzip.
-- **Memory:** every other tool peaks at 4.4x to 9x z-fastq's 0.75 MiB.
+- **Speed:** fq, the fastest other full-check tool, takes 4.08x z-fastq's time on plain input and 2.29x on gzip.
+- **Memory:** every other tool peaks at 4.1x to 9x z-fastq's 0.79 MiB.
 - **Where z-fastq is not fastest:** on no kind of input; it is the fastest tool on every kind of input (geometric mean over the group), plain and gzip.
 
 ## Compared tools
@@ -149,7 +149,7 @@ There were a total of 1 errors.
 </details>
 
 ## Speed and memory
-> <sub>The real runs and synthetic shapes at the medium tier, about 1 GiB of FASTQ each, pooled into kinds of input. Every tool runs on one CPU with the file in the page cache.</sub>
+> <sub>The real runs and synthetic shapes at the medium tier, about 1 GiB of FASTQ each, pooled into kinds of input. Every tool runs on one CPU, with the file in the page cache.</sub>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-overview-dark.png">
@@ -157,14 +157,15 @@ There were a total of 1 errors.
   <img src="results/figures/single-overview-light.png" alt="Time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
-z-fastq itself takes 254.3 ms and 0.75 MiB per plain input, 1457.9 ms and 0.75 MiB per gzip input (geometric means over 12 inputs each); the table gives every tool as a multiple of that.
+z-fastq itself takes 216.1 ms and 0.79 MiB per plain input, 1433.9 ms and 0.79 MiB per gzip input (geometric means over 12 inputs each); the table gives every tool as a multiple of that.
+Geometric-mean process CPU time is 213.9 ms for plain input and 1424.7 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
 
 | Tool           | Plain time | Plain memory | Gzip time | Gzip memory |
 | -------------- | ---------: | -----------: | --------: | ----------: |
 | z-fastq        |      1.00x |        1.00x |     1.00x |       1.00x |
-| fq             |      3.49x |        5.66x |     2.28x |       5.69x |
-| fqtools        |     13.45x |        4.36x |     3.16x |       5.04x |
-| fastQValidator |     25.83x |        8.66x |     5.34x |       9.06x |
+| fq             |      4.08x |        5.29x |     2.29x |       5.38x |
+| fqtools        |     16.14x |        4.11x |     3.17x |       4.78x |
+| fastQValidator |     30.12x |        8.26x |     5.38x |       8.54x |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-speed-dark.png">
@@ -204,8 +205,8 @@ z-fastq itself takes 254.3 ms and 0.75 MiB per plain input, 1457.9 ms and 0.75 M
   <img src="results/figures/single-scaling-memory-light.png" alt="Peak memory by input size" width="100%">
 </picture>
 
-At 1 GiB, z-fastq validates 3.0 to 6.2 GiB/s on plain input and 0.4 to 0.9 GiB/s on gzip input; no other tool is faster there.
-z-fastq peaks at 0.75 MiB at every size and shape. Memory that grows with the input: fqtools by 1.4x on plain longread; fastQValidator by 4.5x on plain longread.
+At 1 GiB, z-fastq validates 3.4 to 8.2 GiB/s on plain input and 0.4 to 0.9 GiB/s on gzip input; no other tool is faster there.
+z-fastq peaks at 0.79 MiB at every size and shape. Memory that grows with the input: fqtools by 1.3x on gzip longread; fastQValidator by 4.4x on plain longread.
 
 ## Other layouts
 > <sub>Mates in two files, with names checked across them, and mates interleaved in one file.</sub>
@@ -214,40 +215,42 @@ z-fastq peaks at 0.75 MiB at every size and shape. Memory that grows with the in
 
 Mates in two files, names checked across them.
 
-z-fastq itself takes 516.6 ms and 1.00 MiB per plain input, 1588.2 ms and 1.00 MiB per gzip input (geometric means over 5 inputs each); the table gives every tool as a multiple of that.
+z-fastq itself takes 435.4 ms and 1.06 MiB per plain input, 1623.2 ms and 1.06 MiB per gzip input (geometric means over 5 inputs each); the table gives every tool as a multiple of that.
+Geometric-mean process CPU time is 376.0 ms for plain input and 1483.5 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
 
 | Tool    | Plain time | Plain memory | Gzip time | Gzip memory |
 | ------- | ---------: | -----------: | --------: | ----------: |
 | z-fastq |      1.00x |        1.00x |     1.00x |       1.00x |
-| fq      |      4.65x |       26.86x |     3.60x |      26.85x |
+| fq      |      6.74x |       25.45x |     3.86x |      25.41x |
 
 ### Interleaved
 
 Mates alternating in one file.
 
-z-fastq itself takes 570.1 ms and 0.75 MiB per plain input, 1644.7 ms and 0.75 MiB per gzip input (geometric means over 5 inputs each); the table gives every tool as a multiple of that.
+z-fastq itself takes 430.0 ms and 0.53 MiB per plain input, 1535.0 ms and 0.81 MiB per gzip input (geometric means over 5 inputs each); the table gives every tool as a multiple of that.
+Geometric-mean process CPU time is 426.7 ms for plain input and 1524.8 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
 
 | Tool    | Plain time | Plain memory | Gzip time | Gzip memory |
 | ------- | ---------: | -----------: | --------: | ----------: |
 | z-fastq |      1.00x |        1.00x |     1.00x |       1.00x |
-| fqtools |      6.01x |        4.25x |     2.72x |       4.83x |
+| fqtools |      8.02x |        6.03x |     2.95x |       4.58x |
 
 ## Reproducibility
 
 <details><summary>How it was measured</summary>
 
-Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. The kernel reports peak memory in 256 KiB steps, so values closer than that are equal. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Generated by `bench/check/run.sh release` on 2026-10-25.
+Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS uses the kernel high-water counter, not an exact allocation count. Quick comparisons treat differences smaller than 256 KiB as inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Generated by `bench/check/run.sh release` on 2026-10-29.
 
 </details>
 
 <details><summary>Identity</summary>
 
-- `z-fastq`: *0.1.0 at 90e46b4*
+- `z-fastq`: *0.1.0 at 246bbb1*
 - `zebrac`: *0.6.2*
-- `zexec`: *12616 bytes, static, no libc*
-- `kernel`: *7.2.11-200.fc44.x86_64*
+- `zexec`: *15000 bytes, static, no libc*
+- `kernel`: *7.2.12-200.fc44.x86_64*
 - `cpu`: *AMD Ryzen 9 3950X 16-Core Processor*
-- `load at batch start`: *2.62 to 11.67*
+- `load at batch start`: *1.34 to 5.65*
 
 </details>
 
@@ -267,14 +270,14 @@ Every tool runs through `zexec -r` inside one zebrac batch per case, held to one
 
 Picked from these results: per group and format, the case where z-fastq leads its fastest full-check rival by the least. `run.sh peer` times z-fastq against a cached reference of the rival on each; `run.sh ab REV` times two z-fastq builds on each.
 
-- `Long reads, plain`: *PromethION, 30 to 153 kb*; rival fq at 3.64x z-fastq's time
-- `Short, fixed length, plain`: *miRNA, 36 bp*; rival fq at 2.63x z-fastq's time
-- `Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival fq at 3.37x z-fastq's time
-- `Synthetic, plain`: *long: 300 kb sequence lines*; rival fq at 3.31x z-fastq's time
-- `Long reads, gzip`: *PromethION, 30 to 153 kb*; rival fq at 1.94x z-fastq's time
-- `Short, fixed length, gzip`: *BGISEQ, 100 bp*; rival fq at 2.12x z-fastq's time
-- `Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival fq at 2.51x z-fastq's time
-- `Synthetic, gzip`: *longread: nanopore headers, rare 300 kb reads*; rival fq at 1.77x z-fastq's time
+- `Long reads, plain`: *PromethION, 30 to 153 kb*; rival fq at 4.95x z-fastq's time
+- `Short, fixed length, plain`: *miRNA, 36 bp*; rival fq at 2.71x z-fastq's time
+- `Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival fq at 3.65x z-fastq's time
+- `Synthetic, plain`: *endings: 100 bp, CRLF and LF lines*; rival fq at 3.95x z-fastq's time
+- `Long reads, gzip`: *PromethION, 30 to 153 kb*; rival fq at 1.99x z-fastq's time
+- `Short, fixed length, gzip`: *BGISEQ, 100 bp*; rival fq at 2.13x z-fastq's time
+- `Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival fq at 2.53x z-fastq's time
+- `Synthetic, gzip`: *longread: nanopore headers, rare 300 kb reads*; rival fq at 1.80x z-fastq's time
 
 </details>
 
@@ -282,9 +285,9 @@ Picked from these results: per group and format, the case where z-fastq leads it
 
 | Tool           | Instructions per byte | Instructions per cycle | Cache misses per MiB | Branch misses per MiB |
 | -------------- | --------------------: | ---------------------: | -------------------: | --------------------: |
-| z-fastq        |                  1.89 |                   3.65 |                 1093 |                    80 |
-| fq             |                  9.51 |                   3.82 |                  426 |                  4653 |
-| fqtools        |                 36.81 |                   3.41 |                  995 |                  1686 |
-| fastQValidator |                 54.05 |                   2.51 |                 3317 |                  4370 |
+| z-fastq        |                  1.47 |                   3.71 |                  980 |                    86 |
+| fq             |                  9.51 |                   3.82 |                  422 |                  4673 |
+| fqtools        |                 36.81 |                   3.36 |                 1179 |                  1697 |
+| fastQValidator |                 54.04 |                   2.53 |                 3221 |                  4482 |
 
 </details>

@@ -4,7 +4,7 @@ source "$(dirname -- "$0")/../lib/bench.sh"
 
 job "records in a FASTQ file"
 truth "the record count the corpus cutter wrote into each manifest (and each shape's state.json), derived without z-fastq"
-remark scaling "Every tool is held to one CPU, so a tool that starts threads (SeqFu starts 8 by default) gains nothing from them here; its CPU time equals its wall time. Lines rise with size because each tool's fixed start cost spreads over more data; SeqFu has the largest start cost, so its line rises the most."
+remark scaling "Every tool is held to one CPU, so a tool that starts threads (SeqFu starts 8 by default) cannot use extra CPU cores here. Elapsed time can still exceed process CPU time because of scheduling and I/O waits. Lines rise with size because each tool's fixed start cost spreads over more data; SeqFu has the largest start cost, so its line rises the most."
 
 lane z-fastq subject "{zfastq} count {in}"
 lane fqtools complete "{bin} count {in}" headline-only

@@ -25,7 +25,7 @@ BENCH_MEM="${BENCH_MEM:-4G}"
 BENCH_JOBS="${BENCH_JOBS:-4}"
 # The most cores one batch may hold. A family whose cases need more is not
 # timed until the lead raises this for that run (BENCH_MAX_CORES=16).
-BENCH_MAX_CORES="${BENCH_MAX_CORES:-8}"
+BENCH_MAX_CORES="${BENCH_MAX_CORES:-16}"
 REAL="$BENCH/data/real"
 SHAPES="$BENCH/data/synthetic"
 
@@ -94,6 +94,9 @@ declare -A LANE_CLASS LANE_TMPL LANE_NOTE LANE_HEADLINE LANE_OUTS DESCRIBE
 declare -A LANE_OUTDIR=() LANE_CORES=() LANE_OF=()
 declare -A FAM_DESC FAM_LANES FAM_STDIN FAM_INPUTS FAM_KIND FAM_PARAMS FAM_VARY FAM_FORMATS FAM_LOOK FAM_MEM
 job() { JOB="$1"; }
+# execution bounded: limit the whole run and stop the pool on worker failure.
+EXECUTION=default RUN_COMPLETE=0
+execution() { EXECUTION="$1"; }
 # order LANES: this feature's table and legend order, ahead of the registry's.
 order() { local n i=0; for n in ${1//,/ }; do REG_ORDER[$n]=$((i++ - 1000)); done; }
 truth() { TRUTH="$1"; }
@@ -272,6 +275,11 @@ run_start() { # mode
     [[ -z "$(git -C "$REPO" status --porcelain -- src build.zig build.zig.zon bench tools | head -1)" ]] || RUN_REV+="+modified"
     read -r load _ </proc/loadavg
     trap 'run_end $?' EXIT
+    if [[ "$EXECUTION" == bounded ]]; then
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        trap 'exit 129' HUP
+    fi
     local size mtime built=""
     if read -r size mtime < <(stat -L -c '%s %Y' -- "$ZFASTQ" 2>/dev/null); then printf -v built ', z-fastq %s bytes built %(%Y-%m-%d %H:%M)T' "$size" "$mtime"; fi
     log run START "$FEATURE $1 at $RUN_REV$built, load $load"
@@ -279,6 +287,7 @@ run_start() { # mode
 run_end() { # exit status
     local outcome=ok end loadmax
     ((${1:-0} == 0)) || outcome=stopped
+    [[ "$EXECUTION" != bounded || "$RUN_COMPLETE" == 1 ]] || outcome=stopped
     printf -v end '%(%Y-%m-%d %H:%M:%S)T' -1
     loadmax="$(printf '%s\n' $RUN_LOADS | sort -n | tail -1)"
     local batches=""
@@ -288,6 +297,9 @@ run_end() { # exit status
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$RUN_STARTED" "$end" "$RUN_MODE" "$RUN_REV" "$(fileid "$ZFASTQ" 2>/dev/null)" \
         "$N_TIMED" "$N_CACHED" "${loadmax:--}" "$outcome" "${LOG_FILE##*/}" >>"$RESULTS/runs.tsv"
     exec 2>&-
+    # On failure, let systemd stop any remaining workers and the logger. A
+    # worker holding stderr open must not delay the service's shutdown.
+    [[ "$EXECUTION" != bounded || "${1:-0}" == 0 ]] || return 0
     wait "$LOG_PID" 2>/dev/null || true
 }
 
@@ -510,7 +522,7 @@ run_init() {
     STAGE=init
     local c name bin receipt version recipe pin v
     for c in jq gawk taskset systemd-run cksum zebrac zig; do
-        command -v "$c" >/dev/null || issue stop "$c not found"
+        builtin command -v "$c" >/dev/null || issue stop "$c not found"
     done
     [[ "$(zebrac --version 2>/dev/null)" == "zebrac 0.6."* ]] || issue stop "zebrac 0.6.x expected"
     local paranoid
@@ -610,6 +622,32 @@ build_subject() {
 }
 
 # --- checks -----------------------------------------------------------------
+# Features may register exact temporary paths for cleanup after cancellation.
+bench_cleanup_path() {
+    [[ -n "${BENCH_CLEANUP:-}" ]] || return 0
+    local kind="$1" path
+    shift
+    for path; do printf '%s\t%s\n' "$kind" "$path" >>"$BENCH_CLEANUP"; done
+}
+# Record only scratch directories, never result or cache directories.
+scratch_dir() {
+    local path
+    path="$(mktemp -d "$1")" || return
+    bench_cleanup_path d "$path"
+    printf '%s\n' "$path"
+}
+# Keep default execution unchanged; a feature already inside a bounded service
+# can run commands there instead of creating an unrelated scope.
+bench_scope() {
+    local quota="$1" memory="$2"
+    shift 2
+    if [[ "$EXECUTION" == bounded ]]; then
+        [[ -n "${INVOCATION_ID:-}" && "${BENCH_BOUNDED:-}" == 1 ]] || die "command is outside its bounded service"
+        "$@"
+    else
+        systemd-run --user --scope -q -p "CPUQuota=$quota" -p "MemoryMax=$memory" "$@"
+    fi
+}
 # One check: run LANE on a case (stdin or file form), map output to the fact,
 # compare with the truth. fact sees LANE, FAMILY, IN (the case paths), TRUTH
 # (the case's manifest value), PARAMS, and, once the lane has ended, RC and
@@ -627,8 +665,9 @@ reject_code() {
 fact_of() { LANE="$name" FAMILY="$fam" IN="$paths" TRUTH="$truth" PARAMS="$params" fact; }
 check_one() { # lane form fam id fmt paths want bytes params truth
     local name="$1" form="$2" fam="$3" paths="$6" want="$7" params="${9:--}" truth="${10:-$7}" out work rc=0 checker_rc=0 value cmd input=- status=fail diff=""
-    work="$(mktemp -d "/var/tmp/bench-$FEATURE.XXXXXX")"
+    work="$(scratch_dir "/var/tmp/bench-$FEATURE.XXXXXX")"
     out="$work/check"
+    bench_cleanup_path f "$out" "$out.err" "$out.fact" "$out.1" "$out.2"
     [[ "$form" == stdin ]] || input="$paths"
     if ((FACT_PIPE)) && uses_stem "$name" "$fam"; then
         # A lane that names its outputs from a stem writes new regular files
@@ -642,6 +681,10 @@ check_one() { # lane form fam id fmt paths want bytes params truth
         ((${#sfx[@]} < 2)) || o2="$stem${sfx[1]}"
         dsfx="$(outdir_of "$name" "$fam")"
         [[ -z "$dsfx" ]] || { od="$stem$dsfx"; mkdir -- "$od"; }
+        for s in "${sfx[@]}"; do bench_cleanup_path f "$stem$s"; done
+        if [[ -n "$od" ]]; then
+            bench_cleanup_outdir "$od" "$name" "$fam" "$paths"
+        fi
         cmd="$(STEM="$stem" lane_cmd "$name" "$input" "$fam" "$params")"
         if [[ "$form" == stdin ]]; then $cmd <"$paths" >/dev/null 2>"$out.err" || rc=$?; else $cmd >/dev/null 2>"$out.err" || rc=$?; fi
         set +e
@@ -698,6 +741,9 @@ check_one() { # lane form fam id fmt paths want bytes params truth
         checker_rc=$?
         set -e
     fi
+    if [[ "$EXECUTION" == bounded ]] && ((rc == 126 || rc == 127 || (rc >= 128 && rc < 255))); then
+        log check FAIL "$name execution failed (exit $rc): $(head -c 300 "$out.err")"
+    fi
     rm -f -- "$out" "$out.err"
     if ! rmdir -- "$work"; then
         log check WARN "unexpected outputs remain in $work"
@@ -718,6 +764,11 @@ check_one() { # lane form fam id fmt paths want bytes params truth
         [[ "$rc" != 0 || -n "$diff" ]] || status=pass
         # A failure records the first differing field instead of every field.
         [[ -z "$diff" ]] || value="$diff"
+    fi
+    if [[ "$EXECUTION" == bounded ]] &&
+        ((checker_rc != 0 || (rc >= 128 && rc < 255) || rc == 126 || rc == 127)); then
+        status=error
+        checker_rc=1
     fi
     printf '%s\t%s\t%s\t%s\t%s\n' "$(status_key "$name" "$fam" "$form" "$(fileid $paths)" "$params")" "$status" "$rc" "$value" "${paths//$REPO\//}"
     ((checker_rc == 0))
@@ -775,7 +826,14 @@ declare -A CHECK_STATUS CHECK_VALUE
 load_checks() {
     [[ -f "$CHECKS" ]] || return 0
     local k s r v
-    while IFS=$'\t' read -r k s r v _; do CHECK_STATUS[$k]="$s" CHECK_VALUE[$k]="$v"; done <"$CHECKS"
+    while IFS=$'\t' read -r k s r v _; do
+        if [[ "$EXECUTION" == bounded ]] && { [[ "$s" == error || "$v" == 'checker failed'* ]] ||
+            ((r == 126 || r == 127 || (r >= 128 && r < 255))); }; then
+            unset 'CHECK_STATUS[$k]' 'CHECK_VALUE[$k]'
+        else
+            CHECK_STATUS[$k]="$s" CHECK_VALUE[$k]="$v"
+        fi
+    done <"$CHECKS"
 }
 run_checks() {
     STAGE=check
@@ -831,6 +889,10 @@ check_jobs() { # agree | lanes
 # a background subshell of this shell, so a job costs no new script start.
 pool() { # function
     local line first=0 result=0 pid
+    if [[ "$EXECUTION" == bounded ]]; then
+        bounded_pool "$1"
+        return "$?"
+    fi
     local pids=()
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
@@ -857,7 +919,7 @@ cached_step() { # name key jobs-function run-function out
     fi
     jobs="$("$3")"
     n="$(grep -c . <<<"$jobs" || true)"
-    log "$name" RUN "$n jobs, $BENCH_JOBS at a time"
+    log "$name" RUN "$n jobs, up to $BENCH_JOBS at a time$(pool_budget)"
     set +e
     pool "$4" <<<"$jobs" >"$out.part"
     local worker_rc=$?
@@ -880,7 +942,7 @@ dispatch_checks() { # job lines on stdin
     jobs="$(cat)"
     [[ -n "$jobs" ]] || return 0
     n="$(grep -c . <<<"$jobs")"
-    log check RUN "$n lane and input pairs, $BENCH_JOBS at a time"
+    log check RUN "$n lane and input pairs, up to $BENCH_JOBS at a time$(pool_budget)"
     local before=0 got
     [[ ! -f "$CHECKS" ]] || before="$(wc -l <"$CHECKS")"
     set +e
@@ -1014,6 +1076,7 @@ run_edges() {
     local t0=$SECONDS
     : >"$out"
     local o="$RESULTS/edges.out" tmpl cmd params="$EDGE_PARAMS" paths truth=""
+    bench_cleanup_path f "$o" "$o.err" "$o.1" "$o.2"
     local stem=""
     for name in "${LANES[@]}"; do
         # A thread variant parses as its base tool does.
@@ -1041,6 +1104,10 @@ run_edges() {
                 [[ -z "$dsfx" ]] || { od="$stem$dsfx"; mkdir -- "$od"; }
             fi
             path="$(edge_path "$edge")" paths="$path"
+            if [[ -n "$stem" ]]; then
+                for s in "${sfx[@]}"; do bench_cleanup_path f "$stem$s"; done
+            fi
+            [[ -z "$od" ]] || bench_cleanup_outdir "$od" "$name" "$fam" "$paths"
             rc=0
             # A lane whose command names no input ({in}, {in1}, {in2}) reads it on stdin.
             if [[ (-n "$fam" && "${FAM_STDIN[$fam]}" == 1) || "$tmpl" != *"{in"* ]]; then
@@ -1111,6 +1178,9 @@ batch_meta() { # form input-id runs warm lanes... -> sets META
     shift 4
     printf -v META 'form %s\ninputs %s\nruns %s\nwarm %s\ncpu %s\nzexec %s\n' "$form" "$inid" "$runs" "$warm" "${BATCH_CPUS:-$BENCH_CPU}" "$ZEXEC_ID"
     for name; do META+="lane $name ${LANE_IDS[$name|${BATCH_FAM:-}]}"$'\n'; done
+    if [[ "$EXECUTION" == bounded ]]; then
+        META+="execution bounded-v1 quota=$((BENCH_MAX_CORES * 100))% memory=$BENCH_MEM swap=0"$'\n'
+    fi
 }
 # The newest cached batch that can stand for META: same form, inputs, runs,
 # CPU, and zexec; at least as many warmups; every wanted lane timed with the
@@ -1171,7 +1241,7 @@ timed_spec() { # name lane input family params [bin]
     local name="$1" lane="$2" stem="" s cmd
     UNLINKS[$name]=""
     if uses_stem "$lane" "$4"; then
-        [[ -n "$OUT_DIR" ]] || OUT_DIR="$(mktemp -d /var/tmp/bench-outputs.XXXXXX)"
+        [[ -n "$OUT_DIR" ]] || OUT_DIR="$(scratch_dir /var/tmp/bench-outputs.XXXXXX)"
         stem="$OUT_DIR/$FEATURE-$name-@RUN@"
         local outs="${LANE_OUTS[$lane]:-}"
         for s in ${outs//,/ }; do UNLINKS[$name]+=" -u $stem$s"; done
@@ -1298,7 +1368,7 @@ time_lanes() { # dir form paths runs warm fam id name=command...
         locks+=("$fd")
     done
     [[ "$cpus" != *,* ]] || n="$(tr ',' '\n' <<<"$cpus" | wc -l)"
-    systemd-run --user --scope -q -p "CPUQuota=$((n * 100))%" -p "MemoryMax=${FAM_MEM[$fam]:-$BENCH_MEM}" \
+    bench_scope "$((n * 100))%" "${FAM_MEM[$fam]:-$BENCH_MEM}" \
         taskset -c "$cpus" zebrac -q -w "$warm" -i "$runs" -a "$runs" -d 1 --json="$dir/zebrac.json" "${cmds[@]}" 2>"$dir/zebrac.err" ||
         die "zebrac failed for $fam $id: $(head -c 400 "$dir/zebrac.err")"
     for fd in "${locks[@]}"; do exec {fd}>&-; done
@@ -1506,16 +1576,19 @@ subject_sentence() { # family
     awk -F'\t' -v fam="$1" -v tier="$HEADLINE" '
         FILENAME ~ /cases.tsv$/ { if (FNR > 1 && $1 == fam && $5 == tier && $6 != "many") fmt[$2] = $3; next }
         FNR == 1 || $1 != fam || !($2 in fmt) || $3 != "z-fastq" { next }
-        { k[fmt[$2]]++; w[fmt[$2]] += log($5); m[fmt[$2]] += log($8) }
+        { k[fmt[$2]]++; w[fmt[$2]] += log($5); m[fmt[$2]] += log($8)
+          if ($11 > 0) { nc[fmt[$2]]++; c[fmt[$2]] += log($11) } }
         END {
             if (!k["gzip"]) {
                 printf "z-fastq itself takes %.1f ms and %.2f MiB per plain input (geometric mean over %d inputs); the table gives every tool as a multiple of that.\n",
                     exp(w["plain"] / k["plain"]) / 1e6, exp(m["plain"] / k["plain"]) / 1024, k["plain"]
+                if (nc["plain"] == k["plain"]) printf "Geometric-mean process CPU time is %.1f ms. Elapsed time also includes launcher overhead and time waiting to run or for I/O.\n", exp(c["plain"] / nc["plain"]) / 1000
                 exit
             }
             printf "z-fastq itself takes %.1f ms and %.2f MiB per plain input, %.1f ms and %.2f MiB per gzip input (geometric means over %s); the table gives every tool as a multiple of that.\n",
                 exp(w["plain"] / k["plain"]) / 1e6, exp(m["plain"] / k["plain"]) / 1024, exp(w["gzip"] / k["gzip"]) / 1e6, exp(m["gzip"] / k["gzip"]) / 1024,
                 (k["plain"] == k["gzip"] ? k["plain"] " inputs each" : k["plain"] " and " k["gzip"] " inputs")
+            if (nc["plain"] == k["plain"] && nc["gzip"] == k["gzip"]) printf "Geometric-mean process CPU time is %.1f ms for plain input and %.1f ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.\n", exp(c["plain"] / nc["plain"]) / 1000, exp(c["gzip"] / nc["gzip"]) / 1000
         }' "$REPORT_DIR/cases.tsv" "$REPORT_DIR/summary.tsv"
 }
 # Per lane, user-space counters per input byte, geometric mean over the plain headline inputs.
@@ -1845,7 +1918,8 @@ current_checks() {
         done
     done < <({ cases; verify_cases; } | with_input_ids) | awk -F'\t' 'FNR == NR { if (!($1 in want)) { want[$1] = $2 "\t" $3 "\t" $4 } next }
         ($1 in want) && !($1 in done) { done[$1] = 1; split(want[$1], w, "\t")
-            printf "%s\t%s\t%s\t%s\t%s\t%s\n", w[1], w[2], $2, $3, substr($4, 1, 40), w[3] }' - "$CHECKS"
+            printf "%s\t%s\t%s\t%s\t%s\t%s\n", w[1], w[2], $2, $3, substr($4, 1, 40), w[3] }' - \
+        <(if [[ "$EXECUTION" == bounded ]]; then tac -- "$CHECKS"; else cat -- "$CHECKS"; fi)
 }
 # One sentence on z-fastq, then the other tools wrong on inputs they were
 # given, as a table (tool, wrong, of, inputs), or a sentence when none was.
@@ -2089,7 +2163,7 @@ readme_repro() {
     printf '## Reproducibility\n\n'
     details "How it was measured"
     cat <<EOF
-Every tool runs through \`zexec -r\` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a $BENCH_MEM memory cap$(mem_caps)$( ((${#LANE_CORES[@]} == 0)) || printf '; a batch with threaded variants holds as many physical cores as its largest lane, one logical CPU each, with each lane pinned to its own cores and z-fastq to one'), after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. The kernel reports peak memory in 256 KiB steps, so values closer than that are equal. Runs per tier, each after one warmup: tiny ${RUNS[tiny]}, xsmall ${RUNS[xsmall]}, small ${RUNS[small]}, medium ${RUNS[medium]}; sizes 1 MiB to 1 GiB. Generated by \`bench/$FEATURE/run.sh release\` on $date.
+Every tool runs through \`zexec -r\` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a $BENCH_MEM memory cap$(mem_caps)$( ((${#LANE_CORES[@]} == 0)) || printf '; a batch with threaded variants holds as many physical cores as its largest lane, one logical CPU each, with each lane pinned to its own cores and z-fastq to one'), after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS uses the kernel high-water counter, not an exact allocation count. Quick comparisons treat differences smaller than 256 KiB as inconclusive. Runs per tier, each after one warmup: tiny ${RUNS[tiny]}, xsmall ${RUNS[xsmall]}, small ${RUNS[small]}, medium ${RUNS[medium]}; sizes 1 MiB to 1 GiB. Generated by \`bench/$FEATURE/run.sh release\` on $date.
 
 </details>
 
@@ -2349,7 +2423,7 @@ build_rev() { # rev -> binary path
     if [[ ! -x "$bin" ]]; then
         if [[ ! -d "$wt" ]]; then git -C "$REPO" worktree add --detach "$wt" "$sha" >&2; else git -C "$wt" checkout -q --detach "$sha"; fi
         log build RUN "z-fastq at ${sha:0:9}"
-        (cd "$wt" && systemd-run --user --scope -q -p CPUQuota=400% -p MemoryMax=4G zig build -Dstatic=true -Doptimize=ReleaseFast -j4) >&2
+        (cd "$wt" && bench_scope 400% 4G zig build -Dstatic=true -Doptimize=ReleaseFast -j4) >&2
         mkdir -p -- "$(dirname -- "$bin")"
         install -m 755 "$wt/zig-out/bin/z-fastq" "$bin"
     fi
@@ -2389,12 +2463,117 @@ run_ab() {
     note "ab: A=${rev_a} B=${rev_b:-working tree}; a change is real only beyond twice the A/A spread and 3% (time), or one 256 KiB step beyond the A/A spread (RSS)"
 }
 
+# --- bounded execution -------------------------------------------------------
+pool_budget() {
+    [[ "$EXECUTION" != bounded ]] || printf ', shared CPU quota %s and memory cap %s' "$BENCH_MAX_CORES" "$BENCH_MEM"
+}
+# Checks are not measurements: tools may share CPUs under the service quota.
+# Thread-count flags do not describe actual CPU use or memory consumption.
+# Stop admitting work when a worker fails; systemd stops remaining children.
+bounded_pool() {
+    local fn="$1" line pid finished rc
+    local -A active=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        if ((${#active[@]} >= BENCH_JOBS)); then
+            rc=0
+            wait -n -p finished "${!active[@]}" || rc=$?
+            if ((rc != 0)); then
+                log check FAIL "verification worker failed (exit $rc); no more jobs will start"
+                return "$rc"
+            fi
+            unset 'active[$finished]'
+        fi
+        (set -e; "$fn" "$line") &
+        pid=$!
+        active[$pid]=1
+    done
+    while ((${#active[@]})); do
+        rc=0
+        wait -n -p finished "${!active[@]}" || rc=$?
+        ((rc == 0)) || return "$rc"
+        unset 'active[$finished]'
+    done
+}
+bench_cleanup_outdir() {
+    local dir="$1" entry
+    shift
+    bench_cleanup_path d "$dir"
+    while IFS= read -r entry; do
+        if [[ "$entry" == */ ]]; then bench_cleanup_path d "$dir/${entry%/}"; else bench_cleanup_path f "$dir/$entry"; fi
+    done < <(outdir_entries "$@")
+}
+bounded_cleanup() {
+    local kind path
+    [[ -f "$BENCH_CLEANUP" ]] || return 0
+    while IFS=$'\t' read -r kind path; do
+        [[ "$kind" != f ]] || rm -f -- "$path"
+    done <"$BENCH_CLEANUP"
+    # Children precede parents, even when an output declaration lists its
+    # directory after the files it contains. Never remove unexpected files.
+    while IFS= read -r path; do
+        [[ ! -d "$path" ]] || rmdir -- "$path" 2>/dev/null ||
+            printf 'bench: retained unexpected or incomplete outputs in %s\n' "$path" >&2
+    done < <(awk -F'\t' '$1 == "d" { print $2 }' "$BENCH_CLEANUP" | sort -ru)
+    rm -- "$BENCH_CLEANUP"
+    rmdir -- "${BENCH_CLEANUP%/*}"
+}
+
+bounded_stop() {
+    local rc="$1"
+    trap '' INT TERM HUP
+    # Stop only the unit created by this invocation. KillMode=control-group
+    # and the stop timeout also cover grandchildren and unresponsive tools.
+    systemctl --user stop "$BENCH_UNIT" >/dev/null 2>&1 || true
+    wait "$BENCH_LAUNCHER" 2>/dev/null || true
+    bounded_cleanup
+    exit "$rc"
+}
+
+
+bounded_run() {
+    local rc n work name
+    [[ "$BENCH_JOBS" =~ ^[1-9][0-9]*$ ]] || die "BENCH_JOBS must be a positive integer"
+    [[ "$BENCH_MAX_CORES" =~ ^[1-9][0-9]*$ ]] || die "BENCH_MAX_CORES must be a positive integer"
+    n="$(cpu_set 1000000 count)"
+    ((BENCH_MAX_CORES <= n)) || die "BENCH_MAX_CORES exceeds the $n physical cores"
+    [[ "$BENCH_MEM" =~ ^[1-9][0-9]*[KMGT]?$ ]] || die "BENCH_MEM must be a positive byte count or K/M/G/T size"
+    work="$(mktemp -d /var/tmp/bench-run.XXXXXX)"
+    BENCH_CLEANUP="$work/cleanup.tsv"
+    : >"$BENCH_CLEANUP"
+    BENCH_UNIT="z-fastq-bench-${work##*.}.service"
+    local envs=("--setenv=BENCH_BOUNDED=1" "--setenv=BENCH_CLEANUP=$BENCH_CLEANUP"
+        "--setenv=BENCH_MAX_CORES=$BENCH_MAX_CORES" "--setenv=BENCH_MEM=$BENCH_MEM" "--setenv=BENCH_JOBS=$BENCH_JOBS"
+        "--setenv=BENCH_CPU=$BENCH_CPU" "--setenv=ZFASTQ=$ZFASTQ" "--setenv=PATH=$PATH")
+    for name in CASES RETIME; do
+        [[ ! -v "$name" ]] || envs+=("--setenv=$name=${!name}")
+    done
+    systemd-run --user --wait --pipe --collect --quiet --unit="$BENCH_UNIT" \
+        --service-type=exec -p "WorkingDirectory=$REPO" \
+        -p "CPUQuota=$((BENCH_MAX_CORES * 100))%" -p "MemoryMax=$BENCH_MEM" \
+        -p MemorySwapMax=0 -p TasksMax=512 -p KillMode=control-group \
+        -p TimeoutStopSec=5s -p RuntimeMaxSec=24h -p OOMPolicy=stop \
+        "${envs[@]}" /usr/bin/bash "$FEATURE_DIR/run.sh" __bounded "$@" &
+    BENCH_LAUNCHER=$!
+    trap 'bounded_stop 130' INT
+    trap 'bounded_stop 143' TERM
+    trap 'bounded_stop 129' HUP
+    set +e
+    wait "$BENCH_LAUNCHER"
+    rc=$?
+    set -e
+    trap - INT TERM HUP
+    bounded_cleanup
+    return "$rc"
+}
+
 # --- guards -------------------------------------------------------------------
 # Declaration mistakes stop every mode at once, before any work: an unknown
 # name, a source without a description or group, a scaling source with one
 # size, a pick that names no case.
 validate() {
     local errs=() fam name src t list used
+    [[ "$EXECUTION" == default || "$EXECUTION" == bounded ]] || errs+=("execution must be default or bounded")
     [[ -n "$JOB" && -n "$TRUTH" ]] || errs+=("job and truth must be declared")
     [[ -v "RUNS[$HEADLINE]" ]] || errs+=("headline tier $HEADLINE has no run settings")
     ((${#FAMILIES[@]})) || errs+=("no family declared")
@@ -2446,6 +2625,13 @@ validate() {
 # CPU, so two runs at once would slow each other. The lock is released when
 # the process exits.
 take_lock() {
+    # Process verification uses the whole CPU allowance, even before timing.
+    # Its exclusive lock excludes other suites; other suites share this lock
+    # and retain their existing per-CPU exclusion.
+    exec 8>"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/z-fastq-bench.lock"
+    local lock_mode=-s
+    [[ "$EXECUTION" != bounded ]] || lock_mode=-x
+    flock -n "$lock_mode" 8 || die "another benchmark holds the execution lock"
     mkdir -p -- "$CACHE"
     # One timing run per CPU: runs pinned to different CPUs may overlap.
     exec 9>"$CACHE/timing-cpu$BENCH_CPU.lock"
@@ -2472,7 +2658,9 @@ bench/$FEATURE/run.sh MODE: $JOB
   list-verify    the extra inputs z-fastq alone is checked on
   help           this text
 
-Timing modes (check, release, peer, ab) hold one machine-wide lock. Results
+Timing modes (check, release, peer, ab) hold a per-CPU lock. Bounded execution
+also excludes other suites, limits parallel checks to BENCH_JOBS, and caps the complete
+run at BENCH_MAX_CORES CPUs and BENCH_MEM memory, with no swap. Results
 and caches live in bench/$FEATURE/results/ and bench/cache/; both are ignored
 by git and reused. RETIME=1 writes fresh release batches and preserves old ones;
 CASES=REGEX keeps only the case ids it matches (paired:tiny for a smoke run).
@@ -2480,13 +2668,25 @@ USAGE
 }
 bench_main() {
     local mode="${1:-}"
+    if [[ "$mode" == __bounded ]]; then
+        [[ "$EXECUTION" == bounded && -n "${INVOCATION_ID:-}" && "${BENCH_BOUNDED:-}" == 1 ]] || die "internal mode needs a bounded service"
+        shift
+        mode="${1:-}"
+    elif [[ "$EXECUTION" == bounded ]]; then
+        case "$mode" in
+            check | release | peer | ab | report) bounded_run "$@"; return ;;
+        esac
+    fi
     mapfile -t LANES < <(for n in "${LANES[@]}"; do printf '%s %s\n' "${REG_ORDER[$n]}" "$n"; done | sort -n | cut -d' ' -f2)
     case "$mode" in
         "" | help | -h | --help) usage; return 0 ;;
         init | check | release | report | list | list-verify | peer | ab) validate ;;
         *) usage >&2; exit 2 ;;
     esac
-    case "$mode" in check | release | peer | ab) take_lock ;; esac
+    case "$mode" in
+        check | release | peer | ab) take_lock ;;
+        report) [[ "$EXECUTION" != bounded ]] || take_lock ;;
+    esac
     case "$mode" in check | release | report | peer | ab) run_start "$mode" ;; esac
     case "$mode" in
         init)
@@ -2533,4 +2733,5 @@ bench_main() {
             ;;
         *) usage >&2; exit 2 ;;
     esac
+    RUN_COMPLETE=1
 }

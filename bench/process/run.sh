@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Benchmark: processing paired reads: copying into plain or gzip files, adapter and quality trimming, and QC tables, on one CPU, then against the peers on 2 to 16 threads. Modes: init, check, release, report, peer, ab REV.
+BENCH_JOBS="${BENCH_JOBS:-8}"
+BENCH_MEM="${BENCH_MEM:-16G}"
 source "$(dirname -- "$0")/../lib/bench.sh"
 
 job "processing paired reads: copying, trimming, and QC tables"
+execution bounded
 truth "copies equal the corpus pairs byte for byte; trimmed pairs and the QC summary equal fastp 1.4.0's with the same settings; QC tables equal FastQC-Rust's"
 expect accept
 facts piped
@@ -245,10 +248,14 @@ decoded() { if [[ "$1" == *.gz ]]; then gzip -dc -- "$1"; else cat -- "$1"; fi; 
 # record count; with SORTED, also the CRC of its records in sorted order (the
 # same records in any order give the same value).
 read_sums() { # file [sorted] -> crc bytes records [sorted-crc]
-    local crc bytes lines sorted=""
-    read -r crc bytes < <(decoded "$1" | cksum)
-    lines="$(decoded "$1" | wc -l)"
-    [[ -z "${2:-}" ]] || read -r sorted _ < <(decoded "$1" | paste - - - - | sort -S 256M --parallel=1 -T /var/tmp | cksum)
+    local crc bytes lines sum sorted=""
+    sum="$(decoded "$1" | cksum)" || return
+    read -r crc bytes <<<"$sum"
+    lines="$(decoded "$1" | wc -l)" || return
+    if [[ -n "${2:-}" ]]; then
+        sum="$(decoded "$1" | paste - - - - | sort -S 256M --parallel=1 -T /var/tmp | cksum)" || return
+        read -r sorted _ <<<"$sum"
+    fi
     printf '%s %s %s%s\n' "$crc" "$bytes" "$((lines / 4))" "${sorted:+ $sorted}"
 }
 # A table as compared: no version or file name line, tied overrepresented
@@ -284,9 +291,16 @@ json_leaves() { # file
 # value in; nothing when every one matches. fastp's fields that z-fastq does
 # not write (the wiki's report reference lists them) are not compared.
 json_diff() { # got want
-    local got
+    local got want diff
     got="$(json_leaves "$1" 2>/dev/null)" && [[ -n "$got" ]] || { printf 'unreadable\n'; return; }
-    comm -23 <(printf '%s\n' "$got") <(json_leaves "$2") | head -1 | cut -f1
+    # No pipe to head: head would close early and comm would die with SIGPIPE
+    # (141), which fails the checker under set -e with pipefail. Consume comm
+    # fully, then take the first line's first field in the shell.
+    want="$(json_leaves "$2")" || return
+    diff="$(comm -23 <(printf '%s\n' "$got") <(printf '%s\n' "$want"))" || return
+    if [[ -z "$diff" ]]; then return 0; fi
+    diff="${diff%%$'\n'*}"
+    printf '%s\n' "${diff%%$'\t'*}"
 }
 
 # The reference: fastp 1.4.0 at one worker on every trimming input, and
@@ -312,9 +326,11 @@ reference_one() {
     IFS=$'\t' read -r fam paths <<<"$1"
     local -a p
     read -r -a p <<<"$paths"
-    dir="$(mktemp -d "/var/tmp/bench-$FEATURE-ref.XXXXXX")" stem="$dir/o"
+    dir="$(scratch_dir "/var/tmp/bench-$FEATURE-ref.XXXXXX")" stem="$dir/o"
+    bench_cleanup_path f "$dir/err" "$stem"_1.fq "$stem"_2.fq "$stem.json" "$stem.html"
     if [[ "$fam" == qc-tables ]]; then
         mkdir -- "$stem.qc"
+        bench_cleanup_outdir "$stem.qc" fastqc-rust "$fam" "$paths"
         $(STEM="$stem" lane_cmd fastqc-rust "$paths" qc-tables) >/dev/null 2>"$dir/err" || { log reference FAIL "fastqc-rust on ${p[0]}: $(head -c 300 "$dir/err")"; rm -f -- "$dir/err"; clear_outdir "$stem.qc" fastqc-rust qc-tables "$paths"; rmdir -- "$dir"; return 1; }
         local m out=""
         for m in 0 1; do
@@ -331,14 +347,21 @@ reference_one() {
         cp -- "$stem.json" "$json"
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$fam" "${p[0]}" "${p[1]}" "$s1" "$s2" "$swd" "$json"
     fi
-    rm -f -- "$dir"/*
+    rm -f -- "$dir/err" "$stem"_1.fq "$stem"_2.fq "$stem.json" "$stem.html"
     rmdir -- "$dir"
 }
 feature_prepare() {
+    local needed available key
+    needed="$(cases | awk -F'\t' '$6 > n { n = $6 } END { printf "%.0f", n * 6 + 1073741824 }')"
+    available="$(df -PB1 /var/tmp | awk 'NR == 2 { print $4 }')"
+    ((available >= needed)) || die "process verification needs at least $needed free bytes under /var/tmp; $available available"
+    key="$(lane_id fastp trim-truseq; lane_id fastp trim-nextera; lane_id fastqc-rust qc-tables; reference_jobs | cut -f2 | tr ' ' '\n' | sort -u | TZ=UTC xargs stat -L -c "%n $FILE_ID_FORMAT"
+        declare -f reference_one read_sums table_of table_norm fastqc_stem | cksum)"
+    # New inputs or commands write separate sidecars. A failed refresh must
+    # leave the JSON and tables named by the saved reference.tsv unchanged.
+    REF_DIR="$RESULTS/reference/$(printf '%s' "$key" | sha256sum | cut -d' ' -f1)"
     mkdir -p -- "$REF_DIR"
-    # Two at a time: fastp holds 1.1 GiB and the record sort 256 MiB per job.
-    BENCH_JOBS=2 cached_step reference "$(lane_id fastp trim-truseq; lane_id fastp trim-nextera; lane_id fastqc-rust qc-tables; reference_jobs | cut -f2 | tr ' ' '\n' | sort -u | TZ=UTC xargs stat -L -c "%n $FILE_ID_FORMAT"
-        declare -f reference_one read_sums table_of table_norm fastqc_stem | cksum)" reference_jobs reference_one "$REFERENCE"
+    cached_step reference "$key" reference_jobs reference_one "$REFERENCE"
     awk -F'\t' '($1 ~ /^trim-/) && $6 > 0 { printf "%s: %d mate 2 reads with S, W, or D; fastp 1.4.0 is not a reference there\n", $2, $6 }' "$REFERENCE" |
         while IFS= read -r line; do log reference WARN "$line"; done
     return 0
@@ -382,7 +405,8 @@ trim_fact() {
     json_got="${OUT1%_1.fq}.json"
     if [[ -n "${EDGE:-}" ]]; then
         # Small edge inputs: fastp runs here, with the family's command.
-        dir="$(mktemp -d "/var/tmp/bench-$FEATURE-edge.XXXXXX")"
+        dir="$(scratch_dir "/var/tmp/bench-$FEATURE-edge.XXXXXX")"
+        bench_cleanup_path f "$dir/o_1.fq" "$dir/o_2.fq" "$dir/o.json" "$dir/o.html"
         $(STEM="$dir/o" lane_cmd fastp "$IN" "$fam") >/dev/null 2>&1 || { printf 'wrong: no reference\n'; rm -f -- "$dir"/*; rmdir -- "$dir"; return; }
         w1="$(read_sums "$dir/o_1.fq" sorted)" w2="$(read_sums "$dir/o_2.fq" sorted)" swd=0 json="$dir/o.json"
     else
@@ -426,8 +450,10 @@ qc_fact() {
     read -r -a in <<<"$IN"
     local m want=() dir="" verdict=accept
     if [[ -n "${EDGE:-}" ]]; then
-        dir="$(mktemp -d "/var/tmp/bench-$FEATURE-edge.XXXXXX")"
+        dir="$(scratch_dir "/var/tmp/bench-$FEATURE-edge.XXXXXX")"
         mkdir -- "$dir/o.qc"
+        bench_cleanup_path f "$dir/want0" "$dir/want1"
+        bench_cleanup_outdir "$dir/o.qc" fastqc-rust qc-tables "$IN"
         $(STEM="$dir/o" lane_cmd fastqc-rust "$IN" qc-tables) >/dev/null 2>&1 || verdict="wrong: no reference"
         for m in 0 1; do table_of fastqc-rust "$dir/o.qc" "${in[$m]}" >"$dir/want$m" || true; want+=("$dir/want$m"); done
         clear_outdir "$dir/o.qc" fastqc-rust qc-tables "$IN"

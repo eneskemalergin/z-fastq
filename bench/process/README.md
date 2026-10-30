@@ -1,32 +1,34 @@
 <!-- markdownlint-disable MD013 MD033 MD041 -->
 
 # Processing paired reads
-> <sub>`z-fastq process` against 3 other processors, on 1 real sequencing run and 0 synthetic shapes, plain and gzip. A tool is timed only where its outputs were right; time and memory come from the same run, on one CPU, a threaded variant on as many cores as its threads.</sub>
+> <sub>`z-fastq process` against 3 other processors, on 4 real sequencing runs and 1 synthetic shape, plain and gzip. A tool is timed only where its outputs were right; time and memory come from the same run, on one CPU, a threaded variant on as many cores as its threads.</sub>
 
-- `z-fastq`: *0.1.0 at b199bc6*
-- `machine`: *Ryzen 9 3950X, Linux 7.2.11; one CPU per run, threaded variants on as many cores as threads*
+- `z-fastq`: *0.1.0 at 246bbb1*
+- `machine`: *Ryzen 9 3950X, Linux 7.2.12; one CPU per run, threaded variants on as many cores as threads*
 - `runner`: *zebrac 0.6.2 with zexec*
 - `data`:
-  - **Real**: *1 public sequencing runs, 1 GiB each, pooled in the bars by the kind of reads they hold*
-    - `Short, fixed length`: *NovaSeq, 150 bp*
-  - **Synthetic**: *0 shapes generated from real reads, each changing one thing; one group in the bars at 1 GiB, and the scaling lines from 1 MiB to 10 MiB*
-- `date`: *2026-10-28*
+  - **Real**: *4 public sequencing runs, 1 GiB each, pooled in the bars by the kind of reads they hold*
+    - `Short, fixed length`: *NovaSeq, 150 bp; NovaSeq, Casava headers; BGISEQ, 100 bp*
+    - `Short, variable length`: *10x mates, 28 and 150 bp*
+  - **Synthetic**: *1 shape generated from real reads, each changing one thing; one group in the bars at 1 GiB, and the scaling lines from 1 MiB to 1 GiB*
+    - `paired`: *100 bp mate pairs*
+- `date`: *2026-10-30*
 
 ## Findings
 
-- **Right answers:** z-fastq wrote the right copies, fastp's records, and FastQC's tables on all 0 checked inputs and rejected every broken pair and record. 3 of the 3 other tools write output from a broken pair or record with exit 0.
-- **Copying into plain files:** fastp takes 18.2x z-fastq's time on plain input and 7.9x on gzip, with 484x its memory; at its fastest, 8 threads, 4.77x z-fastq's time for 17.7x its CPU time.
-- **Copying into gzip files:** fastp takes 7.0x z-fastq's time on plain input and 5.5x on gzip, with 401x its memory; at its fastest, 8 threads, 1.26x z-fastq's time for 6.7x its CPU time.
-- **Trimming, TruSeq settings:** fastp takes 9.8x z-fastq's time on plain input and 8.1x on gzip, with 29x its memory; at its fastest, 8 threads, 1.32x z-fastq's time for 8.7x its CPU time.
-- **Trimming, Nextera settings:** fastp takes 8.6x z-fastq's time on plain input and 7.0x on gzip, with 29x its memory; at its fastest, 8 threads, 1.17x z-fastq's time for 7.4x its CPU time.
-- **QC tables:** FastQC-Rust takes 2.0x z-fastq's time on plain input and 1.6x on gzip, with 3x its memory; at its fastest, 8 threads, 0.73x z-fastq's time for 3.9x its CPU time (faster than z-fastq from 4 threads); FastQC takes 10.7x z-fastq's time on plain input and 9.2x on gzip, with 17x its memory; at its fastest, 8 threads, 2.65x z-fastq's time for 13.5x its CPU time.
+- **Right answers:** z-fastq wrote the right copies, fastp's records, and FastQC's tables on all 80 checked inputs and rejected every broken pair and record. 3 of the 3 other tools write output from a broken pair or record with exit 0.
+- **Copying into plain files:** fastp takes 17.6x z-fastq's time on plain input and 7.7x on gzip, with 483x its memory; at its fastest, 8 threads, 3.68x z-fastq's time for 16.4x its CPU time.
+- **Copying into gzip files:** fastp takes 6.6x z-fastq's time on plain input and 5.1x on gzip, with 400x its memory; at its fastest, 16 threads, 0.87x z-fastq's time for 6.3x its CPU time (faster than z-fastq from 16 threads).
+- **Trimming, TruSeq settings:** fastp takes 12.2x z-fastq's time on plain input and 9.3x on gzip, with 76x its memory; at its fastest, 16 threads, 1.09x z-fastq's time for 11.3x its CPU time.
+- **Trimming, Nextera settings:** fastp takes 9.9x z-fastq's time on plain input and 7.7x on gzip, with 76x its memory; at its fastest, 16 threads, 0.99x z-fastq's time for 9.4x its CPU time (faster than z-fastq from 16 threads).
+- **QC tables:** FastQC-Rust takes 2.1x z-fastq's time on plain input and 1.7x on gzip, with 3x its memory; at its fastest, 8 threads, 0.89x z-fastq's time for 3.6x its CPU time (faster than z-fastq from 4 threads); FastQC takes 11.6x z-fastq's time on plain input and 8.1x on gzip, with 25x its memory; at its fastest, 16 threads, 2.87x z-fastq's time for 11.2x its CPU time.
 
 ## Compared tools
 > <sub>*partial* tools do less than z-fastq: fastp checks records less strictly, and the FastQC tools write no reads and check no pairs. A job is `yes` when the tool was right on every input of it, `partly` on some, `-` when the tool has no such job. Threads: z-fastq runs on one; every other tool runs at 1 thread and again at 2, 4, 8, and 16 on as many physical cores, at the 1 GiB inputs, in the same batches as z-fastq. Malformed rejected: of the broken pairs and records in the edge cases, how many the tool rejects.</sub>
 
 | Tool        | Class   | Copy | Gzip copy | TruSeq trim | Nextera trim | QC tables | Threads      | Malformed rejected |
 | ----------- | ------- | ---- | --------- | ----------- | ------------ | --------- | ------------ | -----------------: |
-| z-fastq     | subject | -    | -         | -           | -            | -         | 1            |             8 of 8 |
+| z-fastq     | subject | yes  | yes       | yes         | yes          | yes       | 1            |             8 of 8 |
 | fastp       | partial | yes  | yes       | yes         | yes          | -         | 1 to 16 (-w) |             0 of 8 |
 | FastQC-Rust | partial | -    | -         | -           | -            | yes       | 1 to 16 (-t) |             1 of 8 |
 | FastQC      | partial | -    | -         | -           | -            | yes       | 1 to 16 (-t) |             1 of 8 |
@@ -41,7 +43,7 @@
 ## Right answers
 > <sub>Copies must equal the corpus pairs byte for byte. Trimmed pairs must hold the records fastp 1.4.0 keeps with the same settings, and every field of z-fastq's QC summary must equal fastp's (its own schema and tool names aside); fastp itself is that reference. QC tables must equal FastQC-Rust's `fastqc_data.txt` without its version and file name lines, tied overrepresented rows in sorted order. The edge cases are small inputs where tools differ: each cell shows what the tool printed, and its color whether that was right.</sub>
 
-z-fastq returned right outputs on all 0 inputs it was given. Every other tool was right on every input it was given.
+z-fastq returned right outputs on all 80 inputs it was given. Every other tool was right on every input it was given.
 
 > [!CAUTION]
 > fastp, FastQC-Rust and FastQC print wrong output and exit 0 on some malformed inputs, so a script cannot tell the pairs are broken.
@@ -64,20 +66,22 @@ z-fastq returned right outputs on all 0 inputs it was given. Every other tool wa
   <img src="results/figures/copying-overview-light.png" alt="Copying: time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
-z-fastq itself takes, geometric means over the 1 GiB inputs: Plain output, 0.64 s and 2.3 MiB on plain input, 1.59 s and 2.3 MiB on gzip; Gzip output, 2.58 s and 2.8 MiB on plain input, 3.39 s and 2.8 MiB on gzip. The table gives every tool as a multiple of that.
+z-fastq itself takes, geometric means over the 1 GiB inputs: Plain output, 0.75 s and 2.3 MiB on plain input, 1.84 s and 2.3 MiB on gzip; Gzip output, 3.45 s and 2.8 MiB on plain input, 4.61 s and 2.8 MiB on gzip. The table gives every tool as a multiple of that.
 
-| Job          | Tool       | Threads | Plain time | Plain CPU | Plain memory | Gzip time | Gzip CPU | Gzip memory |
-| ------------ | ---------- | ------: | ---------: | --------: | -----------: | --------: | -------: | ----------: |
-| Plain output | z-fastq    |       1 |      1.00x |     1.00x |        1.00x |     1.00x |    1.00x |       1.00x |
-| Plain output | fastp      |       1 |     18.21x |    18.86x |      484.36x |     7.85x |    8.48x |     488.06x |
-| Plain output | fastp -w 2 |       2 |     11.00x |    17.08x |      506.52x |     4.17x |    7.79x |     509.60x |
-| Plain output | fastp -w 4 |       4 |      6.10x |    17.09x |      527.13x |     2.52x |    7.49x |     530.51x |
-| Plain output | fastp -w 8 |       8 |      4.77x |    17.71x |      548.27x |     1.83x |    7.81x |     548.70x |
-| Gzip output  | z-fastq    |       1 |      1.00x |     1.00x |        1.00x |     1.00x |    1.00x |       1.00x |
-| Gzip output  | fastp      |       1 |      6.97x |     6.91x |      401.34x |     5.52x |    5.47x |     404.47x |
-| Gzip output  | fastp -w 2 |       2 |      5.40x |     6.43x |      397.95x |     4.38x |    5.09x |     401.71x |
-| Gzip output  | fastp -w 4 |       4 |      2.41x |     6.36x |      406.59x |     1.91x |    4.99x |     409.45x |
-| Gzip output  | fastp -w 8 |       8 |      1.26x |     6.72x |      422.25x |     0.98x |    5.28x |     425.35x |
+| Job          | Tool        | Threads | Plain time | Plain CPU | Plain memory | Gzip time | Gzip CPU | Gzip memory |
+| ------------ | ----------- | ------: | ---------: | --------: | -----------: | --------: | -------: | ----------: |
+| Plain output | z-fastq     |       1 |      1.00x |     1.00x |        1.00x |     1.00x |    1.00x |       1.00x |
+| Plain output | fastp       |       1 |     17.64x |    18.03x |      483.50x |     7.74x |    7.70x |     487.15x |
+| Plain output | fastp -w 2  |       2 |      8.24x |    15.16x |      501.94x |     3.59x |    6.58x |     505.90x |
+| Plain output | fastp -w 4  |       4 |      4.98x |    15.08x |      521.38x |     2.11x |    6.46x |     524.36x |
+| Plain output | fastp -w 8  |       8 |      3.68x |    16.40x |      536.58x |     1.73x |    6.88x |     536.85x |
+| Plain output | fastp -w 16 |      16 |      3.69x |    18.18x |      587.51x |     1.69x |    7.56x |     591.86x |
+| Gzip output  | z-fastq     |       1 |      1.00x |     1.00x |        1.00x |     1.00x |    1.00x |       1.00x |
+| Gzip output  | fastp       |       1 |      6.60x |     6.36x |      400.35x |     5.08x |    5.03x |     406.01x |
+| Gzip output  | fastp -w 2  |       2 |      3.11x |     5.73x |      396.73x |     2.58x |    4.58x |     400.40x |
+| Gzip output  | fastp -w 4  |       4 |      1.76x |     5.71x |      404.75x |     1.37x |    4.52x |     407.78x |
+| Gzip output  | fastp -w 8  |       8 |      1.09x |     6.04x |      420.25x |     0.85x |    4.78x |     423.19x |
+| Gzip output  | fastp -w 16 |      16 |      0.87x |     6.34x |      453.43x |     0.75x |    4.96x |     458.20x |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/copying-speed-dark.png">
@@ -91,6 +95,10 @@ z-fastq itself takes, geometric means over the 1 GiB inputs: Plain output, 0.64 
   <img src="results/figures/copying-memory-light.png" alt="Copying: peak memory by kind of input" width="100%">
 </picture>
 
+**Plain output.** Output per plain 1 GiB input, mean over 5 inputs: z-fastq 1073.7 MB, fastp 1073.7 MB.
+
+**Gzip output.** Output per plain 1 GiB input, mean over 5 inputs: z-fastq 306.8 MB, fastp 269.1 MB.
+
 <details><summary>Scaling</summary>
 
 <picture>
@@ -99,11 +107,11 @@ z-fastq itself takes, geometric means over the 1 GiB inputs: Plain output, 0.64 
   <img src="results/figures/copying-scaling-light.png" alt="Copying: throughput and peak memory by input size" width="100%">
 </picture>
 
-**Plain output.** At 10 MiB, z-fastq processes 0.9 to 0.9 GiB/s on plain input and 0.4 to 0.4 GiB/s on gzip input; no other tool is faster there.
-z-fastq peaks at 2.31 MiB at every size and shape. No other tool grows by more than a quarter either.
+**Plain output.** At 1 GiB, z-fastq processes 1.2 to 1.2 GiB/s on plain input and 0.4 to 0.4 GiB/s on gzip input; no other tool is faster there.
+z-fastq peaks at 2.29 MiB at every size and shape. No other tool grows by more than a quarter either.
 
-**Gzip output.** At 10 MiB, z-fastq processes 0.2 to 0.2 GiB/s on plain input and 0.2 to 0.2 GiB/s on gzip input; no other tool is faster there.
-z-fastq peaks at 2.81 MiB at every size and shape. No other tool grows by more than a quarter either.
+**Gzip output.** At 1 GiB, z-fastq processes 0.2 to 0.2 GiB/s on plain input and 0.2 to 0.2 GiB/s on gzip input. Faster on a single shape there, as throughput over z-fastq's: fastp -w 8 on plain paired (1.05x); fastp -w 8 on gzip paired (1.40x); fastp -w 16 on plain paired (1.34x); fastp -w 16 on gzip paired (1.55x).
+z-fastq peaks at 2.79 MiB at every size and shape. No other tool grows by more than a quarter either.
 
 </details>
 
@@ -116,20 +124,22 @@ z-fastq peaks at 2.81 MiB at every size and shape. No other tool grows by more t
   <img src="results/figures/trimming-overview-light.png" alt="Trimming: time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
-z-fastq itself takes, geometric means over the 1 GiB inputs: TruSeq, 3.98 s and 38.5 MiB on plain input, 4.92 s and 38.4 MiB on gzip; Nextera, 4.04 s and 38.5 MiB on plain input, 4.76 s and 38.4 MiB on gzip. The table gives every tool as a multiple of that.
+z-fastq itself takes, geometric means over the 1 GiB inputs: TruSeq, 3.33 s and 14.7 MiB on plain input, 4.49 s and 14.7 MiB on gzip; Nextera, 3.49 s and 14.7 MiB on plain input, 4.50 s and 14.7 MiB on gzip. The table gives every tool as a multiple of that.
 
-| Job     | Tool       | Threads | Plain time | Plain CPU | Plain memory | Gzip time | Gzip CPU | Gzip memory |
-| ------- | ---------- | ------: | ---------: | --------: | -----------: | --------: | -------: | ----------: |
-| TruSeq  | z-fastq    |       1 |      1.00x |     1.00x |        1.00x |     1.00x |    1.00x |       1.00x |
-| TruSeq  | fastp      |       1 |      9.78x |     9.68x |       29.07x |     8.12x |    8.12x |      29.33x |
-| TruSeq  | fastp -w 2 |       2 |      5.29x |     9.05x |       30.10x |     4.04x |    7.63x |      30.51x |
-| TruSeq  | fastp -w 4 |       4 |      2.63x |     8.57x |       31.11x |     2.26x |    7.32x |      31.48x |
-| TruSeq  | fastp -w 8 |       8 |      1.32x |     8.71x |       33.13x |     1.11x |    7.40x |      33.35x |
-| Nextera | z-fastq    |       1 |      1.00x |     1.00x |        1.00x |     1.00x |    1.00x |       1.00x |
-| Nextera | fastp      |       1 |      8.55x |     8.06x |       29.08x |     6.99x |    6.95x |      29.33x |
-| Nextera | fastp -w 2 |       2 |      4.70x |     7.61x |       30.25x |     4.03x |    6.61x |      30.55x |
-| Nextera | fastp -w 4 |       4 |      2.20x |     7.18x |       31.44x |     1.95x |    6.18x |      31.43x |
-| Nextera | fastp -w 8 |       8 |      1.17x |     7.44x |       33.13x |     1.00x |    6.39x |      33.37x |
+| Job     | Tool        | Threads | Plain time | Plain CPU | Plain memory | Gzip time | Gzip CPU | Gzip memory |
+| ------- | ----------- | ------: | ---------: | --------: | -----------: | --------: | -------: | ----------: |
+| TruSeq  | z-fastq     |       1 |      1.00x |     1.00x |        1.00x |     1.00x |    1.00x |       1.00x |
+| TruSeq  | fastp       |       1 |     12.20x |    12.09x |       75.87x |     9.32x |    9.15x |      76.57x |
+| TruSeq  | fastp -w 2  |       2 |      5.79x |    11.19x |       78.65x |     4.38x |    8.44x |      79.02x |
+| TruSeq  | fastp -w 4  |       4 |      2.97x |    10.73x |       81.02x |     2.26x |    8.14x |      81.64x |
+| TruSeq  | fastp -w 8  |       8 |      1.65x |    10.97x |       85.42x |     1.25x |    8.29x |      86.14x |
+| TruSeq  | fastp -w 16 |      16 |      1.09x |    11.35x |       92.67x |     0.90x |    8.73x |      93.46x |
+| Nextera | z-fastq     |       1 |      1.00x |     1.00x |        1.00x |     1.00x |    1.00x |       1.00x |
+| Nextera | fastp       |       1 |      9.86x |     9.77x |       75.88x |     7.72x |    7.56x |      76.49x |
+| Nextera | fastp -w 2  |       2 |      4.55x |     9.03x |       78.15x |     3.64x |    7.01x |      78.59x |
+| Nextera | fastp -w 4  |       4 |      2.42x |     8.79x |       80.62x |     1.93x |    6.82x |      81.10x |
+| Nextera | fastp -w 8  |       8 |      1.33x |     8.90x |       84.85x |     1.09x |    6.98x |      85.52x |
+| Nextera | fastp -w 16 |      16 |      0.99x |     9.43x |       92.02x |     0.84x |    7.30x |      92.68x |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/trimming-speed-dark.png">
@@ -143,9 +153,9 @@ z-fastq itself takes, geometric means over the 1 GiB inputs: TruSeq, 3.98 s and 
   <img src="results/figures/trimming-memory-light.png" alt="Trimming: peak memory by kind of input" width="100%">
 </picture>
 
-**TruSeq.** Output per plain 1 GiB input, mean over 1 inputs: fastp 1067.5 MB.
+**TruSeq.** Output per plain 1 GiB input, mean over 5 inputs: z-fastq 1025.4 MB, fastp 1025.4 MB.
 
-**Nextera.** Output per plain 1 GiB input, mean over 1 inputs: fastp 1065.6 MB.
+**Nextera.** Output per plain 1 GiB input, mean over 5 inputs: z-fastq 829.3 MB, fastp 829.3 MB.
 
 <details><summary>Scaling</summary>
 
@@ -155,11 +165,11 @@ z-fastq itself takes, geometric means over the 1 GiB inputs: TruSeq, 3.98 s and 
   <img src="results/figures/trimming-scaling-light.png" alt="Trimming: throughput and peak memory by input size" width="100%">
 </picture>
 
-**TruSeq.** At 10 MiB, z-fastq processes 0.1 to 0.1 GiB/s on plain input and 0.1 to 0.1 GiB/s on gzip input; no other tool is faster there.
-z-fastq peaks at 5.06 to 8.31 MiB across sizes and shapes. No other tool grows by more than a quarter either.
+**TruSeq.** At 1 GiB, z-fastq processes 0.3 to 0.3 GiB/s on plain input and 0.2 to 0.2 GiB/s on gzip input. Faster on a single shape there, as throughput over z-fastq's: fastp -w 16 on gzip paired (1.21x).
+z-fastq peaks at 4.54 to 4.79 MiB across sizes and shapes. No other tool grows by more than a quarter either.
 
-**Nextera.** At 10 MiB, z-fastq processes 0.2 to 0.2 GiB/s on plain input and 0.1 to 0.1 GiB/s on gzip input; no other tool is faster there.
-z-fastq peaks at 5.06 to 8.31 MiB across sizes and shapes. No other tool grows by more than a quarter either.
+**Nextera.** At 1 GiB, z-fastq processes 0.3 to 0.3 GiB/s on plain input and 0.2 to 0.2 GiB/s on gzip input. Faster on a single shape there, as throughput over z-fastq's: fastp -w 8 on gzip paired (1.05x); fastp -w 16 on plain paired (1.05x); fastp -w 16 on gzip paired (1.29x).
+z-fastq peaks at 4.54 to 4.79 MiB across sizes and shapes. No other tool grows by more than a quarter either.
 
 </details>
 
@@ -172,19 +182,21 @@ z-fastq peaks at 5.06 to 8.31 MiB across sizes and shapes. No other tool grows b
   <img src="results/figures/qc-overview-light.png" alt="QC tables: time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
-z-fastq itself takes, geometric means over the 1 GiB inputs: FastQC tables, 2.00 s and 14.1 MiB on plain input, 2.97 s and 14.0 MiB on gzip. The table gives every tool as a multiple of that.
+z-fastq itself takes, geometric means over the 1 GiB inputs: FastQC tables, 1.91 s and 10.2 MiB on plain input, 2.99 s and 10.1 MiB on gzip. The table gives every tool as a multiple of that.
 
-| Job           | Tool             | Threads | Plain time | Plain CPU | Plain memory | Gzip time | Gzip CPU | Gzip memory |
-| ------------- | ---------------- | ------: | ---------: | --------: | -----------: | --------: | -------: | ----------: |
-| FastQC tables | z-fastq          |       1 |      1.00x |     1.00x |        1.00x |     1.00x |    1.00x |       1.00x |
-| FastQC tables | FastQC-Rust      |       1 |      2.01x |     2.58x |        3.06x |     1.65x |    1.95x |       3.17x |
-| FastQC tables | FastQC-Rust -t 2 |       2 |      1.02x |     2.52x |        5.16x |     0.89x |    2.02x |       5.48x |
-| FastQC tables | FastQC-Rust -t 4 |       4 |      0.84x |     2.77x |        6.94x |     0.70x |    2.04x |       7.33x |
-| FastQC tables | FastQC-Rust -t 8 |       8 |      0.73x |     3.92x |        6.76x |     0.51x |    2.69x |       9.72x |
-| FastQC tables | FastQC           |       1 |     10.70x |    13.17x |       17.45x |     9.18x |   10.09x |      17.32x |
-| FastQC tables | FastQC -t 2      |       2 |      9.68x |    13.66x |       22.12x |     7.48x |   10.20x |      20.86x |
-| FastQC tables | FastQC -t 4      |       4 |      4.62x |    13.05x |       28.91x |     3.43x |    9.76x |      28.58x |
-| FastQC tables | FastQC -t 8      |       8 |      2.65x |    13.47x |       56.91x |     1.78x |    9.93x |      51.10x |
+| Job           | Tool              | Threads | Plain time | Plain CPU | Plain memory | Gzip time | Gzip CPU | Gzip memory |
+| ------------- | ----------------- | ------: | ---------: | --------: | -----------: | --------: | -------: | ----------: |
+| FastQC tables | z-fastq           |       1 |      1.00x |     1.00x |        1.00x |     1.00x |    1.00x |       1.00x |
+| FastQC tables | FastQC-Rust       |       1 |      2.13x |     2.18x |        2.83x |     1.72x |    1.74x |       2.98x |
+| FastQC tables | FastQC-Rust -t 2  |       2 |      1.17x |     2.20x |        4.36x |     0.95x |    1.77x |       4.60x |
+| FastQC tables | FastQC-Rust -t 4  |       4 |      0.97x |     2.40x |        6.24x |     0.74x |    1.80x |       6.95x |
+| FastQC tables | FastQC-Rust -t 8  |       8 |      0.89x |     3.63x |        6.22x |     0.46x |    2.32x |       9.81x |
+| FastQC tables | FastQC-Rust -t 16 |      16 |      1.22x |     5.18x |        5.97x |     0.76x |    3.63x |       9.62x |
+| FastQC tables | FastQC            |       1 |     11.59x |    10.90x |       24.67x |     8.10x |    7.65x |      24.75x |
+| FastQC tables | FastQC -t 2       |       2 |      9.25x |    10.76x |       34.11x |     5.95x |    7.76x |      32.99x |
+| FastQC tables | FastQC -t 4       |       4 |      4.62x |    10.69x |       37.27x |     2.94x |    7.62x |      36.71x |
+| FastQC tables | FastQC -t 8       |       8 |      2.88x |    11.10x |       69.03x |     1.81x |    7.92x |      64.48x |
+| FastQC tables | FastQC -t 16      |      16 |      2.87x |    11.17x |       70.50x |     1.81x |    7.92x |      64.00x |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/qc-speed-dark.png">
@@ -198,7 +210,7 @@ z-fastq itself takes, geometric means over the 1 GiB inputs: FastQC tables, 2.00
   <img src="results/figures/qc-memory-light.png" alt="QC tables: peak memory by kind of input" width="100%">
 </picture>
 
-**FastQC tables.** Output per plain 1 GiB input, mean over 1 inputs: FastQC-Rust 0.9 MB, FastQC 0.8 MB.
+**FastQC tables.** Output per plain 1 GiB input, mean over 5 inputs: z-fastq 1073.9 MB, FastQC-Rust 0.8 MB, FastQC 0.8 MB.
 
 <details><summary>Scaling</summary>
 
@@ -208,8 +220,8 @@ z-fastq itself takes, geometric means over the 1 GiB inputs: FastQC tables, 2.00
   <img src="results/figures/qc-scaling-light.png" alt="QC tables: throughput and peak memory by input size" width="100%">
 </picture>
 
-**FastQC tables.** At 10 MiB, z-fastq processes 0.3 to 0.3 GiB/s on plain input and 0.0 to 0.0 GiB/s on gzip input. Faster on a single shape there, as throughput over z-fastq's: FastQC-Rust on gzip paired (1.09x).
-z-fastq peaks at 2.81 to 9.33 MiB across sizes and shapes. No other tool grows by more than a quarter either.
+**FastQC tables.** At 1 GiB, z-fastq processes 0.5 to 0.5 GiB/s on plain input and 0.3 to 0.3 GiB/s on gzip input. Faster on a single shape there, as throughput over z-fastq's: FastQC-Rust -t 2 on gzip paired (1.18x); FastQC-Rust -t 4 on plain paired (1.11x); FastQC-Rust -t 4 on gzip paired (1.61x); FastQC-Rust -t 8 on gzip paired (2.58x); FastQC-Rust -t 16 on gzip paired (1.25x).
+z-fastq peaks at 2.79 to 4.29 MiB across sizes and shapes. Memory that grows with the input: FastQC by 1.3x on plain paired.
 
 </details>
 
@@ -217,18 +229,18 @@ z-fastq peaks at 2.81 to 9.33 MiB across sizes and shapes. No other tool grows b
 
 <details><summary>How it was measured</summary>
 
-Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap; a batch with threaded variants holds as many physical cores as its largest lane, one logical CPU each, with each lane pinned to its own cores and z-fastq to one, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. The kernel reports peak memory in 256 KiB steps, so values closer than that are equal. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Generated by `bench/process/run.sh release` on 2026-10-28.
+Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 16G memory cap; a batch with threaded variants holds as many physical cores as its largest lane, one logical CPU each, with each lane pinned to its own cores and z-fastq to one, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS uses the kernel high-water counter, not an exact allocation count. Quick comparisons treat differences smaller than 256 KiB as inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Generated by `bench/process/run.sh release` on 2026-10-30.
 
 </details>
 
 <details><summary>Identity</summary>
 
-- `z-fastq`: *0.1.0 at b199bc6*
+- `z-fastq`: *0.1.0 at 246bbb1*
 - `zebrac`: *0.6.2*
 - `zexec`: *15000 bytes, static, no libc*
-- `kernel`: *7.2.11-200.fc44.x86_64*
+- `kernel`: *7.2.12-200.fc44.x86_64*
 - `cpu`: *AMD Ryzen 9 3950X 16-Core Processor*
-- `load at batch start`: *1.66 to 12.68*
+- `load at batch start`: *1.82 to 8.71*
 
 </details>
 
@@ -276,27 +288,48 @@ Every tool runs through `zexec -r` inside one zebrac batch per case, held to one
 
 Picked from these results: per family, group, and format, the case where z-fastq is closest to, or furthest behind, its fastest rival of any class. `run.sh peer` times z-fastq against a cached reference of the rival on each; `run.sh ab REV` times two z-fastq builds on each.
 
-- `copy-plain: Short, fixed length, plain`: *NovaSeq, 150 bp*; rival fastp -w 8 at 4.77x z-fastq's time
-- `copy-plain: Short, fixed length, gzip`: *NovaSeq, 150 bp*; rival fastp -w 8 at 1.83x z-fastq's time
-- `copy-gzip: Short, fixed length, plain`: *NovaSeq, 150 bp*; rival fastp -w 8 at 1.26x z-fastq's time
-- `copy-gzip: Short, fixed length, gzip`: *NovaSeq, 150 bp*; rival fastp -w 8 at 0.98x z-fastq's time
-- `trim-truseq: Short, fixed length, plain`: *NovaSeq, 150 bp*; rival fastp -w 8 at 1.31x z-fastq's time
-- `trim-truseq: Short, fixed length, gzip`: *NovaSeq, 150 bp*; rival fastp -w 8 at 1.11x z-fastq's time
-- `trim-nextera: Short, fixed length, plain`: *NovaSeq, 150 bp*; rival fastp -w 8 at 1.17x z-fastq's time
-- `trim-nextera: Short, fixed length, gzip`: *NovaSeq, 150 bp*; rival fastp -w 8 at 1.00x z-fastq's time
-- `qc-tables: Short, fixed length, plain`: *NovaSeq, 150 bp*; rival FastQC-Rust -t 8 at 0.72x z-fastq's time
-- `qc-tables: Short, fixed length, gzip`: *NovaSeq, 150 bp*; rival FastQC-Rust -t 8 at 0.51x z-fastq's time
+- `copy-plain: Short, fixed length, plain`: *NovaSeq, Casava headers*; rival fastp -w 8 at 3.58x z-fastq's time
+- `copy-plain: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival fastp -w 16 at 3.44x z-fastq's time
+- `copy-plain: Synthetic, plain`: *paired: 100 bp mate pairs*; rival fastp -w 16 at 3.50x z-fastq's time
+- `copy-plain: Short, fixed length, gzip`: *BGISEQ, 100 bp*; rival fastp -w 16 at 1.34x z-fastq's time
+- `copy-plain: Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival fastp -w 16 at 2.04x z-fastq's time
+- `copy-plain: Synthetic, gzip`: *paired: 100 bp mate pairs*; rival fastp -w 8 at 1.53x z-fastq's time
+- `copy-gzip: Short, fixed length, plain`: *BGISEQ, 100 bp*; rival fastp -w 16 at 0.70x z-fastq's time
+- `copy-gzip: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival fastp -w 16 at 1.02x z-fastq's time
+- `copy-gzip: Synthetic, plain`: *paired: 100 bp mate pairs*; rival fastp -w 16 at 0.75x z-fastq's time
+- `copy-gzip: Short, fixed length, gzip`: *BGISEQ, 100 bp*; rival fastp -w 16 at 0.59x z-fastq's time
+- `copy-gzip: Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival fastp -w 16 at 0.90x z-fastq's time
+- `copy-gzip: Synthetic, gzip`: *paired: 100 bp mate pairs*; rival fastp -w 16 at 0.64x z-fastq's time
+- `trim-truseq: Short, fixed length, plain`: *BGISEQ, 100 bp*; rival fastp -w 16 at 1.02x z-fastq's time
+- `trim-truseq: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival fastp -w 16 at 1.21x z-fastq's time
+- `trim-truseq: Synthetic, plain`: *paired: 100 bp mate pairs*; rival fastp -w 16 at 1.07x z-fastq's time
+- `trim-truseq: Short, fixed length, gzip`: *BGISEQ, 100 bp*; rival fastp -w 16 at 0.77x z-fastq's time
+- `trim-truseq: Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival fastp -w 16 at 1.00x z-fastq's time
+- `trim-truseq: Synthetic, gzip`: *paired: 100 bp mate pairs*; rival fastp -w 16 at 0.83x z-fastq's time
+- `trim-nextera: Short, fixed length, plain`: *NovaSeq, 150 bp*; rival fastp -w 16 at 0.95x z-fastq's time
+- `trim-nextera: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival fastp -w 16 at 1.02x z-fastq's time
+- `trim-nextera: Synthetic, plain`: *paired: 100 bp mate pairs*; rival fastp -w 16 at 0.95x z-fastq's time
+- `trim-nextera: Short, fixed length, gzip`: *BGISEQ, 100 bp*; rival fastp -w 16 at 0.77x z-fastq's time
+- `trim-nextera: Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival fastp -w 16 at 0.90x z-fastq's time
+- `trim-nextera: Synthetic, gzip`: *paired: 100 bp mate pairs*; rival fastp -w 16 at 0.77x z-fastq's time
+- `qc-tables: Short, fixed length, plain`: *NovaSeq, Casava headers*; rival FastQC-Rust -t 8 at 0.66x z-fastq's time
+- `qc-tables: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival FastQC-Rust -t 8 at 0.87x z-fastq's time
+- `qc-tables: Synthetic, plain`: *paired: 100 bp mate pairs*; rival FastQC-Rust -t 4 at 0.90x z-fastq's time
+- `qc-tables: Short, fixed length, gzip`: *BGISEQ, 100 bp*; rival FastQC-Rust -t 8 at 0.41x z-fastq's time
+- `qc-tables: Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival FastQC-Rust -t 8 at 0.56x z-fastq's time
+- `qc-tables: Synthetic, gzip`: *paired: 100 bp mate pairs*; rival FastQC-Rust -t 8 at 0.39x z-fastq's time
 
 </details>
 
 <details><summary>Hardware counters (user space, plain medium-tier inputs, geometric means)</summary>
 
-| Tool       | Instructions per byte | Instructions per cycle | Cache misses per MiB | Branch misses per MiB |
-| ---------- | --------------------: | ---------------------: | -------------------: | --------------------: |
-| z-fastq    |                  2.97 |                   2.98 |                 4470 |                   693 |
-| fastp      |                 78.71 |                   2.70 |                85014 |                 61274 |
-| fastp -w 2 |                 68.19 |                   2.42 |               119004 |                 56853 |
-| fastp -w 4 |                 62.97 |                   2.11 |               150697 |                 54668 |
-| fastp -w 8 |                 60.40 |                   1.92 |               165647 |                 54194 |
+| Tool        | Instructions per byte | Instructions per cycle | Cache misses per MiB | Branch misses per MiB |
+| ----------- | --------------------: | ---------------------: | -------------------: | --------------------: |
+| z-fastq     |                  4.03 |                   2.96 |                 4601 |                   921 |
+| fastp       |                 80.94 |                   2.42 |                95194 |                162945 |
+| fastp -w 2  |                 69.70 |                   2.28 |               111935 |                138626 |
+| fastp -w 4  |                 64.09 |                   2.02 |               152522 |                123235 |
+| fastp -w 8  |                 61.35 |                   1.76 |               166776 |                113909 |
+| fastp -w 16 |                 60.19 |                   1.63 |               169769 |                108585 |
 
 </details>

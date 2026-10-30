@@ -10,6 +10,16 @@ bench="$(dirname -- "$here")"
 work="$(mktemp -d /var/tmp/bench-core.XXXXXX)"
 cleanup() {
     local name
+    if [[ -n "${runner:-}" ]]; then
+        kill -TERM "$runner" 2>/dev/null || true
+        wait "$runner" 2>/dev/null || true
+    fi
+    if [[ -L "$work/feat/results/latest.log" ]]; then
+        name="$(readlink "$work/feat/results/latest.log")"
+        rm -f -- "$work/feat/results/$name" "$work/feat/results/latest.log"
+    fi
+    rm -f -- "$work/feat/results/runs.tsv" "$work/bounded.log" "$work/started" "$work/limits" "$work/child" "$work/want.json" "$work/got.json"
+    rmdir -- "$work/feat/results/logs" 2>/dev/null || true
     if [[ -f "$work/restarts.log" ]]; then
         while IFS= read -r name; do
             [[ "$name" == "$work/feat/results/batches/"* ]] || continue
@@ -481,6 +491,14 @@ then fail 'checker continued after a failed command'; fi
     for reference_family in trim-truseq qc-tables; do
         reference_one "$reference_family"$'\t'"$work/input $work/input" 2>"$work/reference-error.log" && fail 'failed reference producer returned success'
     done
+    read_sums "$work/absent.fastq" > /dev/null 2>"$work/reference-error.log" && fail 'missing reads produced a checksum'
+    printf '{"count":1}\n' >"$work/got.json"
+    printf '{"count":1}\n' >"$work/want.json"
+    [[ -z "$(json_diff "$work/got.json" "$work/want.json")" ]] || fail 'equal JSON differs'
+    printf 'broken JSON\n' >"$work/want.json"
+    json_diff "$work/got.json" "$work/want.json" >/dev/null 2>"$work/reference-error.log" && fail 'broken reference JSON was accepted'
+    printf '{"count":2}\n' >"$work/want.json"
+    [[ "$(json_diff "$work/got.json" "$work/want.json")" == count ]] || fail 'JSON difference was lost'
     exit 0
 ) || fail 'process reference producer checks'
 
@@ -492,5 +510,111 @@ feature ''
 BENCH_CPU="$cpu" bash "$work/feat/run.sh" peer >/dev/null 2>"$work/lock.log" && fail 'a timing mode ran while the lock was held'
 grep -q "timing-cpu$cpu.lock" "$work/lock.log" || fail "lock message missing: $(cat "$work/lock.log")"
 exec 8>&-
+
+# Bounded verification caps concurrent jobs and stops admitting work after a
+# worker failure. An execution error must be retried.
+# shellcheck disable=SC2034,SC2154  # Variables are read by the sourced runner.
+(
+    BASH_ARGV0="$work/feat/run.sh"
+    source "$work/feat/run.sh" __probe
+    execution bounded
+    BENCH_JOBS=1
+    worker() { printf '%s\n' "$1"; [[ "$1" != broken ]]; }
+    set +e
+    pool worker >"$work/worker.log" <<<'first
+broken
+later'
+    status=$?
+    set -e
+    [[ "$status" != 0 && "$(cat "$work/worker.log")" == $'first\nbroken' ]] || fail 'bounded pool continued after failure'
+    BENCH_JOBS=3
+    worker() { printf 'start\n'; sleep 0.05; printf 'end\n'; }
+    seq 12 | pool worker >"$work/worker.log" || fail 'parallel checks failed'
+    awk '$1 == "start" { n++; starts++; if(n>peak) peak=n } $1 == "end" { n-- }
+         END { exit !(starts==12 && n==0 && peak==3) }' "$work/worker.log" || fail 'pool did not run exactly three workers concurrently'
+    BENCH_JOBS=8
+    worker() { printf '%s\n' "$1"; }
+    seq 100 | pool worker >"$work/worker.log" || fail 'pool lost a fast worker completion'
+    [[ "$(wc -l <"$work/worker.log")" == 100 ]] || fail 'pool lost worker output'
+    CHECKS="$work/checks.tsv"
+    printf 'good\tpass\t0\taccept\tx\nwrong\tfail\t0\twrong output\tx\nkilled\tfail\t137\treject\tx\nchecker\tfail\t0\tchecker failed (exit 7)\tx\nerror\terror\t143\treject\tx\n' >"$CHECKS"
+    load_checks
+    [[ -v CHECK_STATUS[good] && -v CHECK_STATUS[wrong] ]] || fail 'lost a completed verdict'
+    [[ ! -v CHECK_STATUS[killed] && ! -v CHECK_STATUS[checker] && ! -v CHECK_STATUS[error] ]] || fail 'execution error was reused'
+    LANE_TMPL[z-fastq]="/usr/bin/bash $work/producer.sh"
+    REG_PATH[z-fastq]=/usr/bin/bash
+    LANE_IDS=(["z-fastq|file"]=A)
+    CHECK_ID=C EXPECT=accept AGREE_LANE="" FACT_PIPE=0
+    fact() { cat >/dev/null; printf 'accept\n'; }
+    printf 'kill -TERM "$$"\n' >"$work/producer.sh"
+    status=0
+    (check_one z-fastq file file test plain "$work/input" accept 6 - accept) >"$work/worker.log" 2>"$work/strict.log" || status=$?
+    [[ "$status" != 0 && "$(cut -f2-3 "$work/worker.log")" == $'error\t143' ]] || fail 'signal death became a reusable verdict'
+    LANES=(z-fastq) FAMILIES=(file) VERIFY=0 SCALING=""
+    FAM_LANES[file]=z-fastq
+    all_cases() { printf 'file\ttest\tplain\t%s\taccept\t6\tsource\tsmall\treal\t-\n' "$work/input"; }
+    cases() { all_cases; }
+    verify_cases() { :; }
+    cache_lane_ids
+    key="$(status_key z-fastq file file "$(fileid "$work/input")" -)"
+    printf '%s\terror\t143\treject\tx\n%s\tpass\t0\taccept\tx\n' "$key" "$key" >"$CHECKS"
+    [[ "$(current_checks | cut -f3)" == pass ]] || fail 'report preferred an old execution error over the successful retry'
+    BENCH_MAX_CORES=2 BENCH_MEM=4G ZEXEC_ID=Z
+    LANE_IDS=(["z-fastq|"]=A)
+    batch_meta file IN 1 1 z-fastq
+    [[ "$META" == *'execution bounded-v1 quota=200% memory=4G swap=0'* ]] || fail 'timing identity lost execution limits'
+    exit 0
+) || fail 'bounded verification checks'
+
+# Real cgroup and cancellation checks use a tiny sleeping worker, never a
+# benchmark tool. Enable on a host with a user systemd manager.
+if [[ "${BENCH_SYSTEMD_TEST:-0}" == 1 ]]; then
+    feature ''
+    # Replace only the generated fixture's dispatch; the runner stays real.
+    sed -i '/^bench_main /d' "$work/feat/run.sh"
+    cat >>"$work/feat/run.sh" <<EOF
+execution bounded
+REPO="$(dirname -- "$bench")"
+validate() { :; }
+run_init() { :; }
+ensure_builds() { :; }
+run_checks() {
+    local cg
+    cg=\$(awk -F: '\$1 == 0 { print \$3 }' /proc/self/cgroup)
+    cat "/sys/fs/cgroup\$cg/cpu.max" "/sys/fs/cgroup\$cg/memory.max" "/sys/fs/cgroup\$cg/memory.swap.max" >"$work/limits"
+    /usr/bin/sleep 30 &
+    printf '%s\\n' "\$!" >"$work/child"
+    : >"$work/started"
+    wait
+}
+bench_main "\$@"
+EOF
+    BENCH_MAX_CORES=1 BENCH_MEM=256M bash "$work/feat/run.sh" check >"$work/bounded.log" 2>&1 &
+    runner=$!
+    for ((attempt=0; attempt<100; attempt++)); do
+        [[ ! -f "$work/started" ]] || break
+        sleep 0.1
+    done
+    if [[ ! -f "$work/started" ]]; then
+        kill -TERM "$runner" 2>/dev/null || true
+        wait "$runner" || true
+        fail "bounded service did not start: $(cat "$work/bounded.log")"
+    fi
+    [[ "$(sed -n '1p' "$work/limits")" == '100000 100000' ]] || fail 'CPU quota was not applied'
+    [[ "$(sed -n '2p' "$work/limits")" == 268435456 ]] || fail 'memory cap was not applied'
+    [[ "$(sed -n '3p' "$work/limits")" == 0 ]] || fail 'swap was not disabled'
+    # A second invocation must not start work, even on a different CPU.
+    BENCH_CPU=2 BENCH_MAX_CORES=1 BENCH_MEM=256M bash "$work/feat/run.sh" check >>"$work/bounded.log" 2>&1 && fail 'bounded runs overlapped'
+    kill -TERM "$runner"
+    status=0
+    wait "$runner" || status=$?
+    runner=""
+    [[ "$status" == 143 ]] || fail "cancellation returned $status"
+    child="$(cat "$work/child")"
+    kill -0 "$child" 2>/dev/null && fail 'cancellation left a worker running'
+    if [[ -f "$work/feat/results/runs.tsv" ]]; then
+        awk -F'\t' 'NR > 1 && $9 == "ok" { exit 1 }' "$work/feat/results/runs.tsv" || fail 'cancelled run reported success'
+    fi
+fi
 
 printf 'bench core: ok\n'
