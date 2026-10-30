@@ -46,7 +46,7 @@ fail() {
 }
 
 # Syntax of every script and of plot.py.
-for f in "$bench"/lib/bench.sh "$bench"/*/run.sh; do bash -n "$f" || fail "syntax: $f"; done
+for f in "$bench"/lib/bench.sh "$bench"/lib/summary.sh "$bench"/*/run.sh; do bash -n "$f" || fail "syntax: $f"; done
 python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$bench/lib/plot.py" || fail 'syntax: plot.py'
 
 # A scratch feature over the real core, data, and cache.
@@ -125,12 +125,59 @@ feature ''
     LANE_IDS["z-fastq|"]=A
     batch_meta stdin IN 11 1 z-fastq
     find_batch "$pre" && fail 'a file batch was reused for stdin'
+    BATCH_CPUS=9 batch_meta file IN 11 1 z-fastq
+    find_batch "$pre" && fail 'timing reused a batch from another CPU set'
+    REPORTING=1 find_batch "$pre" || fail 'a report missed a batch timed on another CPU set'
     # A lane's identity covers its command as well as its binary.
     a="$(lane_id_now seqtk)"
     LANE_TMPL[seqtk]="{bin} size -x {in}"
     [[ "$(lane_id_now seqtk)" != "$a" ]] || fail 'changing a command kept the lane identity'
     exit 0
 ) || fail 'batch-reuse checks'
+
+# Identities follow what is measured: a program by its bytes, the default
+# z-fastq by the source it is built from, a check by the code that decides it.
+feature ''
+# shellcheck disable=SC2034,SC2154  # read by the sourced core's functions
+(
+    BASH_ARGV0="$work/feat/run.sh"
+    source "$work/feat/run.sh" __probe
+    printf 'one\n' >"$work/subject"
+    a="$(binid "$work/subject")"
+    touch -d @1700000000 "$work/subject"
+    [[ "$(binid "$work/subject")" == "$a" ]] || fail 'a new mtime changed a program identity'
+    printf 'two\n' >"$work/subject"
+    [[ "$(binid "$work/subject")" != "$a" ]] || fail 'new bytes kept a program identity'
+    # The default z-fastq: committed trees, unless src or build.zig is dirty.
+    dirty=""
+    git() { case "$*" in *status*) printf '%s' "$dirty" ;; *rev-parse*) printf 'tree\n' ;; esac; }
+    zig() { printf '0.16.0\n'; }
+    REPO="$(dirname -- "$bench")" ZFASTQ_DEFAULT="$work/subject" ZFASTQ="$work/subject"
+    a="$(zfastq_id)"
+    [[ "$a" == src:tree:tree:* ]] || fail "a clean source did not give a source identity: $a"
+    printf 'three\n' >"$work/subject"
+    [[ "$(zfastq_id)" == "$a" ]] || fail 'rebuilding the same source changed the z-fastq identity'
+    dirty=' M src/main.zig'
+    [[ "$(zfastq_id)" == "$(binid "$work/subject")" ]] || fail 'a dirty source did not use the binary identity'
+    dirty=""
+    ZFASTQ="$work/external"
+    printf 'other\n' >"$work/external"
+    [[ "$(zfastq_id)" == "$(binid "$work/external")" ]] || fail 'ZFASTQ=PATH did not use the binary identity'
+    unset -f git zig
+    # The check key: report code is never reached; a helper of fact is.
+    LANES=() EXPECT=accept AGREE_LANE="" REFERENCE=""
+    all_cases() { :; }
+    verify_cases() { :; }
+    helper() { printf 'a\n'; }
+    fact() { helper; }
+    feature_readme() { printf 'old words\n'; }
+    a="$(check_id)"
+    feature_readme() { printf 'new words\n'; }
+    [[ "$(check_id)" == "$a" ]] || fail 'editing report code changed the check key'
+    helper() { printf 'b\n'; }
+    [[ "$(check_id)" != "$a" ]] || fail 'editing a helper of fact kept the check key'
+    exit 0
+) || fail 'identity checks'
 
 # Case parameters: a short:A,long:B value follows the source's read class, a
 # varied parameter names its value in the case id, every placeholder expands,
@@ -181,6 +228,16 @@ feature ''
     ZEXEC_ID=Z BATCH_CPUS="$set2"
     batch_meta file IN 3 1
     [[ "$META" == *$'\n'"cpu $set2"$'\n'* ]] || fail 'the CPU set is not in the batch identity'
+    # Timing holds lanes to the core cap; a report plans batches as they were timed.
+    printf 'input\n' >"$work/input"
+    lanes_at() { printf 'z-fastq\nwide\n'; }
+    status_key() { printf '%s\n' "$1"; }
+    batch_settings() { printf '3 1\n'; }
+    CHECK_STATUS=([z-fastq]=pass [wide]=pass) LANE_CORES=([wide]=2) LANE_IDS=(["z-fastq|file"]=A ["wide|file"]=W) BENCH_MAX_CORES=1
+    plan_batch file "$work/input" small real -
+    [[ " ${BATCH_LANES[*]} " != *" wide "* ]] || fail 'timing planned a lane above the core cap'
+    REPORTING=1 plan_batch file "$work/input" small real -
+    [[ " ${BATCH_LANES[*]} " == *" wide "* ]] || fail 'a report dropped a lane timed above this run'"'"'s core cap'
     exit 0
 ) || fail 'cores checks'
 expect_invalid 'lane fastp partial "{bin} -w 2 {in}" cores=two' 'cores=two is not a positive count'
@@ -337,7 +394,7 @@ then fail 'checker continued after a failed command'; fi
     edge_before="$(edge_key)"
     edge_expectation=reject
     [[ "$(edge_key)" != "$edge_before" ]] || fail 'changed edge expectations kept the old key'
-    ZEXEC_ID="$(fileid "$ZEXEC")"
+    ZEXEC_ID="$(binid "$ZEXEC")"
     plan_batch file "$work/input" small real "$case_parameters"
     dir="$RESULTS/batches/file-test-current"
     mkdir -p -- "$dir"

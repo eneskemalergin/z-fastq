@@ -17,7 +17,7 @@ scaling paired
 
 word title "Processing paired reads"
 word subject "z-fastq process"
-word others "processors"
+word others "tools"
 word timed "its outputs were right"
 word right "right outputs"
 word wrong "wrong output"
@@ -81,20 +81,6 @@ fastp_command() {
     for n in $THREADS; do command "fastp-w$n" "${1/-w 1/-w $n}"; done
 }
 
-family copy-plain "two mate files into two plain files"
-lanes "$FASTP_LANES"
-look full
-input pair "$PAIRED_SOURCES" medium
-input pair paired tiny,xsmall,small,medium
-
-family copy-gzip "two mate files into two gzip files"
-lanes "$FASTP_LANES"
-look full
-command z-fastq "$ZQ_GZIP"
-fastp_command "$FP_GZIP"
-input pair "$PAIRED_SOURCES" medium
-input pair paired tiny,xsmall,small,medium
-
 family trim-truseq "TruSeq adapters, quality and N filters, minimum length 15 (rnaFusion's settings)"
 lanes "$FASTP_LANES"
 look full
@@ -118,10 +104,30 @@ command z-fastq "$ZQ_QC"
 input pair "$PAIRED_SOURCES" medium
 input pair paired tiny,xsmall,small,medium
 
-edges process
-# The report's sections: related jobs side by side, a column each, in one
-# figure per view.
-SECTIONS="copying:Copying=copy-plain/Plain output,copy-gzip/Gzip output|trimming:Trimming=trim-truseq/TruSeq,trim-nextera/Nextera|qc:QC tables=qc-tables/FastQC tables"
+# Copying measures what process costs before it does any work: reading,
+# checking, and writing a pair. One pair at one thread answers that; the
+# trimming and QC jobs carry the comparison across inputs and threads.
+COPY_PAIR=illumina-drr1001190
+COPY_LANES="z-fastq,fastp"
+
+family copy-plain "two mate files into two plain files"
+lanes "$COPY_LANES"
+look full
+input pair "$COPY_PAIR" medium
+
+family copy-gzip "two mate files into two gzip files"
+lanes "$COPY_LANES"
+look full
+command z-fastq "$ZQ_GZIP"
+command fastp "$FP_GZIP"
+input pair "$COPY_PAIR" medium
+
+# The edge cases run each lane with its copy command, the QC tools with their
+# tables; trimming and QC come first, so they name the sources and shapes.
+edges process copy-plain qc-tables
+# The report's sections: the cost of each step on one pair, then related jobs
+# side by side in one figure per view.
+SECTIONS="steps:What each step costs:steps=copy-plain/Copy to plain files,copy-gzip/Copy to gzip files,trim-truseq/TruSeq trim,trim-nextera/Nextera trim|trimming:Trimming:pooled=trim-truseq/TruSeq,trim-nextera/Nextera|qc:QC tables=qc-tables/FastQC tables"
 
 # FastQC's name for an input: the file name without .gz, .bz2, .txt, .fastq,
 # .fq, .csfastq, .sam, .bam, and .ubam, stripped in that order.
@@ -488,7 +494,7 @@ declare -A FAMILY_TITLE=([copy-plain]="Copying into plain files" [copy-gzip]="Co
 tools_table() {
     local name fam line
     {
-        printf 'Tool\tClass\tCopy\tGzip copy\tTruSeq trim\tNextera trim\tQC tables\tThreads\tMalformed rejected\n'
+        printf 'Tool\tClass\tCopy to plain\tCopy to gzip\tTruSeq trim\tNextera trim\tQC tables\tThreads\tMalformed rejected\n'
         printf 'l\tl\tl\tl\tl\tl\tl\tl\tr\n'
         for name in "${LANES[@]}"; do
             [[ ! -v "LANE_OF[$name]" ]] || continue
@@ -547,55 +553,185 @@ process_findings() {
               if (k) line = line sprintf(" %d of the %d other tools write output from a broken pair or record with exit 0.", k, others)
               print line }' "$REPORT_DIR/checks.tsv" "$REPORT_DIR/edges.tsv"
     valid_wrong_bullet
-    for fam in copy-plain copy-gzip trim-truseq trim-nextera qc-tables; do job_bullet "$fam" "${FAMILY_TITLE[$fam]}"; done
+    steps_text bullet
+    gzip_size_bullet
+    for fam in trim-truseq trim-nextera qc-tables; do job_bullet "$fam" "${FAMILY_TITLE[$fam]}"; done
 }
-# z-fastq's own time and memory per job and format, as one sentence.
-section_subject() { # family:job...
-    local spec fam out=""
-    for spec; do
-        fam="${spec%%:*}"
-        out+="$(awk -F'\t' -v fam="$fam" -v job="${spec#*:}" -v tier="$HEADLINE" '
-            FILENAME ~ /cases.tsv$/ { if (FNR > 1 && $1 == fam && $5 == tier && $6 != "many") fmt[$2] = $3; next }
-            FNR == 1 || $1 != fam || !($2 in fmt) || $3 != "z-fastq" { next }
-            { k[fmt[$2]]++; w[fmt[$2]] += log($5 / 1e9); m[fmt[$2]] += log($8 / 1024) }
-            END { s = ""
-                  if (k["plain"]) s = sprintf("%.2f s and %.1f MiB on plain input", exp(w["plain"] / k["plain"]), exp(m["plain"] / k["plain"]))
-                  if (k["gzip"]) s = s (s == "" ? "" : ", ") sprintf("%.2f s and %.1f MiB on gzip", exp(w["gzip"] / k["gzip"]), exp(m["gzip"] / k["gzip"]))
-                  if (s != "") printf "%s, %s; ", job, s }' "$REPORT_DIR/cases.tsv" "$REPORT_DIR/summary.tsv")"
-    done
-    [[ -z "$out" ]] || printf 'z-fastq itself takes, geometric means over the %s inputs: %s. The table gives every tool as a multiple of that.\n\n' "${TIER_SIZE[$HEADLINE]}" "${out%; }"
+# The gzip files z-fastq and fastp wrote in the gzip copy, per plain headline
+# input: one bullet, since a faster preset that writes more bytes is a cost.
+gzip_size_bullet() {
+    awk -F'\t' -v tier="$HEADLINE" -v size="${TIER_SIZE[$HEADLINE]}" 'FILENAME ~ /cases.tsv$/ { if (FNR > 1 && $1 == "copy-gzip" && $5 == tier && $3 == "plain") want[$2] = 1; next }
+        $1 == "copy-gzip" && ($5 in want) && $3 == "pass" && ($2 == "z-fastq" || $2 == "fastp") { n = split($4, f, ";"); for (i = 1; i <= n; i++) if (f[i] ~ /^out_bytes /) { split(f[i], q, " "); s[$2] += q[2]; k[$2]++ } }
+        END { if (k["z-fastq"] && k["fastp"]) { z = s["z-fastq"] / k["z-fastq"]; p = s["fastp"] / k["fastp"]
+              printf "- **Gzip output size:** on that pair, z-fastq'"'"'s default `fast` preset writes %.1f MB, %.0f%% %s than fastp'"'"'s %.1f MB at its default level 4; `--gzip-preset even` or `dense` writes less, more slowly.\n", z / 1e6, (z > p ? z / p - 1 : 1 - z / p) * 100, (z > p ? "more" : "less"), p / 1e6 } }' \
+        "$REPORT_DIR/cases.tsv" "$FAMILY_CHECKS"
 }
 # One report section: the jobs SLUG draws together.
 readme_section() { # slug title family:job...
     local slug="$1" title="$2" spec fam jobs=""
     shift 2
     for spec; do fam="${spec%%:*}"; jobs+="${spec#*:}: ${FAM_DESC[$fam]}. "; done
-    printf '## %s\n> <sub>%sThe real runs and the synthetic pair at %s, plain and gzip input, in the page cache. z-fastq runs on one CPU; every other tool at 1 thread, and at 2, 4, 8, and 16 threads on as many physical cores, in the same batch.</sub>\n\n' "$title" "$jobs" "${TIER_SIZE[$HEADLINE]}"
+    printf '## %s\n> <sub>%sThe real runs and the synthetic pair at %s, plain and gzip input, in the page cache, every tool on one CPU. The other tools at 2 to 16 threads are in the threads part below.</sub>\n\n' "$title" "$jobs" "${TIER_SIZE[$HEADLINE]}"
     picture "$slug-overview" "$title: time and peak RSS relative to z-fastq" && printf '\n'
-    section_subject "$@"
+    printf 'Geometric means over the %s inputs: z-fastq'"'"'s own time and memory, and every other tool'"'"'s as a multiple of them.\n\n' "${TIER_SIZE[$HEADLINE]}"
     MODE_HEADER=Job summary_table "$@"
     printf '\n'
     picture "$slug-speed" "$title: wall time by kind of input" && printf '\n'
     picture "$slug-memory" "$title: peak memory by kind of input" && printf '\n'
     for spec; do output_sentence "${spec%%:*}" "${spec#*:}"; done
+    threads_part "$slug" "$title" "$@"
     details "Scaling"
     picture "$slug-scaling" "$title: throughput and peak memory by input size" && printf '\n'
-    for spec; do printf '**%s.** ' "${spec#*:}"; scaling_sentences "${spec%%:*}"; printf '\n'; done
+    # Jobs whose scaling sentences match say them once, under all their names.
+    local names="" text first="" same=1
+    for spec; do
+        text="$(scaling_sentences "${spec%%:*}")"
+        names+="${names:+ and }${spec#*:}"
+        if [[ -z "$first" ]]; then first="$text"; elif [[ "$text" != "$first" ]]; then same=0; fi
+    done
+    if ((same)); then printf '**%s.** %s\n' "$names" "$first"
+    else for spec; do printf '**%s.** %s\n' "${spec#*:}" "$(scaling_sentences "${spec%%:*}")"; done; fi
     printf '</details>\n\n'
+}
+# The cost of each step on the one pair copying runs on: the copies, then the
+# trims on the same input, z-fastq beside fastp at one thread.
+STEP_FAMILIES="copy-plain copy-gzip trim-truseq trim-nextera"
+declare -A STEP_NAME=([copy-plain]="Copy to plain files" [copy-gzip]="Copy to gzip files" [trim-truseq]="TruSeq trim" [trim-nextera]="Nextera trim")
+steps_part() {
+    printf '## What each step costs\n> <sub>Copying reads both mates, checks every pair, and writes them, with nothing else: what every job of `process` pays before its own work. One pair at %s, every tool on one CPU; each trim on the same pair, from its own job below.</sub>\n\n' "${TIER_SIZE[$HEADLINE]}"
+    picture steps "What each step costs on one pair: wall time and peak memory" && printf '\n'
+    steps_text table
+    printf '\n'
+    steps_text sentence
+    printf '\n'
+}
+# MODE bullet (Findings), table, or sentence, from the medians on the pair.
+steps_text() { # mode
+    local names=""
+    for fam in $STEP_FAMILIES; do names+="$fam=${STEP_NAME[$fam]}|"; done
+    awk -F'\t' -v mode="$1" -v fams="$STEP_FAMILIES" -v names="${names%|}" -v tier="$HEADLINE" -v size="${TIER_SIZE[$HEADLINE]}" '
+        function secs(ns) { return ns >= 1e9 ? sprintf("%.2f s", ns / 1e9) : sprintf("%.0f ms", ns / 1e6) }
+        function mem(kib) { return kib >= 1048576 ? sprintf("%.1f GiB", kib / 1048576) : kib >= 10240 ? sprintf("%.1f MiB", kib / 1024) : sprintf("%.2f MiB", kib / 1024) }
+        BEGIN { nf = split(fams, fl, " "); for (i = 1; i <= nf; i++) want[fl[i]] = 1
+                n = split(names, nl, "|"); for (i = 1; i <= n; i++) { split(nl[i], q, "="); title[q[1]] = q[2] } }
+        FILENAME ~ /cases.tsv$/ { if (FNR > 1 && ($1 in want) && $5 == tier && $6 != "many") { cs[$1, $4, $3] = $2; srcs[$4] = 1; lbl[$4] = $8 } next }
+        FILENAME ~ /style.tsv$/ { if (FNR > 1) label[$1] = $2; next }
+        FNR == 1 { next }
+        { w[$1, $2, $3] = $5; m[$1, $2, $3] = $8 }
+        END {
+            # The one source every step ran.
+            for (s in srcs) { ok = 1; for (i = 1; i <= nf; i++) if (!((fl[i], s, "plain") in cs)) ok = 0; if (ok) src = s }
+            if (src == "") exit
+            P = "plain"
+            zc = w["copy-plain", cs["copy-plain", src, P], "z-fastq"]; fc = w["copy-plain", cs["copy-plain", src, P], "fastp"]
+            zg = w["copy-gzip", cs["copy-gzip", src, P], "z-fastq"]; fg = w["copy-gzip", cs["copy-gzip", src, P], "fastp"]
+            zt = w["trim-truseq", cs["trim-truseq", src, P], "z-fastq"]; ft = w["trim-truseq", cs["trim-truseq", src, P], "fastp"]
+            zm = m["copy-plain", cs["copy-plain", src, P], "z-fastq"]; fm = m["copy-plain", cs["copy-plain", src, P], "fastp"]
+            if (mode == "bullet") {
+                printf "- **Reading and writing a pair:** z-fastq copies one %s pair to plain files in %s and to gzip files in %s; fastp takes %s and %s at one thread, holding %s.\n", size, secs(zc), secs(zg), secs(fc), secs(fg), mem(fm)
+                exit
+            }
+            if (mode == "sentence") {
+                split(lbl[src], q, ": "); name = q[length(q)]
+                printf "On this pair (%s), copying to plain files takes z-fastq %s with %s: reading, checking, and writing are %.0f%% of its %s TruSeq trim. fastp needs %s with %s for the same copy, %.0f%% of its %s trim. Copying to gzip files instead takes z-fastq %s: compressing both mates adds %s, against %s that TruSeq trimming adds.\n", \
+                    name, secs(zc), mem(zm), zc / zt * 100, secs(zt), secs(fc), mem(fm), fc / ft * 100, secs(ft), secs(zg), secs(zg - zc), secs(zt - zc)
+                exit
+            }
+            print "Step\tTool\tPlain wall\tPlain peak memory\tGzip wall\tGzip peak memory"
+            print "l\tl\tr\tr\tr\tr"
+            split("z-fastq fastp", lanes, " ")
+            for (i = 1; i <= nf; i++) for (j = 1; j <= 2; j++) { F = fl[i]; l = lanes[j]; line = title[F] "\t" label[l]
+                for (f = 1; f <= 2; f++) { fmt = (f == 1 ? "plain" : "gzip"); c = cs[F, src, fmt]
+                    line = line (((F, c, l) in w) ? "\t" secs(w[F, c, l]) "\t" mem(m[F, c, l]) : "\t-\t-") }
+                print line }
+        }' "$REPORT_DIR/cases.tsv" "$REPORT_DIR/style.tsv" "$REPORT_DIR/summary.tsv" | { if [[ "$1" == table ]]; then mdtable; else cat; fi; }
+}
+# The other tools at 1 to 16 threads against z-fastq on one core: the figure,
+# a table in absolute units, and where each tool first matches z-fastq.
+threads_part() { # slug title family:job...
+    local slug="$1" title="$2"
+    shift 2
+    printf '### %s: threads\n> <sub>Each other tool at 1, 2, 4, 8, and 16 threads on as many physical cores, z-fastq on one, in the same batches, at the %s inputs. Geometric means over those inputs. Cores used is CPU time over wall time.</sub>\n\n' "$title" "${TIER_SIZE[$HEADLINE]}"
+    picture "$slug-threads" "$title: wall time, CPU time, and peak memory by thread count" && printf '\n'
+    threads_table "$@"
+    printf '\n'
+    threads_sentences "$@"
+}
+threads_table() { # family:job...
+    local fams
+    fams="$(printf '%s|' "$@")"
+    awk -F'\t' -v fams="${fams%|}" -v tier="$HEADLINE" '
+        BEGIN { nf = split(fams, fl, "|"); for (i = 1; i <= nf; i++) { split(fl[i], q, ":"); fam[i] = q[1]; job[q[1]] = q[2]; at[q[1]] = 1 } }
+        FILENAME ~ /cases.tsv$/ { if (FNR > 1 && ($1 in at) && $5 == tier && $6 != "many") { fmt[$1, $2] = $3; if ($3 == "gzip") hasgz = 1 } next }
+        FILENAME ~ /style.tsv$/ { if (FNR > 1) { label[$1] = $2; ord[$1] = $7 + 0; cores[$1] = ($9 > 0 ? $9 : 1); of[$1] = ($10 == "" ? $1 : $10) } next }
+        FNR == 1 || !(($1, $2) in fmt) || $11 <= 0 { next }
+        { k = $1 SUBSEP $3 SUBSEP fmt[$1, $2]; n[k]++; w[k] += log($5 / 1e9); c[k] += log($11 / 1e6); m[k] += log($8 / 1024); lanes[$1, $3] = 1 }
+        END {
+            print "Job\tTool\tThreads" "\tPlain wall s\tPlain CPU s\tPlain cores used\tPlain peak MiB" (hasgz ? "\tGzip wall s\tGzip CPU s\tGzip cores used\tGzip peak MiB" : "")
+            print "l\tl\tr\tr\tr\tr\tr" (hasgz ? "\tr\tr\tr\tr" : "")
+            split("plain gzip", fs, " ")
+            for (x = 1; x <= nf; x++) { F = fam[x]; cnt = 0; delete list
+                for (kk in lanes) { split(kk, q, SUBSEP); if (q[1] == F) list[++cnt] = q[2] }
+                # By tool (its own registry order), then thread count.
+                for (i = 1; i <= cnt; i++) for (j = i + 1; j <= cnt; j++) {
+                    a = list[i]; b = list[j]
+                    if (ord[of[b]] < ord[of[a]] || (of[b] == of[a] && cores[b] < cores[a])) { list[i] = b; list[j] = a } }
+                for (i = 1; i <= cnt; i++) { l = list[i]; name = label[of[l]]; gsub("_", " ", name)
+                    line = job[F] "\t" name "\t" cores[l]
+                    for (f = 1; f <= (hasgz ? 2 : 1); f++) { k = F SUBSEP l SUBSEP fs[f]
+                        if (!n[k]) { line = line "\t-\t-\t-\t-"; continue }
+                        ww = exp(w[k] / n[k]); cc = exp(c[k] / n[k])
+                        line = line sprintf("\t%.2f\t%.2f\t%.1f\t%.1f", ww, cc, cc / ww, exp(m[k] / n[k])) }
+                    print line } }
+        }' "$REPORT_DIR/cases.tsv" "$REPORT_DIR/style.tsv" "$REPORT_DIR/summary.tsv" | mdtable
+}
+# Per job and tool: the fewest threads at which it matches z-fastq's wall
+# time on one core, per input format, from the ratios within each batch.
+threads_sentences() { # family:job...
+    local spec
+    for spec; do
+        awk -F'\t' -v fam="${spec%%:*}" -v job="${spec#*:}" -v tier="$HEADLINE" '
+            FILENAME ~ /cases.tsv$/ { if (FNR > 1 && $1 == fam && $5 == tier && $6 != "many") fmt[$2] = $3; next }
+            FILENAME ~ /style.tsv$/ { if (FNR > 1) { label[$1] = $2; ord[$1] = $7 + 0; cores[$1] = ($9 > 0 ? $9 : 1); of[$1] = ($10 == "" ? $1 : $10) } next }
+            FNR == 1 || $1 != fam || !($2 in fmt) { next }
+            { w[$2, $3] = $5; c[$2, $3] = $11; lanes[$3] = 1 }
+            END {
+                for (l in lanes) if (l != "z-fastq") for (x in fmt) if ((x, l) in w && (x, "z-fastq") in w && c[x, l] > 0 && c[x, "z-fastq"] > 0) {
+                    k = l SUBSEP fmt[x]; n[k]++; sw[k] += log(w[x, l] / w[x, "z-fastq"]); sc[k] += log(c[x, l] / c[x, "z-fastq"]); tools[of[l]] = 1 }
+                nt = 0; for (t in tools) tl[++nt] = t
+                for (i = 1; i <= nt; i++) for (j = i + 1; j <= nt; j++) if (ord[tl[j]] < ord[tl[i]]) { t = tl[i]; tl[i] = tl[j]; tl[j] = t }
+                out = ""
+                for (i = 1; i <= nt; i++) { t = tl[i]; name = label[t]; gsub("_", " ", name); hit = miss = ""; top = 0
+                    split("plain gzip", fs, " ")
+                    for (f = 1; f <= 2; f++) { best = 0; seen = 0
+                        for (l in lanes) if (of[l] == t) { k = l SUBSEP fs[f]; if (!n[k]) continue
+                            seen = 1; if (cores[l] > top) top = cores[l]
+                            r = exp(sw[k] / n[k]); if (r < 1 && (!best || cores[l] < cores[best])) { best = l; br = r; bc = exp(sc[k] / n[k]) } }
+                        if (!seen) continue
+                        if (best) hit = hit (hit == "" ? "" : ", and ") sprintf("from %d threads on %s input (%.2fx z-fastq%ss time for %.1fx its CPU time)", cores[best], fs[f], br, "\047", bc)
+                        else miss = miss (miss == "" ? "" : " or ") fs[f] }
+                    if (hit != "" && miss != "") s = sprintf("%s matches z-fastq on one core %s; on %s input no thread count up to %d does.", name, hit, miss, top)
+                    else if (hit != "") s = sprintf("%s matches z-fastq on one core %s.", name, hit)
+                    else if (miss != "") s = sprintf("%s does not match z-fastq on one core at any thread count up to %d, on %s input.", name, top, miss)
+                    else continue
+                    out = out (out == "" ? "" : " ") s }
+                if (out != "") printf "**%s.** %s\n\n", job, out
+            }' "$REPORT_DIR/cases.tsv" "$REPORT_DIR/style.tsv" "$REPORT_DIR/summary.tsv"
+    done
 }
 feature_readme() {
     family_checks
     readme_head
     printf '## Findings\n\n'
     process_findings
-    printf '\n## Compared tools\n> <sub>*partial* tools do less than z-fastq: fastp checks records less strictly, and the FastQC tools write no reads and check no pairs. A job is `yes` when the tool was right on every input of it, `partly` on some, `-` when the tool has no such job. Threads: z-fastq runs on one; every other tool runs at 1 thread and again at 2, 4, 8, and 16 on as many physical cores, at the %s inputs, in the same batches as z-fastq. Malformed rejected: of the broken pairs and records in the edge cases, how many the tool rejects.</sub>\n\n' "${TIER_SIZE[$HEADLINE]}"
+    printf '\n## Compared tools\n> <sub>*partial* tools do less than z-fastq: fastp checks records less strictly, and the FastQC tools write no reads and check no pairs. A job is `yes` when the tool was right on every input of it, `partly` on some, `-` when the tool has no such job. Threads: z-fastq runs on one; in the trimming and QC jobs every other tool runs at 1 thread and again at 2, 4, 8, and 16 on as many physical cores, at the %s inputs, in the same batches as z-fastq; copying runs every tool on one. Malformed rejected: of the broken pairs and records in the edge cases, how many the tool rejects.</sub>\n\n' "${TIER_SIZE[$HEADLINE]}"
     tools_table
     printf '\n'
     local name
     for name in "${LANES[@]}"; do [[ -z "${LANE_NOTE[$name]}" ]] || printf -- '- `%s %s`: *%s*\n' "${REG_LABEL[$name]}" "$(lane_version "$name")" "${LANE_NOTE[$name]}"; done
     printf '\n> [!IMPORTANT]\n> fastp computes its QC report and pair duplication on every run, so z-fastq'"'"'s trimming lanes write the QC summary and measure pair duplication too. In the QC job z-fastq also writes both mates, which it cannot skip, while the FastQC tools write tables only.\n'
     readme_right
-    readme_section copying Copying "copy-plain:Plain output" "copy-gzip:Gzip output"
+    steps_part
     readme_section trimming Trimming "trim-truseq:TruSeq" "trim-nextera:Nextera"
     readme_section qc "QC tables" "qc-tables:FastQC tables"
     readme_repro
@@ -607,7 +743,10 @@ output_sentence() { # family [job]
         $1 == fam && ($5 in want) && $3 == "pass" && base[$2] { n = split($4, f, ";"); for (i = 1; i <= n; i++) if (f[i] ~ /^out_bytes /) { split(f[i], q, " "); s[$2] += q[2]; k[$2]++ } }
         END { m = 0; for (l in s) list[++m] = l
               for (i = 1; i <= m; i++) for (j = i + 1; j <= m; j++) if (ord[list[j]] < ord[list[i]]) { t = list[i]; list[i] = list[j]; list[j] = t }
-              out = ""; for (i = 1; i <= m; i++) out = out (i == 1 ? "" : ", ") sprintf("%s %.1f MB", label[list[i]], s[list[i]] / k[list[i]] / 1e6)
+              # In the QC job z-fastq writes both mates as well as its tables; the FastQC tools write tables only.
+              qc = fam == "qc-tables"
+              out = ""; for (i = 1; i <= m; i++) out = out (i == 1 ? "" : ", ") sprintf("%s %.1f MB%s", label[list[i]], s[list[i]] / k[list[i]] / 1e6,
+                  !qc ? "" : list[i] == "z-fastq" ? " (both mates in full, which this job cannot skip, and its tables)" : " (tables only)")
               if (out != "") printf "%sOutput per plain %s input, mean over %d inputs: %s.\n\n", (job == "" ? "" : "**" job ".** "), size, k[list[1]], out }' \
         "$REPORT_DIR/cases.tsv" "$REPORT_DIR/style.tsv" "$FAMILY_CHECKS"
 }
