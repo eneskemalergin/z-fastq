@@ -46,15 +46,15 @@ zig build test -Dstatic=true -Doptimize=ReleaseFast --summary all
 
 ## Continuous integration
 
-GitHub Actions runs the same checks on every pull request and every push to `main`, and on any branch when started by hand, each test run in its own checkout, on x86-64 and on an ARM runner. A change that touches only documentation, benchmark reports, or tool recipes skips the builds.
+GitHub Actions checks every pull request and every push to `main`, and any branch when started by hand, on x86-64 and on an ARM runner. A change that touches only documentation, benchmark reports, or tool recipes skips the builds. The first failure stops the run. The runs above stay the local check before a commit; CI repeats only what a separate machine adds.
 
 - **Source checks:** formatting, the syntax of every shell script, shellcheck on the CI scripts, the benchmark Python, and `.github/scripts/docs_check.sh`, which fails on a link, image, or heading anchor that does not exist in the README, the reports, or the wiki.
-- **Tests:** the four runs above on x86-64; Debug and ReleaseFast on aarch64.
-- **Release binaries:** each ReleaseFast run packages its architecture's static binary and smoke-tests every command from the unpacked archive, with Zig off `PATH`.
+- **Tests:** one Debug run per architecture; on x86-64 it targets generic x86-64, so the AVX2 kernels run through run-time dispatch as in the release binary.
+- **Release binaries:** each architecture's static ReleaseFast binary, packaged and smoke-tested on every command from the unpacked archive, with Zig off `PATH`.
 - **Source package:** the files under `.paths` in `build.zig.zon`, fetched into a fresh Zig package and tested through the public module.
 - **Workflows:** actionlint and zizmor, when `.github/` changes.
 
-A `vX.Y.Z` tag runs the release. It goes ahead only for a tag on `main`'s head naming the version in `build.zig.zon` and its changelog entry, and only after `main`'s CI passed on that commit; it then runs every check again without caches and publishes the tested archives with checksums, the changelog entry, and build attestations. Started by hand on `main`, the release workflow rehearses all of that for `main`'s version without publishing. Pushes to `main` that change `wiki/` publish it to the GitHub Wiki.
+A `vX.Y.Z` tag runs the release. It goes ahead only for a tag on `main`'s head naming the version in `build.zig.zon` and its changelog entry, and only once `main`'s CI has passed on that commit; it then publishes the archives that run tested, with checksums, the changelog entry, and build attestations, without building again. A tag pushed before that CI run finishes fails, and the release is re-run after it passes. Started by hand on `main`, the release workflow rehearses the checks for `main`'s version without publishing. Pushes to `main` that change `wiki/` publish it to the GitHub Wiki.
 
 ## Benchmarks
 

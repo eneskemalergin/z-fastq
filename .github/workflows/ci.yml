@@ -1,18 +1,18 @@
 # Checks every pull request and push to main; any other branch runs on request, so no commit is tested twice.
+# The first failure stops the run: a failed lane cancels the other, and nothing is packaged after a failed test.
 #
 # - checks: seconds on one runner. Picks what the rest must run (documentation, benchmark reports, and peer-tool
 #   recipes skip the builds; without a base commit in the shallow clone, everything runs) and fails fast on format,
 #   script syntax, lint of the CI scripts, broken documentation links, and a version without its CHANGELOG.md entry.
 # - workflows: actionlint from a pinned image and zizmor, when .github/ changes.
-# - test: one checkout per configuration, since CLI tests share zig-out/bin/z-fastq. x86-64 runs all four: Debug
-#   for the runner's CPU, so AVX2 compiles inline where it has it; static ReleaseSafe and ReleaseFast for baseline
-#   x86-64, which reach AVX2 through run-time dispatch; and portable kernels. aarch64 has no dispatch, so it runs
-#   Debug and ReleaseFast only. Each ReleaseFast lane packages its release binary and smoke-tests it.
-# - source: the package a Zig dependent fetches, exactly the tracked .paths files, tested from a fresh package.
+# - test: one lane per architecture. Each runs the tests once in Debug, which keeps every safety check at the
+#   lowest build cost; x86-64 builds for baseline x86-64, so AVX2 is reached through run-time dispatch as in the
+#   release binary. Each lane then builds its static ReleaseFast release binary and smoke-tests it; the x86-64
+#   lane also builds the source package a Zig dependent fetches and tests it from a fresh package.
 # - result: one required check for branch protection, whichever jobs ran.
 #
-# The release workflow calls this one with release: true, which runs everything without caches, requires a release
-# tag to name the version, and keeps the tested archives.
+# On main, the tested archives are kept for seven days; the release workflow publishes those for a tag instead of
+# building again. A commit whose push skipped the tests gets them by running this workflow on main by hand.
 name: ci
 
 on:
@@ -20,22 +20,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
-  workflow_call:
-    inputs:
-      release:
-        description: Run every check without caches and keep the tested release archives
-        type: boolean
-        default: false
-    outputs:
-      version:
-        description: The version build.zig.zon declares
-        value: ${{ jobs.checks.outputs.version }}
 
 permissions: {}
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ !inputs.release }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   ZIG_VERSION: 0.16.0
@@ -66,12 +56,11 @@ jobs:
         id: changes
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-          RELEASE: ${{ inputs.release || false }}
         run: |
           set -euo pipefail
           tests=true
           workflows=true
-          if [[ "$RELEASE" != true && "$GITHUB_EVENT_NAME" != workflow_dispatch && -n "$BASE" ]] &&
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch && -n "$BASE" ]] &&
             git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             tests=false
             workflows=false
@@ -87,17 +76,10 @@ jobs:
 
       - name: Check version and release notes
         id: version
-        env:
-          TAG: ${{ github.ref_name }}
-          RELEASE: ${{ inputs.release || false }}
         run: |
           set -euo pipefail
           version=$(bash .github/scripts/release.sh version)
-          if [[ "$RELEASE" == true && "$GITHUB_REF_TYPE" == tag ]]; then
-            bash .github/scripts/release.sh notes "$TAG" > /dev/null
-          else
-            bash .github/scripts/release.sh notes > /dev/null
-          fi
+          bash .github/scripts/release.sh notes > /dev/null
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Check documentation links
@@ -108,7 +90,6 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
           cache-key: checks
-          use-cache: ${{ !inputs.release }}
 
       - name: Check format and scripts
         run: |
@@ -159,29 +140,19 @@ jobs:
     permissions:
       contents: read
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
-          - name: x86-64 Debug
+          - name: x86-64
             runner: ubuntu-24.04
-            flags: ""
-          - name: x86-64 Debug, portable kernels
-            runner: ubuntu-24.04
-            flags: -Dkernel-backend=portable
-          - name: x86-64 ReleaseSafe
-            runner: ubuntu-24.04
-            flags: -Dstatic=true -Doptimize=ReleaseSafe
-          - name: x86-64 ReleaseFast
-            runner: ubuntu-24.04
-            flags: -Dstatic=true -Doptimize=ReleaseFast
+            flags: -Dcpu=baseline
             system: linux-x86_64
-          - name: aarch64 Debug
+            source: true
+          - name: aarch64
             runner: ubuntu-24.04-arm
             flags: ""
-          - name: aarch64 ReleaseFast
-            runner: ubuntu-24.04-arm
-            flags: -Dstatic=true -Doptimize=ReleaseFast
             system: linux-aarch64
+            source: false
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -193,9 +164,8 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
           cache-key: ${{ matrix.name }}
-          use-cache: ${{ !inputs.release }}
 
-      - name: Test
+      - name: Test in Debug
         env:
           FLAGS: ${{ matrix.flags }}
         run: |
@@ -204,13 +174,16 @@ jobs:
           zig build test "${flags[@]}" --summary all
 
       - name: Package and smoke-test the release binary
-        if: matrix.system
         env:
           SYSTEM: ${{ matrix.system }}
         run: bash .github/scripts/release.sh package "$SYSTEM" "$RUNNER_TEMP/release"
 
-      - name: Keep the tested release binary
-        if: matrix.system && inputs.release
+      - name: Build, fetch, and test the source package
+        if: matrix.source
+        run: bash .github/scripts/release.sh package source "$RUNNER_TEMP/release"
+
+      - name: Keep the tested archives
+        if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: release-${{ matrix.system }}
@@ -219,44 +192,10 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  source:
-    name: Source package
-    needs: checks
-    if: needs.checks.outputs.tests == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
-        with:
-          version: ${{ env.ZIG_VERSION }}
-          cache-key: source
-          use-cache: ${{ !inputs.release }}
-
-      - name: Build, fetch, and test the source package
-        run: bash .github/scripts/release.sh package source "$RUNNER_TEMP/release"
-
-      - name: Keep the tested source package
-        if: inputs.release
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: release-source
-          path: ${{ runner.temp }}/release/*.tar.gz
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
-
   result:
     name: CI result
     if: always()
-    needs: [checks, workflows, test, source]
+    needs: [checks, workflows, test]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     permissions: {}
@@ -264,7 +203,6 @@ jobs:
       CHECKS: ${{ needs.checks.result }}
       TESTS_NEEDED: ${{ needs.checks.outputs.tests }}
       TESTS: ${{ needs.test.result }}
-      SOURCE: ${{ needs.source.result }}
       WORKFLOWS_NEEDED: ${{ needs.checks.outputs.workflows }}
       WORKFLOWS: ${{ needs.workflows.result }}
     steps:
@@ -272,7 +210,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$CHECKS" = success
-          for pair in "$TESTS_NEEDED:$TESTS" "$TESTS_NEEDED:$SOURCE" "$WORKFLOWS_NEEDED:$WORKFLOWS"; do
+          for pair in "$TESTS_NEEDED:$TESTS" "$WORKFLOWS_NEEDED:$WORKFLOWS"; do
             case "$pair" in
               true:success|false:skipped) ;;
               *) printf 'Required check did not pass: %s\n' "$pair" >&2; exit 1 ;;

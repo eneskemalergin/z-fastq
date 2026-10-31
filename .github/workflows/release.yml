@@ -1,13 +1,13 @@
-# Publishes a release for a vX.Y.Z tag, in three steps; any failure stops it.
+# Publishes a release for a vX.Y.Z tag, in two steps; the first failure stops it.
 #
 # - gate: the tag names the build.zig.zon version and its CHANGELOG.md entry, it is main's head, and main's CI on
-#   that commit passed (waited for, checking every two minutes, if it is still running). A bad tag fails in seconds.
-# - verify: the whole CI again on the tagged commit, without caches, keeping the tested archives.
-# - publish: checksums and notes, then a draft release, so a failed upload or attestation can be re-run without a
-#   half-published release; attestations; and only then the public release.
+#   that commit has passed. Nothing is waited for or rebuilt: a tag pushed before that CI run finishes fails, and
+#   the release is re-run once it has passed.
+# - publish: the archives that CI run tested and kept, with checksums and notes, as a draft release first, so a
+#   failed upload or attestation can be re-run without a half-published release; attestations; and only then the
+#   public release.
 #
-# Started by hand on main, it rehearses the release for main's version: the same gate (without a tag to check)
-# and verify, and no publish. The tested archives stay on the run for seven days.
+# Started by hand on main, it rehearses the gate for main's version and publishes nothing.
 name: release
 
 on:
@@ -25,12 +25,14 @@ jobs:
   gate:
     name: Release gate
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 5
     permissions:
       contents: read
       actions: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      run: ${{ steps.ci.outputs.run }}
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -54,7 +56,7 @@ jobs:
             test "$tag" = "v$version" || { echo "tag $tag does not match version $version" >&2; exit 1; }
           fi
           bash .github/scripts/release.sh notes "$tag" > /dev/null
-          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\nversion=%s\n' "$tag" "$version" >> "$GITHUB_OUTPUT"
 
       - name: Check the commit is main's head
         env:
@@ -64,48 +66,35 @@ jobs:
           main=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
           test "$GITHUB_SHA" = "$main" || { echo "$TAG at $GITHUB_SHA is not main's head ($main)" >&2; exit 1; }
 
-      - name: Require main's CI to pass on the tagged commit
+      - name: Find main's passed CI run on the commit
+        id: ci
         run: |
           set -euo pipefail
-          deadline=$((SECONDS + 2400))
-          while :; do
-            run=$(gh run list --workflow ci.yml --branch main --event push --commit "$GITHUB_SHA" --limit 1 \
-              --json status,conclusion,url --jq '.[0] // empty | [.status, .conclusion, .url] | @tsv')
-            if [[ -n "$run" ]]; then
-              IFS=$'\t' read -r status conclusion url <<< "$run"
-              if [[ "$status" == completed ]]; then
-                test "$conclusion" = success || { echo "CI on main concluded $conclusion: $url" >&2; exit 1; }
-                echo "CI on main passed: $url"
-                break
-              fi
-            fi
-            ((SECONDS < deadline)) || { echo "CI on main has not passed for $GITHUB_SHA: ${run:-no run}" >&2; exit 1; }
-            sleep 120
-          done
-
-  verify:
-    name: Verify release
-    needs: gate
-    permissions:
-      contents: read
-    uses: ./.github/workflows/ci.yml
-    with:
-      release: true
+          run=$(gh run list --workflow ci.yml --branch main --commit "$GITHUB_SHA" --limit 20 \
+            --json databaseId,event,status,conclusion \
+            --jq '[.[] | select(.event == "push" or .event == "workflow_dispatch")][0] // empty
+              | [.databaseId, .status, .conclusion] | @tsv')
+          [[ -n "$run" ]] || { echo "no CI run on main for $GITHUB_SHA" >&2; exit 1; }
+          IFS=$'\t' read -r id status conclusion <<< "$run"
+          [[ "$status" == completed ]] || { echo "CI run $id on main has not finished; re-run the release after it passes" >&2; exit 1; }
+          [[ "$conclusion" == success ]] || { echo "CI run $id on main concluded $conclusion" >&2; exit 1; }
+          printf 'run=%s\n' "$id" >> "$GITHUB_OUTPUT"
 
   publish:
     name: Publish release
-    needs: [gate, verify]
+    needs: gate
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
+      actions: read
       id-token: write
       attestations: write
       artifact-metadata: write
     env:
       TAG: ${{ needs.gate.outputs.tag }}
-      VERSION: ${{ needs.verify.outputs.version }}
+      VERSION: ${{ needs.gate.outputs.version }}
     steps:
       - name: Check out the tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -124,6 +113,8 @@ jobs:
       - name: Download the tested packages
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
+          run-id: ${{ needs.gate.outputs.run }}
+          github-token: ${{ github.token }}
           pattern: release-*
           path: ${{ runner.temp }}/assets
           merge-multiple: true
