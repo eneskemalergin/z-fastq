@@ -1,14 +1,28 @@
 # Installation
 
-z-fastq is built from source with Zig. The build needs nothing beyond Zig itself: no C compiler, no NASM, and no system zlib, and the release build below is fully static.
+Each [release](https://github.com/eneskemalergin/z-fastq/releases) has a ready-made static binary for Linux on x86-64 and on aarch64; anything else is built from source with Zig.
+
+## Download a release
+
+```bash
+curl -fLO https://github.com/eneskemalergin/z-fastq/releases/download/v0.2.0/z-fastq-0.2.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/eneskemalergin/z-fastq/releases/download/v0.2.0/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf z-fastq-0.2.0-linux-x86_64.tar.gz
+./z-fastq-0.2.0-linux-x86_64/z-fastq --version
+```
+
+On an ARM machine, use `linux-aarch64` in place of `linux-x86_64`. The archive holds the binary and its license. It needs no libraries, so copy it into a directory on your `PATH`. With the [GitHub CLI](https://cli.github.com/), `gh attestation verify z-fastq-0.2.0-linux-x86_64.tar.gz --repo eneskemalergin/z-fastq` also confirms the archive was built by this repository's release workflow.
+
+## Build from source
+
+The build needs nothing beyond Zig itself: no C compiler, no NASM, and no system zlib, and the release build below is fully static.
 
 **You need**
 
 - Linux on x86-64 or aarch64.
 - [Zig](https://ziglang.org/download/) 0.16.0.
 - Network access for the first build, which downloads z-fastq's one package dependency, [zipir](https://github.com/eneskemalergin/zipir) 0.2.1. Later builds reuse it.
-
-## Build
 
 From the repository root:
 

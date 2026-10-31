@@ -4,7 +4,20 @@ The command line is the main product, but the reader, writer, validation, and st
 
 ## Import it
 
-With the repository as a Zig dependency, the module is named `z-fastq`:
+Each release has a source package for Zig to fetch; it holds the source, the build files, the license, the README, and the changelog:
+
+```bash
+zig fetch --save=z_fastq https://github.com/eneskemalergin/z-fastq/releases/download/v0.2.0/z-fastq-0.2.0-source.tar.gz
+```
+
+In `build.zig`, the module is named `z-fastq`:
+
+```zig
+const z_fastq = b.dependency("z_fastq", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("z-fastq", z_fastq.module("z-fastq"));
+```
+
+and in the code:
 
 ```zig
 const zfastq = @import("z-fastq");

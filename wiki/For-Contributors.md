@@ -44,6 +44,18 @@ zig build test -Dstatic=true -Doptimize=ReleaseFast --summary all
 - No test is expected to skip; investigate any skip.
 - Debug builds target the host CPU; the release runs target generic x86-64 and are the ones that test the run-time AVX2 kernels against their scalar versions. A timing is never proof of correct output.
 
+## Continuous integration
+
+GitHub Actions runs the same checks on every pull request and every push to `main`, and on any branch when started by hand, each test run in its own checkout, on x86-64 and on an ARM runner. A change that touches only documentation, benchmark reports, or tool recipes skips the builds.
+
+- **Source checks:** formatting, the syntax of every shell script, shellcheck on the CI scripts, the benchmark Python, and `.github/scripts/docs_check.sh`, which fails on a link, image, or heading anchor that does not exist in the README, the reports, or the wiki.
+- **Tests:** the four runs above on x86-64; Debug and ReleaseFast on aarch64.
+- **Release binaries:** each ReleaseFast run packages its architecture's static binary and smoke-tests every command from the unpacked archive, with Zig off `PATH`.
+- **Source package:** the files under `.paths` in `build.zig.zon`, fetched into a fresh Zig package and tested through the public module.
+- **Workflows:** actionlint and zizmor, when `.github/` changes.
+
+A `vX.Y.Z` tag runs the release. It goes ahead only for a tag on `main`'s head naming the version in `build.zig.zon` and its changelog entry, and only after `main`'s CI passed on that commit; it then runs every check again without caches and publishes the tested archives with checksums, the changelog entry, and build attestations. Started by hand on `main`, the release workflow rehearses all of that for `main`'s version without publishing. Pushes to `main` that change `wiki/` publish it to the GitHub Wiki.
+
 ## Benchmarks
 
 `bench/` compares z-fastq with other tools on the data listed in [References](References). Each suite has a README with its method, findings, and figures; `tools/` installs the pinned tools they need.

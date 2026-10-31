@@ -1,0 +1,6 @@
+# zizmor's settings. The release workflow calls ci.yml by its path, ./.github/workflows/ci.yml, because actionlint
+# does not know the self-repository form zizmor suggests.
+rules:
+  self-repository:
+    ignore:
+      - release.yml

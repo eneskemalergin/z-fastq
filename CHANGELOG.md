@@ -23,6 +23,7 @@ A `process` command that validates, trims, and filters paired reads into two pla
   - Linux aarch64 is supported: `-Dtarget=aarch64-linux` builds it, and release builds are static for the requested architecture. It uses the portable kernels; the AVX2 object is x86-64 only.
   - `-Dstrip` sets whether debug information is stripped; it defaults to on for ReleaseFast, so a profiling build can keep its symbols.
   - `zig build test-<suite>` runs a single test binary, such as `test-reader`, or `test-src` for the in-file tests; `zig build -l` lists them.
+- **Releases.** Each GitHub release carries static, stripped Linux binaries for x86-64 and aarch64 and the source package a Zig dependent fetches, with SHA-256 checksums and build provenance attestations. Both are tested before they are published: each binary is smoke-tested on every command after unpacking, on its own architecture, and the source package is fetched into a fresh package and tested there.
 
 ### Changed
 

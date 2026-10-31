@@ -9,9 +9,7 @@
   </picture>
   <p><strong>Count, check, sample, interleave, and trim paired FASTQ with one static executable built in Zig.</strong></p>
   <p>
-    <!-- When .github/workflows/ci.yml exists:
     <a href="https://github.com/eneskemalergin/z-fastq/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/eneskemalergin/z-fastq/ci.yml?branch=main&amp;style=flat-square&amp;label=CI&amp;logo=githubactions" alt="CI status"></a>
-    -->
     <a href="https://github.com/eneskemalergin/z-fastq/releases/latest"><img src="https://img.shields.io/github/v/release/eneskemalergin/z-fastq?style=flat-square" alt="Latest release"></a>
     <a href="https://github.com/eneskemalergin/z-fastq/wiki"><img src="https://img.shields.io/badge/wiki-documentation-2563eb?style=flat-square" alt="Wiki"></a>
     <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-history-7c3aed?style=flat-square" alt="Changelog"></a>
@@ -98,7 +96,7 @@ z-fastq writes data, not pages: its QC comes out as FastQC-style tables and a JS
 
 ## Start
 
-Build it from source with [Zig 0.16.0](https://ziglang.org/download/); the [installation page](https://github.com/eneskemalergin/z-fastq/wiki/Installation) covers the options.
+Download the static Linux binary for x86-64 or aarch64 from the [latest release](https://github.com/eneskemalergin/z-fastq/releases/latest), or build it from source with [Zig 0.16.0](https://ziglang.org/download/); the [installation page](https://github.com/eneskemalergin/z-fastq/wiki/Installation) covers both.
 
 ```bash
 zig build -Dstatic=true -Doptimize=ReleaseFast    # zig-out/bin/z-fastq; put it on your PATH
