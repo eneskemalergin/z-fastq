@@ -111,7 +111,7 @@ jobs:
           test "$tagged" = "$GITHUB_SHA" || { echo "tag $TAG moved to $tagged during the release" >&2; exit 1; }
 
       - name: Download the tested packages
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           run-id: ${{ needs.gate.outputs.run }}
           github-token: ${{ github.token }}
@@ -147,7 +147,7 @@ jobs:
           gh release upload "$TAG" "$RUNNER_TEMP/assets"/* --clobber
 
       - name: Attest the release packages
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-checksums: ${{ runner.temp }}/assets/SHA256SUMS
 
