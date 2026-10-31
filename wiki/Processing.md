@@ -118,8 +118,22 @@ A failure stops the run and exits with a nonzero status: `1` for invalid input, 
 
 Treat a run as complete only when it exits with `0`.
 
+## Speed
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/process/results/figures/steps-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/process/results/figures/steps-light.png">
+    <img alt="Wall time and peak memory of copying a pair and of two trims, z-fastq beside fastp, on one pair and one CPU." src="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/process/results/figures/steps-light.png" width="760">
+  </picture>
+</p>
+<p align="center"><sub><b>Figure 4.</b> What each step costs on one 1 GiB pair, one CPU each: copying the pair (reading, checking, and writing it), then the two trims. The <a href="https://github.com/eneskemalergin/z-fastq/blob/main/bench/process/README.md">process benchmark</a> has every input, threads, and QC tables.</sub></p>
+
+[Performance](Performance) compares every command, and what other tools gain from threads.
+
 ## Related pages
 
+- [Performance](Performance): speed and memory against fastp, with threads.
 - [Quality control](Quality-Control): what the run measures, and the files MultiQC reads.
 - [Report reference](Report-Reference#report): the `trimming` and `filtering` counts in the report.
 - [Paired reads](Paired-Reads): the name checks every pair passes first.

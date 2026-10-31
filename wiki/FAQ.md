@@ -40,6 +40,10 @@ No. `deinterleave` and `process` create new files and fail on an existing path.
 
 Not today. See [Limits](Limits-and-Supported-Formats).
 
+## How fast is it, and how much memory does it use?
+
+On one core, faster than the other tools that do a whole job, with a few MiB of memory, and its memory does not grow with the input. Some tools that do part of a job, or use many threads, are faster in places. See [Performance](Performance).
+
 ## Is z-fastq a replacement for fastp, FastQC, or SeqKit?
 
 No. It follows fastp's trimming rules and FastQC's QC definitions for the parts it covers, and does much less than any of them. See [Choosing a FASTQ tool](Choosing-a-FASTQ-Tool).

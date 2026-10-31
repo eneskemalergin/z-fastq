@@ -32,6 +32,7 @@ z-fastq is built for those questions: a small, fast tool whose failures are as w
 
 ## Related pages
 
+- [Performance](Performance): the speed and memory comparison with each of these tools.
 - [Home](Home): what z-fastq does, command by command.
 - [Limits and supported formats](Limits-and-Supported-Formats): what is not supported today.
 - [References](References): the tools z-fastq follows and is compared with.

@@ -28,6 +28,7 @@
 **Decide and solve**
 
 - [Choosing a FASTQ tool](Choosing-a-FASTQ-Tool)
+- [Performance](Performance)
 - [Recipes](Recipes)
 - [Troubleshooting](Troubleshooting)
 - [FAQ](FAQ)

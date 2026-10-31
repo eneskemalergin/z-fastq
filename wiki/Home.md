@@ -42,6 +42,7 @@ New here? [Install z-fastq](Installation), then follow [Getting started](Getting
 **Decide and solve**
 
 - [Choosing a FASTQ tool](Choosing-a-FASTQ-Tool): where z-fastq fits, and where another tool fits better.
+- [Performance](Performance): how fast, how much memory, how it is measured, and where another tool is faster.
 - [Recipes](Recipes), [Troubleshooting](Troubleshooting), and the [FAQ](FAQ).
 - [References](References): the tools z-fastq builds on and is compared with, the data it is checked on, and citations.
 

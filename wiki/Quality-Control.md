@@ -117,6 +117,19 @@ The values describe what z-fastq did with the options you gave; they match fastp
 - In Adapter Content, a 12-base read that matches counts even before any longer read, as FastQC-Rust counts it; Java FastQC skips it.
 - IUPAC codes other than `N` count as none of A, C, G, T, or N. fastp groups them with other bases, so GC and base content differ from fastp's only for reads that carry them.
 
+## Speed
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/process/results/figures/qc-overview-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/process/results/figures/qc-overview-light.png">
+    <img alt="Time and peak memory of FastQC-Rust and FastQC relative to z-fastq for FastQC tables of both mates, plain and gzip input." src="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/process/results/figures/qc-overview-light.png" width="760">
+  </picture>
+</p>
+<p align="center"><sub><b>Figure 2.</b> FastQC tables for both mates against FastQC-Rust and FastQC, on 1 GiB inputs and one CPU each; lower left is better. z-fastq also writes both mates in this job, which the FastQC tools do not. The <a href="https://github.com/eneskemalergin/z-fastq/blob/main/bench/process/README.md">process benchmark</a> has threads and every number.</sub></p>
+
+[Performance](Performance) shows what threads buy FastQC-Rust and FastQC, and what they cost in memory.
+
 ## Related pages
 
 - [Processing paired reads](Processing): the trims and filters that make the retained reads.
