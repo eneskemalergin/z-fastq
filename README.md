@@ -9,15 +9,16 @@
   </picture>
   <p><strong>Count, check, sample, interleave, and trim paired FASTQ with one static executable built in Zig.</strong></p>
   <p>
-    <a href="https://github.com/eneskemalergin/z-fastq/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/eneskemalergin/z-fastq/ci.yml?branch=main&amp;style=flat-square&amp;label=CI&amp;logo=githubactions" alt="CI status"></a>
-    <a href="https://github.com/eneskemalergin/z-fastq/releases/latest"><img src="https://img.shields.io/github/v/release/eneskemalergin/z-fastq?style=flat-square" alt="Latest release"></a>
+    <a href="https://github.com/eneskemalergin/z-fastq/releases/latest"><img src="https://img.shields.io/github/v/release/eneskemalergin/z-fastq?style=flat-square&amp;label=release" alt="Latest release"></a>
+    <a href="https://github.com/eneskemalergin/z-fastq/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/eneskemalergin/z-fastq/ci.yml?branch=main&amp;style=flat-square&amp;label=CI&amp;logo=githubactions&amp;logoColor=white" alt="CI status"></a>
+    <a href="https://github.com/eneskemalergin/z-fastq/wiki/Installation"><img src="https://img.shields.io/badge/Linux-x86--64%20%7C%20aarch64-64748b?style=flat-square&amp;logo=linux&amp;logoColor=white" alt="Linux on x86-64 and aarch64"></a>
+    <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-16a34a?style=flat-square" alt="MIT License"></a>
+    <br>
+    <a href="https://github.com/eneskemalergin/z-fastq/wiki/Performance"><img src="https://img.shields.io/badge/1%20core-a%20few%20MiB-0d9488?style=flat-square" alt="One core and a few MiB per run"></a>
+    <a href="bench/README.md"><img src="https://img.shields.io/badge/benchmarks-reports-f59e0b?style=flat-square" alt="Benchmarks"></a>
     <a href="https://github.com/eneskemalergin/z-fastq/wiki"><img src="https://img.shields.io/badge/wiki-documentation-2563eb?style=flat-square" alt="Wiki"></a>
     <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-history-7c3aed?style=flat-square" alt="Changelog"></a>
-    <a href="bench/README.md"><img src="https://img.shields.io/badge/benchmarks-reports-f59e0b?style=flat-square" alt="Benchmarks"></a>
-    <a href="https://github.com/eneskemalergin/z-fastq/wiki/Performance"><img src="https://img.shields.io/badge/1%20core-a%20few%20MiB-f59e0b?style=flat-square" alt="One core and a few MiB per run"></a>
-    <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
-    <img src="https://img.shields.io/badge/platform-Linux%20x86--64%20%7C%20aarch64-64748b?style=flat-square" alt="Supported platforms: Linux x86-64 and aarch64">
-    <a href="LICENSE"><img src="https://img.shields.io/github/license/eneskemalergin/z-fastq?style=flat-square" alt="MIT License"></a>
   </p>
 </div>
 
@@ -119,7 +120,7 @@ The wiki holds the details that would otherwise bury this page:
 
 ## License
 
-z-fastq is released under the [MIT license](LICENSE). gzip decoding uses Zipir 0.2.1 under the [MIT license](https://github.com/eneskemalergin/zipir/blob/v0.2.1/LICENSE); include that notice with binary distributions.
+z-fastq is released under the [MIT license](LICENSE).
 
 ---
 
