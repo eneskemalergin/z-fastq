@@ -584,7 +584,7 @@ readme_head() {
 > <sub>\`${WORD[subject]}\` against $counters other ${WORD[others]}, on $reals real sequencing run$( ((reals == 1)) || echo s) and $shapes synthetic shape$( ((shapes == 1)) || echo s), $fmts. A tool is timed only where ${WORD[timed]}; time and memory come from the same run, $on.</sub>
 
 - \`z-fastq\`: *$rev*
-- \`machine\`: *$cpu, Linux $(uname -r | cut -d- -f1); $per*
+- \`machine\`: *$cpu, Linux; $per*
 - \`runner\`: *$(zebrac --version) with zexec*
 $(data_list)
 - \`date\`: *$date*
@@ -715,7 +715,6 @@ EOF
     printf -- '- `z-fastq`: *%s*\n' "$rev"
     printf -- '- `zebrac`: *%s*\n' "$(zebrac --version | awk '{ print $2 }')"
     printf -- '- `zexec`: *%s bytes, static, no libc*\n' "$(stat -c %s "$ZEXEC")"
-    printf -- '- `kernel`: *%s*\n' "$(uname -r)"
     printf -- '- `cpu`: *%s*\n' "$(awk -F': ' '/model name/ { print $2; exit }' /proc/cpuinfo)"
     printf -- '- `load at batch start`: *%s to %s*\n' "$(awk -F'\t' 'NR > 1 { print $21 }' "$REPORT_DIR/summary.tsv" | sort -n | head -1)" "$(awk -F'\t' 'NR > 1 { print $21 }' "$REPORT_DIR/summary.tsv" | sort -n | tail -1)"
     printf '\n</details>\n\n'

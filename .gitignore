@@ -26,4 +26,5 @@ __pycache__/
 /bench/*/results/*
 !/bench/*/results/figures/
 /bench/*/results/figures/*.svg
+/bench/summary/*.svg
 /wiki/assets/*.svg

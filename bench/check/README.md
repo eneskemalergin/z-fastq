@@ -3,8 +3,8 @@
 # Validating FASTQ files
 > <sub>`z-fastq check` against 3 other validators, on 7 real sequencing runs and 5 synthetic shapes, plain and gzip. A tool is timed only where it accepted the valid input; time and memory come from the same run, on one CPU.</sub>
 
-- `z-fastq`: *0.1.0 at 246bbb1*
-- `machine`: *Ryzen 9 3950X, Linux 7.2.12; one CPU per run*
+- `z-fastq`: *0.2.0, source at 246bbb1*
+- `machine`: *Ryzen 9 3950X, Linux; one CPU per run*
 - `runner`: *zebrac 0.6.2 with zexec*
 - `data`:
   - **Real**: *7 public sequencing runs, 1 GiB each, pooled in the bars by the kind of reads they hold*
@@ -17,7 +17,7 @@
     - `variable`: *50 to 150 bp, annotated plus line*
     - `longread`: *nanopore headers, rare 300 kb reads*
     - `long`: *300 kb sequence lines*
-- `date`: *2026-10-29*
+- `date`: *2026-10-30*
 
 ## Findings
 
@@ -40,7 +40,7 @@
 ## Right answers
 > <sub>Every corpus file is valid, so the right verdict on each is to accept it. The edge cases are small inputs where tools differ: each cell shows what the tool printed, and its color whether that was right.</sub>
 
-z-fastq returned the right verdict on all 228 inputs: every corpus file and synthetic shape on disk, 1 MiB to 1 GiB, plain and gzip. Every other tool was right on every input it was given except these, which are not timed where they gave a wrong verdict:
+z-fastq returned the right verdict on all 228 inputs: every corpus file and synthetic shape on disk, 1 MiB to 1 GiB, plain and gzip. Every other tool was right on every input it was timed on except these, which are not timed where they gave a wrong verdict:
 
 | Tool           | Wrong |  Of | Inputs            |
 | -------------- | ----: | --: | ----------------- |
@@ -49,7 +49,7 @@ z-fastq returned the right verdict on all 228 inputs: every corpus file and synt
 | fastQValidator |     8 |  54 | endings           |
 
 > [!CAUTION]
-> fqtools and fastQValidator print a wrong verdict and exit 0 on some malformed inputs, so a script cannot tell the file is broken.
+> On the edge cases below, fqtools and fastQValidator print a wrong verdict and exit 0 on some malformed inputs, so a script cannot tell the file is broken.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/edges-dark.png">
@@ -157,12 +157,12 @@ There were a total of 1 errors.
   <img src="results/figures/single-overview-light.png" alt="Time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
-z-fastq itself takes 216.1 ms and 0.79 MiB per plain input, 1433.9 ms and 0.79 MiB per gzip input (geometric means over 12 inputs each); the table gives every tool as a multiple of that.
+z-fastq itself takes 216.1 ms and 0.79 MiB per plain input, 1433.9 ms and 0.79 MiB per gzip input (geometric means over 12 inputs each); the table gives every other tool as a multiple of that.
 Geometric-mean process CPU time is 213.9 ms for plain input and 1424.7 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
 
 | Tool           | Plain time | Plain memory | Gzip time | Gzip memory |
 | -------------- | ---------: | -----------: | --------: | ----------: |
-| z-fastq        |      1.00x |        1.00x |     1.00x |       1.00x |
+| z-fastq        |     216 ms |     0.79 MiB |    1.43 s |    0.79 MiB |
 | fq             |      4.08x |        5.29x |     2.29x |       5.38x |
 | fqtools        |     16.14x |        4.11x |     3.17x |       4.78x |
 | fastQValidator |     30.12x |        8.26x |     5.38x |       8.54x |
@@ -206,7 +206,7 @@ Geometric-mean process CPU time is 213.9 ms for plain input and 1424.7 ms for gz
 </picture>
 
 At 1 GiB, z-fastq validates 3.4 to 8.2 GiB/s on plain input and 0.4 to 0.9 GiB/s on gzip input; no other tool is faster there.
-z-fastq peaks at 0.79 MiB at every size and shape. Memory that grows with the input: fqtools by 1.3x on gzip longread; fastQValidator by 4.4x on plain longread.
+z-fastq peaks at 0.79 MiB at every size of the dense, endings, long, longread and variable shapes. Memory that grows with the input: fqtools by 1.3x on gzip longread; fastQValidator by 4.4x on plain longread.
 
 ## Other layouts
 > <sub>Mates in two files, with names checked across them, and mates interleaved in one file.</sub>
@@ -215,40 +215,39 @@ z-fastq peaks at 0.79 MiB at every size and shape. Memory that grows with the in
 
 Mates in two files, names checked across them.
 
-z-fastq itself takes 435.4 ms and 1.06 MiB per plain input, 1623.2 ms and 1.06 MiB per gzip input (geometric means over 5 inputs each); the table gives every tool as a multiple of that.
+z-fastq itself takes 435.4 ms and 1.06 MiB per plain input, 1623.2 ms and 1.06 MiB per gzip input (geometric means over 5 inputs each); the table gives every other tool as a multiple of that.
 Geometric-mean process CPU time is 376.0 ms for plain input and 1483.5 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
 
 | Tool    | Plain time | Plain memory | Gzip time | Gzip memory |
 | ------- | ---------: | -----------: | --------: | ----------: |
-| z-fastq |      1.00x |        1.00x |     1.00x |       1.00x |
+| z-fastq |     435 ms |     1.06 MiB |    1.62 s |    1.06 MiB |
 | fq      |      6.74x |       25.45x |     3.86x |      25.41x |
 
 ### Interleaved
 
 Mates alternating in one file.
 
-z-fastq itself takes 430.0 ms and 0.53 MiB per plain input, 1535.0 ms and 0.81 MiB per gzip input (geometric means over 5 inputs each); the table gives every tool as a multiple of that.
+z-fastq itself takes 430.0 ms and 0.53 MiB per plain input, 1535.0 ms and 0.81 MiB per gzip input (geometric means over 5 inputs each); the table gives every other tool as a multiple of that.
 Geometric-mean process CPU time is 426.7 ms for plain input and 1524.8 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
 
 | Tool    | Plain time | Plain memory | Gzip time | Gzip memory |
 | ------- | ---------: | -----------: | --------: | ----------: |
-| z-fastq |      1.00x |        1.00x |     1.00x |       1.00x |
+| z-fastq |     430 ms |     0.53 MiB |    1.53 s |    0.81 MiB |
 | fqtools |      8.02x |        6.03x |     2.95x |       4.58x |
 
 ## Reproducibility
 
 <details><summary>How it was measured</summary>
 
-Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS uses the kernel high-water counter, not an exact allocation count. Quick comparisons treat differences smaller than 256 KiB as inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Generated by `bench/check/run.sh release` on 2026-10-29.
+Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that `wait4` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Timed by `bench/check/run.sh release`, last on 2026-10-28; this page written on 2026-10-30.
 
 </details>
 
 <details><summary>Identity</summary>
 
-- `z-fastq`: *0.1.0 at 246bbb1*
+- `z-fastq`: *0.2.0, source at 246bbb1*
 - `zebrac`: *0.6.2*
 - `zexec`: *15000 bytes, static, no libc*
-- `kernel`: *7.2.12-200.fc44.x86_64*
 - `cpu`: *AMD Ryzen 9 3950X 16-Core Processor*
 - `load at batch start`: *1.34 to 5.65*
 
@@ -260,9 +259,9 @@ Every tool runs through `zexec -r` inside one zebrac batch per case, held to one
 - `fq`: *tools/bin/fq lint IN*
 - `fqtools`: *tools/bin/fqtools -dualr validate IN*
 - `fastQValidator`: *tools/bin/fastQValidator --file IN --minReadLen 1 --disableSeqIDCheck*
-- `z-fastq`, paired: *zig-out/bin/z-fastq check --paired IN*
-- `z-fastq`, interleaved: *zig-out/bin/z-fastq check --interleaved IN*
-- `fqtools`, interleaved: *tools/bin/fqtools -dualr -i validate IN*
+- `z-fastq`, : *zig-out/bin/z-fastq check --paired IN*
+- `z-fastq`, : *zig-out/bin/z-fastq check --interleaved IN*
+- `fqtools`, : *tools/bin/fqtools -dualr -i validate IN*
 
 </details>
 
@@ -281,7 +280,7 @@ Picked from these results: per group and format, the case where z-fastq leads it
 
 </details>
 
-<details><summary>Hardware counters (user space, plain medium-tier inputs, geometric means)</summary>
+<details><summary>Hardware counters (user space, plain medium-tier inputs, geometric means, tools at one thread)</summary>
 
 | Tool           | Instructions per byte | Instructions per cycle | Cache misses per MiB | Branch misses per MiB |
 | -------------- | --------------------: | ---------------------: | -------------------: | --------------------: |

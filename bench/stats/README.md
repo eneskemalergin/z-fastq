@@ -3,8 +3,8 @@
 # Aggregate statistics
 > <sub>`z-fastq stats` against 5 other tools, on 7 real sequencing runs and 5 synthetic shapes, plain and gzip. A tool is timed only where its values were right; time and memory come from the same run, on one CPU.</sub>
 
-- `z-fastq`: *0.1.0 at 246bbb1*
-- `machine`: *Ryzen 9 3950X, Linux 7.2.12; one CPU per run*
+- `z-fastq`: *0.2.0, source at 246bbb1*
+- `machine`: *Ryzen 9 3950X, Linux; one CPU per run*
 - `runner`: *zebrac 0.6.2 with zexec*
 - `data`:
   - **Real**: *7 public sequencing runs, 1 GiB each, pooled in the bars by the kind of reads they hold*
@@ -17,7 +17,7 @@
     - `variable`: *50 to 150 bp, annotated plus line*
     - `longread`: *nanopore headers, rare 300 kb reads*
     - `long`: *300 kb sequence lines*
-- `date`: *2026-10-29*
+- `date`: *2026-10-30*
 
 ## Findings
 
@@ -43,10 +43,10 @@
 ## Right answers
 > <sub>Reads are compared with the count recorded when the corpus was cut, and every other field with Needletail on the same input, an independent parser that must agree with z-fastq exactly. A printed decimal may differ by half its last digit. The edge cases are small inputs where tools differ: each cell shows what the tool printed, and its color whether that was right.</sub>
 
-z-fastq returned the right values on all 218 inputs: every corpus file and synthetic shape on disk, 1 MiB to 1 GiB, plain and gzip. Every other tool was right on every input it was given.
+z-fastq returned the right values on all 218 inputs: every corpus file and synthetic shape on disk, 1 MiB to 1 GiB, plain and gzip. Every other tool was right on every input it was timed on.
 
 > [!CAUTION]
-> Helicase, SeqFu, SeqKit and seqtk print wrong values and exit 0 on some malformed inputs, so a script cannot tell the values are wrong. Helicase crashes on some malformed gzip input.
+> On the edge cases below, Helicase, SeqFu, SeqKit and seqtk print wrong values and exit 0 on some malformed inputs, so a script cannot tell the values are wrong. Helicase crashes on some malformed gzip input.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/edges-dark.png">
@@ -66,12 +66,12 @@ z-fastq returned the right values on all 218 inputs: every corpus file and synth
   <img src="results/figures/file-overview-light.png" alt="Time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
-z-fastq itself takes 280.1 ms and 0.81 MiB per plain input, 1529.9 ms and 0.81 MiB per gzip input (geometric means over 12 inputs each); the table gives every tool as a multiple of that.
+z-fastq itself takes 280.1 ms and 0.81 MiB per plain input, 1529.9 ms and 0.81 MiB per gzip input (geometric means over 12 inputs each); the table gives every other tool as a multiple of that.
 Geometric-mean process CPU time is 277.2 ms for plain input and 1517.9 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
 
 | Tool       | Plain time | Plain memory | Gzip time | Gzip memory |
 | ---------- | ---------: | -----------: | --------: | ----------: |
-| z-fastq    |      1.00x |        1.00x |     1.00x |       1.00x |
+| z-fastq    |     280 ms |     0.81 MiB |    1.53 s |    0.81 MiB |
 | Needletail |      3.54x |        2.58x |     1.55x |       2.98x |
 | Helicase   |      3.46x |        3.15x |     1.46x |       3.31x |
 | SeqFu      |      1.70x |        6.41x |     2.01x |      18.71x |
@@ -117,7 +117,7 @@ Geometric-mean process CPU time is 277.2 ms for plain input and 1517.9 ms for gz
 </picture>
 
 At 1 GiB, z-fastq summarizes 2.3 to 7.5 GiB/s on plain input and 0.4 to 0.8 GiB/s on gzip input; no other tool is faster there.
-z-fastq peaks at 0.81 MiB at every size and shape. Memory that grows with the input: Needletail by 1.4x on gzip longread; Helicase by 1.5x on plain longread; SeqFu by 1.7x on plain longread; SeqKit by 1.5x on plain endings; seqtk by 14.6x on plain longread.
+z-fastq peaks at 0.81 MiB at every size of the dense, endings, long, longread and variable shapes. Memory that grows with the input: Needletail by 1.4x on gzip longread; Helicase by 1.5x on plain longread; SeqFu by 1.7x on plain longread; SeqKit by 1.5x on plain endings; seqtk by 14.6x on plain longread.
 
 ## Other input forms
 > <sub>The same statistics, with the input on stdin or as many files in one call.</sub>
@@ -147,16 +147,15 @@ Summarizing all 11 xsmall corpus files (110 MiB) in one call, z-fastq takes 33.5
 
 <details><summary>How it was measured</summary>
 
-Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS uses the kernel high-water counter, not an exact allocation count. Quick comparisons treat differences smaller than 256 KiB as inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Generated by `bench/stats/run.sh release` on 2026-10-29.
+Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that `wait4` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Timed by `bench/stats/run.sh release`, last on 2026-10-28; this page written on 2026-10-30.
 
 </details>
 
 <details><summary>Identity</summary>
 
-- `z-fastq`: *0.1.0 at 246bbb1*
+- `z-fastq`: *0.2.0, source at 246bbb1*
 - `zebrac`: *0.6.2*
 - `zexec`: *15000 bytes, static, no libc*
-- `kernel`: *7.2.12-200.fc44.x86_64*
 - `cpu`: *AMD Ryzen 9 3950X 16-Core Processor*
 - `load at batch start`: *2.27 to 9.40*
 
@@ -188,7 +187,7 @@ Picked from these results: per group and format, the case where z-fastq leads it
 
 </details>
 
-<details><summary>Hardware counters (user space, plain medium-tier inputs, geometric means)</summary>
+<details><summary>Hardware counters (user space, plain medium-tier inputs, geometric means, tools at one thread)</summary>
 
 | Tool       | Instructions per byte | Instructions per cycle | Cache misses per MiB | Branch misses per MiB |
 | ---------- | --------------------: | ---------------------: | -------------------: | --------------------: |

@@ -3,8 +3,8 @@
 # Processing paired reads
 > <sub>`z-fastq process` against 3 other tools, on 4 real sequencing runs and 1 synthetic shape, plain and gzip. A tool is timed only where its outputs were right; time and memory come from the same run, on one CPU, a threaded variant on as many cores as its threads.</sub>
 
-- `z-fastq`: *0.1.0, source at 246bbb1*
-- `machine`: *Ryzen 9 3950X, Linux 7.2.13; one CPU per run, threaded variants on as many cores as threads*
+- `z-fastq`: *0.2.0, source at 246bbb1*
+- `machine`: *Ryzen 9 3950X, Linux; one CPU per run, threaded variants on as many cores as threads*
 - `runner`: *zebrac 0.6.2 with zexec*
 - `data`:
   - **Real**: *4 public sequencing runs, 1 GiB each, pooled in the bars by the kind of reads they hold*
@@ -29,9 +29,9 @@
 | Tool        | Class   | Copy to plain | Copy to gzip | TruSeq trim | Nextera trim | QC tables | Threads      | Malformed rejected |
 | ----------- | ------- | ------------- | ------------ | ----------- | ------------ | --------- | ------------ | -----------------: |
 | z-fastq     | subject | yes           | yes          | yes         | yes          | yes       | 1            |             8 of 8 |
-| fastp       | partial | yes           | yes          | yes         | yes          | -         | 1 to 16 (-w) |             0 of 8 |
-| FastQC-Rust | partial | -             | -            | -           | -            | yes       | 1 to 16 (-t) |             1 of 8 |
-| FastQC      | partial | -             | -            | -           | -            | yes       | 1 to 16 (-t) |             1 of 8 |
+| fastp       | partial | yes           | yes          | yes         | yes          | -         | 1 to 16 (-w) |             0 of 6 |
+| FastQC-Rust | partial | -             | -            | -           | -            | yes       | 1 to 16 (-t) |             1 of 2 |
+| FastQC      | partial | -             | -            | -           | -            | yes       | 1 to 16 (-t) |             1 of 2 |
 
 - `fastp 1.4.0`: *writes its JSON and HTML report and measures duplication on every run; compression level 4*
 - `FastQC-Rust 1.1.0`: *QC tables only, no reads written and no pair checks; the QC tables' reference*
@@ -231,10 +231,9 @@ Every tool runs through `zexec -r` inside one zebrac batch per case, held to one
 
 <details><summary>Identity</summary>
 
-- `z-fastq`: *0.1.0, source at 246bbb1*
+- `z-fastq`: *0.2.0, source at 246bbb1*
 - `zebrac`: *0.6.2*
 - `zexec`: *15000 bytes, static, no libc*
-- `kernel`: *7.2.13-200.fc44.x86_64*
 - `cpu`: *AMD Ryzen 9 3950X 16-Core Processor*
 - `load at batch start`: *1.82 to 8.71*
 
