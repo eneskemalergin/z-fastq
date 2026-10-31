@@ -27,7 +27,7 @@ This page maps the code, the tests, and the wiki onto each other, so a change to
 
 ## Tests
 
-Run these from the repository root, one after another, with Zig 0.16.0 on Linux x86-64:
+Run these from the repository root, one after another, with Zig 0.16.0 on Linux x86-64; on aarch64, the portable run repeats the first, since there is nothing to dispatch:
 
 ```bash
 zig fmt --check src tests build.zig

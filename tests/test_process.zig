@@ -911,6 +911,38 @@ test "[cli] - [process]: an unreadable or invalid contaminant list fails before 
     }
 }
 
+test "[edge] - [process]: a contaminant list of 1 MiB is read and one byte more fails before outputs exist" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const p = try Paths.init(allocator, &tmp);
+    try writeInputs(&tmp, "@a/1\nACGT\n+\nIIII\n", "@a/2\nACGT\n+\nIIII\n");
+    const limit = 1 << 20;
+    for ([_]usize{ limit, limit + 1 }) |size| {
+        // One comment line of SIZE bytes, which the list skips.
+        const text = try allocator.alloc(u8, size);
+        @memset(text, 'x');
+        text[0] = '#';
+        text[size - 1] = '\n';
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "list.txt", .data = text });
+        const list = try cli.tempPath(allocator, &tmp.sub_path, "list.txt");
+        const result = try cli.run(allocator, &.{ "process", "--report", p.report, "--contaminants", list, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 });
+        if (size == limit) {
+            try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+            try std.testing.expect(pathExists(p.out1));
+            for ([_][]const u8{ p.out1, p.out2, p.report }) |path| try std.Io.Dir.cwd().deleteFile(std.testing.io, path);
+        } else {
+            try std.testing.expectEqual(@as(u8, 4), result.exit_code);
+            try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, result.stderr, "\n"), "contaminant list exceeds 1 MiB"));
+            try std.testing.expect(!pathExists(p.out1));
+            try std.testing.expect(!pathExists(p.out2));
+            try std.testing.expect(!pathExists(p.report));
+        }
+    }
+}
+
 fn numberValue(value: std.json.Value) ?f64 {
     return switch (value) {
         .integer => |integer| @floatFromInt(integer),

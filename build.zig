@@ -19,11 +19,10 @@ pub fn build(b: *std.Build) void {
             std.process.exit(1);
         },
     }
-    if (requested_target.result.cpu.arch != .x86_64 or
-        requested_target.result.os.tag != .linux)
-    {
+    const arch = requested_target.result.cpu.arch;
+    if ((arch != .x86_64 and arch != .aarch64) or requested_target.result.os.tag != .linux) {
         std.debug.print(
-            "error: z-fastq currently supports Linux x86-64 builds only\n",
+            "error: z-fastq currently supports Linux x86-64 and aarch64 builds only\n",
             .{},
         );
         std.process.exit(1);
@@ -40,7 +39,7 @@ pub fn build(b: *std.Build) void {
     }
     const target = if (release_build)
         b.resolveTargetQuery(.{
-            .cpu_arch = .x86_64,
+            .cpu_arch = arch,
             .os_tag = .linux,
             .abi = .musl,
         })
@@ -60,7 +59,7 @@ pub fn build(b: *std.Build) void {
     const package_version = @import("build.zig.zon").version;
     const build_options = b.addOptions();
     build_options.addOption([:0]const u8, "version", package_version);
-    const link_avx2_object = kernel_backend == .dispatch and
+    const link_avx2_object = kernel_backend == .dispatch and arch == .x86_64 and
         !std.Target.x86.featureSetHas(target.result.cpu.features, .avx2);
     build_options.addOption(bool, "avx2_object", link_avx2_object);
     build_options.addOption(bool, "simd_object", false);

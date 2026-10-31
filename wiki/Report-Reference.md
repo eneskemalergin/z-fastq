@@ -10,7 +10,7 @@ Both documents begin with the same three fields:
 - `tool` gives the `name` and `version` of the z-fastq build that wrote it.
 - `byte_strings` names how paths and the command line are written, `escaped-bytes-v1`: a byte outside printable ASCII becomes `\xHH` and a backslash becomes `\\`, before the usual JSON escaping, so any file name survives the trip.
 
-A value that cannot be computed, such as a mean over zero reads, is `null`. Version 0.1.0 froze the `stats` and `check` documents ([Automation](Automation#json)); these two are new in 0.2.0 and may still change before it is released.
+A value that cannot be computed, such as a mean over zero reads, is `null`. Version 0.1.0 froze the `stats` and `check` documents ([Automation](Automation#json)); these two are new in 0.2.0.
 
 ## Report
 
@@ -22,7 +22,7 @@ The report records what was asked, what was read, what was done, and what was me
 ```json
 {
   "schema": "z-fastq/process-v1",
-  "tool": { "name": "z-fastq", "version": "0.1.0" },
+  "tool": { "name": "z-fastq", "version": "0.2.0" },
   "byte_strings": "escaped-bytes-v1",
   "options": {
     "gzip": false,

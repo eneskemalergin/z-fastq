@@ -4,7 +4,7 @@ I would rather state the edges clearly than let a command look broader than what
 
 ## Supported
 
-- Linux on x86-64.
+- Linux on x86-64 or aarch64.
 - Four-line FASTQ, plain or gzip, including concatenated gzip members; standard input as `-`.
 - Phred+33 qualities, ASCII 33 to 126.
 - IUPAC or ACGTN sequence letters.

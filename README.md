@@ -18,7 +18,7 @@
     <a href="bench/README.md"><img src="https://img.shields.io/badge/benchmarks-reports-f59e0b?style=flat-square" alt="Benchmarks"></a>
     <a href="https://github.com/eneskemalergin/z-fastq/wiki/Performance"><img src="https://img.shields.io/badge/1%20core-a%20few%20MiB-f59e0b?style=flat-square" alt="One core and a few MiB per run"></a>
     <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
-    <img src="https://img.shields.io/badge/platform-Linux%20x86--64-64748b?style=flat-square" alt="Supported platform: Linux x86-64">
+    <img src="https://img.shields.io/badge/platform-Linux%20x86--64%20%7C%20aarch64-64748b?style=flat-square" alt="Supported platforms: Linux x86-64 and aarch64">
     <a href="LICENSE"><img src="https://img.shields.io/github/license/eneskemalergin/z-fastq?style=flat-square" alt="MIT License"></a>
   </p>
 </div>
@@ -35,7 +35,7 @@ I built z-fastq for the FASTQ work that comes before alignment: the steps that r
 - [`process`](https://github.com/eneskemalergin/z-fastq/wiki/Processing): Trim and filter paired reads with fastp's rules into plain or gzip files, with [FastQC-compatible QC](https://github.com/eneskemalergin/z-fastq/wiki/Quality-Control) that MultiQC reads, in one pass.
 - [Zig package](https://github.com/eneskemalergin/z-fastq/wiki/Zig-Library): the reader, writer, validation, and statistics give other Zig programs the same rules without the CLI.
 
-z-fastq reads plain and gzip FASTQ and writes plain FASTQ, gzip from `process`, and text or JSON reports. It runs on Linux x86-64.
+z-fastq reads plain and gzip FASTQ and writes plain FASTQ, gzip from `process`, and text or JSON reports. It runs on Linux, on x86-64 and aarch64.
 
 ## Speed and memory
 
@@ -88,7 +88,7 @@ fastp and FastQC-Rust can use many threads, and with enough of them they match z
 
 ## A few honest tradeoffs
 
-I would like to support more than Linux. For now z-fastq is built and tested on Linux x86-64 only; native Windows and macOS builds are not there yet. If you use Windows, WSL is the way to try it.
+I would like to support more than Linux. For now z-fastq is built and tested on Linux, on x86-64 and aarch64; native Windows and macOS builds are not there yet. If you use Windows, WSL is the way to try it. The benchmarks run on x86-64, where AVX2 code is picked at run time; on aarch64, z-fastq uses its portable vector code, and its speed there is not measured yet.
 
 One core is a choice, not a limit I am waiting to lift. It keeps every run's cost known before it starts, so a pipeline can run one sample per core side by side. The price is one large file on an otherwise idle machine: a tool that spreads it over many cores can finish sooner, and z-fastq does not split a file across cores yet.
 

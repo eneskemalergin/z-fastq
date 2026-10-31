@@ -20,6 +20,7 @@ A `process` command that validates, trims, and filters paired reads into two pla
   - `FileSink.initStreaming` writes at the file handle's current position, for standard output and pipes.
   - `Stats.ratios` returns each ratio of `StatsResult` as an exact numerator and denominator, so callers can round without floating point.
 - **Build.**
+  - Linux aarch64 is supported: `-Dtarget=aarch64-linux` builds it, and release builds are static for the requested architecture. It uses the portable kernels; the AVX2 object is x86-64 only.
   - `-Dstrip` sets whether debug information is stripped; it defaults to on for ReleaseFast, so a profiling build can keep its symbols.
   - `zig build test-<suite>` runs a single test binary, such as `test-reader`, or `test-src` for the in-file tests; `zig build -l` lists them.
 
@@ -31,7 +32,7 @@ A `process` command that validates, trims, and filters paired reads into two pla
   - On CPUs with AVX2, builds whose target lacks AVX2 select 32-byte kernels at run time for newline search past the first 1 KiB of a line, validation of sequences of 1 KiB or more (about a third less time for `check` on PacBio reads, 15 to 20% for `check` and `sample` on ONT reads), validation of lines longer than the read buffer, and `stats` counting on reads of 1 KiB or more (about a quarter less time on long reads).
   - Fraction sampling validates the records it does not select without copying them: 5 to 25% less time for `sample` and single-file `check` on long reads, with no change in memory.
 - **Memory.**
-  - `stats` streams a record larger than the read buffer instead of copying it, so its peak memory no longer grows with read length (772 KiB on every input shape, from up to 1.8 MiB on 300 kb reads), long reads take 5 to 25% less time, and `stats` allocates nothing per record.
+  - `stats` streams a record larger than the read buffer instead of copying it, so its peak memory no longer grows with read length (about 0.8 MiB on every input shape in the stats benchmark, from up to 1.8 MiB on 300 kb reads), long reads take 5 to 25% less time, and `stats` allocates nothing per record.
   - Paired and interleaved fraction sampling draw each pair before reading it and validate unselected pairs without keeping them: on 300 kb read pairs, peak memory for `sample --paired` falls from 2.3 MiB to 0.8 MiB when few pairs are selected. `check --interleaved` and `deinterleave` read a mate whose partner already failed only far enough to report it.
 - **Library.** `FileSink` writes whole pages and keeps a partial last page buffered until the next write or `flush`.
 - **Build.**

@@ -52,10 +52,10 @@ New here? [Install z-fastq](Installation), then follow [Getting started](Getting
 
 ## At a glance
 
-- One static executable for Linux x86-64, written in Zig 0.16.0, with a single package dependency, [zipir](https://github.com/eneskemalergin/zipir), for gzip.
+- One static executable for Linux on x86-64 or aarch64, written in Zig 0.16.0, with a single package dependency, [zipir](https://github.com/eneskemalergin/zipir), for gzip.
 - Single-threaded and streaming: memory does not grow with the size of a file. The two exceptions grow on purpose and are documented: exact-count sampling keeps a small entry per chosen read, and the pair duplication rate a few bytes per pair.
 - Trimming and filtering follow fastp 1.1.0's rules, and quality control follows FastQC 0.13.0's definitions. z-fastq covers part of what those tools do and replaces neither ([References](References)).
-- Version 0.1.0 is released; 0.2.0, which adds `process`, is in development.
+- Version 0.2.0 adds `process`: paired trimming, filtering, and QC in one pass.
 
 > [!NOTE]
 > z-fastq never repairs a malformed record silently. A file it cannot read correctly fails with an error code, the position of the problem, and a nonzero exit status.

@@ -2,8 +2,9 @@
 //!
 //! Every byte kernel has a scalar reference and one generic vector body over a
 //! comptime lane count. Inline code uses the widest tier the compile target
-//! guarantees. When the target lacks AVX2, the same bodies are also compiled
-//! into a separate AVX2 object, and long spans call it on CPUs that have AVX2.
+//! guarantees. When an x86-64 target lacks AVX2, the same bodies are also
+//! compiled into a separate AVX2 object, and long spans call it on CPUs that
+//! have AVX2. On aarch64 the baseline tier's 16 lanes are one NEON register.
 //! Kernels whose work per call outweighs the call at any length, such as
 //! fastp's pair sum in preprocess.zig, use the AVX2 object whenever it applies.
 
@@ -21,7 +22,8 @@ pub fn tierWidth(comptime tier: Tier) comptime_int {
     };
 }
 
-pub const INLINE_TIER: Tier = if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) .avx2 else .baseline;
+pub const INLINE_TIER: Tier = if (builtin.cpu.arch == .x86_64 and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) .avx2 else .baseline;
 pub const INLINE_LANES = tierWidth(INLINE_TIER);
 const BASELINE_LANES = tierWidth(.baseline);
 

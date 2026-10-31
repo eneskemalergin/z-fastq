@@ -10,7 +10,7 @@ With the repository as a Zig dependency, the module is named `z-fastq`:
 const zfastq = @import("z-fastq");
 ```
 
-It is registered from `src/root.zig` and targets Zig 0.16.0 on Linux x86-64.
+It is registered from `src/root.zig` and targets Zig 0.16.0 on Linux, x86-64 or aarch64.
 
 ## What it exports
 
