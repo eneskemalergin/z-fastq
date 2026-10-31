@@ -1,0 +1,17 @@
+# The workflows' actions, pinned by commit, in at most one pull request a month that groups every update.
+# Zig packages are pinned in build.zig.zon and updated by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "chore"

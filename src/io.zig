@@ -14,9 +14,6 @@ pub const DEFAULT_READER_BUFFER_BYTES: usize = 256 * 1024;
 pub const COUNT_READ_BUFFER_BYTES: usize = DEFAULT_READER_BUFFER_BYTES;
 const GZIP_OPTIONAL_HEADER_BYTES_MAX: usize = 64 * 1024;
 
-/// Copied pull interface whose adapter must remain at a stable address and outlive it.
-/// A read initializes the returned prefix and rejects a count beyond the destination.
-/// For a nonempty destination, zero reports EOF.
 pub const ByteSource = struct {
     vtable: *const VTable,
     ctx: *anyopaque,
@@ -32,8 +29,6 @@ pub const ByteSource = struct {
     }
 };
 
-/// Copied push interface whose adapter must remain at a stable address and outlive it.
-/// Writes consume the complete slice; a missing flush callback is a successful no-op.
 pub const ByteSink = struct {
     vtable: *const VTable,
     ctx: *anyopaque,
@@ -58,7 +53,6 @@ pub const ByteSink = struct {
     }
 };
 
-/// Pull adapter over borrowed in-memory bytes.
 pub const SliceSource = struct {
     data: []const u8,
     pos: usize = 0,
@@ -89,7 +83,6 @@ fn sliceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return copy_len;
 }
 
-/// Pull adapter over a borrowed standard reader.
 pub const ReaderSource = struct {
     reader: *std.Io.Reader,
 
@@ -171,7 +164,6 @@ fn byteSourceReadVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize 
     return 0;
 }
 
-/// Buffered pull adapter over a borrowed file handle and caller-owned buffer.
 pub const FileSource = struct {
     file_reader: std.Io.File.Reader,
 
@@ -200,10 +192,42 @@ fn fileSourceRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return readShort(&self.file_reader.interface, dest);
 }
 
-// --- gzip input ---
+pub const GzipPreset = zipir.Preset;
 
-/// Streams and validates complete RFC 1952 member sequences from a borrowed reader.
-/// The reader accepts any buffer size and must share this adapter's stable lifetime.
+pub const GzipSink = struct {
+    compressor: zipir.gzip.Compressor,
+
+    pub fn init(self: *GzipSink, output: *std.Io.Writer, preset: GzipPreset) WriteError!void {
+        self.compressor.init(output, .{ .preset = preset }) catch return error.WriteFailed;
+    }
+
+    pub fn byteSink(self: *GzipSink) ByteSink {
+        return .{
+            .vtable = &GZIP_SINK_VTABLE,
+            .ctx = self,
+        };
+    }
+
+    pub fn finish(self: *GzipSink) WriteError!void {
+        _ = self.compressor.finish() catch return error.WriteFailed;
+    }
+};
+
+const GZIP_SINK_VTABLE = ByteSink.VTable{
+    .write = gzipSinkWrite,
+    .writeVec = gzipSinkWriteVec,
+};
+
+fn gzipSinkWrite(ctx: *anyopaque, data: []const u8) WriteError!void {
+    const self: *GzipSink = @ptrCast(@alignCast(ctx));
+    self.compressor.writer.writeAll(data) catch return error.WriteFailed;
+}
+
+fn gzipSinkWriteVec(ctx: *anyopaque, data: []const []const u8) WriteError!void {
+    const self: *GzipSink = @ptrCast(@alignCast(ctx));
+    writeVecToWriter(&self.compressor.writer, data) catch return error.WriteFailed;
+}
+
 pub const GzipSource = struct {
     input: *std.Io.Reader,
     decoder: zipir.gzip.Decompressor = undefined,
@@ -242,7 +266,6 @@ fn gzipRead(ctx: *anyopaque, dest: []u8) ReadError!usize {
     return readShort(self.decoded(), dest);
 }
 
-/// Push adapter into a borrowed fixed-capacity byte slice.
 pub const SliceSink = struct {
     buffer: []u8,
     pos: usize = 0,
@@ -275,7 +298,6 @@ fn sliceWrite(ctx: *anyopaque, data: []const u8) WriteError!void {
     self.pos = end;
 }
 
-/// Push adapter over a borrowed standard writer.
 pub const WriterSink = struct {
     writer: *std.Io.Writer,
 
@@ -331,16 +353,31 @@ fn writerFlush(ctx: *anyopaque) WriteError!void {
     self.writer.flush() catch return error.WriteFailed;
 }
 
-/// Buffered push adapter over a borrowed file handle and caller-owned buffer.
 pub const FileSink = struct {
     file_writer: std.Io.File.Writer,
+    writer: std.Io.Writer,
 
     pub fn init(
         io: std.Io,
         file: std.Io.File,
         write_buf: []u8,
     ) FileSink {
-        return .{ .file_writer = file.writer(io, write_buf) };
+        return wrap(file.writer(io, &.{}), write_buf);
+    }
+
+    pub fn initStreaming(
+        io: std.Io,
+        file: std.Io.File,
+        write_buf: []u8,
+    ) FileSink {
+        return wrap(file.writerStreaming(io, &.{}), write_buf);
+    }
+
+    fn wrap(file_writer: std.Io.File.Writer, write_buf: []u8) FileSink {
+        return .{
+            .file_writer = file_writer,
+            .writer = .{ .vtable = &FILE_WRITER_VTABLE, .buffer = write_buf },
+        };
     }
 
     pub fn byteSink(self: *FileSink) ByteSink {
@@ -351,6 +388,40 @@ pub const FileSink = struct {
     }
 };
 
+const FILE_WRITER_VTABLE = std.Io.Writer.VTable{
+    .drain = fileSinkDrain,
+    .flush = fileSinkFlushWriter,
+};
+
+fn fileSinkDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    const self: *FileSink = @alignCast(@fieldParentPtr("writer", w));
+    const out = &self.file_writer.interface;
+    if (w.buffer.len == 0) return out.writeSplat(data, splat);
+    var consumed: usize = 0;
+    fill: for (data, 0..) |bytes, index| {
+        const times = if (index + 1 == data.len) splat else 1;
+        for (0..times) |_| {
+            const n = @min(bytes.len, w.buffer.len - w.end);
+            @memcpy(w.buffer[w.end..][0..n], bytes[0..n]);
+            w.end += n;
+            consumed += n;
+            if (n < bytes.len) break :fill;
+        }
+    }
+    const page = std.heap.page_size_min;
+    const whole = if (w.end >= page) w.end - w.end % page else w.end;
+    try out.writeAll(w.buffer[0..whole]);
+    @memmove(w.buffer[0 .. w.end - whole], w.buffer[whole..w.end]);
+    w.end -= whole;
+    return consumed;
+}
+
+fn fileSinkFlushWriter(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    const self: *FileSink = @alignCast(@fieldParentPtr("writer", w));
+    try self.file_writer.interface.writeAll(w.buffer[0..w.end]);
+    w.end = 0;
+}
+
 const FILE_SINK_VTABLE = ByteSink.VTable{
     .write = fileSinkWrite,
     .writeVec = fileSinkWriteVec,
@@ -359,58 +430,51 @@ const FILE_SINK_VTABLE = ByteSink.VTable{
 
 fn fileSinkWrite(ctx: *anyopaque, data: []const u8) WriteError!void {
     const self: *FileSink = @ptrCast(@alignCast(ctx));
-    self.file_writer.interface.writeAll(data) catch return error.WriteFailed;
+    self.writer.writeAll(data) catch return error.WriteFailed;
 }
 
 fn fileSinkWriteVec(ctx: *anyopaque, data: []const []const u8) WriteError!void {
     const self: *FileSink = @ptrCast(@alignCast(ctx));
-    writeVecToWriter(&self.file_writer.interface, data) catch return error.WriteFailed;
+    writeVecToWriter(&self.writer, data) catch return error.WriteFailed;
 }
 
 fn fileSinkFlush(ctx: *anyopaque) WriteError!void {
     const self: *FileSink = @ptrCast(@alignCast(ctx));
-    self.file_writer.interface.flush() catch return error.WriteFailed;
+    self.writer.flush() catch return error.WriteFailed;
 }
 
-test "[property] - [gzip direct delivery]: preserves bytes across members" {
-    const gzip_x = [_]u8{
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0xff, 0x01, 0x01, 0x00, 0xfe, 0xff, 'x',
-        0x83, 0x16, 0xdc, 0x8c, 0x01, 0x00, 0x00, 0x00,
-    };
-    const compressed = gzip_x ++ gzip_x;
-    var input = std.Io.Reader.fixed(&compressed);
-    var source = GzipSource.init(&input);
-    var output: [2]u8 = undefined;
-    var output_len: usize = 0;
+test "[unit] - [gzip sink]: records decode unchanged and a sink flush leaves the member open" {
+    var compressed: [256]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&compressed);
+    const sink = try std.testing.allocator.create(GzipSink);
+    defer std.testing.allocator.destroy(sink);
+    try sink.init(&output, .fast);
+    const byte_sink = sink.byteSink();
+    try byte_sink.write("@r\nACGT\n");
+    try byte_sink.flush();
+    const gzip_header_bytes = 10;
+    try std.testing.expectEqual(gzip_header_bytes, output.end);
+    try byte_sink.writeVec(&.{ "+\n", "IIII\n" });
+    try sink.finish();
 
-    while (try readChunk(gzipReader(&source))) |decoded| {
-        @memcpy(output[output_len..][0..decoded.len], decoded);
-        output_len += decoded.len;
-    }
-
-    try std.testing.expectEqual(output.len, output_len);
-    try std.testing.expectEqualStrings("xx", &output);
+    var input: std.Io.Reader = .fixed(output.buffered());
+    var decoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer decoded.deinit();
+    var decompress: std.compress.flate.Decompress = .init(&input, .gzip, &.{});
+    _ = try decompress.reader.streamRemaining(&decoded.writer);
+    try std.testing.expectEqualStrings("@r\nACGT\n+\nIIII\n", decoded.written());
 }
 
-test "[property] - [gzip input]: compressed output may span many reads" {
-    const compressed = [_]u8{
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff,
-        0x73, 0x74, 0x1c, 0x05, 0xa3, 0x60, 0x14, 0x8c, 0x54, 0x00,
-        0x00, 0x1a, 0xfb, 0x37, 0xb7, 0x00, 0x04, 0x00, 0x00,
-    };
-    var input = std.Io.Reader.fixed(&compressed);
-    var source = GzipSource.init(&input);
-    const bytes = source.byteSource();
-    var output: [1024]u8 = undefined;
-    var written: usize = 0;
-    while (written < output.len) {
-        const end = @min(written + 17, output.len);
-        const n = try bytes.read(output[written..end]);
-        try std.testing.expect(n > 0);
-        written += n;
-    }
+test "[failure] - [gzip sink]: a full output fails the header or the finish" {
+    const sink = try std.testing.allocator.create(GzipSink);
+    defer std.testing.allocator.destroy(sink);
+    var header_space: [4]u8 = undefined;
+    var too_small: std.Io.Writer = .fixed(&header_space);
+    try std.testing.expectError(error.WriteFailed, sink.init(&too_small, .fast));
 
-    try std.testing.expect(std.mem.allEqual(u8, &output, 'A'));
-    try std.testing.expectEqual(@as(usize, 0), try bytes.read(output[0..17]));
+    var trailer_space: [12]u8 = undefined;
+    var no_trailer: std.Io.Writer = .fixed(&trailer_space);
+    try sink.init(&no_trailer, .fast);
+    try sink.byteSink().write("@r\nACGT\n+\nIIII\n");
+    try std.testing.expectError(error.WriteFailed, sink.finish());
 }

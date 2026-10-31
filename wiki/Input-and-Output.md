@@ -1,54 +1,44 @@
 # Input and output
 
-## Plain and gzip input
+## Reading
 
-z-fastq accepts plain FASTQ and gzip-compressed FASTQ. It chooses the decoder from the first two input bytes, not from the filename suffix.
+Every command reads plain FASTQ and gzip through the same path. z-fastq looks at the first two bytes to decide: a file called `reads.fastq` that holds gzip is read as gzip, and `reads.gz` that holds plain text is read as text.
 
-That means both of these are valid situations:
-
-- `reads.fastq` contains gzip bytes.
-- `reads.gz` contains plain FASTQ.
-
-If the first bytes identify gzip, z-fastq commits to gzip decoding. A damaged gzip stream is an input error. The tool does not retry it as plain text.
-
-The gzip reader checks the gzip header, DEFLATE stream, CRC32, and uncompressed size. Concatenated gzip members are supported.
-
-CRC32 and uncompressed size are stored at the end of each gzip member, so they are checked after that member has been decoded. A command can process and write records from a member before it finds that the member's check fails. It still exits with status `3`, and the FASTQ it wrote is the beginning of the output a valid input would give. See [Automation](Automation) for handling partial output.
+Once the first bytes say gzip, the whole stream must be valid gzip; a damaged stream is an error and is never retried as text. Concatenated gzip members are read in order, and each one's CRC-32 and length are checked. Those checks sit at the end of a member, so a command may already have written records from a member before it finds the member damaged ([Automation](Automation#partial-output)).
 
 ## Standard input
 
-Use `-` explicitly:
+Standard input is read only when you write `-`; leaving out the path is an error, not a request for stdin.
 
 ```bash
 gzip -dc reads.fastq.gz | z-fastq stats -
 ```
 
-An omitted path does not mean stdin. A command accepts stdin at most once. Exact-count sampling needs a regular file because it reads the input twice.
+A command reads standard input at most once. A pipe can be read only once, so other names for it, such as `/dev/stdin`, count as the same input. Exact-count sampling needs a regular file, because it reads twice.
 
-## Standard output
+## Writing
 
-`count`, `stats`, and successful JSON output go to standard output. Diagnostics go to standard error. Sampling and interleaving commands write FASTQ to standard output.
+Results, JSON, and FASTQ go to standard output; messages go to standard error. FASTQ is always written as four lines per record with LF endings.
 
-FASTQ output uses four logical lines per record and LF line endings. z-fastq does not currently write gzip output. Use an external compressor:
+| Command                                       | Reads              | Writes                       |
+| --------------------------------------------- | ------------------ | ---------------------------- |
+| `count`, `stats`, `check`                     | one or more inputs | standard output              |
+| `check --paired`, `sample --paired`           | two inputs         | standard output              |
+| `check --interleaved`, `sample --interleaved` | one input          | standard output              |
+| `interleave`                                  | two inputs         | standard output              |
+| `deinterleave`                                | one input          | two new files                |
+| `process`                                     | two inputs         | two new files, plain or gzip |
 
-```bash
-z-fastq sample --fraction 0.1 reads.fastq | gzip > sample.fastq.gz
-```
+Only `process --gzip` writes gzip; for the other commands, pipe the output to `gzip`. New output files are never overwritten: an existing path fails before anything is written.
 
-`deinterleave` is the exception: it writes two requested output files.
+Standard output may not be one of the inputs. `z-fastq count a.fastq b.fastq >> b.fastq` fails with `input file is output file` (status `2`) before reading anything, so the input is never touched. If standard output fails, for example because the reader of a pipe has exited, the command reports `error: standard output: I/O error` and exits with `3`.
 
-## Multiple inputs
+## Memory
 
-`count` and `stats` accept multiple independent inputs. They process them in argument order and keep their results separate. Paired commands have fixed shapes:
+z-fastq reads through fixed buffers; no command maps or loads a whole file. The [limits page](Limits-and-Supported-Formats#memory) lists what each command keeps.
 
-- `check --paired` and `sample --paired` take two inputs.
-- `check --interleaved` and `sample --interleaved` take one input.
-- `interleave` takes two inputs.
-- `deinterleave` takes one input and two output paths.
+## Related pages
 
-## Streaming boundary
-
-The parser reads through bounded byte sources. It does not map or load a complete FASTQ file into memory for normal count, stats, validation, sampling, or pair operations. Exact-count sampling keeps selection state for the requested count and makes a second pass over the file.
-
-See [Limits and supported formats](Limits-and-Supported-Formats) for the line and format boundaries.
-
+- [Automation](Automation): exit statuses, and what to do with partial output.
+- [Limits and supported formats](Limits-and-Supported-Formats): the formats read and the memory each command keeps.
+- [Troubleshooting](Troubleshooting#a-gzip-input-fails): when a gzip input fails.

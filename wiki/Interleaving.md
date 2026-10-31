@@ -1,45 +1,50 @@
-# Interleaving and deinterleaving
+# Interleaving
 
-These commands change pair layout. They do not trim, reorder, or repair records.
+Paired reads come in two layouts. Most sequencers write two files, R1 and R2; some tools prefer one interleaved file, in which each mate 1 record is followed by its mate 2. `interleave` and `deinterleave` move between the two, checking every pair on the way.
 
-## Combine R1 and R2
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/pair-layouts-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/pair-layouts-light.png">
+    <img alt="R1 and R2 files on the left, one interleaved file on the right with mates alternating; interleave goes right, deinterleave goes left." src="assets/pair-layouts-light.png" width="680">
+  </picture>
+</p>
+<p align="center"><sub><b>Figure 1.</b> Two files and one interleaved file hold the same pairs in a different order.</sub></p>
 
-```bash
-z-fastq interleave R1.fastq.gz R2.fastq.gz > reads.interleaved.fastq
-```
+Both commands validate every record and match the mates' names ([Paired reads](Paired-Reads)) before writing a pair. They never trim, reorder, or repair anything.
 
-For each pair, z-fastq:
-
-1. Reads one record from R1 and one from R2.
-2. Validates both records.
-3. Checks their names using the selected pair policy.
-4. Writes R1, then R2.
-
-The output is plain FASTQ with LF line endings. Use `--pair-names exact` when the complete first tokens must match:
+## interleave
 
 ```bash
-z-fastq interleave --pair-names exact R1.fastq R2.fastq > reads.interleaved.fastq
+z-fastq interleave R1.fastq.gz R2.fastq.gz > interleaved.fastq
+z-fastq interleave R1.fastq.gz R2.fastq.gz | gzip > interleaved.fastq.gz
 ```
 
-To compress the output, use an external compressor:
+The result goes to standard output as plain FASTQ; pipe it to `gzip` to compress it. Add `--pair-names exact` when the whole first word of each name must match.
+
+## deinterleave
 
 ```bash
-z-fastq interleave R1.fastq R2.fastq | gzip > reads.interleaved.fastq.gz
+z-fastq deinterleave --out1 R1.fastq --out2 R2.fastq interleaved.fastq.gz
 ```
 
-## Split an interleaved stream
+The first record of each pair goes to `--out1`, the second to `--out2`. Both must be new files; z-fastq never overwrites one. A failure partway, such as a broken pair, leaves the two files partly written.
 
-```bash
-z-fastq deinterleave \
-  --out1 R1.fastq \
-  --out2 R2.fastq \
-  reads.interleaved.fastq.gz
-```
+## Inputs and failures
 
-The first record in each pair goes to `--out1`; the second goes to `--out2`.
+Each input may be plain, gzip, or `-` for standard input, with at most one `-`. The first broken record, mismatched name, or unequal record count stops the run with a nonzero exit status ([Automation](Automation#exit-status)).
 
-Output paths are created exclusively. z-fastq does not truncate or overwrite an existing file. It opens the input before creating the output paths, but a later validation or write failure can still leave empty or partial output files.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/layout/results/figures/interleave-overview-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/layout/results/figures/interleave-overview-light.png">
+    <img alt="Wall time and peak memory of other interleaving tools relative to z-fastq, plain and gzip input." src="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/layout/results/figures/interleave-overview-light.png" width="760">
+  </picture>
+</p>
+<p align="center"><sub><b>Figure 2.</b> Interleaving: time and peak memory relative to z-fastq. fqkit is faster on plain input, but it, seqtk, SeqFu, and fqtools also write output from broken pairs with exit status 0. The <a href="https://github.com/eneskemalergin/z-fastq/blob/main/bench/layout/README.md">layout benchmark</a> has the details and the same figure for deinterleaving.</sub></p>
 
-## Input and failure behavior
+## Related pages
 
-Both input commands accept plain FASTQ, gzip FASTQ, and explicit stdin. At most one input may be `-`. A record error, pair-name error, or unequal pair count stops the operation at the first failing pair. See [Paired reads](Paired-Reads) for name matching and [Automation](Automation) for exit status classes.
+- [Paired reads](Paired-Reads): how mate names are matched.
+- [Sampling](Sampling#pairs): paired samples come out interleaved.
+- [Recipes](Recipes#make-an-interleaved-gzip-file): an interleaved gzip file in one line.

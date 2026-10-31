@@ -1,47 +1,58 @@
 # Limits and supported formats
 
-## Supported today
+I would rather state the edges clearly than let a command look broader than what has been tested. These are today's boundaries, not promises about the final project.
 
-- Linux x86-64 builds.
-- Plain four-line FASTQ input.
-- gzip-compressed FASTQ input, including concatenated gzip members.
-- Explicit standard input with `-`.
-- Phred+33 quality bytes from ASCII 33 through 126.
-- IUPAC sequence validation, or the narrower ACGTN policy.
+## Supported
 
-## Not supported today
+- Linux on x86-64 or aarch64.
+- Four-line FASTQ, plain or gzip, including concatenated gzip members; standard input as `-`.
+- Phred+33 qualities, ASCII 33 to 126.
+- IUPAC or ACGTN sequence letters.
+- gzip output from `process --gzip`.
 
-- FASTA input.
-- Wrapped sequence or quality lines.
-- gzip output from the CLI.
-- BGZF, ZIP, tar, bzip2, xz, and zstd containers.
-- Remote object stores or network paths.
-- Memory-mapped or worker-thread CLI execution.
-- Automatic repair or record recovery after malformed input.
+## Not supported
 
-These are current boundaries, not promises about the final project. I would rather state them clearly than make a command appear broader than its tested behavior.
+- FASTA, and wrapped sequence or quality lines.
+- BGZF, ZIP, tar, bzip2, xz, and zstd.
+- gzip output from commands other than `process`.
+- Remote paths and object stores.
+- Several threads per command.
+- Repairing or skipping malformed records.
+- From fastp: automatic adapter detection, automatic poly-G mode, and the average-quality, maximum-length, and low-complexity filters; writing the surviving mate of a dropped pair.
 
-## Logical line limit
+## Line length
 
-The default maximum logical line length is 16 MiB. Override it per command:
+The longest line accepted is 16 MiB by default. Raise it per command when a file really has longer lines, as long-read files can:
 
 ```bash
 z-fastq check --max-line-bytes 33554432 reads.fastq
 ```
 
-The limit applies to the line content, not the LF terminator. Raising it allows longer single-line fields; it does not enable wrapped FASTQ.
+The limit counts the line's content, not its line ending. Raising it does not allow wrapped records.
 
-## Location semantics
+## Memory
 
-Validation locations use:
+What a command keeps decides its memory, and the line limit bounds it.
 
-- A zero-based record index.
-- A zero-based byte offset in the decompressed FASTQ stream.
-- A one-based line number within the record.
+| Command                                 | Keeps                                                       |
+| --------------------------------------- | ----------------------------------------------------------- |
+| `count`, `check`, `stats`               | no record bytes: a few MiB at any line length               |
+| `check --paired`, `check --interleaved` | each mate's header, to compare names                        |
+| `sample`, `interleave`, `deinterleave`  | a record too large for the read buffer, until it is written |
+| `sample --count K`                      | about 4 bytes per chosen record                             |
+| `process`                               | the same, plus the QC tables below when QC is requested     |
 
-For gzip input, the byte offset is not a compressed-file offset. It points into the decoded FASTQ stream that the parser sees.
+With 15 MiB lines, `count`, `check`, and `stats` peak near 5 MiB, `check --paired` near 37 MiB, `sample` near 50 MiB, and `interleave` near 100 MiB, so raise `--max-line-bytes` only as far as the data needs.
 
-## Record shape
+When `process` measures QC, per mate and per population (raw and retained) it keeps up to 800 KiB of quality tables, 48 KiB of adapter counters, up to 5 MB for the 100,000 sequence keys behind duplication, and 8 bytes per tile and cycle for per-tile quality: about 0.7 MB for 600 tiles of 151-base reads, at most 21 MB. `--pair-duplication` adds about 10 bytes per pair, at most 1 GiB. Trimming itself uses under 16 KiB at any read length.
 
-The current parser expects one header line, one sequence line, one plus line, and one quality line per record. The sequence and quality fields must have equal byte lengths. Empty fields are valid when both are empty.
+## gzip
 
+- A gzip header field (file name, comment, or extra field) may be at most 64 KiB.
+- Bytes after the last gzip member are an error, even zero padding that `gzip -dc` accepts.
+
+## Related pages
+
+- [Input and output](Input-and-Output): how gzip and standard input are read.
+- [Choosing a FASTQ tool](Choosing-a-FASTQ-Tool): tools that cover what z-fastq does not.
+- [Troubleshooting](Troubleshooting#a-line-is-too-long): raising the line limit.

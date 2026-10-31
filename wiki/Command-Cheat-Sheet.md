@@ -1,104 +1,121 @@
 # Command cheat sheet
 
-Use this page to choose a command. Open the linked page when the command's edge cases matter.
+The whole command line on one page: what each command is for, how to call it, and every option. Each section links to the page that explains it in depth.
 
-## Pick the command
+`<path|->` means a file, or `-` for standard input. Every command reads plain FASTQ and gzip alike.
 
-`count` prints one record count for each independent input:
+## The commands
 
-```bash
-z-fastq count reads.fastq.gz
-```
+### count
 
-`stats` prints aggregate read, base, composition, and quality fields:
+Counts records, as fast as the file can be read. See [Counting and statistics](Counting-and-Statistics).
 
 ```bash
-z-fastq stats reads.fastq.gz
+z-fastq count <path|-> [<path|-> ...]
+z-fastq count lane1.fastq.gz lane2.fastq.gz
 ```
 
-`check` validates one input:
+### stats
+
+Summarizes reads, bases, length, GC, and quality. See [Counting and statistics](Counting-and-Statistics#stats).
 
 ```bash
-z-fastq check reads.fastq.gz
+z-fastq stats [--json] <path|-> [<path|-> ...]
+z-fastq stats --json reads.fastq.gz > stats.json
 ```
 
-`sample` writes a selected FASTQ stream to standard output:
+### check
+
+Validates every record, or every pair with `--paired` or `--interleaved`. Prints nothing on success. See [Validation](Validation) and [Paired reads](Paired-Reads).
 
 ```bash
-z-fastq sample --fraction 0.1 --seed 11 reads.fastq.gz > sample.fastq
+z-fastq check [--json] <path|-> [<path|-> ...]
+z-fastq check --paired R1.fastq.gz R2.fastq.gz
+z-fastq check --interleaved interleaved.fastq.gz
 ```
 
-`interleave` validates two mates and writes R1, then R2, to standard output:
+### sample
+
+Writes a reproducible subset to standard output, by fraction or by exact count. Exact counts need regular files. See [Sampling](Sampling).
+
+```bash
+z-fastq sample (--fraction P | --count K) [--seed S] <path|->
+z-fastq sample --paired --count 100000 --seed 7 R1.fastq.gz R2.fastq.gz > sample.fastq
+```
+
+### interleave and deinterleave
+
+Join R1 and R2 into one interleaved stream, or split one into two new files. See [Interleaving](Interleaving).
 
 ```bash
 z-fastq interleave R1.fastq.gz R2.fastq.gz > interleaved.fastq
+z-fastq deinterleave --out1 R1.fastq --out2 R2.fastq interleaved.fastq.gz
 ```
 
-`deinterleave` validates one interleaved input and creates two output files:
+### process
+
+Validates, trims, filters, and measures pairs into two new files, with an optional report and MultiQC files. See [Processing paired reads](Processing) and [Quality control](Quality-Control).
 
 ```bash
-z-fastq deinterleave --out1 R1.fastq --out2 R2.fastq interleaved.fastq
+z-fastq process --out1 OUT1 --out2 OUT2 [options] R1 R2
+z-fastq process --gzip --adapter1 CTGTCTCTTATACACATCT --adapter2 CTGTCTCTTATACACATCT \
+  --trim-poly-g 10 --min-length 30 --report sample.json \
+  --out1 trimmed_R1.fastq.gz --out2 trimmed_R2.fastq.gz R1.fastq.gz R2.fastq.gz
 ```
 
-## Input shapes
+## Options
 
-```text
-count         <path|-> [<path|-> ...]
-stats         <path|-> [<path|-> ...]
-check         <path|-> [<path|-> ...]
-check --paired R1 R2
-check --interleaved interleaved.fastq
-sample        <path|->
-sample --paired R1 R2
-sample --interleaved interleaved.fastq
-interleave    R1 R2
-deinterleave --out1 R1 --out2 R2 interleaved.fastq
-```
+### Everywhere
 
-`sample` requires exactly one ordinary input, two inputs for `--paired`, and one input for `--interleaved`. Exact-count forms require regular file paths because they use two passes.
+- `-h`, `--help`: help, before or after a command. `-V`, `--version`: the version, before a command.
+- `--max-line-bytes N`: the longest line accepted, 16 MiB by default ([Limits](Limits-and-Supported-Formats#line-length)).
+- `--`: ends the options, for a path that starts with `-`, as in `z-fastq count -- ./-odd.fastq`.
 
-## Shared options
+An option that takes a value may be given only once; a repeat is an error rather than the last one winning.
 
-```text
--h, --help
--V, --version
---max-line-bytes N
-```
+### Records and pairs
 
-The default maximum logical line length is 16 MiB. Use `--` before a path that begins with a hyphen:
+- `--alphabet iupac|acgtn`: which sequence letters pass, `iupac` by default. Every command but `count` and `stats` takes it.
+- `--paired`, `--interleaved`: for `check` and `sample`, read two mate files or one interleaved file.
+- `--pair-names illumina|exact`: how mate names are matched, `illumina` by default ([Paired reads](Paired-Reads#how-names-are-matched)). For every pair command and `process`.
+- `--json`: machine-readable output from `stats` and `check` ([Automation](Automation#json)).
 
-```bash
-z-fastq count -- ./-named.fastq
-```
+### Sampling
 
-## Validation and pair options
+- `--fraction P`: keep each record with chance P, in one pass.
+- `--count K`: keep exactly K records, in two passes.
+- `--seed S`: the seed, 11 by default.
 
-```text
---alphabet iupac
---alphabet acgtn
---paired
---interleaved
---pair-names illumina
---pair-names exact
-```
+### Processing
 
-The pair flags apply to `check` and `sample`. The standalone pair commands accept `--pair-names` directly.
+Outputs:
 
-## Sample options
+- `--out1 PATH`, `--out2 PATH`: the two new FASTQ files.
+- `--gzip`, `--gzip-preset fast|even|dense`: compress them, with the `fast` preset by default.
+- `--report PATH`: the JSON report. `--qc-tables DIR` and `--qc-summary PATH`: files for MultiQC.
+- `--max-pairs N`: stop after N pairs.
 
-```text
---fraction P
---count K
---seed S
-```
+Trims, each off unless given:
 
-`--fraction` and `--count` are mutually exclusive. The default seed is `11`.
+- `--adapter1 A1 --adapter2 A2`: adapters and mate overlaps.
+- `--trim-poly-g N`: poly-G tails, scanning at least N bases.
+- `--trim-tail-window W --trim-tail-quality Q`: low-quality 3' ends.
 
-## Machine output
+Filters, each off unless given:
 
-```bash
-z-fastq stats --json reads.fastq.gz
-z-fastq check --json reads.fastq.gz
-```
+- `--low-quality Q --max-low-quality-percent P`: too many bases below quality Q.
+- `--max-n N`: more than N `N` bases.
+- `--min-length N`: shorter than N bases.
 
-The current build supports `--json` for `stats` and `check`, but its document shape is provisional. See [Automation](Automation).
+Measurements:
+
+- `--contaminants PATH`: name the likely source of overrepresented sequences.
+- `--pair-duplication`: the pair duplication rate.
+
+[Processing](Processing) gives each option's range, and [Quality control](Quality-Control) says which options need each other.
+
+## Related pages
+
+- [Getting started](Getting-Started): the main commands, one at a time.
+- [Automation](Automation): exit statuses and JSON output.
+- [Recipes](Recipes): complete commands for everyday jobs.

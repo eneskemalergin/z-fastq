@@ -4,10 +4,10 @@
 
 const std = @import("std");
 const fastq = @import("fastq.zig");
+const simd = @import("simd.zig");
 
 pub const Options = fastq.ReaderOptions;
 
-// Bare plus lines let the fast path derive every tail offset from the sequence length.
 const DenseLayout = struct {
     sequence_start: usize,
     sequence_end: usize,
@@ -54,10 +54,10 @@ const DenseLayout = struct {
         const quality_len = fastq.lineContentLen(quality);
         return header_len >= 2 and fastq.headerPrefixIsValid(record[0], record[1]) and
             record[layout.sequence_start - 1] == '\n' and
-            !@call(.always_inline, containsNewline, .{ 1, .{header} }) and
+            !simd.containsNewline(header, null) and
             header_len <= max_line_bytes and
             record[layout.sequence_end] == '\n' and
-            !@call(.always_inline, containsNewline, .{ 2, .{ sequence, quality } }) and
+            !simd.containsNewline(sequence, quality) and
             sequence_len <= max_line_bytes and
             record[layout.plus_start] == '+' and
             record[layout.plus_start + 1] == '\n' and
@@ -86,7 +86,6 @@ const FastProgress = struct {
     records: usize = 0,
 };
 
-/// Allocation-free scanner; only `record_index` and `byte_offset` are caller-readable state.
 pub const Scanner = struct {
     options: Options,
     machine: fastq.Machine = .{},
@@ -96,10 +95,7 @@ pub const Scanner = struct {
     last_header_line_bytes: usize = 0,
     current_record_minimal_plus: bool = false,
     current_record_dense_eligible: bool = false,
-    line_raw_len: usize = 0,
-    line_first_byte: u8 = 0,
-    line_second_byte: u8 = 0,
-    line_last_byte: u8 = 0,
+    line: fastq.LineBytes = .{},
     line_start_offset: u64 = 0,
     record_index: u64 = 0,
     byte_offset: u64 = 0,
@@ -109,23 +105,18 @@ pub const Scanner = struct {
         return .{ .options = options };
     }
 
-    /// Returns and clears the structural diagnostic retained after a parse error.
     pub fn takeLastError(self: *Scanner) ?fastq.ParseError {
         const err = self.last_error;
         self.last_error = null;
         return err;
     }
 
-    /// Consumes as many bytes as possible from one input chunk.
-    ///
-    /// On success the returned count equals `data.len`. Structural failures leave
-    /// details for `takeLastError`.
     pub fn feed(self: *Scanner, data: []const u8) fastq.ReaderError!usize {
         var pos: usize = 0;
         while (pos < data.len) {
             if (self.fast_path_enabled and
                 self.machine.expected == .header and
-                self.line_raw_len == 0)
+                self.line.raw_len == 0)
             {
                 const progress = try self.feedFast(data[pos..]);
                 if (progress.bytes > 0) {
@@ -149,9 +140,8 @@ pub const Scanner = struct {
         return pos;
     }
 
-    /// Finalizes an unterminated last line and rejects an incomplete record.
     pub fn finishEof(self: *Scanner) fastq.ReaderError!void {
-        if (self.line_raw_len > 0) try self.finishLine(false);
+        if (self.line.raw_len > 0) try self.finishLine(false);
         const missing_line = self.machine.missingLine() orelse return;
         self.storeError(
             .s004_truncated_record,
@@ -178,7 +168,6 @@ pub const Scanner = struct {
                         remaining = data[cursor..];
                         if (remaining.len < active.record_stride) continue;
                     }
-                    // A full remaining stride has already failed this layout proof.
                     if (remaining.len >= active.record_stride) self.observeDenseLayout(null);
                 }
             }
@@ -224,7 +213,7 @@ pub const Scanner = struct {
         }
 
         var line_ends: [4]usize = undefined;
-        if (!findRecordNewlines(data, &line_ends)) return 0;
+        if (!simd.findNewlines(data, &line_ends)) return 0;
 
         const header_end = line_ends[0];
         const sequence_start = header_end + 1;
@@ -246,7 +235,6 @@ pub const Scanner = struct {
             const sequence_content_len = fastq.lineContentLen(data[sequence_start..sequence_end]);
             const plus_content_len = fastq.lineContentLen(data[plus_start..plus_end]);
             const quality_content_len = fastq.lineContentLen(data[quality_start..quality_end]);
-            // Failed normalized proofs keep line-limit and structural error order in the fallback.
             if (header_len < 2 or !fastq.headerPrefixIsValid(data[0], data[1]) or
                 header_len > self.options.max_line_bytes or
                 sequence_content_len > self.options.max_line_bytes or
@@ -289,7 +277,7 @@ pub const Scanner = struct {
         var pos: usize = 0;
 
         while (pos < data.len) {
-            const rel = std.mem.findScalar(u8, data[pos..], '\n');
+            const rel = simd.findNewline(data[pos..]);
             if (rel == null) {
                 try self.consumeLineBytes(data[pos..]);
                 self.byte_offset = try fastq.progressAfter(self.byte_offset, data.len - pos);
@@ -339,32 +327,18 @@ pub const Scanner = struct {
     }
 
     fn consumeLineBytes(self: *Scanner, bytes: []const u8) fastq.ReaderError!void {
-        if (bytes.len == 0) return;
-        const previous_len = self.line_raw_len;
-        if (previous_len == 0) self.line_first_byte = bytes[0];
-        self.line_raw_len = std.math.add(usize, self.line_raw_len, bytes.len) catch
-            return error.LineTooLong;
-        if (previous_len < 2 and self.line_raw_len >= 2) {
-            self.line_second_byte = bytes[1 - previous_len];
-        }
-        self.line_last_byte = bytes[bytes.len - 1];
-        if (self.line_raw_len > self.options.max_line_bytes) {
-            const excess = self.line_raw_len - self.options.max_line_bytes;
-            if (excess > 1 or self.line_last_byte != '\r') return error.LineTooLong;
-        }
+        try self.line.add(bytes, self.options.max_line_bytes);
     }
 
     fn finishLine(self: *Scanner, terminated_by_lf: bool) fastq.ReaderError!void {
-        const had_cr = terminated_by_lf and
-            self.line_raw_len > 0 and
-            self.line_last_byte == '\r';
-        const content_len = self.line_raw_len - @intFromBool(had_cr);
+        const had_cr = terminated_by_lf and self.line.holdsCr();
+        const content_len = self.line.contentLen(terminated_by_lf);
         if (content_len > self.options.max_line_bytes) return error.LineTooLong;
 
         const line_kind = self.machine.expected;
         switch (line_kind) {
             .header => {
-                self.last_header_line_bytes = std.math.add(usize, self.line_raw_len, 1) catch
+                self.last_header_line_bytes = std.math.add(usize, self.line.raw_len, 1) catch
                     return error.LineTooLong;
                 self.current_record_dense_eligible = !had_cr;
             },
@@ -378,8 +352,8 @@ pub const Scanner = struct {
             .quality => {},
         }
 
-        const first_byte = if (content_len == 0) null else self.line_first_byte;
-        const second_byte = if (content_len < 2) null else self.line_second_byte;
+        const first_byte = self.line.firstByte(content_len);
+        const second_byte = self.line.secondByte(content_len);
         var machine = self.machine;
         const record_ready = machine.push(content_len, first_byte, second_byte) catch |err| {
             return self.structuralError(err, self.line_start_offset);
@@ -402,10 +376,7 @@ pub const Scanner = struct {
                 self.observeDenseLayout(null);
             }
         }
-        self.line_raw_len = 0;
-        self.line_first_byte = 0;
-        self.line_second_byte = 0;
-        self.line_last_byte = 0;
+        self.line = .{};
         self.line_start_offset = self.byte_offset;
     }
 
@@ -436,80 +407,6 @@ pub const Scanner = struct {
     }
 };
 
-fn containsNewline(comptime slice_count: usize, slices: [slice_count][]const u8) bool {
-    const len = slices[0].len;
-    inline for (slices[1..]) |slice| std.debug.assert(slice.len == len);
-
-    const vector_len = std.simd.suggestVectorLength(u8) orelse @sizeOf(usize);
-    const Vector = @Vector(vector_len, u8);
-    const newline: Vector = @splat('\n');
-
-    if (len >= vector_len) {
-        const full_end = len - len % vector_len;
-        var pos: usize = 0;
-        while (pos < full_end) : (pos += vector_len) {
-            var found = false;
-            inline for (slices) |slice| {
-                const chunk: Vector = slice[pos..][0..vector_len].*;
-                found = @reduce(.Or, chunk == newline) or found;
-            }
-            if (found) return true;
-        }
-        if (pos < len) {
-            var found = false;
-            inline for (slices) |slice| {
-                const chunk: Vector = slice[len - vector_len ..][0..vector_len].*;
-                found = @reduce(.Or, chunk == newline) or found;
-            }
-            if (found) return true;
-        }
-        return false;
-    }
-
-    for (0..len) |pos| {
-        inline for (slices) |slice| {
-            if (slice[pos] == '\n') return true;
-        }
-    }
-    return false;
-}
-
-fn findRecordNewlines(bytes: []const u8, line_ends: *[4]usize) bool {
-    var found: usize = 0;
-    var pos: usize = 0;
-    while (bytes.len - pos >= 32) : (pos += 32) {
-        const first_mask = fastq.newlineMask(16, bytes[pos..][0..16]);
-        const second_mask = fastq.newlineMask(16, bytes[pos + 16 ..][0..16]);
-        var mask = @as(u32, first_mask) | @as(u32, second_mask) << 16;
-        while (mask != 0) {
-            line_ends[found] = pos + @as(usize, @intCast(@ctz(mask)));
-            found += 1;
-            if (found == line_ends.len) return true;
-            mask &= mask - 1;
-        }
-    }
-    if (bytes.len - pos >= 16) {
-        var mask = fastq.newlineMask(16, bytes[pos..][0..16]);
-        while (mask != 0) {
-            line_ends[found] = pos + @as(usize, @intCast(@ctz(mask)));
-            found += 1;
-            if (found == line_ends.len) return true;
-            mask &= mask - 1;
-        }
-        pos += 16;
-    }
-    for (bytes[pos..], pos..) |byte, index| {
-        if (byte != '\n') continue;
-        line_ends[found] = index;
-        found += 1;
-        if (found == line_ends.len) return true;
-    }
-    return false;
-}
-
-/// Counts all records in one slice and replaces `scanner` with the final state.
-///
-/// Structural failures leave details in `scanner` for `takeLastError`.
 pub fn countSlice(
     data: []const u8,
     options: Options,
@@ -521,23 +418,45 @@ pub fn countSlice(
     return scanner.record_index;
 }
 
-test "[unit] - [dense layout]: construction derives complete record offsets" {
-    const layout = DenseLayout.fromRecordEnd(11, 2).?;
-
-    try std.testing.expect(layout.sequence_start == 3);
-    try std.testing.expect(layout.sequence_end == 5);
-    try std.testing.expect(layout.plus_start == 6);
-    try std.testing.expect(layout.quality_start == 8);
-    try std.testing.expect(layout.quality_end == 10);
-    try std.testing.expect(layout.record_stride == 11);
+test "[edge] - [dense layout]: record geometry is derived when it fits and rejected when it cannot" {
+    const max = std.math.maxInt(usize);
+    const Row = struct { record_bytes: usize, seq_len: usize, expected: ?DenseLayout };
+    const rows = [_]Row{
+        .{
+            .record_bytes = 11,
+            .seq_len = 2,
+            .expected = .{
+                .sequence_start = 3,
+                .sequence_end = 5,
+                .plus_start = 6,
+                .quality_start = 8,
+                .quality_end = 10,
+                .record_stride = 11,
+            },
+        },
+        .{ .record_bytes = 0, .seq_len = 0, .expected = null },
+        .{ .record_bytes = 8, .seq_len = 2, .expected = null },
+        .{ .record_bytes = max, .seq_len = max, .expected = null },
+    };
+    for (rows) |row| {
+        try std.testing.expectEqualDeep(row.expected, DenseLayout.fromRecordEnd(row.record_bytes, row.seq_len));
+    }
 }
 
-test "[failure] - [dense layout]: construction rejects impossible geometry" {
-    const max = std.math.maxInt(usize);
+test "[unit] - [dense layout]: confirmation waits for two matching records" {
+    const short = "@a\nAC\n+\n!!\n";
+    const long = "@longer\nA\n+\n!\n";
+    var scan = Scanner.init(.{ .max_line_bytes = 64 });
 
-    try std.testing.expect(DenseLayout.fromRecordEnd(0, 0) == null);
-    try std.testing.expect(DenseLayout.fromRecordEnd(8, 2) == null);
-    try std.testing.expect(DenseLayout.fromRecordEnd(max, max) == null);
+    try std.testing.expectEqual(short.len, try scan.feed(short));
+    try std.testing.expect(!scan.layout_confirmed);
+    try std.testing.expectEqual(short.len, try scan.feed(short));
+    try std.testing.expect(scan.layout_confirmed);
+
+    try std.testing.expectEqual(long.len, try scan.feed(long));
+    try std.testing.expect(!scan.layout_confirmed);
+    try std.testing.expectEqual(long.len, try scan.feed(long));
+    try std.testing.expect(scan.layout_confirmed);
 }
 
 test "[property] - [count scanner]: dense validation checks every field region" {
@@ -614,59 +533,6 @@ test "[property] - [count scanner]: dense validation checks every field region" 
             try std.testing.expectEqual(case.line, details.line_in_record);
             try std.testing.expectEqual(prefix.len + case.offset, details.byte_offset);
         }
-    }
-}
-
-test "[property] - [dense newline scan]: matches scalar searches across vector tails" {
-    const lanes = std.simd.suggestVectorLength(u8) orelse @sizeOf(usize);
-    var first_storage: [3 * lanes + 2]u8 = undefined;
-    var second_storage: [3 * lanes + 2]u8 = undefined;
-    for ([_]usize{ 0, 1, lanes - 1 }) |alignment| {
-        for (0..2 * lanes + 3) |len| {
-            @memset(&first_storage, '\n');
-            @memset(&second_storage, '\n');
-            const first = first_storage[alignment..][0..len];
-            const second = second_storage[alignment..][0..len];
-            @memset(first, 0xff);
-            @memset(second, '\r');
-            try std.testing.expect(!containsNewline(1, .{first}));
-            try std.testing.expect(!containsNewline(2, .{ first, second }));
-
-            for (0..len) |pos| {
-                inline for (.{ first, second }, .{ 0xff, '\r' }) |slice, original| {
-                    slice[pos] = '\n';
-                    const first_has_lf = std.mem.findScalar(u8, first, '\n') != null;
-                    const second_has_lf = std.mem.findScalar(u8, second, '\n') != null;
-                    try std.testing.expectEqual(first_has_lf, containsNewline(1, .{first}));
-                    try std.testing.expectEqual(
-                        first_has_lf or second_has_lf,
-                        containsNewline(2, .{ first, second }),
-                    );
-                    slice[pos] = original;
-                }
-            }
-        }
-    }
-}
-
-test "[edge] - [record newline scan]: vector boundaries and incomplete input are exact" {
-    const cases = [_][4]usize{
-        .{ 14, 15, 30, 31 },
-        .{ 15, 16, 31, 32 },
-        .{ 30, 31, 62, 63 },
-        .{ 31, 32, 63, 64 },
-        .{ 126, 127, 128, 129 },
-    };
-
-    for (cases) |expected| {
-        var data: [131]u8 = @splat('x');
-        for (expected) |index| data[index] = '\n';
-        data[130] = '\n';
-        var actual: [4]usize = undefined;
-
-        try std.testing.expect(findRecordNewlines(&data, &actual));
-        try std.testing.expectEqual(expected, actual);
-        try std.testing.expect(!findRecordNewlines(data[0..expected[3]], &actual));
     }
 }
 
@@ -771,26 +637,6 @@ test "[edge] - [count scanner]: counts and error locations cross 32 bits with an
     }
 }
 
-test "[edge] - [count scanner]: fast progress rejects maximum offset and record count" {
-    const data = "@r\nA\n+\n!\n";
-
-    var offset = Scanner.init(.{});
-    offset.fast_path_enabled = true;
-    offset.byte_offset = std.math.maxInt(u64);
-
-    try std.testing.expectError(error.ArithmeticLimit, offset.feed(data));
-    try std.testing.expectEqual(std.math.maxInt(u64), offset.byte_offset);
-    try std.testing.expectEqual(@as(u64, 0), offset.record_index);
-
-    var records = Scanner.init(.{});
-    records.fast_path_enabled = true;
-    records.record_index = std.math.maxInt(u64);
-
-    try std.testing.expectError(error.ArithmeticLimit, records.feed(data));
-    try std.testing.expectEqual(std.math.maxInt(u64), records.record_index);
-    try std.testing.expectEqual(@as(u64, 0), records.byte_offset);
-}
-
 test "[property] - [dense exit]: short tails preserve prediction and changed records relearn" {
     const record = "@r1\nAAAA\n+\n!!!!\n";
     const longer = "@longer-id\nAA\n+\n!!\n";
@@ -819,7 +665,7 @@ test "[property] - [dense exit]: short tails preserve prediction and changed rec
     }
 }
 
-test "[edge] - [dense exit]: checked progress and line-limit commit boundaries stay intact" {
+test "[failure] - [count scanner]: arithmetic and line-limit errors keep the last completed record" {
     const record = "@r1\nAAAA\n+\n!!!!\n";
     const changed = "@longer\nAA\n+\n!!\n";
     for ([_]bool{ false, true }) |overflow_offset| {
@@ -845,20 +691,31 @@ test "[edge] - [dense exit]: checked progress and line-limit commit boundaries s
     try std.testing.expectEqual(@as(u64, record.len * 2), limited.byte_offset);
 }
 
-test "[edge] - [count scanner]: incremental progress rejects maximum offset and record count" {
+test "[edge] - [count scanner]: byte-offset and record-count limits reject the record on both paths" {
     const data = "@r\nA\n+\n!\n";
+    const max = std.math.maxInt(u64);
+    for ([_]bool{ false, true }) |fast_path_enabled| {
+        var offset = Scanner.init(.{});
+        offset.fast_path_enabled = fast_path_enabled;
+        offset.byte_offset = max;
+        try std.testing.expectError(error.ArithmeticLimit, offset.feed(data));
+        try std.testing.expectEqual(max, offset.byte_offset);
+        try std.testing.expectEqual(@as(u64, 0), offset.record_index);
 
-    var offset = Scanner.init(.{});
-    offset.byte_offset = std.math.maxInt(u64);
+        var records = Scanner.init(.{});
+        records.fast_path_enabled = fast_path_enabled;
+        records.record_index = max;
+        try std.testing.expectError(error.ArithmeticLimit, records.feed(data));
+        try std.testing.expectEqual(max, records.record_index);
+    }
+}
 
-    try std.testing.expectError(error.ArithmeticLimit, offset.feed(data));
-    try std.testing.expectEqual(std.math.maxInt(u64), offset.byte_offset);
-    try std.testing.expectEqual(@as(u64, 0), offset.record_index);
-
-    var records = Scanner.init(.{});
-    records.record_index = std.math.maxInt(u64);
-
-    try std.testing.expectError(error.ArithmeticLimit, records.feed(data));
-    try std.testing.expectEqual(std.math.maxInt(u64), records.record_index);
-    try std.testing.expectEqual(@as(u64, data.len), records.byte_offset);
+test "[edge] - [count scanner]: record-count overflow on the second record of one feed is rejected" {
+    const record = "@r\nA\n+\n!\n";
+    for ([_]bool{ false, true }) |fast_path_enabled| {
+        var scanner = Scanner.init(.{});
+        scanner.fast_path_enabled = fast_path_enabled;
+        scanner.record_index = std.math.maxInt(u64) - 1;
+        try std.testing.expectError(error.ArithmeticLimit, scanner.feed(record ** 2));
+    }
 }

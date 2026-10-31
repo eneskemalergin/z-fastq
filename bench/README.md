@@ -1,177 +1,132 @@
-<!-- markdownlint-disable MD033 MD041 -->
+<!-- markdownlint-disable MD013 MD033 MD041 -->
 
 # Benchmarks
 
-Publication benches for z-fastq. Suites live in `bench/<name>/`. Each suite checks that timed commands agree on the compared fact, then [zebrac](https://github.com/eneskemalergin/zebrac) records wall, peak RSS, and minor page faults.
+How z-fastq compares with the tools people use for the same FASTQ jobs, at a glance. Each feature report below holds the detail: every input, format, and size, the edge cases, scaling, and the commands.
 
-Zebrac is Linux-only. Peers, adapters, zebrac, and report Python are under [`tools/`](../tools/README.md). **This repo tests Linux x86-64 only.** Other OS cells below are from each tool's own docs or release assets, not from me.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="summary/01-jobs-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="summary/01-jobs-light.png">
+    <img src="summary/01-jobs-light.png" alt="Each job: the fastest complete and partial tools as multiples of z-fastq's time and memory" width="100%">
+  </picture>
+</p>
 
-## Suites
+| Job                      | z-fastq time | z-fastq memory | Complete tool | Its time | Its memory | Partial tool | Its time | Its memory |
+| ------------------------ | -----------: | -------------: | ------------- | -------: | ---------: | ------------ | -------: | ---------: |
+| Count records            |       147 ms |       0.81 MiB | Needletail    |    1.37x |      2.57x | Helicase     |    1.22x |      3.19x |
+| Aggregate statistics     |       280 ms |       0.81 MiB | Needletail    |    3.54x |      2.58x | SeqFu        |    1.70x |      6.41x |
+| Validate a file          |       216 ms |       0.79 MiB | fq            |    4.08x |      5.29x | fqtools      |   16.14x |      4.11x |
+| Validate a pair          |       435 ms |       1.06 MiB | fq            |    6.74x |     25.45x | -            |        - |          - |
+| Sample by fraction       |       237 ms |       0.98 MiB | IRMA Core     |    5.05x |      4.79x | Rasusa       |    0.99x |      4.61x |
+| Sample by count          |       421 ms |       1.34 MiB | IRMA Core     |    2.78x |      3.50x | Rasusa       |    1.00x |      7.78x |
+| Sample pairs by fraction |       438 ms |       1.29 MiB | IRMA Core     |    3.71x |      3.35x | Rasusa       |    0.77x |      3.57x |
+| Interleave a pair        |       471 ms |       1.06 MiB | IRMA Core     |    3.06x |      3.81x | fqkit        |    1.12x |     13.10x |
+| Deinterleave a pair      |       782 ms |       1.06 MiB | IRMA Core     |    4.80x |      3.84x | fqkit        |    0.94x |     12.31x |
+| Trim a pair              |       3.41 s |      14.68 MiB | -             |        - |          - | fastp        |   10.97x |     75.88x |
+| QC tables for a pair     |       1.91 s |      10.17 MiB | -             |        - |          - | FastQC-Rust  |    2.13x |      2.83x |
 
-| Suite | Report | Compared fact |
-| ----- | ------ | ------------- |
-| [`count`](count/) | [REPORT.md](count/REPORT.md) | record count integer |
-| [`stats`](stats/) | [REPORT.md](stats/REPORT.md) | human stats block (lengths, ACGTN, GC, arithmetic Phred, Q20/Q30) |
-| [`check`](check/) | [REPORT.md](check/REPORT.md) | FASTQ structure, symbols, quality, and pair semantics |
-| [`sample`](sample/) | [REPORT.md](sample/REPORT.md) | source-ordered subset; exact `min(K,N)` or pair-complete fraction |
-| [`interleave`](interleave/) | [REPORT.md](interleave/REPORT.md) | validated pair-complete interleaved stdout in source order |
-| [`deinterleave`](deinterleave/) | [REPORT.md](deinterleave/REPORT.md) | validated pair-complete split into two files in source order |
+- A *complete* tool does the whole job z-fastq does, checks included; a *partial* one does part of it (fewer checks, or no reads written). Partial tools are shown, never ranked with complete ones.
+- Times and memory: z-fastq's own, then each tool's as a multiple of z-fastq's; geometric means over the 1 GiB plain inputs, every tool on one CPU.
 
-Each suite builds one ReleaseFast z-fastq binary at `zig-out/bin/z-fastq`.
+## How the numbers are taken
 
-## Run
+Every tool's output is checked against an independent truth before any timing; a tool is timed only on the inputs it got right. Each case runs every tool in one batch, on one pinned CPU each (threaded variants on as many physical cores as threads), with the input in the page cache. Wall time comes from the runner, peak memory and CPU time from the kernel for the tool alone. Peak RSS can lag the true peak by up to about 0.5 MiB, so smaller memory differences are inconclusive.
 
-```bash
-tools/install.sh all
-tools/install.sh --check all
-bash bench/shared/download_data.sh
-bash bench/count/run.sh
-bash bench/shared/download_data.sh --suite stats
-bash bench/stats/run.sh
-bash bench/shared/download_data.sh --suite check
-bash bench/check/run.sh
-bash bench/shared/download_data.sh --suite sample
-bash bench/sample/run.sh
-bash bench/shared/download_data.sh --suite interleave
-bash bench/interleave/run.sh
-bash bench/shared/download_data.sh --suite deinterleave
-bash bench/deinterleave/run.sh
-```
+## Broken input
 
-Publication sampling (also each `run.sh` default): **5000 ms, 25 runs, 5 warmups**. Zebrac stops when both duration and min-samples are met. Zebrac and every timed command run pinned to one CPU with `taskset -c $ZEBRAC_CPU` (default 4). Children inherit the affinity, so runtime and helper threads in peers share that core.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="summary/02-broken-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="summary/02-broken-light.png">
+    <img src="summary/02-broken-light.png" alt="Of the malformed inputs each tool was given, how many it rejected" width="100%">
+  </picture>
+</p>
 
-Bring-up:
+| Tool           | Given | Rejected | Passed on, exit 0 | Crashed |
+| -------------- | ----: | -------: | ----------------: | ------: |
+| z-fastq        |    54 |       54 |                 0 |       0 |
+| IRMA Core      |    21 |       21 |                 0 |       0 |
+| Needletail     |    16 |       16 |                 0 |       0 |
+| fqtools        |    28 |       22 |                 6 |       0 |
+| fastQValidator |     9 |        7 |                 2 |       0 |
+| Rasusa         |     9 |        7 |                 2 |       0 |
+| fq             |    18 |       13 |                 5 |       0 |
+| FastQC         |     2 |        1 |                 1 |       0 |
+| FastQC-Rust    |     2 |        1 |                 1 |       0 |
+| Helicase       |    16 |        8 |                 4 |       4 |
+| SeqFu          |    28 |       11 |                17 |       0 |
+| SeqKit         |    18 |        7 |                11 |       0 |
+| Fasten         |     9 |        2 |                 7 |       0 |
+| fqkit          |    21 |        2 |                19 |       0 |
+| fastp          |     6 |        0 |                 6 |       0 |
+| seqtk          |    31 |        0 |                31 |       0 |
 
-```bash
-bash bench/count/run.sh --small-real --runs 5 --warmup 3
-bash bench/stats/run.sh --small-real --runs 5 --warmup 3
-bash bench/check/run.sh --small-real --runs 5 --warmup 3
-bash bench/sample/run.sh --small-real --runs 5 --warmup 3
-bash bench/interleave/run.sh --small-real --runs 5 --warmup 3
-bash bench/deinterleave/run.sh --small-real --runs 5 --warmup 3
-```
+A tool that passes a broken record on with exit 0 leaves a script no way to tell; z-fastq stops with the record, byte offset, and rule it broke.
 
-Count `--small-real` uses MiniSeq R1 and PacBio CCS in the Dense and Long slots, not SRR1810900 or DRR217704. Stats `--small-real` times DenseSmall, Variable, and HiFi; publication stats also times Long and PairR1. Stats never times Dense: every quality byte is `?`.
+## One core against many
 
-Check `--small-real` uses the small SE, paired, Casava, slash-name, interleaved, and concatenated-gzip rows. The suite still has one runner and one REPORT.md; the showcase is four families so they are not one race. SE geometry (small: DenseSmall / Variable / HiFi; publication: Dense / Variable / Long / HiFi) is the occupancy and efficiency analog of count/stats. Pair layout is `--paired` vs `--interleaved` on the same mates. Name policy is SRA-style paired names vs Casava `1:N:0:` / `2:N:0:` vs `@id/1` / `@id/2` on the same MiniSeq sequences. Concat gzip is two DenseSmall members, timed only for z-fastq. External validators (`fq lint --lint-mode panic`, `fastQValidator --minReadLen 0`, `seqfu check --deep --quiet`, `fqtools -d -a -u -l -q s validate`) are timed only on positive workloads they accept; fixture disagreement is recorded and does not fail the run. SeqKit, seqtk, Needletail, Helicase, fastp, and BBTools are not timed here.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="summary/03-threads-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="summary/03-threads-light.png">
+    <img src="summary/03-threads-light.png" alt="Wall time of the other tools by thread count against z-fastq on one core" width="100%">
+  </picture>
+</p>
 
-Sample `--small-real` uses the small SE, paired, and interleaved rows, each timed as `--fraction 0.1` and `--count 1000` with seed 11. The showcase is four families so they are not one race: SE fraction, SE exact-count (occupancy on each, separately), pair-layout fraction, and pair-layout count. seqtk `sample` / `sample -2` is the screened SE exact reference (LF, nonempty, bare plus; not Dense named-plus). Descriptive timed peers are SeqKit, Rasusa, `fq subsample`, fqkit (exact SE only), and IRMA Core (plain SE and paired only). BBTools `reformat.sh` is disabled: its JVM used two to four cores even with `threads=1`. SeqKit RSS is the Go image and is omitted from occupancy. Fasten is not timed (stdin-only, no seed). IRMA gzip is probed and not timed: gzip and plain select different records. IRMA interleaved is not timed: one file is SE records, not pair units. File-writing peers sink to `/dev/null`.
+| Job                  | Tool        | 1 thread |       2 |      4 |      8 |     16 |
+| -------------------- | ----------- | -------: | ------: | -----: | -----: | -----: |
+| Trim a pair          | z-fastq     |   3.41 s |       - |      - |      - |      - |
+| Trim a pair          | fastp       |  37.40 s | 17.51 s | 9.14 s | 5.06 s | 3.55 s |
+| QC tables for a pair | z-fastq     |   1.91 s |       - |      - |      - |      - |
+| QC tables for a pair | FastQC-Rust |   4.07 s |  2.23 s | 1.86 s | 1.69 s | 2.32 s |
+| QC tables for a pair | FastQC      |  22.10 s | 17.64 s | 8.82 s | 5.48 s | 5.46 s |
 
-Interleave `--small-real` uses DenseSmall + PairSmallR2; publication uses PairR1 + PairR2. One family: two mate files → validated interleaved stdout. Casava names, slash names, and mixed gzip are fixtures, not a second race. seqtk `mergepe` is the screened exact layout reference (LF, nonempty, bare plus). Descriptive timed peers are SeqFu `interleave -c` (first-token check, not z-fastq illumina), fqkit `merge`, and IRMA Core `xleave` (gzip timed: layout zip, not a sampler RNG). BBTools `reformat.sh` is disabled: its JVM used two to four cores even with `threads=1`. SeqKit `pair` is not timed: two output files, not interleaved stdout. SeqFu interleave is one process and is included in occupancy.
+Wall time on the 1 GiB plain inputs; z-fastq runs on one core. The process report gives CPU time at each count.
 
-Deinterleave `--small-real` uses InterleavedSmall; publication uses Interleaved. One family: one interleaved file → two mate files. Casava names and slash names are fixtures, not a second race. seqtk `seq -l 0 -1`/`-2` is the screened positional layout reference (LF, nonempty, bare plus) and is not timed: two processes, odd/even records, no pair-name check. Descriptive timed peers are SeqFu `deinterleave -c` (`-c` did not reject slash or P001 here; unlike SeqFu interleave `-c` on slash), fqkit `split` (positional; odd extra R1 is unequal counts), and IRMA Core `xleave` (gzip timed: layout split; rejects P001 stem mismatch and odd count). BBTools `reformat.sh` and its fixture check are disabled: its JVM used two to four cores even with `threads=1`. SeqKit `split2` is not timed: size/parts, not R1/R2. z-fastq exclusive-create cannot reuse `/dev/null`; timed runs write two files to tmpfs and a companion reaper unlinks the known output names so zebrac can repeat the same argv. SeqFu deinterleave is one process and is included in occupancy.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="summary/04-threads-memory-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="summary/04-threads-memory-light.png">
+    <img src="summary/04-threads-memory-light.png" alt="The threaded runs on time against memory, relative to z-fastq on one core" width="100%">
+  </picture>
+</p>
 
-Timed argv is the tool. Do not wrap in `bash -c` or a pipeline; that measures the shell. Plain vs gzip are separate sections. Gzip throughput is decoded FASTQ MiB/s.
+| Job                  | Tool        |   1 thread |          2 |          4 |          8 |         16 |
+| -------------------- | ----------- | ---------: | ---------: | ---------: | ---------: | ---------: |
+| Trim a pair          | z-fastq     |   14.7 MiB |          - |          - |          - |          - |
+| Trim a pair          | fastp       | 1113.6 MiB | 1150.6 MiB | 1186.1 MiB | 1249.5 MiB | 1355.2 MiB |
+| QC tables for a pair | z-fastq     |   10.2 MiB |          - |          - |          - |          - |
+| QC tables for a pair | FastQC-Rust |   28.8 MiB |   44.3 MiB |   63.5 MiB |   63.2 MiB |   60.7 MiB |
+| QC tables for a pair | FastQC      |  251.0 MiB |  347.0 MiB |  379.2 MiB |  702.3 MiB |  717.3 MiB |
 
-## Binaries
+Peak memory of the same runs. Threads buy the other tools wall time, never memory: at the thread count where a tool first matches z-fastq's time, it still holds many times z-fastq's memory.
 
-Stripped Linux x86-64 sizes on 2026-09-15; the z-fastq row is from 2026-09-30, using Zipir 0.2.1 with unused networking code and unwind tables disabled. Adapters are my wrappers, not upstream CLIs. BBTools is the retained class tree, not one ELF.
+## Where z-fastq is not fastest
 
-| Binary | Version | Bytes | This host |
-| ------ | ------- | ----: | --------- |
-| z-fastq | 0.0.18 | 544,928 | static |
-| seqtk | 1.5-r133 | 77,600 | `libz`, `libm`, `libc` |
-| FastQValidator | 0.1.1a | 169,120 | `libz`, `libstdc++`, `libgcc_s`, `libm`, `libc` |
-| Needletail adapter | 0.7.3 | 425,896 | `libgcc_s`, `libc` |
-| Helicase adapter | 0.2.0 | 428,944 | `libgcc_s`, `libc` |
-| Fasten `fasten_sample` | 0.9.0 | 470,336 | `libgcc_s`, `libc` |
-| fqtools | 2.3 + HTSlib 1.24 | 905,088 | `libz`, `libm`, `libc` (HTSlib in the binary) |
-| SeqFu | 1.27.1 | 1,673,280 | `libz`, `libm`, `libc` |
-| IRMA Core | 0.10.1 | 2,485,768 | `libgcc_s`, `libpthread`, `libm`, `libdl`, `libc` |
-| fq | 0.12.0 | 2,740,832 | `libgcc_s`, `libpthread`, `libm`, `libc` |
-| fastp | 1.3.7 | 3,007,424 | static |
-| Rasusa | 5.1.0 | 5,640,352 | `libgcc_s`, `librt`, `libpthread`, `libdl`, `libc` |
-| fqkit | 0.4.14 | 6,007,128 | `liblzma`, `libz`, `libbz2`, `libgcc_s`, plus fontconfig/freetype/harfbuzz/png/xml/glib |
-| SeqKit | 2.13.0 | 20,076,696 | static |
-| BBTools | 40.02 | 19,359,140 | Java class tree; needs a JVM |
+- **Sample by fraction:** Rasusa (partial) takes 0.99x z-fastq's time, with 4.6x its memory.
+- **Sample pairs by fraction:** Rasusa (partial) takes 0.77x z-fastq's time, with 3.6x its memory.
+- **Deinterleave a pair:** fqkit (partial) takes 0.94x z-fastq's time, with 12.3x its memory.
+- **QC tables for a pair:** FastQC-Rust at 4 threads takes 0.97x z-fastq's time on one core, for 2.4x its CPU time.
 
-seqtk is the smallest file (`libz` at runtime). z-fastq is larger because it is static, with the Zipir gzip decoder compiled in. The ISA-L build it replaced was 783,168 bytes.
+## Feature reports
 
-## Targets
+- [count](count/README.md): Counting records; timed 2026-10-28, z-fastq 0.2.0, source at 246bbb1.
+- [stats](stats/README.md): Aggregate statistics; timed 2026-10-28, z-fastq 0.2.0, source at 246bbb1.
+- [check](check/README.md): Validating FASTQ files; timed 2026-10-28, z-fastq 0.2.0, source at 246bbb1.
+- [sample](sample/README.md): Sampling records; timed 2026-10-28, z-fastq 0.2.0, source at 246bbb1.
+- [layout](layout/README.md): Converting paired layouts; timed 2026-10-28, z-fastq 0.2.0, source at 246bbb1.
+- [process](process/README.md): Processing paired reads; timed 2026-10-29, z-fastq 0.2.0, source at 246bbb1.
 
-`yes` = author ships or documents that OS/arch. `pkg` = Bioconda/conda only. `cargo` = `cargo install` / compile. `—` = not stated. `no` = author or this project says no. I have only run the Linux x86-64 column.
+## Limits
 
-| Binary | linux amd64 | linux arm64 | macOS amd64 | macOS arm64 | Windows |
-| ------ | ----------- | ----------- | ----------- | ----------- | ------- |
-| z-fastq | yes | no | no | no | no |
-| seqtk | yes | pkg | — | pkg | — |
-| FastQValidator | yes | — | — | — | — |
-| Needletail | yes | — | CI wheels | CI wheels | — |
-| Helicase | yes (AVX2/SSE3) | NEON | — | NEON | — |
-| Fasten | yes | cargo | cargo | cargo | cargo |
-| fqtools | yes | pkg | pkg | pkg | — |
-| SeqFu | yes | — | yes | Darwin zip | no |
-| IRMA Core | yes | — | — | — | — |
-| fq | yes | — | yes | — | yes |
-| fastp | yes | — | compile | compile | — |
-| Rasusa | yes | yes | yes | yes | — |
-| fqkit | cargo | cargo | cargo | cargo | cargo |
-| SeqKit | yes | yes | yes | yes | yes |
-| BBTools | JVM | JVM | JVM | JVM | JVM |
+- One CPU per tool in every comparison except the threads figure; a tool built for many cores may do better with them.
+- The real-run groups are uneven: three short fixed-length runs, one variable-length run, one synthetic shape per job.
+- Copying a pair (the process report's first part) is the cost floor of `process`, not a job of its own, so it is not in the job figure.
 
-Needletail and Helicase are libraries; I time Linux x86-64 adapters. Helicase wants AVX2, SSE3, or NEON. fastp's Linux binary is the documented prebuilt; macOS is compile/conda.
-
-## Dependencies
-
-Runtime shared libraries on this install, then what the build actually pulls in.
-
-| Binary | Runtime libs | Stack |
-| ------ | ------------ | ----- |
-| z-fastq | none | Zig std + Zipir 0.2.1 gzip (Zig package pinned by hash) |
-| seqtk | `libz` | one C file |
-| FastQValidator | `libz`, libstdc++ | libStatGen |
-| Needletail adapter | libc, libgcc | 11 crates (`flate2`) |
-| Helicase adapter | libc, libgcc | 12 crates (`deko`, `memmap2`, `flate2`) |
-| Fasten | libc, libgcc | Rust crate graph |
-| fqtools | `libz` | HTSlib 1.24 (bz2/lzma/curl off in my recipe) |
-| SeqFu | `libz` | Nim 2.2.12 + 16 Nimble packages |
-| IRMA Core | libc, libgcc, libpthread, libdl | upstream Rust release |
-| fq | libc, libgcc, libpthread | upstream Rust release |
-| fastp | none (static) | ISA-L + libdeflate + Highway when built from source |
-| Rasusa | libc, libgcc, libpthread, libdl | upstream Rust release |
-| fqkit | zlib, lzma, bz2, font stack | Rust + plotters/GUI libs |
-| SeqKit | none (static) | Go, many codecs in-binary |
-| BBTools | JVM | Java runtime + class tree |
-
-z-fastq: no loader; Zipir is a pinned Zig package compiled into the static binary. seqtk is the shallowest dynamic C peer. fqtools is HTSlib. fqkit and SeqFu are the heavy package graphs. BBTools is a JVM.
-
-## Files
-
-`bench/shared/` has `tools.sh`, `catalog.sh`, `datasets.manifest`, `features.tsv`, `download_data.sh`, and `generate_derived.sh`. Cache and downloads are gitignored. After a full publication run, commit each suite's `REPORT.md` plus `results/figures/*.png`.
-
-Each suite's `generate_report.py` is the report and plot renderer. The shared shell scripts prepare registry selections, FASTQ files, and JSON metadata; they do not parse zebrac results or draw figures.
-
-The shared catalog is for every comparison, not only `count`. `features.tsv` assigns ids per suite, set, and role. `count` times three SE shapes and also checks a two-member concat gzip. Pair, interleaved, Casava, and slash-name files are for `check`, `sample`, `interleave`, and `deinterleave`. IUPAC, lowercase, empty records, and CRLF stay in `tests/data/synthetic`.
-
-| Id | Accession | What it is | Count | Stats | Check | Sample | Interleave | Deinterleave |
-| -- | --------- | ---------- | ----- | ----- | ----- | ------ | ---------- | ------------ |
-| Dense | SRR1810900 | HiSeq 2500 ChIP-seq, 24.5M x 50 bp, named plus, Q=`?`. Plain ~6.1 GiB. | publication volume | no (constant Q) | SE | SE | no | no |
-| DenseSmall | SRR10325788 R1 | MiniSeq, 60,910 x 153 bp, bare plus. Pair-small left. | `--small-real` dense | real Illumina Q | SE / pair left | SE / pair | pair-small | no |
-| PairSmallR2 | SRR10325788 R2 | MiniSeq mate | ConcatGzip dep | with R1 | `--paired` | `--paired` | pair-small | no |
-| Variable | ERR164407 | 454 GS FLX Titanium, 40-631 bp (mean 345). | mixed-length | min/max/mean | SE | SE | no | no |
-| Long | DRR217704 | MinION Klebsiella WGS, 21,247 reads, 17-92,337 bp (mean 7,435). | publication long | length and Q | SE | SE | no | no |
-| HiFi | DRR054114 | PacBio CCS, 1,114 reads, 863-7274 bp. | `--small-real` long | CCS Q | SE | `--small-real` SE | no | no |
-| PairR1 / PairR2 | ERR5404925 | MiSeq, 349,760 pairs, trimmed 30-151 bp. | no | PairR1 lengths | `--paired` | `--paired` | publication pair | no |
-| ConcatGzip | derived | DenseSmall as two gzip members. | agreement check | no | gzip members | no | no | no |
-| InterleavedSmall | derived | MiniSeq R1/R2 interleaved. | no | no | `--interleaved` | `--interleaved` | no | small |
-| Interleaved | derived | ERR5404925 interleaved. | no | no | `--interleaved` | `--interleaved` | no | publication |
-| CasavaR1 / CasavaR2 | derived | MiniSeq bases, Casava `1:N:0:` / `2:N:0:` names. | no | no | `--pair-names illumina` | no | no | no |
-| SlashR1 / SlashR2 | derived | MiniSeq bases, `@id/1` / `@id/2`. | no | no | illumina vs exact | no | no | no |
+## Reproduce
 
 ```bash
-bash bench/shared/download_data.sh                     # count publication (+ ConcatGzip)
-bash bench/shared/download_data.sh --small             # count bring-up
-bash bench/shared/download_data.sh --suite stats
-bash bench/shared/download_data.sh --suite stats --small
-bash bench/shared/download_data.sh --suite check --small
-bash bench/shared/download_data.sh --suite check
-bash bench/shared/download_data.sh --suite sample --small
-bash bench/shared/download_data.sh --suite sample
-bash bench/shared/download_data.sh --suite interleave --small
-bash bench/shared/download_data.sh --suite interleave
-bash bench/shared/download_data.sh --suite deinterleave --small
-bash bench/shared/download_data.sh --suite deinterleave
-bash bench/shared/download_data.sh --all
+bench/process/run.sh release    # one feature: checks, timing, its README (each feature has its own run.sh)
+bench/process/run.sh summary    # this page, from every feature's report tables
 ```
-
-Old GridION amplicon ERR5404926 (400-700 bp) is not Long. `download_data.sh` replaces `REAL_Long.fastq.gz` when the recorded source URL does not match DRR217704.

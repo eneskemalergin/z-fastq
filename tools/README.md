@@ -14,32 +14,56 @@ tools/install.sh --list
 
 The scripts prepare the tools needed by local comparison workflows. They do not change the shell or install system packages.
 
+Builds and staging use a fresh directory under `/var/tmp`. Cleanup records generated paths and removes unchanged recorded files with `rm`, then empty directories with `rmdir`. Changed or unexpected files, including partial build outputs created after the last recording, remain at the printed path for inspection. `KEEP_TOOL_WORK=1` retains the build directory. Older installations, earlier staging directories, and incomplete Python environments are retained; the installer does not remove them automatically.
+
+Smoke checks remove their explicitly named outputs. FastQC data is checked directly inside its ZIP without extracting the report tree.
+
 ## Current tools
 
-The rows below list the pinned comparison tools, the retained Linux x86-64 size, and their roles. The sizes were measured from the current local installation on 2026-09-15. Compiled-tool values are exact byte lengths of the stripped executable linked from `tools/bin/`. The BBTools value is the sum of regular files in its retained runtime tree because BBTools is a Java class tree rather than one executable. Versions are defined by `tools/versions.sh`.
+The table lists the pinned comparison tools and the retained Linux x86-64 size of each pinned version. Compiled-tool values are exact byte lengths of the stripped executable linked from `tools/bin/`. The BBTools value is the sum of regular files in its retained runtime tree because BBTools is a Java class tree rather than one executable. The FastQC value is the same kind of sum because FastQC is a Java distribution with a Python launcher rather than one executable. Versions are defined by `tools/versions.sh`.
 
-| Tool                 |              Version | Size (bytes) | Use here                                                      |
-| -------------------- | -------------------: | -----------: | ------------------------------------------------------------- |
-| `seqtk`              |             1.5-r133 |       77,600 | Count reference, compatible sampling, and interleave delivery |
-| `FastQValidator`     |               0.1.1a |      169,120 | Descriptive validation peer                                   |
-| `Fasten`             |                0.9.0 |      470,336 | Plain interleaved probability sampling                        |
-| `Needletail adapter` |                0.7.3 |      425,896 | One-worker parser checks for count and aggregate stats        |
-| `Helicase adapter`   |                0.2.0 |      428,944 | One-worker parser checks for count and aggregate stats        |
-| `fqtools`            | 2.3 with HTSlib 1.24 |      905,088 | Independent count and validation cases                        |
-| `SeqFu`              |               1.27.1 |    1,673,280 | Count, stats, check, interleave, and deinterleave             |
-| `IRMA Core`          |               0.10.1 |    2,485,768 | Exact sampling, interleave, and deinterleave                  |
-| `fq`                 |               0.12.0 |    2,740,832 | Validation and paired sampling reference                      |
-| `fastp`              |                1.3.7 |    3,007,424 | Short-read QC and preprocessing peer                          |
-| `Rasusa`             |                5.1.0 |    5,640,352 | Paired sampling and broader sampling peer                     |
-| `fqkit`              |               0.4.14 |    6,007,128 | Interleave, deinterleave, stats, sampling, and sharding       |
-| `SeqKit`             |               2.13.0 |   20,076,696 | Broad stats, sampling, pairing, and conversion peer           |
-| `BBTools`            |                40.02 |   19,359,140 | Sampling, pair validation, interleave, and deinterleave       |
+| Tool                 |              Version | Size (bytes) |
+| -------------------- | -------------------: | -----------: |
+| `seqtk`              |             1.5-r133 |       77,552 |
+| `FastQValidator`     |               0.1.1a |      169,072 |
+| `Fasten`             |                0.9.0 |      470,288 |
+| `Needletail adapter` |                0.7.3 |      425,912 |
+| `Helicase adapter`   |                0.2.0 |      428,944 |
+| `fqtools`            | 2.3 with HTSlib 1.24 |      905,048 |
+| `SeqFu`              |               1.29.0 |    2,227,064 |
+| `IRMA Core`          |               0.11.0 |    2,601,752 |
+| `fq`                 |               0.12.0 |    2,740,832 |
+| `fastp`              |                1.4.0 |    3,007,424 |
+| `Rasusa`             |                5.1.0 |    5,640,352 |
+| `fqkit`              |               0.4.14 |    6,007,912 |
+| `fastqc-rust`        |                1.1.0 |    6,278,600 |
+| `FastQC`             |               0.13.0 |   14,418,443 |
+| `SeqKit`             |               2.14.0 |   20,473,816 |
+| `BBTools`            |                40.05 |   27,434,020 |
 
-The table describes local comparison inputs; it does not rank the tools.
+What each tool is used for here:
+
+- `seqtk`: count reference, compatible sampling, and interleave delivery.
+- `FastQValidator`: descriptive validation peer.
+- `Fasten`: plain interleaved probability sampling.
+- Needletail and Helicase adapters: one-worker parser checks for count and aggregate stats.
+- `fqtools`: independent count and validation cases.
+- `SeqFu`: count, stats, check, interleave, and deinterleave.
+- `IRMA Core`: exact sampling, interleave, and deinterleave.
+- `fq`: validation and paired sampling reference.
+- `fastp`: short-read QC and preprocessing peer.
+- `Rasusa`: paired sampling and broader sampling peer.
+- `fqkit`: interleave, deinterleave, stats, sampling, and sharding.
+- `SeqKit`: broad stats, sampling, pairing, and conversion peer.
+- `BBTools`: sampling, pair validation, interleave, and deinterleave.
+- `FastQC`: descriptive Java QC report peer.
+- `fastqc-rust`: descriptive Rust QC report peer with Java matching text output.
+
+This list describes local comparison inputs; it does not rank the tools.
 
 ## Report Python and zebrac
 
-`tools/venv` is also the report environment. `tools/install.sh` (or `tools/install.sh venv`) installs pinned matplotlib 3.10.6, pandas 3.0.1, and tabulate 0.10.0 into that venv. Bench scripts call `tools/venv/bin/python` and do not use a second virtualenv.
+`tools/venv` is also the report environment. `tools/install.sh` (or `tools/install.sh venv`) installs pinned matplotlib 3.11.2, pandas 3.0.6, and tabulate 0.10.0 into that venv. Bench scripts call `tools/venv/bin/python` and do not use a second virtualenv.
 
 The benchmark runner is [zebrac](https://github.com/eneskemalergin/zebrac). Keep the Linux binary at `tools/zebrac`. `tools/install.sh --check zebrac` and `tools/install.sh --check all` verify that path; they do not download or build zebrac.
 
@@ -52,11 +76,11 @@ tools/install.sh --check zebrac
 ## Tracked contents
 
 - `install.sh` prepares and checks external command installations, the report Python packages in `tools/venv`, and the presence of `tools/zebrac`.
-- `versions.sh` owns the selected tool versions.
+- `versions.sh` pins the selected tool versions.
 - `patches/` contains small source fixes required by pinned external recipes.
 - `wrappers/` contains adapters for tools that need a common comparison interface.
 
-## Scope of the comparisons
+## What the comparisons cover
 
 The tools support correctness checks and local development comparisons for overlapping FASTQ operations. A comparison must establish compatible output and failure behavior before timing anything.
 

@@ -1,63 +1,77 @@
 # Sampling
 
-`sample` writes selected FASTQ records to standard output. It supports a reproducible fraction mode and an exact-count mode. The two modes have different input requirements.
+`sample` writes a subset of the records to standard output, and gives the same subset every time it sees the same input and seed. That makes a sample something you can rerun, share, and compare, rather than a one-off.
 
-## Select a fraction
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/sampling-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/sampling-light.png">
+    <img alt="Fraction mode keeps each record on its own, about the requested share; count mode keeps exactly K records after a first pass." src="assets/sampling-light.png" width="680">
+  </picture>
+</p>
+<p align="center"><sub><b>Figure 1.</b> The two ways to sample. A fraction decides each record on its own, so the total varies a little; a count keeps exactly K records.</sub></p>
+
+## By fraction or by count
 
 ```bash
 z-fastq sample --fraction 0.1 --seed 42 reads.fastq.gz > sample.fastq
-```
-
-The selector makes one deterministic decision per record. The output count is therefore approximate, not an exact tenth of the input.
-
-Accepted fraction forms are `0`, `1`, decimals beginning with `0.`, and decimals beginning with `1.` whose remaining digits are zero. Percentages and scientific notation are not accepted.
-
-The default seed is `11`. Set it explicitly when you need the current selection to repeat:
-
-```bash
-z-fastq sample --fraction 0.01 --seed 2025 reads.fastq > sample-a.fastq
-z-fastq sample --fraction 0.01 --seed 2025 reads.fastq > sample-b.fastq
-cmp sample-a.fastq sample-b.fastq
-```
-
-The same seed and input record stream repeat the current selection. The project may change its generator before the `0.1.0` interface settles.
-
-## Select an exact count
-
-```bash
 z-fastq sample --count 1000 --seed 42 reads.fastq > sample.fastq
 ```
 
-The command selects `min(1000, record_count)` records. It uses two passes over a regular file, so exact-count mode rejects stdin. The selection state grows with the requested count, not with the size of the FASTQ file.
+**`--fraction P`** decides for each record on its own, in a single pass, so it works on pipes. You get about a share P of the records. A fraction is written `0`, `1`, `0.` and digits, or `1.` and zeros; percentages and scientific notation are refused.
 
-## Sample pairs
+**`--count K`** keeps exactly K records, or every record when there are fewer. It reads the file twice, once to count and once to write, so it needs a regular file rather than a pipe.
 
-For two mate files, the output is an interleaved stream:
+`--fraction 0` and `--count 0` write nothing; they only validate the input.
 
-```bash
-z-fastq sample --paired --fraction 0.1 --seed 42 R1.fastq R2.fastq > sample.interleaved.fastq
-```
+## Seeds
 
-For an already interleaved input:
+The seed is 11 unless you set it. The same seed, input, and options always select the same records:
 
 ```bash
-z-fastq sample --interleaved --count 1000 --seed 42 reads.interleaved.fastq > sample.interleaved.fastq
+z-fastq sample --fraction 0.01 --seed 2025 reads.fastq > a.fastq
+z-fastq sample --fraction 0.01 --seed 2025 reads.fastq > b.fastq
+cmp a.fastq b.fastq
 ```
 
-The pair is the sampling unit. z-fastq never selects R1 and R2 independently. Paired exact-count sampling requires regular file paths for both mates.
+This holds within a version of z-fastq; pin the version when exact records must stay the same across upgrades.
 
-## Validation and partial output
-
-z-fastq validates records before writing selected records. A later malformed record can still leave earlier output on stdout. Do not replace a trusted file until the command succeeds:
+## Pairs
 
 ```bash
-if z-fastq sample --fraction 0.1 --seed 42 reads.fastq > sample.tmp.fastq; then
-    mv sample.tmp.fastq sample.fastq
-else
-    rm -f sample.tmp.fastq
-    exit 1
-fi
+z-fastq sample --paired --fraction 0.1 --seed 42 R1.fastq R2.fastq > sample.fastq
+z-fastq sample --interleaved --count 1000 --seed 42 interleaved.fastq > sample.fastq
 ```
 
-This is a stream-oriented command. It does not write gzip output. Pipe the completed stream through `gzip` when needed.
+The pair is the unit: both mates are kept or neither. The output is one interleaved stream, mate 1 then mate 2, which [`deinterleave`](Interleaving#deinterleave) splits back into two files.
 
+## Memory and safety for exact counts
+
+An exact count remembers a small entry for each chosen record, never the reads themselves, so its memory follows K rather than the size of the file:
+
+```math
+\text{memory} \approx 4\ \text{bytes} \times K
+```
+
+Past $`2^{32}`$ records an entry takes 8 bytes. In practice `--count 10000000` holds about 40 MB.
+
+Because the file is read twice, it must not change in between. z-fastq compares its inode, size, and modification time across the two passes and stops with `input changed during exact sampling` if any differs; a rewrite that keeps all three is not detected.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/sample/results/figures/fraction-overview-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/sample/results/figures/fraction-overview-light.png">
+    <img alt="Wall time and peak memory of other samplers relative to z-fastq for fraction sampling, plain and gzip input." src="https://raw.githubusercontent.com/eneskemalergin/z-fastq/main/bench/sample/results/figures/fraction-overview-light.png" width="760">
+  </picture>
+</p>
+<p align="center"><sub><b>Figure 2.</b> Fraction sampling: time and peak memory relative to z-fastq. The tools faster than z-fastq here check less of each record; the <a href="https://github.com/eneskemalergin/z-fastq/blob/main/bench/sample/README.md">sample benchmark</a> shows where, and how exact counts compare.</sub></p>
+
+## Output
+
+The output is plain FASTQ; pipe it to `gzip` for compression. Records are written as they are chosen, so a malformed record late in the input fails the run after earlier records were written. Write to a temporary file and keep it only on success ([Automation](Automation#partial-output)).
+
+## Related pages
+
+- [Paired reads](Paired-Reads): how mates are matched before a pair is kept.
+- [Interleaving](Interleaving): splitting a paired sample back into R1 and R2.
+- [Recipes](Recipes#take-a-paired-subset-as-two-files): a paired subset as two files in one line.

@@ -1,16 +1,28 @@
 # Installation
 
-## Supported build
+Each [release](https://github.com/eneskemalergin/z-fastq/releases) has a ready-made static binary for Linux on x86-64 and on aarch64; anything else is built from source with Zig.
 
-The supported build is:
+## Download a release
 
-- Linux x86-64.
-- Zig `0.16.0`.
-- Network access for the first build, which downloads the pinned Zipir package.
+```bash
+curl -fLO https://github.com/eneskemalergin/z-fastq/releases/download/v0.2.0/z-fastq-0.2.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/eneskemalergin/z-fastq/releases/download/v0.2.0/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf z-fastq-0.2.0-linux-x86_64.tar.gz
+./z-fastq-0.2.0-linux-x86_64/z-fastq --version
+```
 
-Release builds are static. gzip input is decoded by [Zipir](https://github.com/eneskemalergin/zipir), a Zig package that `build.zig.zon` pins to its `v0.2.1` release archive and package hash. The build needs no NASM, C compiler, or system zlib.
+On an ARM machine, use `linux-aarch64` in place of `linux-x86_64`. The archive holds the binary and its license. It needs no libraries, so copy it into a directory on your `PATH`. With the [GitHub CLI](https://cli.github.com/), `gh attestation verify z-fastq-0.2.0-linux-x86_64.tar.gz --repo eneskemalergin/z-fastq` also confirms the archive was built by this repository's release workflow.
 
-## Build a release binary
+## Build from source
+
+The build needs nothing beyond Zig itself: no C compiler, no NASM, and no system zlib, and the release build below is fully static.
+
+**You need**
+
+- Linux on x86-64 or aarch64.
+- [Zig](https://ziglang.org/download/) 0.16.0.
+- Network access for the first build, which downloads z-fastq's one package dependency, [zipir](https://github.com/eneskemalergin/zipir) 0.2.1. Later builds reuse it.
 
 From the repository root:
 
@@ -19,48 +31,36 @@ zig build -Dstatic=true -Doptimize=ReleaseFast
 ./zig-out/bin/z-fastq --version
 ```
 
-The current version prints:
+The second line prints `z-fastq 0.2.0`.
 
-```text
-z-fastq 0.0.18
-```
+- `-Doptimize=ReleaseSafe` keeps Zig's safety checks in the release build.
+- A plain `zig build` gives a debug build, for working on the code.
 
-For a safety-checked static build, use `ReleaseSafe`:
+The binary stays in `zig-out/bin/`; there is no package-manager install yet. Copy or link it into a directory on your `PATH` to call it as `z-fastq`.
 
-```bash
-zig build -Dstatic=true -Doptimize=ReleaseSafe
-```
+## Faster code on newer CPUs
 
-Use `Debug` while changing the project:
+The x86-64 release binary runs on any x86-64 CPU and switches to faster code where the CPU allows: PCLMUL and SSE4.1 for the gzip checksum, and AVX2 for line search, validation, and base and quality counting on records of 1 KiB or more. The output is identical either way. The aarch64 release binary runs on any ARMv8-A CPU and selects nothing at run time.
 
-```bash
-zig build
-```
-
-## Portable checksum kernels
-
-The release binary is compiled for generic x86-64. By default Zipir picks its checksum kernels at run time for the CPU the binary runs on: gzip CRC-32 uses PCLMUL and SSE4.1 when available. To build only the portable kernels:
+<details>
+<summary>Build without run-time selection</summary>
 
 ```bash
 zig build -Dstatic=true -Doptimize=ReleaseFast -Dkernel-backend=portable
 ```
 
-The default is `-Dkernel-backend=dispatch`. This does not change the supported target or the output; the test suite passes with both settings.
+This build uses only the instructions of its target CPU. The default is `-Dkernel-backend=dispatch`, and the tests pass with both.
 
-## Run the tests
+</details>
+
+## Check the build
 
 ```bash
 zig build test --summary all
 ```
 
-The test step covers the parser, writer, count scanner, statistics, validation, sampling, paired operations, and installed CLI behavior.
+## Related pages
 
-## Use the binary from the build tree
-
-The project does not install a system-wide command. Run the binary from the build output:
-
-```bash
-./zig-out/bin/z-fastq stats reads.fastq
-```
-
-If you want `z-fastq` on your `PATH`, copy or link `zig-out/bin/z-fastq` into a directory you manage. The project does not provide a package-manager install path yet.
+- [Getting started](Getting-Started): a first run, command by command.
+- [Troubleshooting](Troubleshooting): when the build or the binary does not behave.
+- [For contributors](For-Contributors): the full set of test runs.

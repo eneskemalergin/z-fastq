@@ -1,10 +1,10 @@
 # Getting started
 
-This is the short path I recommend when you first try z-fastq. It starts with a tiny file so you can see what each command owns.
+This is the path I recommend for a first look: a tiny file, and one command at a time, so you can see exactly what each one does. It takes a few minutes, and assumes `z-fastq` is on your `PATH` ([Installation](Installation)).
 
-## 1. Create a FASTQ file
+## 1. Make a file
 
-Save this as `reads.fastq`:
+Save this as `reads.fastq`. It holds two records, one of five bases and one of three:
 
 ```fastq
 @read-1
@@ -17,75 +17,43 @@ GGC
 III
 ```
 
-The file has two records. The first sequence has five bases and the second has three.
-
-## 2. Check the file
+## 2. Check it
 
 ```bash
 z-fastq check reads.fastq
 ```
 
-There is no success message. A zero exit status means the input passed structural, sequence, and quality validation.
+Nothing is printed. For `check`, silence and exit status `0` mean the file is valid, which is exactly what a script wants. [Validation](Validation) explains what is checked.
 
-Try the narrower alphabet policy too:
-
-```bash
-z-fastq check --alphabet acgtn reads.fastq
-```
-
-This file passes because it contains only A, C, G, T, and N.
-
-## 3. Count the records
+## 3. Count and summarize it
 
 ```bash
 z-fastq count reads.fastq
-```
-
-Output:
-
-```text
-2
-```
-
-`count` is the command to use when you do not need to materialize or summarize the records.
-
-## 4. Read the summary
-
-```bash
 z-fastq stats reads.fastq
 ```
 
-The report includes read count, total bases, length range, nucleotide counts, GC fraction, and Phred quality summaries. [Counting and statistics](Counting-and-Statistics) defines each field.
+`count` prints `2`. `stats` adds bases, lengths, base composition, GC, and quality; [Counting and statistics](Counting-and-Statistics) explains each number.
 
-## 5. Read compressed input through the same command
+## 4. Read gzip and pipes
 
 ```bash
 gzip -c reads.fastq > reads.fastq.gz
 z-fastq stats reads.fastq.gz
-```
-
-z-fastq detects gzip from the input header. The `.gz` suffix is not what selects the decoder.
-
-## 6. Read from a pipe
-
-```bash
 gzip -dc reads.fastq.gz | z-fastq count -
 ```
 
-The `-` is explicit. z-fastq does not treat a missing path as standard input.
+z-fastq recognizes gzip by its first bytes rather than by the `.gz` name, and reads standard input only when you write `-` ([Input and output](Input-and-Output)).
 
-## 7. Make a repeatable sample
+## 5. Take a sample
 
 ```bash
-z-fastq sample --fraction 0.5 --seed 42 reads.fastq > sample.fastq
+z-fastq sample --fraction 0.5 --seed 3 reads.fastq > sample.fastq
 ```
 
-Use the same seed and input when you need the current selection to repeat. Read [Sampling](Sampling) before using exact-count mode or paired data.
+With seed 3 it keeps one of the two records. Run it again: the same seed and input always give the same records. [Sampling](Sampling) also covers exact counts and pairs.
 
-## What to read next
+## Where next
 
-- [Command cheat sheet](Command-Cheat-Sheet) for the complete invocation shapes.
-- [Validation](Validation) for error codes and alphabet policies.
-- [Paired reads](Paired-Reads) before processing R1 and R2 files.
-- [Input and output](Input-and-Output) for gzip, stdin, and output boundaries.
-
+- **Paired reads?** Read [Paired reads](Paired-Reads), then [Processing paired reads](Processing).
+- **A script or workflow?** Read [Automation](Automation) for exit statuses and partial output.
+- **An option?** The [Command cheat sheet](Command-Cheat-Sheet) has them all.

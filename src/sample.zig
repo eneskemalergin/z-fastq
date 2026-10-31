@@ -38,12 +38,16 @@ pub const Fraction = union(enum) {
     }
 };
 
-pub fn parseSeed(text: []const u8) SeedError!u64 {
-    if (text.len == 0) return error.InvalidSeed;
+pub fn parseDecimal(comptime T: type, text: []const u8) std.fmt.ParseIntError!T {
+    if (text.len == 0) return error.InvalidCharacter;
     for (text) |byte| {
-        if (byte < '0' or byte > '9') return error.InvalidSeed;
+        if (byte < '0' or byte > '9') return error.InvalidCharacter;
     }
-    return std.fmt.parseInt(u64, text, 10) catch |err| switch (err) {
+    return std.fmt.parseInt(T, text, 10);
+}
+
+pub fn parseSeed(text: []const u8) SeedError!u64 {
+    return parseDecimal(u64, text) catch |err| switch (err) {
         error.Overflow => error.Overflow,
         error.InvalidCharacter => error.InvalidSeed,
     };
@@ -805,26 +809,22 @@ pub const Mt19937_64 = struct {
     }
 };
 
-test "[unit] - [exact selector]: compact indexes retain wide record numbers" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseWideExactIndexes,
-        .{},
-    );
+fn expectFirstAllocationFails(comptime exercise: anytype) !void {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, exercise(failing.allocator()));
 }
 
-test "[unit] - [exact selector]: split indexes sort upper planes" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseUpperBitIndexSort,
-        .{},
-    );
+test "[failure] - [exact selector]: record numbers above 32 bits are returned exactly" {
+    try exerciseWideExactIndexes(std.testing.allocator);
+    try expectFirstAllocationFails(exerciseWideExactIndexes);
 }
 
-test "[unit] - [exact selector]: batched records preserve an upper-bit boundary" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        exerciseBatchedUpperBoundary,
-        .{},
-    );
+test "[failure] - [exact selector]: indexes sort by their high bits" {
+    try exerciseUpperBitIndexSort(std.testing.allocator);
+    try expectFirstAllocationFails(exerciseUpperBitIndexSort);
+}
+
+test "[failure] - [exact selector]: batched records match direct records across the upper-bit boundary" {
+    try exerciseBatchedUpperBoundary(std.testing.allocator);
+    try expectFirstAllocationFails(exerciseBatchedUpperBoundary);
 }

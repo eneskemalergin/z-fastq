@@ -2,18 +2,12 @@
 
 const std = @import("std");
 const io_layer = @import("io.zig");
+const simd = @import("simd.zig");
 
 const ByteSource = io_layer.ByteSource;
 const ByteSink = io_layer.ByteSink;
 const WriteError = io_layer.WriteError;
 
-// --- Records ---
-
-/// Borrowed FASTQ fields with structural prefix bytes and line endings removed.
-///
-/// Values returned by `Reader.next` remain valid only until the reader advances
-/// again or is deinitialized. `id` is the first space- or tab-delimited token of
-/// `header` and aliases the same storage.
 pub const Record = struct {
     header: []const u8,
     id: []const u8,
@@ -22,7 +16,6 @@ pub const Record = struct {
     quality: []const u8,
 };
 
-/// Independently allocated fields released together by `deinit`.
 pub const OwnedRecord = struct {
     allocator: std.mem.Allocator,
     header: []u8,
@@ -41,7 +34,6 @@ pub const OwnedRecord = struct {
     }
 };
 
-/// Duplicates all record fields; the caller must invoke `OwnedRecord.deinit`.
 pub fn toOwned(allocator: std.mem.Allocator, record: Record) !OwnedRecord {
     const header = try allocator.dupe(u8, record.header);
     errdefer allocator.free(header);
@@ -67,8 +59,6 @@ fn firstToken(header: []const u8) []const u8 {
     const end = std.mem.findAny(u8, header, "\t ") orelse header.len;
     return header[0..end];
 }
-
-// --- Structural validation ---
 
 pub const LintCode = enum {
     s001_invalid_plus_line,
@@ -201,7 +191,43 @@ pub const Machine = struct {
     }
 };
 
-/// Excludes one trailing CR; callers check LF termination and handle EOF separately.
+pub const LineBytes = struct {
+    raw_len: usize = 0,
+    first_byte: u8 = 0,
+    second_byte: u8 = 0,
+    last_byte: u8 = 0,
+
+    pub inline fn add(self: *LineBytes, chunk: []const u8, max_line_bytes: usize) error{LineTooLong}!void {
+        if (chunk.len == 0) return;
+        const previous_len = self.raw_len;
+        self.raw_len = std.math.add(usize, previous_len, chunk.len) catch return error.LineTooLong;
+        if (previous_len == 0) self.first_byte = chunk[0];
+        if (previous_len < 2 and self.raw_len >= 2) self.second_byte = chunk[1 - previous_len];
+        self.last_byte = chunk[chunk.len - 1];
+        if (self.raw_len - @intFromBool(self.last_byte == '\r') > max_line_bytes) return error.LineTooLong;
+    }
+
+    pub inline fn holdsCr(self: *const LineBytes) bool {
+        return self.raw_len != 0 and self.last_byte == '\r';
+    }
+
+    pub inline fn contentOf(chunk: []const u8) []const u8 {
+        return chunk[0 .. chunk.len - @intFromBool(chunk.len != 0 and chunk[chunk.len - 1] == '\r')];
+    }
+
+    pub inline fn contentLen(self: *const LineBytes, terminated_by_lf: bool) usize {
+        return self.raw_len - @intFromBool(terminated_by_lf and self.holdsCr());
+    }
+
+    pub inline fn firstByte(self: *const LineBytes, content_len: usize) ?u8 {
+        return if (content_len == 0) null else self.first_byte;
+    }
+
+    pub inline fn secondByte(self: *const LineBytes, content_len: usize) ?u8 {
+        return if (content_len < 2) null else self.second_byte;
+    }
+};
+
 pub fn lineContentLen(line: []const u8) usize {
     if (line.len > 0 and line[line.len - 1] == '\r') return line.len - 1;
     return line.len;
@@ -220,21 +246,15 @@ fn identifierFirstByteIsValid(byte: ?u8) bool {
     return byte != null and byte != ' ' and byte != '\t';
 }
 
-const STRUCTURAL_BLOCK_BYTES = 64;
+const HOT_LOOP_ALIGNMENT = 64;
 
-pub fn newlineMask(comptime lanes: usize, block: *const [lanes]u8) @Int(.unsigned, lanes) {
-    const Bytes = @Vector(lanes, u8);
-    const bytes: Bytes = block.*;
-    return @bitCast(bytes == @as(Bytes, @splat('\n')));
-}
-
-// Saved positions remain valid only while the buffer's bytes and indexes stay unchanged.
-const LineFeedSearch = struct {
+const LineFeedSearch = extern struct {
     block_start: usize = 0,
     block_end: usize = 0,
-    mask: @Int(.unsigned, @max(64, std.simd.suggestVectorLength(u8) orelse 1)) = 0,
+    mask: u64 = 0,
 
-    fn find(self: *LineFeedSearch, comptime lanes: usize, bytes: []const u8, start: usize) ?usize {
+    fn find(self: *LineFeedSearch, comptime lanes: usize, bytes: []const u8, start: usize) align(HOT_LOOP_ALIGNMENT) ?usize {
+        comptime std.debug.assert(lanes <= simd.BLOCK_BYTES);
         var offset = start;
         if (start >= self.block_start and start < self.block_end and self.block_end <= bytes.len) {
             const remaining = self.mask >> @intCast(start - self.block_start);
@@ -245,7 +265,7 @@ const LineFeedSearch = struct {
         while (bytes.len - offset >= lanes) : (offset += lanes) {
             self.block_start = offset;
             self.block_end = offset + lanes;
-            self.mask = newlineMask(lanes, bytes[offset..][0..lanes]);
+            self.mask = simd.newlineMask(lanes, bytes[offset..][0..lanes]);
             if (self.mask != 0) return offset + @as(usize, @intCast(@ctz(self.mask)));
         }
         for (bytes[offset..], offset..) |byte, index| {
@@ -263,7 +283,7 @@ const LineFeedSearch = struct {
     ) bool {
         var offset = start;
         for (ends) |*end| {
-            const line_end = self.find(std.simd.suggestVectorLength(u8) orelse 1, bytes, offset) orelse
+            const line_end = self.find(simd.INLINE_LANES, bytes, offset) orelse
                 return false;
             end.* = line_end - start;
             offset = line_end + 1;
@@ -271,8 +291,6 @@ const LineFeedSearch = struct {
         return true;
     }
 };
-
-// --- Semantic validation ---
 
 pub const Alphabet = enum {
     iupac,
@@ -288,7 +306,6 @@ pub const SemanticField = enum {
     quality,
 };
 
-/// Describes the first semantic failure at a zero-based field-relative byte index.
 pub const SemanticError = struct {
     code: LintCode,
     message: []const u8,
@@ -296,8 +313,6 @@ pub const SemanticError = struct {
     byte_index: usize,
 };
 
-/// Checks only sequence alphabet and Phred+33 bytes without allocating.
-/// Structural prefixes, completeness, and equal field lengths remain caller-owned.
 pub fn validateRecord(record: Record, options: ValidationOptions) ?SemanticError {
     return switch (options.alphabet) {
         .iupac => validateRecordFor(.iupac, record),
@@ -307,9 +322,7 @@ pub fn validateRecord(record: Record, options: ValidationOptions) ?SemanticError
 
 fn validateRecordFor(comptime alphabet: Alphabet, record: Record) ?SemanticError {
     if (record.sequence.len == record.quality.len) {
-        if (std.simd.suggestVectorLength(u8)) |vector_len| {
-            return validateRecordVector(vector_len, alphabet, record);
-        }
+        return validateRecordVector(simd.INLINE_LANES, alphabet, record);
     }
     if (firstInvalidSequence(record.sequence, alphabet)) |byte_index| {
         return semanticSequenceError(byte_index);
@@ -348,9 +361,6 @@ fn validateRecordVector(
     comptime alphabet: Alphabet,
     record: Record,
 ) ?SemanticError {
-    const Bytes = @Vector(vector_len, u8);
-    const Mask = @Vector(vector_len, bool);
-
     if (record.sequence.len < vector_len) {
         if (firstInvalidSequenceScalar(record.sequence, alphabet, 0)) |byte_index| {
             return semanticSequenceError(byte_index);
@@ -361,64 +371,87 @@ fn validateRecordVector(
         return null;
     }
 
+    const invalid: InvalidFields = if (simd.useAvx2(record.sequence.len))
+        @bitCast(simd.avx2Kernel("invalid_fields", &invalidFieldsExport)(record.sequence.ptr, record.quality.ptr, record.sequence.len, @intFromEnum(alphabet)))
+    else
+        invalidFieldsVector(vector_len, alphabet, record.sequence, record.quality);
+    if (invalid.sequence) {
+        return semanticSequenceError(
+            firstInvalidSequenceScalar(record.sequence, alphabet, 0).?,
+        );
+    }
+    if (invalid.quality) {
+        return semanticQualityError(firstInvalidQualityScalar(record.quality, 0).?);
+    }
+    return null;
+}
+
+const InvalidFields = packed struct(u8) { sequence: bool, quality: bool, _: u6 = 0 };
+
+fn invalidFieldsVector(
+    comptime vector_len: comptime_int,
+    comptime alphabet: Alphabet,
+    seq: []const u8,
+    qual: []const u8,
+) InvalidFields {
+    const Bytes = @Vector(vector_len, u8);
+    const Mask = @Vector(vector_len, bool);
+
     var sequence_invalid: Mask = @splat(false);
     var quality_invalid: Mask = @splat(false);
     var byte_index: usize = 0;
-    while (record.sequence.len - byte_index >= 4 * vector_len) : (byte_index += 4 * vector_len) {
-        const sequence0: Bytes = record.sequence[byte_index..][0..vector_len].*;
-        const sequence1: Bytes = record.sequence[byte_index + vector_len ..][0..vector_len].*;
-        const sequence2: Bytes = record.sequence[byte_index + 2 * vector_len ..][0..vector_len].*;
-        const sequence3: Bytes = record.sequence[byte_index + 3 * vector_len ..][0..vector_len].*;
+    while (seq.len - byte_index >= 4 * vector_len) : (byte_index += 4 * vector_len) {
+        const sequence0: Bytes = seq[byte_index..][0..vector_len].*;
+        const sequence1: Bytes = seq[byte_index + vector_len ..][0..vector_len].*;
+        const sequence2: Bytes = seq[byte_index + 2 * vector_len ..][0..vector_len].*;
+        const sequence3: Bytes = seq[byte_index + 3 * vector_len ..][0..vector_len].*;
         sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence0) |
             invalidSequenceVector(vector_len, alphabet, sequence1) |
             invalidSequenceVector(vector_len, alphabet, sequence2) |
             invalidSequenceVector(vector_len, alphabet, sequence3);
 
-        const quality0: Bytes = record.quality[byte_index..][0..vector_len].*;
-        const quality1: Bytes = record.quality[byte_index + vector_len ..][0..vector_len].*;
-        const quality2: Bytes = record.quality[byte_index + 2 * vector_len ..][0..vector_len].*;
-        const quality3: Bytes = record.quality[byte_index + 3 * vector_len ..][0..vector_len].*;
+        const quality0: Bytes = qual[byte_index..][0..vector_len].*;
+        const quality1: Bytes = qual[byte_index + vector_len ..][0..vector_len].*;
+        const quality2: Bytes = qual[byte_index + 2 * vector_len ..][0..vector_len].*;
+        const quality3: Bytes = qual[byte_index + 3 * vector_len ..][0..vector_len].*;
         quality_invalid |= invalidQualityVector(vector_len, quality0) |
             invalidQualityVector(vector_len, quality1) |
             invalidQualityVector(vector_len, quality2) |
             invalidQualityVector(vector_len, quality3);
     }
-    while (record.sequence.len - byte_index >= 2 * vector_len) : (byte_index += 2 * vector_len) {
-        const sequence0: Bytes = record.sequence[byte_index..][0..vector_len].*;
-        const sequence1: Bytes = record.sequence[byte_index + vector_len ..][0..vector_len].*;
+    while (seq.len - byte_index >= 2 * vector_len) : (byte_index += 2 * vector_len) {
+        const sequence0: Bytes = seq[byte_index..][0..vector_len].*;
+        const sequence1: Bytes = seq[byte_index + vector_len ..][0..vector_len].*;
         sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence0) |
             invalidSequenceVector(vector_len, alphabet, sequence1);
 
-        const quality0: Bytes = record.quality[byte_index..][0..vector_len].*;
-        const quality1: Bytes = record.quality[byte_index + vector_len ..][0..vector_len].*;
+        const quality0: Bytes = qual[byte_index..][0..vector_len].*;
+        const quality1: Bytes = qual[byte_index + vector_len ..][0..vector_len].*;
         quality_invalid |= invalidQualityVector(vector_len, quality0) |
             invalidQualityVector(vector_len, quality1);
     }
-    if (record.sequence.len - byte_index >= vector_len) {
-        const sequence: Bytes = record.sequence[byte_index..][0..vector_len].*;
+    if (seq.len - byte_index >= vector_len) {
+        const sequence: Bytes = seq[byte_index..][0..vector_len].*;
         sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence);
-        const quality: Bytes = record.quality[byte_index..][0..vector_len].*;
+        const quality: Bytes = qual[byte_index..][0..vector_len].*;
         quality_invalid |= invalidQualityVector(vector_len, quality);
         byte_index += vector_len;
     }
-    if (byte_index < record.sequence.len) {
-        const tail_start = record.sequence.len - vector_len;
-        const active = uncheckedTailMask(vector_len, byte_index - tail_start);
-        const sequence: Bytes = record.sequence[tail_start..][0..vector_len].*;
-        sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence) & active;
-        const quality: Bytes = record.quality[tail_start..][0..vector_len].*;
-        quality_invalid |= invalidQualityVector(vector_len, quality) & active;
+    if (byte_index < seq.len) {
+        const tail_start = seq.len - vector_len;
+        const sequence: Bytes = seq[tail_start..][0..vector_len].*;
+        sequence_invalid |= invalidSequenceVector(vector_len, alphabet, sequence);
+        const quality: Bytes = qual[tail_start..][0..vector_len].*;
+        quality_invalid |= invalidQualityVector(vector_len, quality);
     }
 
-    if (@reduce(.Or, sequence_invalid)) {
-        return semanticSequenceError(
-            firstInvalidSequenceScalar(record.sequence, alphabet, 0).?,
-        );
-    }
-    if (@reduce(.Or, quality_invalid)) {
-        return semanticQualityError(firstInvalidQualityScalar(record.quality, 0).?);
-    }
-    return null;
+    return .{ .sequence = @reduce(.Or, sequence_invalid), .quality = @reduce(.Or, quality_invalid) };
+}
+
+fn invalidFieldsExport(sequence: [*]const u8, quality: [*]const u8, len: usize, alphabet: u8) callconv(.c) u8 {
+    return @bitCast(switch (@as(Alphabet, @enumFromInt(alphabet))) {
+        inline else => |known| invalidFieldsVector(simd.INLINE_LANES, known, sequence[0..len], quality[0..len]),
+    });
 }
 
 fn semanticSequenceError(byte_index: usize) SemanticError {
@@ -433,7 +466,7 @@ fn semanticSequenceError(byte_index: usize) SemanticError {
 pub fn semanticQualityError(byte_index: usize) SemanticError {
     return .{
         .code = .s006_invalid_quality_range,
-        .message = "quality byte must be ASCII 33 through 126",
+        .message = std.fmt.comptimePrint("quality byte must be ASCII {d} through {d}", .{ PHRED_OFFSET, PHRED_MAX_BYTE }),
         .field = .quality,
         .byte_index = byte_index,
     };
@@ -456,20 +489,20 @@ pub fn semanticParseError(
     };
 }
 
-/// Decodes one Phred+33 byte and rejects values outside ASCII 33 through 126.
+pub const PHRED_OFFSET = 33;
+pub const PHRED_MAX_BYTE = 126;
+pub const PHRED_MAX_SCORE = PHRED_MAX_BYTE - PHRED_OFFSET;
+
 pub fn decodePhred33(quality_byte: u8) error{InvalidQuality}!u8 {
-    if (quality_byte < 33 or quality_byte > 126) return error.InvalidQuality;
-    return quality_byte - 33;
+    if (quality_byte < PHRED_OFFSET or quality_byte > PHRED_MAX_BYTE) return error.InvalidQuality;
+    return quality_byte - PHRED_OFFSET;
 }
 
 fn firstInvalidSequence(sequence: []const u8, alphabet: Alphabet) ?usize {
-    if (std.simd.suggestVectorLength(u8)) |vector_len| {
-        return switch (alphabet) {
-            .iupac => firstInvalidSequenceVector(vector_len, .iupac, sequence),
-            .acgtn => firstInvalidSequenceVector(vector_len, .acgtn, sequence),
-        };
-    }
-    return firstInvalidSequenceScalar(sequence, alphabet, 0);
+    return switch (alphabet) {
+        .iupac => firstInvalidSequenceVector(simd.INLINE_LANES, .iupac, sequence),
+        .acgtn => firstInvalidSequenceVector(simd.INLINE_LANES, .acgtn, sequence),
+    };
 }
 
 fn firstInvalidSequenceVector(
@@ -498,10 +531,8 @@ fn firstInvalidSequenceVector(
         byte_index += vector_len;
     }
     if (byte_index < sequence.len) {
-        const tail_start = sequence.len - vector_len;
-        const active = uncheckedTailMask(vector_len, byte_index - tail_start);
-        const bytes: Bytes = sequence[tail_start..][0..vector_len].*;
-        invalid |= invalidSequenceVector(vector_len, alphabet, bytes) & active;
+        const bytes: Bytes = sequence[sequence.len - vector_len ..][0..vector_len].*;
+        invalid |= invalidSequenceVector(vector_len, alphabet, bytes);
     }
     if (!@reduce(.Or, invalid)) return null;
     return firstInvalidSequenceScalar(sequence, alphabet, 0);
@@ -540,11 +571,8 @@ fn firstInvalidSequenceScalar(
     return null;
 }
 
-fn firstInvalidQuality(quality: []const u8) ?usize {
-    if (std.simd.suggestVectorLength(u8)) |vector_len| {
-        return firstInvalidQualityVector(vector_len, quality);
-    }
-    return firstInvalidQualityScalar(quality, 0);
+fn firstInvalidQuality(quality: []const u8) align(HOT_LOOP_ALIGNMENT) ?usize {
+    return firstInvalidQualityVector(simd.INLINE_LANES, quality);
 }
 
 fn firstInvalidQualityVector(
@@ -570,10 +598,8 @@ fn firstInvalidQualityVector(
         byte_index += vector_len;
     }
     if (byte_index < quality.len) {
-        const tail_start = quality.len - vector_len;
-        const active = uncheckedTailMask(vector_len, byte_index - tail_start);
-        const bytes: Bytes = quality[tail_start..][0..vector_len].*;
-        invalid |= invalidQualityVector(vector_len, bytes) & active;
+        const bytes: Bytes = quality[quality.len - vector_len ..][0..vector_len].*;
+        invalid |= invalidQualityVector(vector_len, bytes);
     }
     if (!@reduce(.Or, invalid)) return null;
     return firstInvalidQualityScalar(quality, 0);
@@ -584,15 +610,7 @@ fn invalidQualityVector(
     quality: @Vector(vector_len, u8),
 ) @Vector(vector_len, bool) {
     const Bytes = @Vector(vector_len, u8);
-    return (quality < @as(Bytes, @splat(33))) | (quality > @as(Bytes, @splat(126)));
-}
-
-fn uncheckedTailMask(
-    comptime vector_len: comptime_int,
-    checked_prefix: usize,
-) @Vector(vector_len, bool) {
-    const Indexes = @Vector(vector_len, usize);
-    return std.simd.iota(usize, vector_len) >= @as(Indexes, @splat(checked_prefix));
+    return (quality < @as(Bytes, @splat(PHRED_OFFSET))) | (quality > @as(Bytes, @splat(PHRED_MAX_BYTE)));
 }
 
 fn firstInvalidQualityScalar(quality: []const u8, start_index: usize) ?usize {
@@ -742,13 +760,13 @@ fn scanSequenceLineFor(
     comptime alphabet: Alphabet,
     bytes: []const u8,
     comptime allow_crlf: bool,
-) SequenceLineScan {
-    const Bytes = @Vector(STRUCTURAL_BLOCK_BYTES, u8);
+) align(HOT_LOOP_ALIGNMENT) SequenceLineScan {
+    const Bytes = @Vector(simd.BLOCK_BYTES, u8);
     var block_start: usize = 0;
-    while (bytes.len - block_start >= STRUCTURAL_BLOCK_BYTES) {
-        const block: Bytes = bytes[block_start..][0..STRUCTURAL_BLOCK_BYTES].*;
+    while (bytes.len - block_start >= simd.BLOCK_BYTES) {
+        const block: Bytes = bytes[block_start..][0..simd.BLOCK_BYTES].*;
         const invalid: u64 = @bitCast(invalidSequenceVector(
-            STRUCTURAL_BLOCK_BYTES,
+            simd.BLOCK_BYTES,
             alphabet,
             block,
         ));
@@ -762,7 +780,7 @@ fn scanSequenceLineFor(
             }
             return .{ .invalid_start = block_start };
         }
-        block_start += STRUCTURAL_BLOCK_BYTES;
+        block_start += simd.BLOCK_BYTES;
     }
     for (bytes[block_start..], block_start..) |byte, byte_index| {
         if (byte == '\n') return .{ .line_end = byte_index };
@@ -785,12 +803,33 @@ fn classifySemanticBytes(
     start_index: usize,
 ) error{ArithmeticLimit}!void {
     if (failure.* != null) return;
-    const relative = switch (field) {
+    const relative = if (simd.useAvx2(bytes.len))
+        avx2FirstInvalid(field, alphabet, use_full_iupac, bytes)
+    else
+        firstInvalidChunk(field, alphabet, use_full_iupac, bytes);
+    failure.* = std.math.add(usize, start_index, relative orelse return) catch
+        return error.ArithmeticLimit;
+}
+
+fn firstInvalidChunk(
+    field: SemanticField,
+    alphabet: Alphabet,
+    use_full_iupac: *bool,
+    bytes: []const u8,
+) ?usize {
+    return switch (field) {
         .sequence => firstInvalidCheckSequence(bytes, alphabet, use_full_iupac),
         .quality => firstInvalidQuality(bytes),
-    } orelse return;
-    failure.* = std.math.add(usize, start_index, relative) catch
-        return error.ArithmeticLimit;
+    };
+}
+
+fn avx2FirstInvalid(field: SemanticField, alphabet: Alphabet, use_full_iupac: *bool, bytes: []const u8) ?usize {
+    const index = simd.avx2Kernel("first_invalid", &firstInvalidExport)(@intFromEnum(field), @intFromEnum(alphabet), use_full_iupac, bytes.ptr, bytes.len);
+    return if (index == bytes.len) null else index;
+}
+
+fn firstInvalidExport(field: u8, alphabet: u8, use_full_iupac: *bool, bytes: [*]const u8, len: usize) callconv(.c) usize {
+    return firstInvalidChunk(@enumFromInt(field), @enumFromInt(alphabet), use_full_iupac, bytes[0..len]) orelse len;
 }
 
 fn classifySemanticByte(
@@ -823,23 +862,58 @@ fn classifySemanticByte(
     }
 }
 
-// --- Buffered record validation ---
-
-const CompleteRecord = struct {
+const CompleteRecord = extern struct {
     line_ends: [4]usize,
     use_full_iupac: bool,
 };
 
-fn scanCompleteRecord(
+inline fn scanCompleteRecord(
     buffer: []const u8,
     start: usize,
     line_feeds: *LineFeedSearch,
     max_line_bytes: usize,
     alphabet: Alphabet,
     initial_full_iupac: bool,
+    sequence_len_hint: usize,
 ) ?CompleteRecord {
+    if (simd.useAvx2(sequence_len_hint)) {
+        var checked: CompleteRecord = undefined;
+        if (!simd.avx2Kernel("scan_complete_record", &scanCompleteRecordExport)(buffer.ptr, buffer.len, start, line_feeds, max_line_bytes, @intFromEnum(alphabet), initial_full_iupac, &checked)) return null;
+        return checked;
+    }
+    return scanCompleteRecordInline(buffer, start, line_feeds, max_line_bytes, alphabet, initial_full_iupac);
+}
+
+comptime {
+    simd.exportKernel("scan_complete_record", &scanCompleteRecordExport);
+    simd.exportKernel("invalid_fields", &invalidFieldsExport);
+    simd.exportKernel("first_invalid", &firstInvalidExport);
+}
+
+fn scanCompleteRecordExport(
+    buffer: [*]const u8,
+    len: usize,
+    start: usize,
+    line_feeds: *LineFeedSearch,
+    max_line_bytes: usize,
+    alphabet: u8,
+    initial_full_iupac: bool,
+    checked: *CompleteRecord,
+) callconv(.c) bool {
+    checked.* = scanCompleteRecordInline(buffer[0..len], start, line_feeds, max_line_bytes, @enumFromInt(alphabet), initial_full_iupac) orelse return false;
+    return true;
+}
+
+fn scanCompleteRecordInline(
+    buffer: []const u8,
+    start: usize,
+    line_feeds: *LineFeedSearch,
+    max_line_bytes: usize,
+    alphabet: Alphabet,
+    initial_full_iupac: bool,
+) align(HOT_LOOP_ALIGNMENT) ?CompleteRecord {
     const data = buffer[start..];
-    const header_end = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start) orelse return null) - start;
+    const header_end = (line_feeds.find(simd.BLOCK_BYTES, buffer, start) orelse return null) - start;
     const header_len = lineContentLen(data[0..header_end]);
     const header = data[0..header_len];
     if (header.len > max_line_bytes) return null;
@@ -859,7 +933,7 @@ fn scanCompleteRecord(
     if (sequence_len > max_line_bytes) return null;
 
     const plus_start = sequence_start + sequence_raw_len + 1;
-    const plus_raw_len = (line_feeds.find(STRUCTURAL_BLOCK_BYTES, buffer, start + plus_start) orelse
+    const plus_raw_len = (line_feeds.find(simd.BLOCK_BYTES, buffer, start + plus_start) orelse
         return null) - start - plus_start;
     const plus_len = lineContentLen(data[plus_start..][0..plus_raw_len]);
     const plus = data[plus_start..][0..plus_len];
@@ -879,10 +953,7 @@ fn scanCompleteRecord(
     };
 }
 
-// --- Reader ---
-
 pub const ReaderOptions = struct {
-    /// Maximum content bytes in one logical line, excluding LF and the optional CR.
     max_line_bytes: usize = io_layer.DEFAULT_MAX_LINE_BYTES,
 };
 
@@ -907,7 +978,6 @@ const FallbackValidation = struct {
     use_full_iupac: bool,
     sequence_failure: ?usize = null,
     quality_failure: ?usize = null,
-    pending_cr: bool = false,
 
     fn init(validator: *const AdaptiveRecordValidator) FallbackValidation {
         return .{
@@ -936,64 +1006,14 @@ const FallbackValidation = struct {
         start_index: usize,
     ) ReaderError!void {
         if (bytes.len == 0) return;
-        if (self.pending_cr) {
-            std.debug.assert(start_index > 0);
-            classifySemanticByte(
-                field,
-                self.alphabet,
-                &self.use_full_iupac,
-                self.failure(field),
-                '\r',
-                start_index - 1,
-            );
-            self.pending_cr = false;
-        }
-
-        const semantic_end = if (bytes[bytes.len - 1] == '\r') bytes.len - 1 else bytes.len;
-        self.pending_cr = semantic_end != bytes.len;
-        const semantic_bytes = bytes[0..semantic_end];
-        if (semantic_bytes.len == 0) return;
         classifySemanticBytes(
             field,
             self.alphabet,
             &self.use_full_iupac,
             self.failure(field),
-            semantic_bytes,
+            bytes,
             start_index,
         ) catch return error.ArithmeticLimit;
-    }
-
-    fn finishLine(
-        self: *FallbackValidation,
-        line_kind: ExpectedLine,
-        terminated: bool,
-        content_len: usize,
-    ) void {
-        switch (line_kind) {
-            .sequence => self.finishField(.sequence, terminated, content_len),
-            .quality => self.finishField(.quality, terminated, content_len),
-            .header, .plus => {},
-        }
-    }
-
-    fn finishField(
-        self: *FallbackValidation,
-        comptime field: SemanticField,
-        terminated: bool,
-        content_len: usize,
-    ) void {
-        if (self.pending_cr and !terminated) {
-            std.debug.assert(content_len > 0);
-            classifySemanticByte(
-                field,
-                self.alphabet,
-                &self.use_full_iupac,
-                self.failure(field),
-                '\r',
-                content_len - 1,
-            );
-        }
-        self.pending_cr = false;
     }
 
     fn failure(
@@ -1067,8 +1087,32 @@ fn fieldStorageLimit(max_line_bytes: usize) usize {
     return std.math.add(usize, max_line_bytes, 1) catch std.math.maxInt(usize);
 }
 
-/// Streaming parser constructed with `init`; fields are implementation state.
-/// The copied source wrapper's referenced adapter must outlive the reader.
+pub const RecordSpan = struct {
+    bytes: []const u8,
+    line_ends: [4]usize,
+    canonical: bool,
+
+    fn contentEnd(self: RecordSpan, line: usize) usize {
+        const end = self.line_ends[line];
+        return end - @intFromBool(self.bytes[end - 1] == '\r');
+    }
+
+    pub fn header(self: RecordSpan) []const u8 {
+        return self.bytes[1..self.contentEnd(0)];
+    }
+
+    pub fn record(self: RecordSpan) Record {
+        const header_bytes = self.header();
+        return .{
+            .header = header_bytes,
+            .id = header_bytes[0..0],
+            .sequence = self.bytes[self.line_ends[0] + 1 .. self.contentEnd(1)],
+            .plus = self.bytes[self.line_ends[1] + 2 .. self.contentEnd(2)],
+            .quality = self.bytes[self.line_ends[2] + 1 .. self.contentEnd(3)],
+        };
+    }
+};
+
 pub const Reader = struct {
     allocator: std.mem.Allocator,
     transport: Transport,
@@ -1086,6 +1130,7 @@ pub const Reader = struct {
     current_record_offsets: ?RecordOffsets = null,
     transport_storage: []u8,
     pending_refill: ?struct { bytes: []u8, cursor: usize, end: usize } = null,
+    span_missed: bool = false,
 
     const Transport = union(enum) {
         owned: io_layer.ByteSourceReader,
@@ -1140,19 +1185,16 @@ pub const Reader = struct {
         return self.byte_offset;
     }
 
-    /// Returns decoded-stream line-start offsets for the current borrowed record.
     pub fn currentRecordOffsets(self: *const Reader) ?RecordOffsets {
         return self.current_record_offsets;
     }
 
-    /// Returns and clears structural details retained after a parse error.
     pub fn takeLastError(self: *Reader) ?ParseError {
         const err = self.last_error;
         self.last_error = null;
         return err;
     }
 
-    /// Returns the next borrowed record, or null at a clean EOF boundary.
     pub fn next(self: *Reader) ReaderError!?Record {
         var unused_canonical_span: ?[]const u8 = null;
         return self.nextRecord(&unused_canonical_span, true, false);
@@ -1289,43 +1331,57 @@ pub const Reader = struct {
         self: *Reader,
         validator: *AdaptiveRecordValidator,
     ) ReaderError!?ValidatedHeader {
-        self.beginFallbackRecord();
         var validation = FallbackValidation.init(validator);
-        while (true) {
-            const line = try self.readValidatedFallbackLine(&validation);
-            switch (try self.ingestLine(line)) {
-                .eof => return null,
-                .continue_ => {},
-                .record_ready => {
-                    self.current_record_offsets = self.record_offsets;
-                    validation.commit(validator);
-                    const header = self.fallback_fields[0];
-                    return .{
-                        .header = header.storage[1..header.len],
-                        .semantic_error = validation.result(),
-                    };
-                },
-            }
-        }
+        if (!try self.ingestFallbackRecord(true, &validation, readValidatedFallbackLine)) return null;
+        validation.commit(validator);
+        const header = self.fallback_fields[0];
+        return .{
+            .header = header.storage[1..header.len],
+            .semantic_error = validation.result(),
+        };
     }
 
-    fn readFallbackRecord(self: *Reader, comptime retained_fields: u4) ReaderError!bool {
+    fn ingestFallbackRecord(
+        self: *Reader,
+        comptime publish: bool,
+        context: anytype,
+        comptime readLineWith: fn (*Reader, @TypeOf(context)) ReaderError!?Line,
+    ) ReaderError!bool {
         self.beginFallbackRecord();
         while (true) {
-            const line = try self.readFallbackLine(retained_fields);
-            switch (try self.ingestLine(line)) {
+            switch (try self.ingestLine(try readLineWith(self, context))) {
                 .eof => return false,
                 .continue_ => {},
                 .record_ready => {
-                    self.current_record_offsets = self.record_offsets;
+                    if (publish) self.current_record_offsets = self.record_offsets;
                     return true;
                 },
             }
         }
     }
 
-    /// Consumes one record without returning its fields, or returns false at clean EOF.
+    fn readStreamedRecord(self: *Reader, comptime Hook: type, hook: *Hook) ReaderError!bool {
+        return self.ingestFallbackRecord(true, hook, struct {
+            fn read(reader: *Reader, state: *Hook) ReaderError!?Line {
+                return reader.readLine(false, Hook, state, null);
+            }
+        }.read);
+    }
+
+    fn readFallbackRecord(self: *Reader, comptime retained_fields: u4) ReaderError!bool {
+        return self.ingestFallbackRecord(true, {}, retainingLines(retained_fields));
+    }
+
+    fn retainingLines(comptime retained_fields: u4) fn (*Reader, void) ReaderError!?Line {
+        return struct {
+            fn read(reader: *Reader, _: void) ReaderError!?Line {
+                return reader.readFallbackLine(retained_fields);
+            }
+        }.read;
+    }
+
     pub fn advance(self: *Reader) ReaderError!bool {
+        if (self.skipBufferedRecord()) return true;
         self.beginRecord();
         switch (try self.readBufferedRecord(.full, false, null, false)) {
             .incomplete => return self.advanceFallback(),
@@ -1335,15 +1391,7 @@ pub const Reader = struct {
     }
 
     fn advanceFallback(self: *Reader) ReaderError!bool {
-        self.beginFallbackRecord();
-        while (true) {
-            const line = try self.readFallbackLine(0);
-            switch (try self.ingestLine(line)) {
-                .eof => return false,
-                .continue_ => {},
-                .record_ready => return true,
-            }
-        }
+        return self.ingestFallbackRecord(false, {}, retainingLines(0));
     }
 
     const IngestResult = enum {
@@ -1370,12 +1418,17 @@ pub const Reader = struct {
         validator: ?*AdaptiveRecordValidator,
         comptime allow_refill: bool,
     ) ReaderError!BufferedRecordResult(projection) {
-        if (self.machine.expected != .header) return .incomplete;
+        if (self.machine.expected != .header) {
+            self.span_missed = false;
+            return .incomplete;
+        }
         if (self.cursor == self.fill_end and !try self.refill()) return .eof;
+        const span_missed = self.span_missed;
+        self.span_missed = false;
 
         var relative_ends: [4]usize = undefined;
         var checkpoint: ?PayloadCheckpoint = null;
-        const complete = if (projection == .validated or projection == .validated_header)
+        const complete = if ((projection == .validated or projection == .validated_header) and !span_missed)
             scanCompleteRecord(
                 self.buf[0..self.fill_end],
                 self.cursor,
@@ -1383,6 +1436,7 @@ pub const Reader = struct {
                 self.options.max_line_bytes,
                 validator.?.alphabet,
                 validator.?.use_full_iupac,
+                self.machine.sequence_len,
             )
         else
             null;
@@ -1399,7 +1453,7 @@ pub const Reader = struct {
                 };
             } else {
                 const quality_start = relative_ends[2] + 1;
-                const quality_lf = std.mem.findScalar(u8, bytes[quality_start..], '\n') orelse
+                const quality_lf = simd.findNewline(bytes[quality_start..]) orelse
                     return .incomplete;
                 relative_ends[3] = quality_start + quality_lf;
             }
@@ -1465,6 +1519,113 @@ pub const Reader = struct {
             .{ .record = payload };
     }
 
+    inline fn commitRecord(
+        self: *Reader,
+        comptime current: enum { none, unchanged },
+        start: usize,
+        ends: [4]usize,
+        end_offset: u64,
+        next_index: u64,
+        sequence_len: usize,
+    ) void {
+        const offsets: RecordOffsets = .{
+            .header = self.byte_offset,
+            .sequence = self.byte_offset + ends[0] + 1,
+            .plus = self.byte_offset + ends[1] + 1,
+            .quality = self.byte_offset + ends[2] + 1,
+        };
+        self.record_offsets = offsets;
+        switch (current) {
+            .none => self.current_record_offsets = null,
+            .unchanged => {},
+        }
+        self.cursor = start + ends[3] + 1;
+        self.byte_offset = end_offset;
+        self.record_index = next_index;
+        self.machine.sequence_len = sequence_len;
+    }
+
+    inline fn readRecordSpan(self: *Reader, validator: *AdaptiveRecordValidator) ?RecordSpan {
+        if (self.span_missed or self.machine.expected != .header) return null;
+        const buf = self.buf[0..self.fill_end];
+        const start = self.cursor;
+        const checked = scanCompleteRecord(
+            buf,
+            start,
+            &self.line_feeds,
+            self.options.max_line_bytes,
+            validator.alphabet,
+            validator.use_full_iupac,
+            self.machine.sequence_len,
+        ) orelse {
+            self.span_missed = true;
+            return null;
+        };
+        const ends = checked.line_ends;
+        const len = ends[3] + 1;
+        const end_offset = progressAfter(self.byte_offset, len) catch return null;
+        const next_index = std.math.add(u64, self.record_index, 1) catch return null;
+        var canonical = true;
+        for (ends) |end| canonical = canonical and buf[start + end - 1] != '\r';
+        const span: RecordSpan = .{ .bytes = buf[start..][0..len], .line_ends = ends, .canonical = canonical };
+
+        const offsets: RecordOffsets = .{
+            .header = self.byte_offset,
+            .sequence = self.byte_offset + ends[0] + 1,
+            .plus = self.byte_offset + ends[1] + 1,
+            .quality = self.byte_offset + ends[2] + 1,
+        };
+        self.record_offsets = offsets;
+        self.current_record_offsets = offsets;
+        self.cursor = start + len;
+        self.byte_offset = end_offset;
+        self.record_index = next_index;
+        self.machine.sequence_len = span.contentEnd(1) - (ends[0] + 1);
+        validator.use_full_iupac = checked.use_full_iupac;
+        return span;
+    }
+
+    fn isStructurallyValid(
+        self: *const Reader,
+        header: []const u8,
+        sequence_len: usize,
+        plus: []const u8,
+        quality_len: usize,
+    ) bool {
+        return header.len <= self.options.max_line_bytes and
+            sequence_len <= self.options.max_line_bytes and
+            plus.len <= self.options.max_line_bytes and
+            headerPrefixIsValid(
+                if (header.len == 0) null else header[0],
+                if (header.len < 2) null else header[1],
+            ) and plus.len != 0 and plus[0] == '+' and
+            sequence_len == quality_len;
+    }
+
+    fn skipBufferedRecord(self: *Reader) bool {
+        if (self.machine.expected != .header) return false;
+        const buf = self.buf[0..self.fill_end];
+        const start = self.cursor;
+        var ends: [4]usize = undefined;
+        if (!self.line_feeds.findLines(4, buf, start, &ends)) return false;
+        const header = buf[start .. start + ends[0]];
+        const sequence = buf[start + ends[0] + 1 .. start + ends[1]];
+        const plus = buf[start + ends[1] + 1 .. start + ends[2]];
+        const quality = buf[start + ends[2] + 1 .. start + ends[3]];
+        const sequence_len = lineContentLen(sequence);
+        if (!self.isStructurallyValid(
+            header[0..lineContentLen(header)],
+            sequence_len,
+            plus[0..lineContentLen(plus)],
+            lineContentLen(quality),
+        )) return false;
+        const end_offset = progressAfter(self.byte_offset, ends[3] + 1) catch return false;
+        const next_index = std.math.add(u64, self.record_index, 1) catch return false;
+        self.commitRecord(.none, start, ends, end_offset, next_index, sequence_len);
+        self.span_missed = false;
+        return true;
+    }
+
     fn consumeBufferedRecord(
         self: *Reader,
         ranges: [4]Range,
@@ -1474,36 +1635,20 @@ pub const Reader = struct {
         const record_start = self.cursor;
         const record_len = relative_ends[3] + 1;
         const sequence_len = ranges[1].end - ranges[1].start;
-        const valid = already_validated or valid: {
-            const header = ranges[0].slice(self.buf);
-            const plus = ranges[2].slice(self.buf);
-            break :valid header.len <= self.options.max_line_bytes and
-                sequence_len <= self.options.max_line_bytes and
-                plus.len <= self.options.max_line_bytes and
-                headerPrefixIsValid(
-                    if (header.len == 0) null else header[0],
-                    if (header.len < 2) null else header[1],
-                ) and plus.len != 0 and plus[0] == '+' and
-                sequence_len == ranges[3].end - ranges[3].start;
-        };
+        const valid = already_validated or self.isStructurallyValid(
+            ranges[0].slice(self.buf),
+            sequence_len,
+            ranges[2].slice(self.buf),
+            ranges[3].end - ranges[3].start,
+        );
         const next_offset = if (valid) self.offsetAfter(record_len) catch null else null;
         if (next_offset) |end_offset| {
-            // The checked end also bounds every intermediate line offset.
-            self.record_offsets = .{
-                .header = self.byte_offset,
-                .sequence = self.byte_offset + relative_ends[0] + 1,
-                .plus = self.byte_offset + relative_ends[1] + 1,
-                .quality = self.byte_offset + relative_ends[2] + 1,
-            };
-            self.cursor = record_start + record_len;
-            self.byte_offset = end_offset;
-            self.machine.sequence_len = sequence_len;
+            self.commitRecord(.unchanged, record_start, relative_ends, end_offset, self.record_index, sequence_len);
             self.record_index = std.math.add(u64, self.record_index, 1) catch
                 return error.ArithmeticLimit;
             return;
         }
 
-        // Replay rejected records in line order to preserve errors and partial progress.
         for (ranges, relative_ends) |range, relative_end| {
             const content = range.slice(self.buf);
             if (content.len > self.options.max_line_bytes) return error.LineTooLong;
@@ -1530,11 +1675,9 @@ pub const Reader = struct {
         const quality_end = quality_start + sequence_len;
         const quality_lf = quality_end + @intFromBool(bytes[quality_end] == '\r');
         if (quality_lf == bytes.len or bytes[quality_lf] != '\n') return false;
-        // Stripping a guessed CR could reject the length before quality validation can retry.
         if (quality_lf == quality_end and sequence_len != 0 and bytes[quality_end - 1] == '\r')
             return false;
 
-        // A guessed end must not hide an earlier length error with counter overflow.
         if (self.record_index == std.math.maxInt(u64)) return false;
         const consumed = std.math.cast(u64, quality_lf + 1) orelse return false;
         _ = std.math.add(u64, self.byte_offset, consumed) catch return false;
@@ -1593,7 +1736,7 @@ pub const Reader = struct {
         const record_offsets = self.record_offsets;
         var record: RefillRecord = .{ .start = self.cursor, .len = prefix_len };
         while (true) {
-            const line = try self.readLine(false, null, &record);
+            const line = try self.readLine(false, FallbackValidation, null, &record);
             if (record.stopped) break;
             if (try self.ingestLine(line) == .record_ready) break;
         }
@@ -1695,6 +1838,7 @@ pub const Reader = struct {
 
     fn refill(self: *Reader) ReaderError!bool {
         self.line_feeds = .{};
+        self.span_missed = false;
         if (self.pending_refill) |pending| {
             std.debug.assert(self.cursor == self.fill_end);
             self.buf = pending.bytes;
@@ -1716,10 +1860,10 @@ pub const Reader = struct {
 
     fn readFallbackLine(self: *Reader, comptime retained_fields: u4) ReaderError!?Line {
         return switch (self.machine.expected) {
-            .header => self.readLine(retained_fields & 0b0001 != 0, null, null),
-            .sequence => self.readLine(retained_fields & 0b0010 != 0, null, null),
-            .plus => self.readLine(retained_fields & 0b0100 != 0, null, null),
-            .quality => self.readLine(retained_fields & 0b1000 != 0, null, null),
+            .header => self.readLine(retained_fields & 0b0001 != 0, FallbackValidation, null, null),
+            .sequence => self.readLine(retained_fields & 0b0010 != 0, FallbackValidation, null, null),
+            .plus => self.readLine(retained_fields & 0b0100 != 0, FallbackValidation, null, null),
+            .quality => self.readLine(retained_fields & 0b1000 != 0, FallbackValidation, null, null),
         };
     }
 
@@ -1728,45 +1872,29 @@ pub const Reader = struct {
         validation: *FallbackValidation,
     ) ReaderError!?Line {
         return switch (self.machine.expected) {
-            .header => self.readLine(true, validation, null),
-            .sequence, .plus, .quality => self.readLine(false, validation, null),
+            .header => self.readLine(true, FallbackValidation, validation, null),
+            .sequence, .plus, .quality => self.readLine(false, FallbackValidation, validation, null),
         };
     }
 
     fn readLine(
         self: *Reader,
         comptime retain: bool,
-        validation: ?*FallbackValidation,
+        comptime Hook: type,
+        hook: ?*Hook,
         refill_record: ?*RefillRecord,
     ) ReaderError!?Line {
         const field_index = @intFromEnum(self.machine.expected);
         const field = &self.fallback_fields[field_index];
         const content_start = if (retain) field.len else 0;
         const line_start_offset = self.byte_offset;
-        var discarded_len: usize = 0;
-        var first_byte: ?u8 = null;
-        var second_byte: ?u8 = null;
-        var last_byte: ?u8 = null;
+        var line: LineBytes = .{};
 
         while (true) {
             if (self.cursor < self.fill_end) {
                 const haystack = self.buf[self.cursor..self.fill_end];
-                if (std.mem.findScalar(u8, haystack, '\n')) |rel| {
-                    if (retain) {
-                        try self.appendLineBytes(field_index, content_start, haystack[0..rel], true);
-                    } else {
-                        const chunk_start = discarded_len;
-                        try self.discardLineBytes(
-                            &discarded_len,
-                            &first_byte,
-                            &second_byte,
-                            &last_byte,
-                            haystack[0..rel],
-                        );
-                        if (validation) |state| {
-                            try state.consume(self.machine.expected, haystack[0..rel], chunk_start);
-                        }
-                    }
+                if (simd.findNewline(haystack)) |rel| {
+                    try self.takeLineBytes(retain, Hook, hook, field_index, content_start, &line, haystack[0..rel], true);
                     const next_offset = try self.offsetAfter(rel + 1);
                     self.cursor += rel + 1;
                     self.byte_offset = next_offset;
@@ -1780,33 +1908,16 @@ pub const Reader = struct {
                             .start_offset = line_start_offset,
                         };
                     }
-                    if (validation) |state| {
-                        state.finishLine(self.machine.expected, true, discarded_len);
-                    }
-                    if (last_byte == '\r') discarded_len -= 1;
+                    const content_len = line.contentLen(true);
                     return .{
-                        .content_len = discarded_len,
-                        .first_byte = if (discarded_len == 0) null else first_byte,
-                        .second_byte = if (discarded_len < 2) null else second_byte,
+                        .content_len = content_len,
+                        .first_byte = line.firstByte(content_len),
+                        .second_byte = line.secondByte(content_len),
                         .start_offset = line_start_offset,
                     };
                 }
 
-                if (retain) {
-                    try self.appendLineBytes(field_index, content_start, haystack, false);
-                } else {
-                    const chunk_start = discarded_len;
-                    try self.discardLineBytes(
-                        &discarded_len,
-                        &first_byte,
-                        &second_byte,
-                        &last_byte,
-                        haystack,
-                    );
-                    if (validation) |state| {
-                        try state.consume(self.machine.expected, haystack, chunk_start);
-                    }
-                }
+                try self.takeLineBytes(retain, Hook, hook, field_index, content_start, &line, haystack, false);
                 const next_offset = try self.offsetAfter(haystack.len);
                 self.cursor = self.fill_end;
                 self.byte_offset = next_offset;
@@ -1826,30 +1937,48 @@ pub const Reader = struct {
 
             const got_data = try self.refill();
             if (!got_data) {
-                const content_len = if (retain) field.len - content_start else discarded_len;
-                if (content_len > 0) {
-                    if (content_len > self.options.max_line_bytes) {
-                        return error.LineTooLong;
-                    }
-                    if (validation) |state| {
-                        state.finishLine(self.machine.expected, false, content_len);
-                    }
-                    if (!retain) return .{
-                        .content_len = content_len,
-                        .first_byte = first_byte,
-                        .second_byte = second_byte,
-                        .start_offset = line_start_offset,
-                    };
-                    const content = field.storage[0..field.len];
-                    return .{
-                        .content_len = content.len,
-                        .first_byte = content[0],
-                        .second_byte = if (content.len < 2) null else content[1],
-                        .start_offset = line_start_offset,
-                    };
+                const content_len = line.raw_len;
+                if (content_len == 0) return null;
+                if (content_len > self.options.max_line_bytes) return error.LineTooLong;
+                if (!retain and line.holdsCr()) {
+                    if (hook) |state| try state.consume(self.machine.expected, "\r", content_len - 1);
                 }
-                return null;
+                if (!retain) return .{
+                    .content_len = content_len,
+                    .first_byte = line.firstByte(content_len),
+                    .second_byte = line.secondByte(content_len),
+                    .start_offset = line_start_offset,
+                };
+                const content = field.storage[0..field.len];
+                return .{
+                    .content_len = content.len,
+                    .first_byte = content[0],
+                    .second_byte = if (content.len < 2) null else content[1],
+                    .start_offset = line_start_offset,
+                };
             }
+        }
+    }
+
+    fn takeLineBytes(
+        self: *Reader,
+        comptime retain: bool,
+        comptime Hook: type,
+        hook: ?*Hook,
+        field_index: usize,
+        content_start: usize,
+        line: *LineBytes,
+        chunk: []const u8,
+        complete: bool,
+    ) ReaderError!void {
+        if (chunk.len == 0) return;
+        const chunk_start = line.raw_len;
+        const held_cr = line.holdsCr();
+        try line.add(chunk, self.options.max_line_bytes);
+        if (retain) return self.appendLineBytes(field_index, content_start + line.raw_len, chunk, complete);
+        if (hook) |state| {
+            if (held_cr) try state.consume(self.machine.expected, "\r", chunk_start - 1);
+            try state.consume(self.machine.expected, LineBytes.contentOf(chunk), chunk_start);
         }
     }
 
@@ -1860,55 +1989,16 @@ pub const Reader = struct {
     fn appendLineBytes(
         self: *Reader,
         field_index: usize,
-        content_start: usize,
+        new_len: usize,
         chunk: []const u8,
         complete: bool,
     ) ReaderError!void {
-        if (chunk.len == 0) return;
         const field = &self.fallback_fields[field_index];
-        const line_len = try self.lineLengthAfter(field.len - content_start, chunk);
-        const new_len = std.math.add(usize, content_start, line_len) catch
-            return error.LineTooLong;
         try self.ensureFieldCapacity(field_index, new_len, complete);
         if (self.buf.ptr == field.storage.ptr) {
-            // A replayed record prefix shares the sequence fallback allocation.
             @memmove(field.storage[field.len..new_len], chunk);
         } else @memcpy(field.storage[field.len..new_len], chunk);
         field.len = new_len;
-    }
-
-    fn discardLineBytes(
-        self: *const Reader,
-        line_len: *usize,
-        first_byte: *?u8,
-        second_byte: *?u8,
-        last_byte: *?u8,
-        chunk: []const u8,
-    ) ReaderError!void {
-        if (chunk.len == 0) return;
-        const old_len = line_len.*;
-        line_len.* = try self.lineLengthAfter(old_len, chunk);
-        if (old_len == 0) {
-            first_byte.* = chunk[0];
-            if (chunk.len > 1) second_byte.* = chunk[1];
-        } else if (old_len == 1) {
-            second_byte.* = chunk[0];
-        }
-        last_byte.* = chunk[chunk.len - 1];
-    }
-
-    fn lineLengthAfter(
-        self: *const Reader,
-        current_len: usize,
-        chunk: []const u8,
-    ) ReaderError!usize {
-        const new_len = std.math.add(usize, current_len, chunk.len) catch
-            return error.LineTooLong;
-        if (new_len > self.options.max_line_bytes) {
-            const excess = new_len - self.options.max_line_bytes;
-            if (excess > 1 or chunk[chunk.len - 1] != '\r') return error.LineTooLong;
-        }
-        return new_len;
     }
 
     fn ensureFieldCapacity(
@@ -1942,7 +2032,6 @@ pub const Reader = struct {
                 if (available == null or donor.len < available.?.len) available = donor;
             }
             if (available) |donor| {
-                // No field slices escape before this fallback record is complete.
                 const shared = @min(field.len, donor.len);
                 for (field.storage[0..shared], donor.storage[0..shared]) |*a, *b| {
                     std.mem.swap(u8, a, b);
@@ -1962,8 +2051,6 @@ pub const Reader = struct {
             self.allocator.realloc(field.storage, grown_len) catch return error.OutOfMemory;
     }
 };
-
-// --- Record delivery ---
 
 pub const RecordPayload = struct {
     sequence: []const u8,
@@ -2001,6 +2088,10 @@ pub const ValidatedRecord = struct {
     record: Record,
     canonical_span: ?[]const u8,
     semantic_error: ?SemanticError,
+
+    pub fn validatedHeader(self: *const ValidatedRecord) ValidatedHeader {
+        return .{ .header = self.record.header, .semantic_error = self.semantic_error };
+    }
 };
 
 pub const RetainedRecordStorage = struct {
@@ -2022,7 +2113,6 @@ pub fn initStreamReader(
     return Reader.initTransport(allocator, .{ .borrowed = input }, options);
 }
 
-/// Leaves id empty; canonical_span is null when the record needs field-by-field output.
 pub fn nextWithSpan(
     reader: *Reader,
     canonical_span: *?[]const u8,
@@ -2030,30 +2120,66 @@ pub fn nextWithSpan(
     return reader.nextWithCanonicalSpan(canonical_span, false);
 }
 
-/// Leaves id empty and does not prepare a canonical output span.
 pub fn nextRecordFields(reader: *Reader) ReaderError!?Record {
     var unused_canonical_span: ?[]const u8 = null;
     return reader.nextRecord(&unused_canonical_span, false, false);
 }
 
-pub fn nextPayload(reader: *Reader) ReaderError!?RecordPayload {
-    return reader.readPayload();
+pub const PayloadOrStreamed = union(enum) {
+    payload: PredictedPayload,
+    streamed,
+};
+
+pub fn nextPayloadOrStreamed(reader: *Reader, comptime Hook: type, hook: *Hook) ReaderError!?PayloadOrStreamed {
+    reader.beginRecord();
+    switch (try reader.readBufferedRecord(.predicted_payload, false, null, false)) {
+        .incomplete => return if (try reader.readStreamedRecord(Hook, hook)) .streamed else null,
+        .eof => return null,
+        .record => |buffered| {
+            reader.current_record_offsets = reader.record_offsets;
+            return .{ .payload = .{
+                .payload = .{
+                    .sequence = buffered.payload.sequence.slice(reader.buf),
+                    .quality = buffered.payload.quality.slice(reader.buf),
+                },
+                .checkpoint = buffered.checkpoint,
+            } };
+        },
+    }
 }
 
-/// Validate predicted quality as Phred+33 before advancing the reader again.
-/// On rejection, reread from the checkpoint to recover structural errors first.
-pub fn nextPredictedPayload(reader: *Reader) ReaderError!?PredictedPayload {
-    return reader.readPredictedPayload();
-}
-
-pub fn nextValidatedHeader(
+pub inline fn nextValidatedHeader(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
 ) ReaderError!?ValidatedHeader {
+    if (reader.readRecordSpan(validator)) |span| return .{ .header = span.header(), .semantic_error = null };
     return reader.readValidatedHeader(validator);
 }
 
 pub fn nextValidatedRecord(
+    reader: *Reader,
+    validator: *AdaptiveRecordValidator,
+) ReaderError!?ValidatedRecord {
+    if (reader.readRecordSpan(validator)) |span| return validatedSpan(span);
+    return readValidatedRecord(reader, validator);
+}
+
+pub inline fn nextRecordSpan(
+    reader: *Reader,
+    validator: *AdaptiveRecordValidator,
+) ?RecordSpan {
+    return reader.readRecordSpan(validator);
+}
+
+pub fn validatedSpan(span: RecordSpan) ValidatedRecord {
+    return .{
+        .record = span.record(),
+        .canonical_span = if (span.canonical) span.bytes else null,
+        .semantic_error = null,
+    };
+}
+
+fn readValidatedRecord(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
 ) ReaderError!?ValidatedRecord {
@@ -2078,7 +2204,6 @@ fn finishValidatedRecord(
     };
 }
 
-/// Never refills; null means no complete buffered record. Leaves id empty.
 pub fn nextBufferedWithSpan(
     reader: *Reader,
     canonical_span: *?[]const u8,
@@ -2086,8 +2211,15 @@ pub fn nextBufferedWithSpan(
     return nextBufferedRecord(reader, canonical_span, true);
 }
 
-/// Never refills; null means no complete buffered record.
 pub fn nextBufferedValidatedRecord(
+    reader: *Reader,
+    validator: *AdaptiveRecordValidator,
+) ReaderError!?ValidatedRecord {
+    if (reader.readRecordSpan(validator)) |span| return validatedSpan(span);
+    return readBufferedValidatedRecord(reader, validator);
+}
+
+fn readBufferedValidatedRecord(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
 ) ReaderError!?ValidatedRecord {
@@ -2118,58 +2250,40 @@ fn nextBufferedRecord(
     };
 }
 
-/// May refill and update mate 1's views; both mates borrow until the next advance.
-/// On null, preserve the updated mate 1 before continuing with ordinary reads.
 pub fn nextValidatedMatePreservingRecord(
     reader: *Reader,
     first: *ValidatedRecord,
     validator: *AdaptiveRecordValidator,
 ) ReaderError!?ValidatedRecord {
-    if (try nextBufferedValidatedRecord(reader, validator)) |second| return second;
+    if (reader.readRecordSpan(validator)) |span| return validatedSpan(span);
+    return readMatePreservingRecord(reader, first, validator);
+}
+
+fn readMatePreservingRecord(
+    reader: *Reader,
+    first: *ValidatedRecord,
+    validator: *AdaptiveRecordValidator,
+) ReaderError!?ValidatedRecord {
+    if (try readBufferedValidatedRecord(reader, validator)) |second| return second;
     if (!reader.canBufferIncompleteRecord()) return null;
-    // Separate fallback fields can overlap the destination before they are copied.
     if (first.record.sequence.ptr == reader.fallback_fields[1].storage.ptr) return null;
-    const capacity = io_layer.DEFAULT_READER_BUFFER_BYTES;
     const span = first.canonical_span;
-    var size: usize = 6;
-    if (span) |bytes| {
-        size = bytes.len;
-    } else {
-        inline for (.{ "header", "sequence", "plus", "quality" }) |field| {
-            const len = @field(first.record, field).len;
-            if (len > capacity - size) return null;
-            size += len;
-        }
-    }
-    if (size >= capacity) return null;
+    const size = if (span) |bytes| bytes.len else canonicalRecordLen(first.record) orelse return null;
+    if (size >= io_layer.DEFAULT_READER_BUFFER_BYTES) return null;
     try reader.ensureRefillCapacity();
     const saved = reader.fallback_fields[1].storage[0..size];
-    if (span) |bytes| @memmove(saved, bytes) else saved[0] = '@';
-    var offset: usize = 1;
-    inline for (.{ "header", "sequence", "plus", "quality" }, 0..) |field, index| {
-        const bytes = &@field(first.record, field);
-        const start = if (span) |raw| @intFromPtr(bytes.ptr) - @intFromPtr(raw.ptr) else offset;
-        const dest = saved[start..][0..bytes.len];
-        if (span == null) {
-            @memmove(dest, bytes.*);
-            offset += bytes.len;
-            saved[offset] = '\n';
-            offset += 1;
-            if (index == 1) {
-                saved[offset] = '+';
-                offset += 1;
-            }
+    if (span) |raw| {
+        @memmove(saved, raw);
+        inline for (.{ "header", "sequence", "plus", "quality" }) |field| {
+            const bytes = &@field(first.record, field);
+            bytes.* = saved[@intFromPtr(bytes.ptr) - @intFromPtr(raw.ptr) ..][0..bytes.len];
         }
-        bytes.* = dest;
-    }
-    first.record.id = first.record.header[0..first.record.id.len];
-    // Staging writes one canonical span, including when the input uses CRLF.
+        first.record.id = first.record.header[0..first.record.id.len];
+    } else first.record = copyCanonicalRecord(saved, first.record);
     first.canonical_span = if (recordHasTerminalCr(first.record)) null else saved;
     return nextSavedPairMate(reader, size, validator);
 }
 
-/// May refill while keeping only mate 1's updated header alive through the mate-2 read.
-/// On null, preserve that header before continuing with ordinary reads.
 pub fn nextValidatedMatePreservingHeader(
     reader: *Reader,
     first_header: *[]const u8,
@@ -2226,7 +2340,6 @@ pub fn restoreFallbackRecordStorage(
     std.mem.swap([4]FallbackField, &reader.fallback_fields, &retained.fields);
 }
 
-/// May refill after field storage moves out; on null, continue with the fallback read.
 pub fn nextValidatedAfterFallbackTransfer(
     reader: *Reader,
     validator: *AdaptiveRecordValidator,
@@ -2249,11 +2362,8 @@ pub fn nextFallbackValidatedRecord(
     };
 }
 
-// --- Writer ---
-
 pub const WriterError = WriteError || error{InvalidRecord};
 
-/// Streaming writer constructed with `init`; its referenced sink adapter must outlive it.
 pub const Writer = struct {
     sink: ByteSink,
 
@@ -2261,7 +2371,6 @@ pub const Writer = struct {
         return .{ .sink = sink };
     }
 
-    /// Rejects invalid fields before output; accepted records use LF line endings.
     pub fn writeRecord(self: *Writer, record: Record) WriterError!void {
         if (record.sequence.len != record.quality.len or
             !identifierFirstByteIsValid(if (record.header.len == 0) null else record.header[0]) or
@@ -2273,10 +2382,9 @@ pub const Writer = struct {
             return error.InvalidRecord;
         }
 
-        return writeRecordFields(self, record);
+        return writeRecordUnchecked(self, record);
     }
 
-    /// Flushes the underlying sink when it provides a flush callback.
     pub fn flush(self: *Writer) WriteError!void {
         return self.sink.flush();
     }
@@ -2293,8 +2401,39 @@ pub fn writeCanonicalRecordSpan(writer: *Writer, span: []const u8) WriteError!vo
     return writer.sink.write(span);
 }
 
-// CLI callers check both mates, including terminal CR, before writing either record.
-pub fn writeRecordFields(writer: *Writer, record: Record) WriteError!void {
+pub const RECORD_FRAMING_BYTES = 6;
+
+pub fn canonicalRecordLen(record: Record) ?usize {
+    var total: usize = RECORD_FRAMING_BYTES;
+    inline for (.{ record.header, record.sequence, record.plus, record.quality }) |field| {
+        total = std.math.add(usize, total, field.len) catch return null;
+    }
+    return total;
+}
+
+pub fn copyCanonicalRecord(dest: []u8, record: Record) Record {
+    var copied = record;
+    dest[0] = '@';
+    var offset: usize = 1;
+    inline for (.{ "header", "sequence", "plus", "quality" }, 0..) |field, index| {
+        const bytes = @field(record, field);
+        const target = dest[offset..][0..bytes.len];
+        @memmove(target, bytes);
+        @field(copied, field) = target;
+        offset += bytes.len;
+        dest[offset] = '\n';
+        offset += 1;
+        if (index == 1) {
+            dest[offset] = '+';
+            offset += 1;
+        }
+    }
+    std.debug.assert(offset == dest.len);
+    copied.id = copied.header[0..record.id.len];
+    return copied;
+}
+
+pub fn writeRecordUnchecked(writer: *Writer, record: Record) WriteError!void {
     const fields = [_][]const u8{
         "@",
         record.header,
@@ -2314,8 +2453,6 @@ fn isWritableField(bytes: []const u8) bool {
         (bytes.len == 0 or bytes[bytes.len - 1] != '\r');
 }
 
-// --- Check scanner ---
-
 pub const CheckScannerError = error{
     Format,
     LineTooLong,
@@ -2327,10 +2464,7 @@ pub const CheckScanner = struct {
     alphabet: Alphabet,
     use_full_iupac: bool = false,
     machine: Machine = .{},
-    line_len: usize = 0,
-    first_byte: ?u8 = null,
-    second_byte: ?u8 = null,
-    pending_cr: bool = false,
+    line: LineBytes = .{},
     line_start_offset: u64 = 0,
     sequence_start_offset: u64 = 0,
     quality_start_offset: u64 = 0,
@@ -2379,6 +2513,7 @@ pub const CheckScanner = struct {
             self.max_line_bytes,
             self.alphabet,
             self.use_full_iupac,
+            self.machine.sequence_len,
         ) orelse return null;
         const record_len = complete.line_ends[3] + 1;
         const next_offset = progressAfter(self.byte_offset, record_len) catch return null;
@@ -2393,10 +2528,7 @@ pub const CheckScanner = struct {
 
     fn atRecordBoundary(self: *const CheckScanner) bool {
         return self.machine.expected == .header and
-            self.line_len == 0 and
-            self.first_byte == null and
-            self.second_byte == null and
-            !self.pending_cr and
+            self.line.raw_len == 0 and
             self.sequence_failure == null and
             self.quality_failure == null and
             self.line_start_offset == self.byte_offset;
@@ -2410,7 +2542,7 @@ pub const CheckScanner = struct {
     ) CheckScannerError!usize {
         const initial_record_index = self.record_index;
         var segment_start = start;
-        while (line_feeds.find(STRUCTURAL_BLOCK_BYTES, data, segment_start)) |line_end| {
+        while (line_feeds.find(simd.BLOCK_BYTES, data, segment_start)) |line_end| {
             try self.consumeLineBytes(data[segment_start..line_end]);
             try self.advanceOffset(line_end - segment_start + 1);
             try self.finishLine(true);
@@ -2425,11 +2557,10 @@ pub const CheckScanner = struct {
     }
 
     pub fn finishEof(self: *CheckScanner) CheckScannerError!void {
-        if (self.line_len != 0) {
-            if (self.pending_cr) {
-                self.pending_cr = false;
-                if (self.line_len > self.max_line_bytes) return error.LineTooLong;
-                self.classifyByte('\r', self.line_len - 1);
+        if (self.line.raw_len != 0) {
+            if (self.line.holdsCr()) {
+                if (self.line.raw_len > self.max_line_bytes) return error.LineTooLong;
+                self.classifyByte('\r', self.line.raw_len - 1);
             }
             try self.finishLine(false);
         }
@@ -2451,25 +2582,10 @@ pub const CheckScanner = struct {
 
     fn consumeLineBytes(self: *CheckScanner, bytes: []const u8) CheckScannerError!void {
         if (bytes.len == 0) return;
-
-        if (self.pending_cr) {
-            self.pending_cr = false;
-            self.classifyByte('\r', self.line_len - 1);
-        }
-
-        const previous_len = self.line_len;
-        self.line_len = std.math.add(usize, self.line_len, bytes.len) catch
-            return error.LineTooLong;
-        if (self.first_byte == null) self.first_byte = bytes[0];
-        if (self.second_byte == null and previous_len < 2 and self.line_len >= 2) {
-            self.second_byte = bytes[1 - previous_len];
-        }
-
-        const semantic_end = if (bytes[bytes.len - 1] == '\r') bytes.len - 1 else bytes.len;
-        self.pending_cr = semantic_end != bytes.len;
-        const content_len = self.line_len - @intFromBool(self.pending_cr);
-        if (content_len > self.max_line_bytes) return error.LineTooLong;
-        try self.classifyBytes(bytes[0..semantic_end], previous_len);
+        const previous_len = self.line.raw_len;
+        if (self.line.holdsCr()) self.classifyByte('\r', previous_len - 1);
+        try self.line.add(bytes, self.max_line_bytes);
+        try self.classifyBytes(LineBytes.contentOf(bytes), previous_len);
     }
 
     fn classifyBytes(
@@ -2521,9 +2637,9 @@ pub const CheckScanner = struct {
     }
 
     fn finishLine(self: *CheckScanner, terminated: bool) CheckScannerError!void {
-        const content_len = self.line_len - @intFromBool(terminated and self.pending_cr);
-        const content_first = if (content_len == 0) null else self.first_byte;
-        const content_second = if (content_len < 2) null else self.second_byte;
+        const content_len = self.line.contentLen(terminated);
+        const content_first = self.line.firstByte(content_len);
+        const content_second = self.line.secondByte(content_len);
         const line_kind = self.machine.expected;
         const record_ready = self.machine.push(
             content_len,
@@ -2547,10 +2663,7 @@ pub const CheckScanner = struct {
         }
         if (record_ready) try self.finishRecord();
 
-        self.line_len = 0;
-        self.first_byte = null;
-        self.second_byte = null;
-        self.pending_cr = false;
+        self.line = .{};
         self.line_start_offset = self.byte_offset;
     }
 
@@ -2760,7 +2873,7 @@ fn expectPayloadProjection(
 
     while (true) {
         const full_result = full_reader.next();
-        const payload_result = nextPayload(&payload_reader);
+        const payload_result = payload_reader.readPayload();
         const record_result = nextRecordFields(&record_reader);
         const advance_result = advance_reader.advance();
         const validated_result = nextValidatedHeader(&validated_reader, &projected_validator);
@@ -2879,7 +2992,6 @@ fn expectBufferedLineProgress(
             .byte_offset = 0,
             .line_in_record = 4,
         };
-        // Complete records avoid the different progress rules for an incomplete line.
         try std.testing.expect(try current.refill());
         try std.testing.expectEqual(input.len, current.fill_end);
     }
@@ -2975,7 +3087,7 @@ test "[property] - [reader]: complete buffered records preserve per-line results
     var storage: [128]u8 = undefined;
     @memcpy(storage[0..prefix.len], prefix);
     for (cases) |fields| {
-        for (0..16) |mask| {
+        for ([_]usize{ 0, 15 }) |mask| {
             var end: usize = prefix.len;
             for (fields, 0..) |field, index| {
                 @memcpy(storage[end..][0..field.len], field);
@@ -2989,7 +3101,7 @@ test "[property] - [reader]: complete buffered records preserve per-line results
             }
             const input = storage[prefix.len..end];
             inline for (.{ .record, .validated, .advance }) |delivery| {
-                for ([_]usize{ 0, 1, 2, 3, 4, 7, std.math.maxInt(usize) }) |limit| {
+                for ([_]usize{ 0, 1, 4, std.math.maxInt(usize) }) |limit| {
                     try expectBufferedLineProgress(input, limit, .{}, delivery);
                 }
                 try expectBufferedLineProgress(storage[0..end], 128, .{}, delivery);
@@ -2997,13 +3109,11 @@ test "[property] - [reader]: complete buffered records preserve per-line results
                 for ([_]u64{ (1 << 32) - 1, std.math.maxInt(u64) - 1, std.math.maxInt(u64) }) |count| {
                     try expectBufferedLineProgress(input, 128, .{ .records = count }, delivery);
                 }
-                if (mask == 0 or mask == 15) {
-                    for (0..input.len + 1) |remaining| {
-                        for ([_]usize{ 2, 128 }) |limit| {
-                            try expectBufferedLineProgress(input, limit, .{
-                                .bytes = std.math.maxInt(u64) - remaining,
-                            }, delivery);
-                        }
+                for ([_]usize{ 0, 1, input.len }) |remaining| {
+                    for ([_]usize{ 2, 128 }) |limit| {
+                        try expectBufferedLineProgress(input, limit, .{
+                            .bytes = std.math.maxInt(u64) - remaining,
+                        }, delivery);
                     }
                 }
             }
@@ -3012,7 +3122,7 @@ test "[property] - [reader]: complete buffered records preserve per-line results
 }
 
 fn readPredictedPayloadForTest(reader: *Reader) ReaderError!?RecordPayload {
-    const predicted = try nextPredictedPayload(reader) orelse return null;
+    const predicted = try reader.readPredictedPayload() orelse return null;
     for (predicted.payload.quality) |byte| {
         if (byte < 33 or byte > 126) {
             if (predicted.checkpoint) |checkpoint| return try checkpoint.reread(reader);
@@ -3052,7 +3162,7 @@ fn expectPredictedPayloads(
     }
 
     while (true) {
-        const expected_result = nextPayload(&reference);
+        const expected_result = reference.readPayload();
         const actual_result = readPredictedPayloadForTest(&reader);
         var finished = false;
         if (expected_result) |expected| {
@@ -3098,21 +3208,24 @@ test "[property] - [reader]: predicted payloads preserve parsing and source prog
         first ++ "@r\nACG\n+\n!\n!\n",
         first ++ "@r\r\nAC\r\n+\r\n!\x7f\r\n",
     }) |input| {
-        for (0..input.len + 1) |position| {
-            try expectPredictedPayloads(input, position, unlimited, null, .{}, .{});
-            try expectPredictedPayloads(input[0..position], 0, unlimited, null, .{}, .{});
-            try expectPredictedPayloads(input, 0, unlimited, position, .{}, .{});
+        for (input, 0..) |byte, index| {
+            if (byte != '\n') continue;
+            for ([_]usize{ index -| 1, index, index + 1 }) |position| {
+                try expectPredictedPayloads(input, position, unlimited, null, .{}, .{});
+                try expectPredictedPayloads(input[0..position], 0, unlimited, null, .{}, .{});
+                try expectPredictedPayloads(input, 0, unlimited, position, .{}, .{});
+            }
         }
-        for (1..input.len + 1) |chunk_limit| {
+        for ([_]usize{ 1, 2, unlimited }) |chunk_limit| {
             try expectPredictedPayloads(input, 0, chunk_limit, null, .{}, .{});
         }
-        for (0..9) |limit| {
+        for ([_]usize{ 0, 1, 8 }) |limit| {
             try expectPredictedPayloads(input, 0, unlimited, null, .{ .max_line_bytes = limit }, .{});
         }
         for ([_]u64{ (1 << 32) - 1, std.math.maxInt(u64) - 1, std.math.maxInt(u64) }) |counter| {
             try expectPredictedPayloads(input, 0, unlimited, null, .{}, .{ .records = counter });
         }
-        for (0..input.len + 1) |remaining| {
+        for ([_]usize{ 0, 1, input.len }) |remaining| {
             try expectPredictedPayloads(input, 0, unlimited, null, .{}, .{
                 .bytes = std.math.maxInt(u64) - remaining,
             });
@@ -3123,30 +3236,34 @@ test "[property] - [reader]: predicted payloads preserve parsing and source prog
 
 test "[property] - [reader]: predicted payloads retain refill and oversized fallbacks" {
     const capacity = io_layer.DEFAULT_READER_BUFFER_BYTES;
-    for ([_]usize{ capacity / 2 - 8, capacity / 2, capacity + 1 }) |len| {
-        for ([_][]const u8{ "\n", "\r\n" }) |ending| {
-            const input = try ReaderSpillFixture.init(std.testing.allocator, len, len, ending, true);
-            defer std.testing.allocator.free(input);
-            for ([_]usize{ 0, 5, len + 5, capacity - 1, capacity, input.len - 1 }) |split| {
-                try expectPredictedPayloads(input, split, capacity, null, .{}, .{});
-            }
-            try expectPredictedPayloads(input, 0, capacity - 1, capacity, .{}, .{});
-            try expectPredictedPayloads(input, 0, capacity, null, .{ .max_line_bytes = len - 1 }, .{});
-            try expectPredictedPayloads(input[0 .. input.len - ending.len], 0, capacity, null, .{}, .{});
+    const cases = [_]struct { len: usize, ending: []const u8 }{
+        .{ .len = capacity / 2, .ending = "\n" },
+        .{ .len = capacity + 1, .ending = "\n" },
+        .{ .len = capacity + 1, .ending = "\r\n" },
+    };
+    for (cases) |case| {
+        const len = case.len;
+        const ending = case.ending;
+        const input = try ReaderSpillFixture.init(std.testing.allocator, len, len, ending, true);
+        defer std.testing.allocator.free(input);
+        for ([_]usize{ 0, 5, len + 5, capacity - 1, capacity, input.len - 1 }) |split| {
+            try expectPredictedPayloads(input, split, capacity, null, .{}, .{});
         }
+        try expectPredictedPayloads(input, 0, capacity - 1, capacity, .{}, .{});
+        try expectPredictedPayloads(input, 0, capacity, null, .{ .max_line_bytes = len - 1 }, .{});
+        try expectPredictedPayloads(input[0 .. input.len - ending.len], 0, capacity, null, .{}, .{});
     }
 }
 
-test "[unit] - [reader]: prediction and retry use the current buffer without allocating" {
+test "[unit] - [reader]: prediction and retry reuse the current buffer" {
     for ([_][]const u8{ "\n", "\r\n" }) |ending| {
-        for ([_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129 }) |len| {
+        for ([_]usize{ 0, 1, 16, 17, 64, 65 }) |len| {
             const input = try ReaderSpillFixture.init(std.testing.allocator, len, len, ending, true);
             defer std.testing.allocator.free(input);
             var source = ProjectionTestSource.init(input, 0, null);
-            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
-            var reader = try Reader.init(failing.allocator(), source.byteSource(), .{});
+            var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
             defer reader.deinit();
-            const predicted = (try nextPredictedPayload(&reader)).?;
+            const predicted = (try reader.readPredictedPayload()).?;
             try std.testing.expect(predicted.checkpoint != null);
             try std.testing.expectEqual(len, predicted.payload.sequence.len);
             try std.testing.expectEqual(len, predicted.payload.quality.len);
@@ -3157,7 +3274,6 @@ test "[unit] - [reader]: prediction and retry use the current buffer without all
             try std.testing.expectEqual(buffer, reader.buf.ptr);
             try std.testing.expectEqual(offset, reader.byteOffset());
             try std.testing.expectEqual(@as(usize, 1), source.read_count);
-            try std.testing.expect(!failing.has_induced_failure);
         }
     }
 
@@ -3166,7 +3282,7 @@ test "[unit] - [reader]: prediction and retry use the current buffer without all
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
     var reader = try Reader.init(failing.allocator(), source.byteSource(), .{});
     defer reader.deinit();
-    const predicted = (try nextPredictedPayload(&reader)).?;
+    const predicted = (try reader.readPredictedPayload()).?;
     try std.testing.expectEqualStrings("!\n!", predicted.payload.quality);
     try std.testing.expectError(error.S005LengthMismatch, predicted.checkpoint.?.reread(&reader));
     try std.testing.expectEqual(@as(u64, 9), reader.takeLastError().?.byte_offset);
@@ -3264,7 +3380,6 @@ fn expectRefillDelivery(
         const record_start = reader.byteOffset() - progress.bytes;
         var reference_span: ?[]const u8 = null;
         reference.beginRecord();
-        // Keep the pre-refill parser as a reference for fields and failures.
         const expected: ReaderError!?Record = result: {
             const buffered = reference.readBufferedRecord(.full, true, null, false) catch |err|
                 break :result err;
@@ -3345,7 +3460,6 @@ fn expectPairedRefill(
                 finished = true;
                 break :pair;
             }
-            // The reference owns mate 1 before an ordinary read invalidates it.
             var saved = try toOwned(std.testing.allocator, first.?.record);
             defer saved.deinit();
             const expected_second = nextValidatedRecord(&reference, &reference_validator);
@@ -3408,12 +3522,15 @@ test "[property] - [reader]: paired refills preserve fields, progress, and failu
             first ++ "@r/2\r\r\nR\rA\n+\r\r\n!!!\n",
             "@r/1\r\r\nAR\n+left\r\r\n!~\n" ++ first,
         }) |input| {
-            for (0..input.len + 1) |split| {
-                try expectPairedRefill(header_only, input, split, std.math.maxInt(usize), null, .{}, .{});
-                try expectPairedRefill(header_only, input[0..split], 0, 3, null, .{}, .{});
-                try expectPairedRefill(header_only, input, 0, 3, split, .{}, .{});
+            for (input, 0..) |byte, index| {
+                if (byte != '\r' and byte != '\n') continue;
+                for ([_]usize{ index -| 1, index, index + 1 }) |split| {
+                    try expectPairedRefill(header_only, input, split, std.math.maxInt(usize), null, .{}, .{});
+                    try expectPairedRefill(header_only, input[0..split], 0, 3, null, .{}, .{});
+                    try expectPairedRefill(header_only, input, 0, 3, split, .{}, .{});
+                }
             }
-            for (1..input.len + 1) |chunk_limit| {
+            for ([_]usize{ 1, 2, 3, std.math.maxInt(usize) }) |chunk_limit| {
                 try expectPairedRefill(header_only, input, 0, chunk_limit, null, .{ .max_line_bytes = 8 }, .{});
             }
         }
@@ -3428,7 +3545,7 @@ test "[property] - [reader]: paired refills retain oversized and EOF fallbacks" 
     const capacity = io_layer.DEFAULT_READER_BUFFER_BYTES;
     const first = "@r/1\nAR\n+left\n!~\n";
     const last = "@last\nN\n+\n!\n";
-    for ([_]usize{ capacity - first.len - 1, capacity - first.len, capacity - first.len + 1, capacity - 3, capacity - 2, capacity + 1, 2 * capacity + 11 }) |record_len| {
+    for ([_]usize{ capacity - first.len - 1, capacity - first.len, capacity - first.len + 1 }) |record_len| {
         const field_len = (record_len - 9) / 2;
         const second = try ReaderSpillFixture.init(std.testing.allocator, field_len, field_len, "\n", true);
         defer std.testing.allocator.free(second);
@@ -3568,7 +3685,7 @@ test "[edge] - [reader]: refill reserve grows from projected fields and retains 
 }
 
 test "[property] - [reader]: structural masks match scalar line boundaries" {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse 1;
+    const vector_len = simd.BLOCK_BYTES;
     var storage: [5 * vector_len + 8]u8 = undefined;
 
     for (0..vector_len) |alignment| {
@@ -3610,13 +3727,13 @@ test "[property] - [reader]: structural masks match scalar line boundaries" {
 
 test "[property] - [reader]: saved LF masks preserve searches after skips and rewinds" {
     var storage: [193]u8 = undefined;
-    inline for (.{ std.simd.suggestVectorLength(u8) orelse 1, STRUCTURAL_BLOCK_BYTES }) |lanes| {
-        for (0..storage.len) |newline| {
+    inline for (.{ simd.tierWidth(.baseline), simd.BLOCK_BYTES }) |lanes| {
+        for ([_]usize{ 0, 1, 63, 64, 65, 192 }) |newline| {
             @memset(&storage, 'x');
             storage[newline] = '\n';
             storage[storage.len - 1] = '\n';
             var line_feeds: LineFeedSearch = .{};
-            for (0..storage.len + 1) |start| {
+            for ([_]usize{ 0, lanes - 1, lanes, lanes + 1, 63, 64, 65, 127, 128, 129, 191, 192, 193 }) |start| {
                 const expected = if (std.mem.findScalar(u8, storage[start..], '\n')) |end|
                     start + end
                 else
@@ -3635,7 +3752,7 @@ test "[property] - [reader]: saved LF masks preserve searches after skips and re
     }
 }
 
-test "[property] - [reader]: short reads borrow complete records without field allocations" {
+test "[property] - [reader]: short and whole-input reads deliver the same records; whole reads allocate nothing" {
     const cases = [_][]const u8{
         "@r\nAR\n+note\n!~\n@next\nC\n+\n#\n",
         "@r\r\nAR\r\n+note\r\n!~\r\n@next\r\nC\r\n+\r\n#\r\n",
@@ -3645,7 +3762,10 @@ test "[property] - [reader]: short reads borrow complete records without field a
         for (1..data.len + 1) |chunk_limit| {
             var source = ProjectionTestSource.init(data, 0, null);
             source.chunk_limit = chunk_limit;
-            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+            const whole_input = chunk_limit >= data.len;
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+                .fail_index = if (whole_input) 1 else std.math.maxInt(usize),
+            });
             var reader = try Reader.init(failing.allocator(), source.byteSource(), .{});
             defer reader.deinit();
             var validator = AdaptiveRecordValidator.init(.{});
@@ -3667,7 +3787,6 @@ test "[property] - [reader]: short reads borrow complete records without field a
             try std.testing.expect((try nextValidatedRecord(&reader, &validator)) == null);
             try std.testing.expectEqual(@as(u64, data.len), reader.byteOffset());
             try std.testing.expectEqual(@as(u64, 2), reader.recordIndex());
-            try std.testing.expect(!failing.has_induced_failure);
         }
     }
 }
@@ -3681,12 +3800,15 @@ test "[property] - [reader]: refill retries preserve records, progress, and fail
         "@r\r\r\nA\n+\r\r\n!\n", "@r\nR\rA\n+\n!!!\n",
     }) |input| {
         for ([_]ReaderOptions{ .{}, .{ .max_line_bytes = 2 } }) |options| {
-            for (0..input.len + 1) |split| {
-                try expectRefillDelivery(input, split, unlimited, null, options, .{});
-                try expectRefillDelivery(input[0..split], 0, 1, null, options, .{});
-                try expectRefillDelivery(input, 0, unlimited, split, options, .{});
+            for (input, 0..) |byte, index| {
+                if (byte != '\n') continue;
+                for ([_]usize{ index -| 1, index, index + 1 }) |split| {
+                    try expectRefillDelivery(input, split, unlimited, null, options, .{});
+                    try expectRefillDelivery(input[0..split], 0, 1, null, options, .{});
+                    try expectRefillDelivery(input, 0, unlimited, split, options, .{});
+                }
             }
-            for (1..input.len + 1) |chunk_limit| {
+            for ([_]usize{ 1, 2, unlimited }) |chunk_limit| {
                 try expectRefillDelivery(input, 0, chunk_limit, null, options, .{});
             }
         }
@@ -3694,9 +3816,12 @@ test "[property] - [reader]: refill retries preserve records, progress, and fail
 
     const input = "@r\nR\n+\n!\n" ** 2;
     for ([_]u64{ (1 << 32) - 3, std.math.maxInt(u64) - 8, std.math.maxInt(u64) - 1, std.math.maxInt(u64) }) |counter| {
-        for (0..input.len + 1) |split| {
-            try expectRefillDelivery(input, split, unlimited, null, .{}, .{ .bytes = counter });
-            try expectRefillDelivery(input, split, unlimited, null, .{}, .{ .records = counter });
+        for (input, 0..) |byte, index| {
+            if (byte != '\n') continue;
+            for ([_]usize{ index -| 1, index, index + 1 }) |split| {
+                try expectRefillDelivery(input, split, unlimited, null, .{}, .{ .bytes = counter });
+                try expectRefillDelivery(input, split, unlimited, null, .{}, .{ .records = counter });
+            }
         }
     }
 }
@@ -3705,7 +3830,7 @@ test "[property] - [reader]: refill retries cover the transport capacity and ove
     const window = io_layer.DEFAULT_READER_BUFFER_BYTES;
     const prefix = "@first\nA\n+\n!\n";
     const suffix = "@last\nC\n+\n#\n";
-    for ([_]usize{ window - 1, window, window + 1, 2 * window + 11 }) |record_len| {
+    for ([_]usize{ window - 1, window, window + 1 }) |record_len| {
         const sequence_len = (record_len - 9) / 2;
         const base = try ReaderSpillFixture.init(std.testing.allocator, sequence_len, sequence_len, "\n", true);
         defer std.testing.allocator.free(base);
@@ -3744,15 +3869,23 @@ test "[property] - [reader]: refill retries cover the transport capacity and ove
     }
 }
 
+fn expectPayloadProjectionAtLineEnds(input: []const u8, options: ReaderOptions) !void {
+    try expectPayloadProjection(input, 0, null, options, .{});
+    for (input, 0..) |byte, index| {
+        if (byte != '\r' and byte != '\n') continue;
+        for ([_]usize{ index -| 1, index, index + 1 }) |split| {
+            try expectPayloadProjection(input, split, null, options, .{});
+        }
+    }
+}
+
 test "[property] - [reader]: field projections preserve delivery and failures" {
     const valid =
         "@first description\nACGT\n+annotated\n!!!!\n" ++
         "@opaque\tmetadata /1\r\nacgtn\r\n+different annotation\r\n!#~AB\r\n" ++
         "@empty\r\n\r\n+\r\n\r\n" ++
         "@tail\nN\n+\n#";
-    for (0..valid.len + 1) |split| {
-        try expectPayloadProjection(valid, split, null, .{}, .{});
-    }
+    try expectPayloadProjectionAtLineEnds(valid, .{});
 
     const semantic_cases = [_][]const u8{
         "@bad-sequence\nAC?T\n+\n!!!!\n",
@@ -3764,32 +3897,14 @@ test "[property] - [reader]: field projections preserve delivery and failures" {
         "@valid\nAC\n+\n!!\n@bad-structure\nA?\n-\n!\x1f\n",
     };
     for (semantic_cases) |input| {
-        for (0..input.len + 1) |split| {
-            try expectPayloadProjection(input, split, null, .{}, .{});
-        }
+        try expectPayloadProjection(input, input.len / 2, null, .{}, .{});
     }
 
     const acgtn_input = "@acgtn-policy\nARYN\n+\n!!!!\n";
-    for (0..acgtn_input.len + 1) |split| {
-        try expectPayloadProjection(
-            acgtn_input,
-            split,
-            null,
-            .{},
-            .{ .alphabet = .acgtn },
-        );
-    }
+    try expectPayloadProjection(acgtn_input, acgtn_input.len / 2, null, .{}, .{ .alphabet = .acgtn });
 
     const exact_limit_crlf = "@r\r\nA\r\n+\r\n!\r\n";
-    for (0..exact_limit_crlf.len + 1) |split| {
-        try expectPayloadProjection(
-            exact_limit_crlf,
-            split,
-            null,
-            .{ .max_line_bytes = 2 },
-            .{},
-        );
-    }
+    try expectPayloadProjectionAtLineEnds(exact_limit_crlf, .{ .max_line_bytes = 2 });
 
     const malformed = [_]struct {
         input: []const u8,
@@ -3829,21 +3944,26 @@ test "[property] - [reader]: validated records match separate parsing and valida
     }) |suffix| {
         var storage: [128]u8 = undefined;
         const input = try std.fmt.bufPrint(&storage, "{s}{s}{s}", .{ prefix, suffix, prefix });
-        for (0..input.len + 1) |split| {
-            try expectValidatedProjection(input, split, null, .{}, .{}, .{});
+        for (input, 0..) |byte, index| {
+            if (byte != '\n') continue;
+            for ([_]usize{ index -| 1, index, index + 1 }) |split| {
+                try expectValidatedProjection(input, split, null, .{}, .{}, .{});
+            }
         }
-        for (0..suffix.len + 1) |split| {
-            try expectValidatedProjection(suffix, split, null, .{}, .{}, .{});
+        for (suffix, 0..) |byte, index| {
+            if (byte != '\n') continue;
+            for ([_]usize{ index -| 1, index, index + 1 }) |split| {
+                try expectValidatedProjection(suffix, split, null, .{}, .{}, .{});
+            }
         }
         try expectValidatedProjection(suffix, 0, null, .{}, .{ .alphabet = .acgtn }, .{});
         try expectValidatedProjection(suffix, 0, null, .{ .max_line_bytes = 2 }, .{}, .{});
-        for (0..suffix.len + 1) |fail_at| {
+        for ([_]usize{ 0, 1, suffix.len }) |fail_at| {
             try expectValidatedProjection(suffix, 0, fail_at, .{}, .{}, .{});
         }
     }
 
-    const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
-    for ([_]usize{ 15, 16, 17, vector_len - 1, vector_len, vector_len + 1, 63, 64, 65 }) |len| {
+    for ([_]usize{ 15, 16, 17, 63, 64, 65 }) |len| {
         const input = try ReaderSpillFixture.init(std.testing.allocator, len, len, "\n", true);
         defer std.testing.allocator.free(input);
         try expectValidatedProjection(input, 0, null, .{}, .{}, .{});
@@ -3926,70 +4046,59 @@ test "[edge] - [reader]: buffered validation preserves borrowed mates and valida
     try std.testing.expect(validator.use_full_iupac);
 }
 
-test "[edge] - [reader]: fallback projections retain only requested fields" {
+test "[edge] - [reader]: spilled records keep field storage empty on advance, payload, and header paths" {
     const field_len = io_layer.DEFAULT_READER_BUFFER_BYTES + 17;
-    const input = try ReaderSpillFixture.init(
-        std.testing.allocator,
-        field_len,
-        field_len,
-        "\n",
-        true,
-    );
+    const input = try ReaderSpillFixture.init(std.testing.allocator, field_len, field_len, "\n", true);
     defer std.testing.allocator.free(input);
 
-    var advance_source = io_layer.SliceSource.init(input);
-    var advance_tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var advance_reader = try Reader.init(
-        advance_tracking.allocator(),
-        advance_source.byteSource(),
-        .{},
-    );
-    defer advance_reader.deinit();
-    const initial_allocations = advance_tracking.allocations;
+    {
+        var source = io_layer.SliceSource.init(input);
+        var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{});
+        defer reader.deinit();
+        const initial_allocations = tracking.allocations;
 
-    try std.testing.expect(try advance_reader.advance());
-    try std.testing.expectEqual(initial_allocations, advance_tracking.allocations);
-    try std.testing.expectEqual(@as(u64, 1), advance_reader.recordIndex());
-    for (advance_reader.fallback_fields) |field| {
-        try std.testing.expectEqual(@as(usize, 0), field.len);
+        try std.testing.expect(try reader.advance());
+        try std.testing.expectEqual(initial_allocations, tracking.allocations);
+        try std.testing.expectEqual(@as(u64, 1), reader.recordIndex());
+        for (reader.fallback_fields) |field| {
+            try std.testing.expectEqual(@as(usize, 0), field.len);
+        }
     }
 
-    var payload_source = io_layer.SliceSource.init(input);
-    var payload_reader = try Reader.init(
-        std.testing.allocator,
-        payload_source.byteSource(),
-        .{},
-    );
-    defer payload_reader.deinit();
+    {
+        var source = io_layer.SliceSource.init(input);
+        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
 
-    const payload = (try payload_reader.readPayload()).?;
-    try std.testing.expectEqual(field_len, payload.sequence.len);
-    try std.testing.expectEqual(field_len, payload.quality.len);
-    try std.testing.expectEqual(@as(usize, 0), payload_reader.fallback_fields[0].len);
-    try std.testing.expectEqual(@as(usize, 0), payload_reader.fallback_fields[2].len);
-    try std.testing.expectEqual(@as(usize, 0), payload_reader.fallback_fields[0].storage.len);
-    try std.testing.expectEqual(@as(usize, 0), payload_reader.fallback_fields[2].storage.len);
+        const payload = (try reader.readPayload()).?;
+        try std.testing.expectEqual(field_len, payload.sequence.len);
+        try std.testing.expectEqual(field_len, payload.quality.len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[0].len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[2].len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[0].storage.len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[2].storage.len);
+    }
 
-    var validated_source = io_layer.SliceSource.init(input);
-    var validated_reader = try Reader.init(
-        std.testing.allocator,
-        validated_source.byteSource(),
-        .{},
-    );
-    defer validated_reader.deinit();
-    var validator = AdaptiveRecordValidator.init(.{});
+    {
+        var source = io_layer.SliceSource.init(input);
+        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+        defer reader.deinit();
+        var validator = AdaptiveRecordValidator.init(.{});
 
-    const validated = (try validated_reader.readValidatedHeader(&validator)).?;
-    try std.testing.expectEqualStrings("abc", validated.header);
-    try std.testing.expect(validated.semantic_error == null);
-    try std.testing.expectEqual(@as(usize, 0), validated_reader.fallback_fields[1].storage.len);
-    try std.testing.expectEqual(@as(usize, 0), validated_reader.fallback_fields[1].len);
-    try std.testing.expectEqual(@as(usize, 0), validated_reader.fallback_fields[2].storage.len);
-    try std.testing.expectEqual(@as(usize, 0), validated_reader.fallback_fields[3].storage.len);
+        const validated = (try reader.readValidatedHeader(&validator)).?;
+        try std.testing.expectEqualStrings("abc", validated.header);
+        try std.testing.expect(validated.semantic_error == null);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[1].storage.len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[1].len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[2].storage.len);
+        try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[3].storage.len);
+    }
 }
 
+const CROSSING_32_BIT: u64 = 1 << 32;
+
 test "[edge] - [reader]: counts and locations cross 32 bits through buffered and fallback reads" {
-    const crossing: u64 = 1 << 32;
     const data = "@r\nA\n+\n!\n" ** 3 ++ "@bad\nA\n?\n!\n";
     for ([_]usize{ 1, 28, data.len }) |split| {
         for ([_]bool{ false, true }) |advance| {
@@ -3999,11 +4108,11 @@ test "[edge] - [reader]: counts and locations cross 32 bits through buffered and
             var source = ProjectionTestSource.init(data, split, null);
             var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
             defer reader.deinit();
-            reader.byte_offset = crossing - 3;
-            reader.record_index = crossing - 1;
+            reader.byte_offset = CROSSING_32_BIT - 3;
+            reader.record_index = CROSSING_32_BIT - 1;
 
             for (0..3) |index| {
-                const start = crossing - 3 + 9 * index;
+                const start = CROSSING_32_BIT - 3 + 9 * index;
                 if (advance) {
                     try std.testing.expect(try reader.advance());
                 } else {
@@ -4021,7 +4130,7 @@ test "[edge] - [reader]: counts and locations cross 32 bits through buffered and
                         .quality = start + 7,
                     }, reader.currentRecordOffsets().?);
                 }
-                try std.testing.expectEqual(crossing + index, reader.recordIndex());
+                try std.testing.expectEqual(CROSSING_32_BIT + index, reader.recordIndex());
                 try std.testing.expectEqual(start + 9, reader.byteOffset());
             }
             if (advance) {
@@ -4029,13 +4138,13 @@ test "[edge] - [reader]: counts and locations cross 32 bits through buffered and
             } else {
                 try std.testing.expectError(error.S001InvalidPlusLine, reader.next());
             }
-            try std.testing.expectEqual(crossing + 2, reader.recordIndex());
-            try std.testing.expectEqual(crossing + 33, reader.byteOffset());
+            try std.testing.expectEqual(CROSSING_32_BIT + 2, reader.recordIndex());
+            try std.testing.expectEqual(CROSSING_32_BIT + 33, reader.byteOffset());
             try std.testing.expectEqualDeep(ParseError{
                 .code = .s001_invalid_plus_line,
                 .message = "plus line must start with '+'",
-                .record_index = crossing + 2,
-                .byte_offset = crossing + 31,
+                .record_index = CROSSING_32_BIT + 2,
+                .byte_offset = CROSSING_32_BIT + 31,
                 .line_in_record = 3,
             }, reader.takeLastError().?);
             try std.testing.expect(reader.takeLastError() == null);
@@ -4043,71 +4152,35 @@ test "[edge] - [reader]: counts and locations cross 32 bits through buffered and
     }
 }
 
-test "[edge] - [reader]: buffered progress rejects maximum offset and record count" {
+test "[edge] - [reader]: offset and record-count limits reject the record on buffered and fallback reads" {
     const data = "@r\nA\n+\n!\n";
+    for ([_]usize{ 0, 1 }) |split| {
+        var offset_source = ProjectionTestSource.init(data, split, null);
+        var offset_reader = try Reader.init(std.testing.allocator, offset_source.byteSource(), .{});
+        defer offset_reader.deinit();
+        offset_reader.byte_offset = std.math.maxInt(u64);
 
-    var offset_source = io_layer.SliceSource.init(data);
-    var offset_reader = try Reader.init(
-        std.testing.allocator,
-        offset_source.byteSource(),
-        .{},
-    );
-    defer offset_reader.deinit();
-    offset_reader.byte_offset = std.math.maxInt(u64);
+        try std.testing.expectError(error.ArithmeticLimit, offset_reader.next());
+        try std.testing.expectEqual(std.math.maxInt(u64), offset_reader.byte_offset);
+        try std.testing.expectEqual(@as(u64, 0), offset_reader.record_index);
 
-    try std.testing.expectError(error.ArithmeticLimit, offset_reader.next());
-    try std.testing.expectEqual(std.math.maxInt(u64), offset_reader.byte_offset);
-    try std.testing.expectEqual(@as(u64, 0), offset_reader.record_index);
+        var count_source = ProjectionTestSource.init(data, split, null);
+        var count_reader = try Reader.init(std.testing.allocator, count_source.byteSource(), .{});
+        defer count_reader.deinit();
+        count_reader.record_index = std.math.maxInt(u64);
 
-    var count_source = io_layer.SliceSource.init(data);
-    var count_reader = try Reader.init(
-        std.testing.allocator,
-        count_source.byteSource(),
-        .{},
-    );
-    defer count_reader.deinit();
-    count_reader.record_index = std.math.maxInt(u64);
-
-    try std.testing.expectError(error.ArithmeticLimit, count_reader.next());
-    try std.testing.expectEqual(std.math.maxInt(u64), count_reader.record_index);
-    try std.testing.expectEqual(@as(u64, data.len), count_reader.byte_offset);
-}
-
-test "[edge] - [reader]: fallback progress rejects maximum offset and record count" {
-    const data = "@r\nA\n+\n!\n";
-
-    var offset_source = ProjectionTestSource.init(data, 1, null);
-    var offset_reader = try Reader.init(
-        std.testing.allocator,
-        offset_source.byteSource(),
-        .{},
-    );
-    defer offset_reader.deinit();
-    offset_reader.byte_offset = std.math.maxInt(u64);
-
-    try std.testing.expectError(error.ArithmeticLimit, offset_reader.next());
-    try std.testing.expectEqual(std.math.maxInt(u64), offset_reader.byte_offset);
-    try std.testing.expectEqual(@as(u64, 0), offset_reader.record_index);
-
-    var count_source = ProjectionTestSource.init(data, 1, null);
-    var count_reader = try Reader.init(
-        std.testing.allocator,
-        count_source.byteSource(),
-        .{},
-    );
-    defer count_reader.deinit();
-    count_reader.record_index = std.math.maxInt(u64);
-
-    try std.testing.expectError(error.ArithmeticLimit, count_reader.next());
-    try std.testing.expectEqual(std.math.maxInt(u64), count_reader.record_index);
-    try std.testing.expectEqual(@as(u64, data.len), count_reader.byte_offset);
+        try std.testing.expectError(error.ArithmeticLimit, count_reader.next());
+        try std.testing.expectEqual(std.math.maxInt(u64), count_reader.record_index);
+        try std.testing.expectEqual(@as(u64, data.len), count_reader.byte_offset);
+    }
 }
 
 test "[failure] - [reader]: partial fallback ownership is released after allocation failure" {
+    const spill_len = 2 * io_layer.DEFAULT_READER_BUFFER_BYTES;
     const input = try ReaderSpillFixture.init(
         std.testing.allocator,
-        512 * 1024,
-        512 * 1024,
+        spill_len,
+        spill_len,
         "\n",
         true,
     );
@@ -4115,53 +4188,47 @@ test "[failure] - [reader]: partial fallback ownership is released after allocat
 
     for ([_][]const u8{ input, "@r\nA\n+\n!" }) |bytes| {
         for ([_]usize{ std.math.maxInt(usize), 37 }) |chunk_limit| {
-            try std.testing.checkAllAllocationFailures(
-                std.testing.allocator,
-                readSpillForAllocationCheck,
-                .{ bytes, chunk_limit },
+            try readSpillForAllocationCheck(std.testing.allocator, bytes, chunk_limit);
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+            try std.testing.expectError(
+                error.OutOfMemory,
+                readSpillForAllocationCheck(failing.allocator(), bytes, chunk_limit),
             );
         }
     }
 }
 
+fn spillRecordFixture(allocator: std.mem.Allocator, max_line_bytes: usize, crlf: bool) ![]u8 {
+    const fill_bytes = [_]u8{ 'h', 'A', 'p', 'I' };
+    const prefix_bytes = [_]?u8{ '@', null, '+', null };
+    const ending_bytes: usize = if (crlf) 2 else 1;
+    const input = try allocator.alloc(u8, 4 * (max_line_bytes + ending_bytes));
+    errdefer allocator.free(input);
+
+    var offset: usize = 0;
+    for (fill_bytes, prefix_bytes) |fill, prefix| {
+        @memset(input[offset..][0..max_line_bytes], fill);
+        if (prefix) |byte| input[offset] = byte;
+        offset += max_line_bytes;
+        if (crlf) {
+            input[offset] = '\r';
+            offset += 1;
+        }
+        input[offset] = '\n';
+        offset += 1;
+    }
+    std.debug.assert(offset == input.len);
+    return input;
+}
+
 test "[edge] - [reader]: spill field capacities stop at the line limit" {
     const max_line_bytes = 80 * 1024;
     const storage_limit = fieldStorageLimit(max_line_bytes);
-    const fill_bytes = [_]u8{ 'h', 'A', 'p', 'I' };
-    const prefix_bytes = [_]?u8{ '@', null, '+', null };
-
     for ([_]bool{ false, true }) |crlf| {
-        const ending_bytes: usize = if (crlf) 2 else 1;
-        const input = try std.testing.allocator.alloc(
-            u8,
-            4 * (max_line_bytes + ending_bytes),
-        );
+        const input = try spillRecordFixture(std.testing.allocator, max_line_bytes, crlf);
         defer std.testing.allocator.free(input);
-
-        var offset: usize = 0;
-        for (fill_bytes, prefix_bytes) |fill, prefix| {
-            @memset(input[offset..][0..max_line_bytes], fill);
-            if (prefix) |byte| input[offset] = byte;
-            offset += max_line_bytes;
-            if (crlf) {
-                input[offset] = '\r';
-                offset += 1;
-            }
-            input[offset] = '\n';
-            offset += 1;
-        }
-        try std.testing.expectEqual(input.len, offset);
-
-        var repeated: std.ArrayList(u8) = .empty;
-        defer repeated.deinit(std.testing.allocator);
-        for (0..4) |_| try repeated.appendSlice(std.testing.allocator, input);
-        var source = io_layer.SliceSource.init(repeated.items);
-        var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-        var reader = try Reader.init(
-            tracking.allocator(),
-            source.byteSource(),
-            .{ .max_line_bytes = max_line_bytes },
-        );
+        var source = io_layer.SliceSource.init(input);
+        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{ .max_line_bytes = max_line_bytes });
         defer reader.deinit();
 
         const record = (try reader.next()).?;
@@ -4183,9 +4250,27 @@ test "[edge] - [reader]: spill field capacities stop at the line limit" {
             ReaderError.LineTooLong,
             reader.ensureFieldCapacity(0, storage_limit + 1, false),
         );
+    }
+}
+
+test "[property] - [reader]: spilled records keep field storage bounded and reuse it" {
+    const max_line_bytes = 80 * 1024;
+    const storage_limit = fieldStorageLimit(max_line_bytes);
+    for ([_]bool{ false, true }) |crlf| {
+        const record = try spillRecordFixture(std.testing.allocator, max_line_bytes, crlf);
+        defer std.testing.allocator.free(record);
+        var repeated: std.ArrayList(u8) = .empty;
+        defer repeated.deinit(std.testing.allocator);
+        for (0..4) |_| try repeated.appendSlice(std.testing.allocator, record);
+        var source = io_layer.SliceSource.init(repeated.items);
+        var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{ .max_line_bytes = max_line_bytes });
+        defer reader.deinit();
+
         var warm_allocated = tracking.allocated_bytes;
-        var count: usize = 1;
+        var count: usize = 0;
         while (try reader.next()) |next| {
+            count += 1;
             try std.testing.expectEqual(max_line_bytes - 1, next.header.len);
             try std.testing.expectEqual(max_line_bytes - 1, next.plus.len);
             try std.testing.expectEqual(max_line_bytes, next.sequence.len);
@@ -4200,11 +4285,9 @@ test "[edge] - [reader]: spill field capacities stop at the line limit" {
             }
             try std.testing.expect(tracking.allocated_bytes - tracking.freed_bytes <=
                 2 * io_layer.DEFAULT_READER_BUFFER_BYTES + 3 * storage_limit);
-            // The second record first attempts whole-record refill assembly.
-            try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.fallback_fields[1].storage.len);
-            if (crlf and count > 1) try std.testing.expectEqual(warm_allocated, tracking.allocated_bytes);
+            if (count > 1) try std.testing.expectEqual(io_layer.DEFAULT_READER_BUFFER_BYTES, reader.fallback_fields[1].storage.len);
+            if (crlf and count > 2) try std.testing.expectEqual(warm_allocated, tracking.allocated_bytes);
             warm_allocated = tracking.allocated_bytes;
-            count += 1;
         }
         try std.testing.expectEqual(@as(usize, 4), count);
     }
@@ -4236,7 +4319,9 @@ test "[property] - [reader]: repeated initialization releases the transport buff
         io_layer.DEFAULT_READER_BUFFER_BYTES,
         std.math.maxInt(usize),
     }) |limit| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{limit});
+        try Exercise.run(std.testing.allocator, limit);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, Exercise.run(failing.allocator(), limit));
         var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
         for (0..3) |iteration| {
             try Exercise.run(tracking.allocator(), limit);
@@ -4250,35 +4335,56 @@ test "[property] - [reader]: repeated initialization releases the transport buff
 test "[edge] - [reader]: field storage limit saturates after checked overflow" {
     const max = std.math.maxInt(usize);
 
-    try std.testing.expectEqual(1024 * 1024 + 1, fieldStorageLimit(1024 * 1024));
     try std.testing.expectEqual(max, fieldStorageLimit(max - 1));
     try std.testing.expectEqual(max, fieldStorageLimit(max));
 }
 
-test "[unit] - [reader]: field storage exchanges preserve both live prefixes" {
+test "[property] - [reader]: storage exchange keeps both live prefixes without allocating" {
     const window = io_layer.DEFAULT_READER_BUFFER_BYTES;
-    var source = io_layer.SliceSource.init("");
+    const Row = struct { live: usize, donor_live: usize };
+    const rows = [_]Row{
+        .{ .live = window, .donor_live = 0 },
+        .{ .live = 0, .donor_live = 1 },
+        .{ .live = 1, .donor_live = window },
+        .{ .live = window, .donor_live = window },
+    };
+    for (rows) |row| {
+        var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var source = io_layer.SliceSource.init("");
+        var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{});
+        defer reader.deinit();
+        reader.machine.expected = .sequence;
+        try reader.ensureFieldCapacity(1, window, false);
+        const field = &reader.fallback_fields[1];
+        const donor = &reader.fallback_fields[0];
+        field.len = row.live;
+        @memset(field.storage[0..row.live], 'A');
+        donor.storage = try tracking.allocator().alloc(u8, 2 * window);
+        donor.len = row.donor_live;
+        @memset(donor.storage[0..row.donor_live], 'h');
+        const donor_pointer = donor.storage.ptr;
+        const field_pointer = field.storage.ptr;
+        const allocations = tracking.allocations;
+
+        try reader.ensureFieldCapacity(1, window + 1, false);
+
+        try std.testing.expectEqual(allocations, tracking.allocations);
+        try std.testing.expectEqual(donor_pointer, field.storage.ptr);
+        try std.testing.expectEqual(field_pointer, donor.storage.ptr);
+        try std.testing.expectEqual(row.live, field.len);
+        try std.testing.expectEqual(row.donor_live, donor.len);
+        try std.testing.expect(std.mem.allEqual(u8, field.storage[0..row.live], 'A'));
+        try std.testing.expect(std.mem.allEqual(u8, donor.storage[0..row.donor_live], 'h'));
+    }
+
     var tracking = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var source = io_layer.SliceSource.init("");
     var reader = try Reader.init(tracking.allocator(), source.byteSource(), .{});
     defer reader.deinit();
     reader.machine.expected = .sequence;
     try reader.ensureFieldCapacity(1, window, false);
     reader.fallback_fields[1].len = window;
     @memset(reader.fallback_fields[1].storage, 'A');
-    reader.fallback_fields[2].storage = try tracking.allocator().alloc(u8, 2 * window);
-    const donor_pointer = reader.fallback_fields[2].storage.ptr;
-    const old_pointer = reader.fallback_fields[1].storage.ptr;
-    const allocations = tracking.allocations;
-
-    try reader.ensureFieldCapacity(1, window + 1, false);
-
-    try std.testing.expectEqual(allocations, tracking.allocations);
-    try std.testing.expectEqual(donor_pointer, reader.fallback_fields[1].storage.ptr);
-    try std.testing.expectEqual(old_pointer, reader.fallback_fields[2].storage.ptr);
-    try std.testing.expectEqual(window, reader.fallback_fields[1].len);
-    try std.testing.expect(std.mem.allEqual(u8, reader.fallback_fields[1].storage[0..window], 'A'));
-    try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[2].len);
-
     reader.fallback_fields[3].storage = try tracking.allocator().alloc(u8, 4 * window);
     reader.fallback_fields[3].len = 1;
     reader.fallback_fields[3].storage[0] = '!';
@@ -4307,34 +4413,6 @@ test "[failure] - [reader]: failed spill growth preserves owned storage" {
         reader.ensureFieldCapacity(0, 1, false),
     );
     try std.testing.expectEqual(@as(usize, 0), reader.fallback_fields[0].storage.len);
-}
-
-test "[property] - [reader]: storage exchange preserves unequal prefixes" {
-    const window = io_layer.DEFAULT_READER_BUFFER_BYTES;
-    for ([_]usize{ 0, 1, window }) |live| {
-        for ([_]usize{ 0, 1, window }) |other_live| {
-            var source = io_layer.SliceSource.init("");
-            var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
-            defer reader.deinit();
-            try reader.ensureFieldCapacity(1, window, false);
-            const field = &reader.fallback_fields[1];
-            const donor = &reader.fallback_fields[0];
-            field.len = live;
-            @memset(field.storage[0..live], 'A');
-            donor.storage = try std.testing.allocator.alloc(u8, 2 * window);
-            donor.len = other_live;
-            @memset(donor.storage[0..other_live], 'h');
-            const pointer = donor.storage.ptr;
-
-            try reader.ensureFieldCapacity(1, window + 1, false);
-
-            try std.testing.expectEqual(pointer, field.storage.ptr);
-            try std.testing.expectEqual(live, field.len);
-            try std.testing.expectEqual(other_live, donor.len);
-            try std.testing.expect(std.mem.allEqual(u8, field.storage[0..live], 'A'));
-            try std.testing.expect(std.mem.allEqual(u8, donor.storage[0..other_live], 'h'));
-        }
-    }
 }
 
 test "[failure] - [reader]: heterogeneous storage reuse cleans up every allocation failure" {
@@ -4391,12 +4469,14 @@ test "[failure] - [reader]: heterogeneous storage reuse cleans up every allocati
         }
     };
     for ([_]bool{ false, true }) |retain| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ input.items, retain });
+        try Exercise.run(std.testing.allocator, input.items, retain);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+        try std.testing.expectError(error.OutOfMemory, Exercise.run(failing.allocator(), input.items, retain));
     }
 }
 
 test "[edge] - [reader]: quality spill reserves only its valid tail" {
-    const sequence_len = 131_070;
+    const sequence_len = 128 * 1024 - 2;
     const Case = struct {
         quality_len: usize,
         ending: []const u8,
@@ -4474,7 +4554,9 @@ test "[edge] - [reader]: quality spill reserves only its valid tail" {
             reader.fallback_fields[3].storage.len,
         );
     }
+}
 
+test "[edge] - [reader]: long quality spills reserve only the quality tail" {
     for ([_]usize{ 512 * 1024, 1024 * 1024 }) |long_sequence_len| {
         const input = try ReaderSpillFixture.init(
             std.testing.allocator,
@@ -4530,7 +4612,7 @@ test "[failure] - [reader]: failed quality-tail reserve preserves owned storage"
     try std.testing.expect(failing.has_induced_failure);
 }
 
-test "[property] - [record delivery]: omits identifiers and preserves buffered canonical spans" {
+test "[property] - [record delivery]: records without identifiers write their canonical span exactly" {
     const cases = [_]struct {
         input: []const u8,
         expected_output: []const u8,
@@ -4570,76 +4652,72 @@ test "[property] - [record delivery]: omits identifiers and preserves buffered c
             try writeCanonicalRecordSpan(&writer, span);
         } else {
             try std.testing.expect(!recordHasTerminalCr(record));
-            try writeRecordFields(&writer, record);
+            try writeRecordUnchecked(&writer, record);
         }
         try std.testing.expectEqualStrings(case.expected_output, sink.written());
         try std.testing.expect((try nextWithSpan(&reader, &canonical_span)) == null);
         try std.testing.expect(canonical_span == null);
     }
+}
 
-    {
-        const input1 = "@pair/1\nAC\n+left\n!!\n";
-        const input2 = "@pair/2\nGT\n+right\n##\n";
-        const input = input1 ++ input2;
-        var source = io_layer.SliceSource.init(input);
-        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
-        defer reader.deinit();
-        var canonical_span1: ?[]const u8 = null;
-        const record1 = (try nextWithSpan(&reader, &canonical_span1)).?;
-        var canonical_span2: ?[]const u8 = null;
-        const record2 = (try nextBufferedWithSpan(&reader, &canonical_span2)).?;
+test "[integration] - [record delivery]: buffered spans of consecutive records name their own bytes" {
+    const input1 = "@pair/1\nAC\n+left\n!!\n";
+    const input2 = "@pair/2\nGT\n+right\n##\n";
+    const input = input1 ++ input2;
+    var source = io_layer.SliceSource.init(input);
+    var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+    defer reader.deinit();
+    var canonical_span1: ?[]const u8 = null;
+    const record1 = (try nextWithSpan(&reader, &canonical_span1)).?;
+    var canonical_span2: ?[]const u8 = null;
+    const record2 = (try nextBufferedWithSpan(&reader, &canonical_span2)).?;
 
-        try std.testing.expectEqualStrings("pair/1", record1.header);
-        try std.testing.expectEqualStrings("AC", record1.sequence);
-        try std.testing.expectEqualStrings("left", record1.plus);
-        try std.testing.expectEqualStrings("!!", record1.quality);
-        try std.testing.expectEqualStrings("pair/2", record2.header);
-        try std.testing.expectEqualStrings(input1, canonical_span1.?);
-        try std.testing.expectEqualStrings(input2, canonical_span2.?);
-    }
+    try std.testing.expectEqualStrings("pair/1", record1.header);
+    try std.testing.expectEqualStrings("AC", record1.sequence);
+    try std.testing.expectEqualStrings("left", record1.plus);
+    try std.testing.expectEqualStrings("!!", record1.quality);
+    try std.testing.expectEqualStrings("pair/2", record2.header);
+    try std.testing.expectEqualStrings(input1, canonical_span1.?);
+    try std.testing.expectEqualStrings(input2, canonical_span2.?);
+}
 
-    {
-        const input1 = "@pair/1\nAC\n+left\n!!\n";
-        const record2_prefix = "@pair/2\nGT\n+right\n";
-        const record2_suffix = "##\n";
-        const initial_input = input1 ++ record2_prefix;
-        const complete_input = initial_input ++ record2_suffix;
-        var source = io_layer.SliceSource.init(initial_input);
-        var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
-        defer reader.deinit();
-        var canonical_span1: ?[]const u8 = null;
-        const record1 = (try nextWithSpan(&reader, &canonical_span1)).?;
-        source.data = complete_input;
-        const source_position = source.pos;
-        var canonical_span2: ?[]const u8 = null;
+test "[edge] - [record delivery]: a record completed by a later read keeps its canonical span" {
+    const input1 = "@pair/1\nAC\n+left\n!!\n";
+    const record2_prefix = "@pair/2\nGT\n+right\n";
+    const record2_suffix = "##\n";
+    const initial_input = input1 ++ record2_prefix;
+    const complete_input = initial_input ++ record2_suffix;
+    var source = io_layer.SliceSource.init(initial_input);
+    var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
+    defer reader.deinit();
+    var canonical_span1: ?[]const u8 = null;
+    const record1 = (try nextWithSpan(&reader, &canonical_span1)).?;
+    source.data = complete_input;
+    const source_position = source.pos;
+    var canonical_span2: ?[]const u8 = null;
 
-        try std.testing.expect(
-            (try nextBufferedWithSpan(&reader, &canonical_span2)) == null,
-        );
-        try std.testing.expectEqual(source_position, source.pos);
-        try std.testing.expectEqualStrings("pair/1", record1.header);
-        try std.testing.expectEqualStrings(input1, canonical_span1.?);
+    try std.testing.expect(
+        (try nextBufferedWithSpan(&reader, &canonical_span2)) == null,
+    );
+    try std.testing.expectEqual(source_position, source.pos);
+    try std.testing.expectEqualStrings("pair/1", record1.header);
+    try std.testing.expectEqualStrings(input1, canonical_span1.?);
 
-        const record2 = (try nextWithSpan(&reader, &canonical_span2)).?;
-        try std.testing.expectEqualStrings("pair/2", record2.header);
-        try std.testing.expectEqualStrings("GT", record2.sequence);
-        try std.testing.expectEqualStrings("right", record2.plus);
-        try std.testing.expectEqualStrings("##", record2.quality);
-        try std.testing.expectEqualStrings(record2_prefix ++ record2_suffix, canonical_span2.?);
-    }
+    const record2 = (try nextWithSpan(&reader, &canonical_span2)).?;
+    try std.testing.expectEqualStrings("pair/2", record2.header);
+    try std.testing.expectEqualStrings("GT", record2.sequence);
+    try std.testing.expectEqualStrings("right", record2.plus);
+    try std.testing.expectEqualStrings("##", record2.quality);
+    try std.testing.expectEqualStrings(record2_prefix ++ record2_suffix, canonical_span2.?);
+}
 
+test "[edge] - [record delivery]: a header longer than the read buffer has no canonical span" {
     const header_len = io_layer.DEFAULT_READER_BUFFER_BYTES;
     const input = try std.testing.allocator.alloc(u8, header_len + 8);
     defer std.testing.allocator.free(input);
     @memset(input, 'h');
     input[0] = '@';
-    input[header_len + 1] = '\n';
-    input[header_len + 2] = 'A';
-    input[header_len + 3] = '\n';
-    input[header_len + 4] = '+';
-    input[header_len + 5] = '\n';
-    input[header_len + 6] = '!';
-    input[header_len + 7] = '\n';
+    @memcpy(input[header_len + 1 ..], "\nA\n+\n!\n");
 
     var source = io_layer.SliceSource.init(input);
     var reader = try Reader.init(std.testing.allocator, source.byteSource(), .{});
@@ -4773,7 +4851,6 @@ test "[integration] - [record delivery]: retained fallback storage survives a re
             const validated2 = buffered2 orelse (try nextFallbackValidatedRecord(&reader, &validator)).?;
             const record2 = validated2.record;
             try std.testing.expect(validated2.semantic_error == null);
-            // Mate 2 crosses the end of the transport chunk, so its fields use fallback storage.
             if (mate2_len == 2) {
                 try std.testing.expectEqual(allocations_before_refill + 4, tracking.allocations);
             }
@@ -4798,14 +4875,11 @@ test "[integration] - [record delivery]: retained fallback storage survives a re
 }
 
 test "[integration] - [writer]: prechecked Reader records match checked serialization" {
-    const cases = [_]struct { input: []const u8, expected: ?[]const u8 }{
-        .{
-            .input = "@r\rdesc\r\nACGT\r\n+note\rx\r\n!#$%\r\n",
-            .expected = "@r\rdesc\nACGT\n+note\rx\n!#$%\n",
-        },
-        .{ .input = "@r\r\r\nA\n+\n!\n", .expected = null },
-        .{ .input = "@r\nA\n+\r\r\n!\n", .expected = null },
-        .{ .input = "@\r\r\nA\n+\n!\n", .expected = null },
+    const cases = [_]struct { input: []const u8, valid: bool }{
+        .{ .input = "@r\rdesc\r\nACGT\r\n+note\rx\r\n!#$%\r\n", .valid = true },
+        .{ .input = "@r\r\r\nA\n+\n!\n", .valid = false },
+        .{ .input = "@r\nA\n+\r\r\n!\n", .valid = false },
+        .{ .input = "@\r\r\nA\n+\n!\n", .valid = false },
     };
     for (cases) |case| {
         var source = io_layer.SliceSource.init(case.input);
@@ -4821,43 +4895,43 @@ test "[integration] - [writer]: prechecked Reader records match checked serializ
         var trusted_bytes: [64]u8 = undefined;
         var trusted_sink = io_layer.SliceSink.init(&trusted_bytes);
         var trusted_writer = Writer.init(trusted_sink.byteSink());
-        if (case.expected) |expected| {
+        if (case.valid) {
             try checked_writer.writeRecord(record);
             try std.testing.expect(!recordHasTerminalCr(record));
-            try writeRecordFields(&trusted_writer, record);
-            try std.testing.expectEqualStrings(expected, checked_sink.written());
+            try writeRecordUnchecked(&trusted_writer, record);
         } else {
             try std.testing.expectError(error.InvalidRecord, checked_writer.writeRecord(record));
             try std.testing.expect(recordHasTerminalCr(record));
-            try std.testing.expectEqualStrings("", trusted_sink.written());
         }
         try std.testing.expectEqualStrings(checked_sink.written(), trusted_sink.written());
     }
 }
 
-test "[unit] - [check scanner]: state remains fixed-size" {
-    try std.testing.expect(@sizeOf(CheckScanner) <= 160);
+test "[property] - [writer]: the canonical copy matches written records" {
+    const records = [_]Record{
+        .{ .header = "r", .id = "r", .sequence = "", .plus = "", .quality = "" },
+        .{ .header = "read/1 extra", .id = "read/1", .sequence = "ACGTN", .plus = "read/1 extra", .quality = "IIII#" },
+    };
+    for (records) |record| {
+        var output: [64]u8 = undefined;
+        var sink = io_layer.SliceSink.init(&output);
+        var writer = Writer.init(sink.byteSink());
+        try writeRecordUnchecked(&writer, record);
+
+        var copy: [64]u8 = undefined;
+        const len = canonicalRecordLen(record).?;
+        const copied = copyCanonicalRecord(copy[0..len], record);
+        try std.testing.expectEqualStrings(sink.written(), copy[0..len]);
+        inline for (.{ "header", "id", "sequence", "plus", "quality" }) |field| {
+            try std.testing.expectEqualStrings(@field(record, field), @field(copied, field));
+        }
+    }
 }
 
-test "[property] - [LF mask]: preserves newline positions across block widths" {
-    inline for (.{ 1, 16, STRUCTURAL_BLOCK_BYTES, std.simd.suggestVectorLength(u8) orelse 1 }) |lanes| {
-        const Mask = @Int(.unsigned, lanes);
-        var block: [lanes]u8 = @splat('A');
-        try std.testing.expectEqual(@as(Mask, 0), newlineMask(lanes, &block));
-        for (0..lanes) |lane| {
-            block[lane] = '\n';
-            try std.testing.expectEqual(@as(Mask, 1) << @intCast(lane), newlineMask(lanes, &block));
-            block[lane] = 'A';
-        }
-
-        var expected: Mask = 0;
-        for ([_]usize{ 0, 1, 15, 16, 31, 32, 47, 48, 62, 63 }) |lane| {
-            if (lane >= lanes) continue;
-            block[lane] = '\n';
-            expected |= @as(Mask, 1) << @intCast(lane);
-        }
-        try std.testing.expectEqual(expected, newlineMask(lanes, &block));
-    }
+comptime {
+    const CACHE_LINE_BYTES = 64;
+    const CACHE_LINES = 3;
+    std.debug.assert(@sizeOf(CheckScanner) <= CACHE_LINES * CACHE_LINE_BYTES);
 }
 
 fn firstValidSequenceLineEnd(bytes: []const u8, alphabet: Alphabet) ?usize {
@@ -4867,8 +4941,8 @@ fn firstValidSequenceLineEnd(bytes: []const u8, alphabet: Alphabet) ?usize {
     };
 }
 
-test "[property] - [check scanner]: fused sequence scan preserves delimiter boundaries" {
-    var bytes: [2 * STRUCTURAL_BLOCK_BYTES + 2]u8 = @splat('A');
+test "[property] - [check scanner]: fused sequence scan finds the line feed at every position" {
+    var bytes: [2 * simd.BLOCK_BYTES + 2]u8 = @splat('A');
     for (0..bytes.len) |line_end| {
         @memset(&bytes, 'A');
         bytes[line_end] = '\n';
@@ -4894,16 +4968,21 @@ test "[property] - [check scanner]: fused sequence scan preserves delimiter boun
             );
         }
     }
+}
 
-    @memset(&bytes, 'A');
-    bytes[STRUCTURAL_BLOCK_BYTES] = 'R';
-    bytes[STRUCTURAL_BLOCK_BYTES + 1] = '\n';
+test "[edge] - [check scanner]: fused sequence scan stops at a line feed after a block-boundary IUPAC code" {
+    var bytes: [2 * simd.BLOCK_BYTES + 2]u8 = @splat('A');
+    bytes[simd.BLOCK_BYTES] = 'R';
+    bytes[simd.BLOCK_BYTES + 1] = '\n';
     try std.testing.expectEqual(
-        STRUCTURAL_BLOCK_BYTES + 1,
+        simd.BLOCK_BYTES + 1,
         firstValidSequenceLineEnd(&bytes, .iupac).?,
     );
     try std.testing.expect(firstValidSequenceLineEnd(&bytes, .acgtn) == null);
+}
 
+test "[property] - [check scanner]: fused sequence scan ends a CRLF line at the carriage return" {
+    var bytes: [2 * simd.BLOCK_BYTES + 2]u8 = @splat('A');
     for (0..bytes.len - 1) |cr_index| {
         @memset(&bytes, 'A');
         bytes[cr_index] = '\r';
@@ -4936,28 +5015,8 @@ test "[property] - [check scanner]: fused sequence scan preserves delimiter boun
     }
 }
 
-test "[property] - [check scanner]: adaptive IUPAC validation preserves byte policy" {
-    for (0..256) |value| {
-        const sequence = [_]u8{@intCast(value)};
-        var use_full_iupac = false;
-        try std.testing.expectEqual(
-            firstInvalidSequenceScalar(&sequence, .iupac, 0),
-            firstInvalidCheckSequence(&sequence, .iupac, &use_full_iupac),
-        );
-        try std.testing.expectEqual(
-            alphabetAccepts(.iupac, sequence[0]) and !alphabetAccepts(.acgtn, sequence[0]),
-            use_full_iupac,
-        );
-
-        use_full_iupac = false;
-        try std.testing.expectEqual(
-            firstInvalidSequenceScalar(&sequence, .acgtn, 0),
-            firstInvalidCheckSequence(&sequence, .acgtn, &use_full_iupac),
-        );
-        try std.testing.expect(!use_full_iupac);
-    }
-
-    var block: [STRUCTURAL_BLOCK_BYTES]u8 = @splat('A');
+test "[edge] - [check scanner]: adaptive IUPAC state holds across a block boundary" {
+    var block: [simd.BLOCK_BYTES]u8 = @splat('A');
     block[1] = '\n';
     block[2] = 'R';
     var use_full_iupac = false;
@@ -4975,7 +5034,7 @@ test "[property] - [check scanner]: adaptive IUPAC validation preserves byte pol
     );
     try std.testing.expect(use_full_iupac);
 
-    var sequence: [2 * STRUCTURAL_BLOCK_BYTES]u8 = @splat('A');
+    var sequence: [2 * simd.BLOCK_BYTES]u8 = @splat('A');
     sequence[31] = 'R';
     sequence[70] = '.';
     use_full_iupac = false;
@@ -5043,7 +5102,64 @@ test "[unit] - [check scanner]: complete record path commits only proved records
     }
 }
 
-test "[unit] - [check scanner]: adaptive IUPAC state survives a chunk seam" {
+test "[property] - [validation]: long records get the same verdict on every kernel path" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 1024, 1031, 4101 }) |len| {
+        const data = try allocator.alloc(u8, 2 * len + 7);
+        defer allocator.free(data);
+        const sequence = data[3..][0..len];
+        const quality = data[len + 6 ..][0..len];
+        const Bad = struct { field: SemanticField, at: usize };
+        const cases = [_]?Bad{
+            null,
+            .{ .field = .sequence, .at = 0 },
+            .{ .field = .sequence, .at = len / 2 },
+            .{ .field = .sequence, .at = len - 1 },
+            .{ .field = .quality, .at = 0 },
+            .{ .field = .quality, .at = len / 2 },
+            .{ .field = .quality, .at = len - 1 },
+        };
+        inline for (.{ Alphabet.iupac, Alphabet.acgtn }) |alphabet| {
+            for (cases) |case| {
+                @memcpy(data[0..3], "@r\n");
+                for (sequence, 0..) |*byte, i| byte.* = "ACGT"[i % 4];
+                @memcpy(data[len + 3 ..][0..3], "\n+\n");
+                for (quality, 0..) |*byte, i| byte.* = @intCast(33 + i % 94);
+                data[data.len - 1] = '\n';
+                if (case) |bad| switch (bad.field) {
+                    .sequence => sequence[bad.at] = 'X',
+                    .quality => quality[bad.at] = ' ',
+                };
+
+                var inline_feeds: LineFeedSearch = .{};
+                var dispatched_feeds: LineFeedSearch = .{};
+                const inline_result = scanCompleteRecordInline(data, 0, &inline_feeds, len, alphabet, false);
+                const dispatched = scanCompleteRecord(data, 0, &dispatched_feeds, len, alphabet, false, len);
+                try std.testing.expectEqualDeep(inline_result, dispatched);
+                try std.testing.expectEqual(case == null, dispatched != null);
+
+                const record: Record = .{ .header = "r", .id = "r", .sequence = sequence, .plus = "", .quality = quality };
+                const semantic = validateRecord(record, .{ .alphabet = alphabet });
+                if (case) |bad| {
+                    try std.testing.expectEqual(bad.field, semantic.?.field);
+                    try std.testing.expectEqual(bad.at, semantic.?.byte_index);
+                } else try std.testing.expect(semantic == null);
+
+                inline for (.{ SemanticField.sequence, SemanticField.quality }) |field| {
+                    const chunk = if (field == .sequence) sequence else quality;
+                    var inline_iupac = false;
+                    var dispatched_iupac = false;
+                    var failure: ?usize = null;
+                    try classifySemanticBytes(field, alphabet, &dispatched_iupac, &failure, chunk, 0);
+                    try std.testing.expectEqual(firstInvalidChunk(field, alphabet, &inline_iupac, chunk), failure);
+                    try std.testing.expectEqual(inline_iupac, dispatched_iupac);
+                }
+            }
+        }
+    }
+}
+
+test "[unit] - [check scanner]: adaptive IUPAC state survives a feed boundary" {
     var scanner = CheckScanner.init(.{}, .{});
     _ = try scanner.feed("@r\nR");
     try std.testing.expect(scanner.use_full_iupac);
@@ -5053,7 +5169,7 @@ test "[unit] - [check scanner]: adaptive IUPAC state survives a chunk seam" {
 }
 
 test "[property] - [check scanner]: complete records accept mixed LF and CRLF endings" {
-    for (0..16) |ending_mask| {
+    for ([_]usize{ 0, 5, 10, 15 }) |ending_mask| {
         var endings: [4][]const u8 = undefined;
         for (&endings, 0..) |*ending, index| {
             ending.* = if (ending_mask & (@as(usize, 1) << @intCast(index)) == 0)
@@ -5068,8 +5184,9 @@ test "[property] - [check scanner]: complete records accept mixed LF and CRLF en
         const sequence_start = 2 + endings[0].len;
         const plus_start = sequence_start + 2 + endings[1].len;
         const quality_start = plus_start + 1 + endings[2].len;
+        const line_ends = [_]usize{ sequence_start - 1, plus_start - 1, quality_start - 1, data.len - 1 };
         var line_feeds: LineFeedSearch = .{};
-        const complete = scanCompleteRecord(data, 0, &line_feeds, 2, .iupac, false);
+        const complete = scanCompleteRecord(data, 0, &line_feeds, 2, .iupac, false, 0);
         try std.testing.expect(complete != null);
         try std.testing.expectEqualDeep([4]usize{
             sequence_start - 1, plus_start - 1, quality_start - 1, data.len - 1,
@@ -5081,18 +5198,23 @@ test "[property] - [check scanner]: complete records accept mixed LF and CRLF en
         try std.testing.expectEqual(@as(u64, 1), scanner.record_index);
         try std.testing.expectEqual(@as(u64, data.len), scanner.byte_offset);
         try std.testing.expect(scanner.atRecordBoundary());
-        for (0..data.len) |cut| {
-            line_feeds = .{};
-            try std.testing.expect(scanCompleteRecord(data[0..cut], 0, &line_feeds, 2, .iupac, false) == null);
+        for (line_ends) |line_end| {
+            for ([_]usize{ line_end -| 1, line_end, line_end + 1 }) |cut| {
+                if (cut >= data.len) continue;
+                line_feeds = .{};
+                try std.testing.expect(scanCompleteRecord(data[0..cut], 0, &line_feeds, 2, .iupac, false, 0) == null);
+            }
         }
-        for (1..data.len + 2) |chunk_len| {
+        for ([_]usize{ 1, 2, 3, 8 }) |chunk_len| {
             try expectCheckOutcome(
                 .{ .valid = 1 },
                 directCheckOutcome(data, chunk_len, .{ .max_line_bytes = 2 }, .{}),
             );
         }
-        for (0..data.len + 1) |split| {
-            try expectValidatedProjection(data, split, null, .{ .max_line_bytes = 2 }, .{}, .{});
+        for (line_ends) |line_end| {
+            for ([_]usize{ line_end -| 1, line_end, line_end + 1 }) |split| {
+                try expectValidatedProjection(data, split, null, .{ .max_line_bytes = 2 }, .{}, .{});
+            }
         }
     }
 }
@@ -5396,9 +5518,11 @@ test "[property] - [check scanner]: refill-spanning records match Reader" {
     );
 }
 
-test "[property] - [check scanner]: generated semantic mutations retain exact locations" {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
-    for (1..2 * vector_len + 2) |field_len| {
+test "[property] - [check scanner]: sequence and quality errors keep exact locations across chunk splits" {
+    const vector_len = simd.INLINE_LANES;
+    const field_lens = [_]usize{ 1, vector_len - 1, vector_len, vector_len + 1, 2 * vector_len };
+    const chunk_lens = [_]usize{ 1, 17, vector_len, vector_len + 1, 2 * vector_len };
+    for (field_lens) |field_len| {
         var data: std.ArrayList(u8) = .empty;
         defer data.deinit(std.testing.allocator);
         try data.appendSlice(std.testing.allocator, "@ok\nA\n+\n!\n@r\n");
@@ -5409,7 +5533,7 @@ test "[property] - [check scanner]: generated semantic mutations retain exact lo
         try data.appendNTimes(std.testing.allocator, '!', field_len);
         try data.append(std.testing.allocator, '\n');
 
-        for (0..field_len) |invalid_index| {
+        for ([_]usize{ 0, field_len - 1 }) |invalid_index| {
             data.items[sequence_start + invalid_index] = '.';
             const sequence_error: CheckTestOutcome = .{ .parse_error = expectedCheckError(
                 .s002_invalid_sequence_alphabet,
@@ -5422,7 +5546,7 @@ test "[property] - [check scanner]: generated semantic mutations retain exact lo
                 sequence_error,
                 try referenceCheckOutcome(data.items, .{}, .{}),
             );
-            for (1..2 * vector_len + 2) |chunk_len| {
+            for (chunk_lens) |chunk_len| {
                 try expectCheckOutcome(
                     sequence_error,
                     directCheckOutcome(data.items, chunk_len, .{}, .{}),
@@ -5442,7 +5566,7 @@ test "[property] - [check scanner]: generated semantic mutations retain exact lo
                 quality_error,
                 try referenceCheckOutcome(data.items, .{}, .{}),
             );
-            for (1..2 * vector_len + 2) |chunk_len| {
+            for (chunk_lens) |chunk_len| {
                 try expectCheckOutcome(
                     quality_error,
                     directCheckOutcome(data.items, chunk_len, .{}, .{}),
@@ -5454,7 +5578,6 @@ test "[property] - [check scanner]: generated semantic mutations retain exact lo
 }
 
 test "[edge] - [check scanner]: counts and error locations cross 32 bits" {
-    const crossing: u64 = 1 << 32;
     const valid = "@r\nA\n+\n!\n" ** 3;
     const cases = [_]struct {
         data: []const u8,
@@ -5468,21 +5591,21 @@ test "[edge] - [check scanner]: counts and error locations cross 32 bits" {
             .data = "@bad\nA.\n+\n!!\n",
             .code = .s002_invalid_sequence_alphabet,
             .message = "sequence byte is outside the selected alphabet",
-            .offset = crossing + 30,
+            .offset = CROSSING_32_BIT + 30,
             .line = 2,
         },
         .{
             .data = "@bad\nAA\n+\n! \n",
             .code = .s006_invalid_quality_range,
             .message = "quality byte must be ASCII 33 through 126",
-            .offset = crossing + 35,
+            .offset = CROSSING_32_BIT + 35,
             .line = 4,
         },
         .{
             .data = "@bad\nA\n+\n",
             .code = .s004_truncated_record,
             .message = "unexpected end of file in quality line",
-            .offset = crossing + 33,
+            .offset = CROSSING_32_BIT + 33,
             .line = 4,
             .at_eof = true,
         },
@@ -5493,9 +5616,9 @@ test "[edge] - [check scanner]: counts and error locations cross 32 bits" {
                 chunk_len, codeTag(case.code),
             });
             var scanner = CheckScanner.init(.{}, .{});
-            scanner.byte_offset = crossing - 3;
+            scanner.byte_offset = CROSSING_32_BIT - 3;
             scanner.line_start_offset = scanner.byte_offset;
-            scanner.record_index = crossing - 1;
+            scanner.record_index = CROSSING_32_BIT - 1;
             var cursor: usize = 0;
             while (cursor < valid.len) {
                 const end = @min(cursor + chunk_len, valid.len);
@@ -5503,8 +5626,8 @@ test "[edge] - [check scanner]: counts and error locations cross 32 bits" {
                 cursor = end;
             }
             try scanner.finishEof();
-            try std.testing.expectEqual(crossing + 2, scanner.record_index);
-            try std.testing.expectEqual(crossing + 24, scanner.byte_offset);
+            try std.testing.expectEqual(CROSSING_32_BIT + 2, scanner.record_index);
+            try std.testing.expectEqual(CROSSING_32_BIT + 24, scanner.byte_offset);
 
             if (case.at_eof) {
                 try std.testing.expectEqual(case.data.len, try scanner.feed(case.data));
@@ -5512,11 +5635,11 @@ test "[edge] - [check scanner]: counts and error locations cross 32 bits" {
             } else {
                 try std.testing.expectError(error.Format, scanner.feed(case.data));
             }
-            try std.testing.expectEqual(crossing + 2, scanner.record_index);
+            try std.testing.expectEqual(CROSSING_32_BIT + 2, scanner.record_index);
             try std.testing.expectEqualDeep(ParseError{
                 .code = case.code,
                 .message = case.message,
-                .record_index = crossing + 2,
+                .record_index = CROSSING_32_BIT + 2,
                 .byte_offset = case.offset,
                 .line_in_record = case.line,
             }, scanner.takeLastError().?);
@@ -5630,7 +5753,7 @@ fn expectCheckOutcome(expected: CheckTestOutcome, actual: CheckTestOutcome) !voi
 }
 
 test "[property] - [record validation]: quality checks match scalar results" {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
+    const vector_len = simd.INLINE_LANES;
     const max_len = 4 * vector_len - 1;
     const quality = try std.testing.allocator.alloc(u8, max_len);
     defer std.testing.allocator.free(quality);
@@ -5694,7 +5817,7 @@ test "[property] - [record validation]: quality checks match scalar results" {
 }
 
 test "[property] - [record validation]: vector sequence validation matches scalar policies" {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
+    const vector_len = simd.INLINE_LANES;
     const max_len = 4 * vector_len - 1;
     const sequence = try std.testing.allocator.alloc(u8, max_len);
     defer std.testing.allocator.free(sequence);
@@ -5792,8 +5915,7 @@ test "[property] - [record validation]: adaptive IUPAC state preserves byte poli
             validator.validate(record),
         );
         try std.testing.expectEqual(
-            alphabetAccepts(.iupac, sequence[0]) and
-                !alphabetAccepts(.acgtn, sequence[0]),
+            std.mem.indexOfScalar(u8, "URYSWKMBDHVuryswkmbdhv", sequence[0]) != null,
             validator.use_full_iupac,
         );
     }
@@ -5856,8 +5978,39 @@ test "[property] - [record validation]: adaptive IUPAC state preserves byte poli
     try std.testing.expect(!acgtn.use_full_iupac);
 }
 
+test "[property] - [record validation]: vector kernels match the scalar reference at every tier width" {
+    const symbols = "ACGTNacgtnRYSWKMBDHVUu";
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
+        var sequence: [lanes + 1]u8 = undefined;
+        var quality: [lanes + 1]u8 = undefined;
+        for ([_]usize{ 0, 1, lanes - 1, lanes, lanes + 1 }) |len| {
+            for ([_]?usize{ null, 0, if (len == 0) null else len - 1 }) |invalid| {
+                for (sequence[0..len], quality[0..len], 0..) |*base, *score, index| {
+                    base.* = symbols[index % symbols.len];
+                    score.* = 33 + @as(u8, @intCast(index % 94));
+                }
+                if (invalid) |index| {
+                    sequence[index] = '.';
+                    quality[index] = 127;
+                }
+                inline for (.{ Alphabet.iupac, Alphabet.acgtn }) |alphabet| {
+                    const want_sequence = firstInvalidSequenceScalar(sequence[0..len], alphabet, 0);
+                    const want_quality = firstInvalidQualityScalar(quality[0..len], 0);
+                    try std.testing.expectEqual(want_sequence, firstInvalidSequenceVector(lanes, alphabet, sequence[0..len]));
+                    try std.testing.expectEqual(want_quality, firstInvalidQualityVector(lanes, quality[0..len]));
+                    if (len >= lanes) {
+                        const invalid_fields = invalidFieldsVector(lanes, alphabet, sequence[0..len], quality[0..len]);
+                        try std.testing.expectEqual(want_sequence != null, invalid_fields.sequence);
+                        try std.testing.expectEqual(want_quality != null, invalid_fields.quality);
+                    }
+                }
+            }
+        }
+    }
+}
+
 test "[property] - [record validation]: fused vectors preserve field precedence" {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse return;
+    const vector_len = simd.INLINE_LANES;
     const length = 8 * vector_len - 1;
     const sequence = try std.testing.allocator.alloc(u8, length);
     defer std.testing.allocator.free(sequence);

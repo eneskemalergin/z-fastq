@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const fastq = @import("fastq.zig");
+const simd = @import("simd.zig");
 
 pub const StatsError = error{
     S005LengthMismatch,
@@ -14,7 +15,24 @@ pub const QualityError = struct {
     byte: u8,
 };
 
-/// Materialized counters and ratios; optional values are null for an empty population.
+pub const Ratio = struct {
+    numerator: u128,
+    denominator: u128,
+
+    pub fn value(self: Ratio) ?f64 {
+        if (self.denominator == 0) return null;
+        return @as(f64, @floatFromInt(self.numerator)) / @as(f64, @floatFromInt(self.denominator));
+    }
+};
+
+pub const Ratios = struct {
+    mean_length: Ratio,
+    gc_fraction: Ratio,
+    mean_quality: Ratio,
+    q20_fraction: Ratio,
+    q30_fraction: Ratio,
+};
+
 pub const StatsResult = struct {
     reads: u64,
     bases: u64,
@@ -36,7 +54,6 @@ pub const StatsResult = struct {
     q30_fraction: ?f64,
 };
 
-/// Allocation-free accumulator whose totals change only after a complete valid update.
 pub const Stats = struct {
     reads: u64 = 0,
     bases: u64 = 0,
@@ -53,7 +70,6 @@ pub const Stats = struct {
     q30_bases: u64 = 0,
     last_quality_error: ?QualityError = null,
 
-    /// Validates and applies one record without partially changing any counter.
     pub fn addRecord(self: *Stats, record: fastq.Record) StatsError!void {
         self.last_quality_error = null;
         var quality_error: ?QualityError = null;
@@ -61,7 +77,20 @@ pub const Stats = struct {
             self.last_quality_error = quality_error;
             return err;
         };
+        try self.applyTotals(delta);
+    }
 
+    pub fn addStreamed(self: *Stats, streamed: *const StreamedTotals) StatsError!void {
+        self.last_quality_error = null;
+        if (streamed.quality_error) |quality_error| {
+            self.last_quality_error = quality_error;
+            return error.S006InvalidQuality;
+        }
+        if (streamed.overflow) return error.Overflow;
+        try self.applyTotals(try totalsFromPayload(streamed.totals, streamed.sequence_len));
+    }
+
+    inline fn applyTotals(self: *Stats, delta: RecordTotals) StatsError!void {
         var updated = self.*;
         updated.reads = try add(self.reads, 1);
         updated.bases = try add(self.bases, delta.length);
@@ -84,35 +113,46 @@ pub const Stats = struct {
         self.* = updated;
     }
 
-    /// Returns and clears details retained after S006.
     pub fn takeLastQualityError(self: *Stats) ?QualityError {
         const quality_error = self.last_quality_error;
         self.last_quality_error = null;
         return quality_error;
     }
 
-    /// Materializes ratios without changing the accumulator.
     pub fn result(self: *const Stats) StatsResult {
-        const gc_bases = @as(u128, self.a) + self.c + self.g + self.t;
+        const exact = self.ratios();
         return .{
             .reads = self.reads,
             .bases = self.bases,
             .min_length = if (self.reads == 0) null else self.min_length,
             .max_length = if (self.reads == 0) null else self.max_length,
-            .mean_length = ratio(self.bases, self.reads),
+            .mean_length = exact.mean_length.value(),
             .a = self.a,
             .c = self.c,
             .g = self.g,
             .t = self.t,
             .n = self.n,
             .other_bases = self.other_bases,
-            .gc_fraction = ratioWide(@as(u128, self.g) + self.c, gc_bases),
+            .gc_fraction = exact.gc_fraction.value(),
             .quality_sum = self.quality_sum,
-            .mean_quality = ratio(self.quality_sum, self.bases),
+            .mean_quality = exact.mean_quality.value(),
             .q20_bases = self.q20_bases,
-            .q20_fraction = ratio(self.q20_bases, self.bases),
+            .q20_fraction = exact.q20_fraction.value(),
             .q30_bases = self.q30_bases,
-            .q30_fraction = ratio(self.q30_bases, self.bases),
+            .q30_fraction = exact.q30_fraction.value(),
+        };
+    }
+
+    pub fn ratios(self: *const Stats) Ratios {
+        return .{
+            .mean_length = .{ .numerator = self.bases, .denominator = self.reads },
+            .gc_fraction = .{
+                .numerator = @as(u128, self.g) + self.c,
+                .denominator = @as(u128, self.a) + self.c + self.g + self.t,
+            },
+            .mean_quality = .{ .numerator = self.quality_sum, .denominator = self.bases },
+            .q20_fraction = .{ .numerator = self.q20_bases, .denominator = self.bases },
+            .q30_fraction = .{ .numerator = self.q30_bases, .denominator = self.bases },
         };
     }
 };
@@ -130,11 +170,14 @@ const RecordTotals = struct {
     q30_bases: u64,
 };
 
-const PayloadTotals = struct {
-    base_counts: [6]usize,
-    quality_sum: u64,
-    q20_bases: usize,
-    q30_bases: usize,
+pub const Q20_SCORE = 20;
+pub const Q30_SCORE = 30;
+
+const PayloadTotals = extern struct {
+    base_counts: [6]usize = .{0} ** 6,
+    quality_sum: u64 = 0,
+    q20_bases: usize = 0,
+    q30_bases: usize = 0,
 };
 
 fn recordTotals(
@@ -147,9 +190,12 @@ fn recordTotals(
         try payloadTotals(u64, record.sequence, record.quality, quality_error)
     else
         try payloadTotals(u128, record.sequence, record.quality, quality_error);
+    return totalsFromPayload(payload_totals, record.sequence.len);
+}
 
+fn totalsFromPayload(payload_totals: PayloadTotals, length: usize) StatsError!RecordTotals {
     return .{
-        .length = std.math.cast(u64, record.sequence.len) orelse return error.Overflow,
+        .length = std.math.cast(u64, length) orelse return error.Overflow,
         .a = std.math.cast(u64, payload_totals.base_counts[0]) orelse return error.Overflow,
         .c = std.math.cast(u64, payload_totals.base_counts[1]) orelse return error.Overflow,
         .g = std.math.cast(u64, payload_totals.base_counts[2]) orelse return error.Overflow,
@@ -163,9 +209,62 @@ fn recordTotals(
     };
 }
 
+pub const StreamedTotals = struct {
+    totals: PayloadTotals = .{},
+    sequence_len: usize = 0,
+    quality_error: ?QualityError = null,
+    overflow: bool = false,
+
+    pub fn consume(
+        self: *StreamedTotals,
+        line_kind: fastq.ExpectedLine,
+        bytes: []const u8,
+        start_index: usize,
+    ) fastq.ReaderError!void {
+        switch (line_kind) {
+            .sequence => self.consumeField(.sequence, bytes, start_index),
+            .quality => self.consumeField(.quality, bytes, start_index),
+            .header, .plus => {},
+        }
+    }
+
+    fn consumeField(self: *StreamedTotals, comptime field: fastq.SemanticField, bytes: []const u8, start_index: usize) void {
+        self.add(field == .quality, bytes, start_index);
+    }
+
+    fn add(self: *StreamedTotals, is_quality: bool, bytes: []const u8, start_index: usize) void {
+        if (bytes.len == 0) return;
+        if (!is_quality) {
+            self.sequence_len += bytes.len;
+            var no_quality_error: ?QualityError = null;
+            const chunk = chunkTotals(.sequence, bytes, &no_quality_error) catch unreachable;
+            for (&self.totals.base_counts, chunk.base_counts) |*total, count| total.* += count;
+            return;
+        }
+        if (self.quality_error != null or self.overflow) return;
+        var chunk_error: ?QualityError = null;
+        const chunk = chunkTotals(.quality, bytes, &chunk_error) catch |err| switch (err) {
+            error.S006InvalidQuality => {
+                self.quality_error = .{ .byte_index = start_index + chunk_error.?.byte_index, .byte = chunk_error.?.byte };
+                return;
+            },
+            else => {
+                self.overflow = true;
+                return;
+            },
+        };
+        self.totals.quality_sum = std.math.add(u64, self.totals.quality_sum, chunk.quality_sum) catch {
+            self.overflow = true;
+            return;
+        };
+        self.totals.q20_bases += chunk.q20_bases;
+        self.totals.q30_bases += chunk.q30_bases;
+    }
+};
+
 fn maxQualitySum(length: usize) ?u64 {
     const length_u64 = std.math.cast(u64, length) orelse return null;
-    return std.math.mul(u64, length_u64, 93) catch null;
+    return std.math.mul(u64, length_u64, fastq.PHRED_MAX_SCORE) catch null;
 }
 
 fn payloadTotals(
@@ -174,22 +273,78 @@ fn payloadTotals(
     quality: []const u8,
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
-    if (sum_type == u64) {
-        if (std.simd.suggestVectorLength(u8)) |vector_len| {
-            if (vector_len >= 2 and
-                vector_len % 2 == 0 and
-                vector_len <= std.math.maxInt(u16) / std.math.maxInt(u8) and
-                quality.len >= vector_len)
-            {
-                return payloadTotalsVector(vector_len, sequence, quality, quality_error);
-            }
-        }
+    if (sum_type == u64 and simd.useAvx2(quality.len)) return avx2Totals(.both, sequence, quality, quality_error);
+    return payloadTotalsInline(sum_type, .both, sequence, quality, quality_error);
+}
+
+fn chunkTotals(comptime parts: Parts, bytes: []const u8, quality_error: *?QualityError) StatsError!PayloadTotals {
+    const sequence = if (parts == .sequence) bytes else "";
+    const quality = if (parts == .quality) bytes else "";
+    if (simd.useAvx2(bytes.len)) return avx2Totals(parts, sequence, quality, quality_error);
+    return payloadTotalsInline(u64, parts, sequence, quality, quality_error);
+}
+
+fn avx2Totals(parts: Parts, sequence: []const u8, quality: []const u8, quality_error: *?QualityError) StatsError!PayloadTotals {
+    var totals: PayloadTotals = undefined;
+    var error_index: usize = undefined;
+    var error_byte: u8 = undefined;
+    switch (simd.avx2Kernel("payload_totals", &payloadTotalsExport)(@intFromEnum(parts), sequence.ptr, sequence.len, quality.ptr, quality.len, &totals, &error_index, &error_byte)) {
+        0 => return totals,
+        1 => {
+            quality_error.* = .{ .byte_index = error_index, .byte = error_byte };
+            return error.S006InvalidQuality;
+        },
+        else => return error.Overflow,
     }
-    return payloadTotalsScalar(sum_type, sequence, quality, quality_error);
+}
+
+comptime {
+    simd.exportKernel("payload_totals", &payloadTotalsExport);
+}
+
+fn payloadTotalsExport(
+    parts: u8,
+    sequence: [*]const u8,
+    sequence_len: usize,
+    quality: [*]const u8,
+    quality_len: usize,
+    totals: *PayloadTotals,
+    error_index: *usize,
+    error_byte: *u8,
+) callconv(.c) u8 {
+    var quality_error: ?QualityError = null;
+    totals.* = switch (@as(Parts, @enumFromInt(parts))) {
+        inline else => |known| payloadTotalsInline(u64, known, sequence[0..sequence_len], quality[0..quality_len], &quality_error),
+    } catch |err| switch (err) {
+        error.S006InvalidQuality => {
+            error_index.* = quality_error.?.byte_index;
+            error_byte.* = quality_error.?.byte;
+            return 1;
+        },
+        else => return 2,
+    };
+    return 0;
+}
+
+const Parts = enum { both, sequence, quality };
+
+fn payloadTotalsInline(
+    comptime sum_type: type,
+    comptime parts: Parts,
+    sequence: []const u8,
+    quality: []const u8,
+    quality_error: *?QualityError,
+) StatsError!PayloadTotals {
+    const len = if (parts == .sequence) sequence.len else quality.len;
+    if (sum_type == u64 and len >= simd.INLINE_LANES) {
+        return payloadTotalsVector(simd.INLINE_LANES, parts, sequence, quality, quality_error);
+    }
+    return payloadTotalsScalar(sum_type, parts, sequence, quality, quality_error);
 }
 
 fn payloadTotalsScalar(
     comptime sum_type: type,
+    comptime parts: Parts,
     sequence: []const u8,
     quality: []const u8,
     quality_error: *?QualityError,
@@ -198,24 +353,29 @@ fn payloadTotalsScalar(
     var quality_sum: sum_type = 0;
     var q20_bases: usize = 0;
     var q30_bases: usize = 0;
-    for (sequence, quality, 0..) |base, quality_byte, byte_index| {
-        const score = fastq.decodePhred33(quality_byte) catch {
-            quality_error.* = .{ .byte_index = byte_index, .byte = quality_byte };
-            return error.S006InvalidQuality;
-        };
-        quality_sum += score;
-        if (score >= 20) q20_bases += 1;
-        if (score >= 30) q30_bases += 1;
-
-        const index: usize = switch (base) {
-            'A', 'a' => 0,
-            'C', 'c' => 1,
-            'G', 'g' => 2,
-            'T', 't' => 3,
-            'N', 'n' => 4,
-            else => 5,
-        };
-        base_counts[index] += 1;
+    if (parts != .sequence) {
+        for (quality, 0..) |quality_byte, byte_index| {
+            const score = fastq.decodePhred33(quality_byte) catch {
+                quality_error.* = .{ .byte_index = byte_index, .byte = quality_byte };
+                return error.S006InvalidQuality;
+            };
+            quality_sum += score;
+            if (score >= Q20_SCORE) q20_bases += 1;
+            if (score >= Q30_SCORE) q30_bases += 1;
+        }
+    }
+    if (parts != .quality) {
+        for (sequence) |base| {
+            const index: usize = switch (base) {
+                'A', 'a' => 0,
+                'C', 'c' => 1,
+                'G', 'g' => 2,
+                'T', 't' => 3,
+                'N', 'n' => 4,
+                else => 5,
+            };
+            base_counts[index] += 1;
+        }
     }
     return .{
         .base_counts = base_counts,
@@ -227,10 +387,13 @@ fn payloadTotalsScalar(
 
 fn payloadTotalsVector(
     comptime vector_len: comptime_int,
+    comptime parts: Parts,
     sequence: []const u8,
     quality: []const u8,
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
+    comptime std.debug.assert(vector_len >= 2 and vector_len % 2 == 0 and
+        vector_len <= std.math.maxInt(u16) / std.math.maxInt(u8));
     const half_len = vector_len / 2;
     const vectors_per_quality_block: usize = std.math.maxInt(u8) - 1;
     const vectors_per_base_block: usize = std.math.maxInt(u8) - 1;
@@ -238,10 +401,10 @@ fn payloadTotalsVector(
     const Mask = @Vector(vector_len, bool);
     const Lanes = @Vector(half_len, u16);
     const ReductionLanes = @Vector(half_len, u32);
-    const phred_offset: Bytes = @splat(33);
-    const maximum_score: Bytes = @splat(93);
-    const q20_score: Bytes = @splat(20);
-    const q30_score: Bytes = @splat(30);
+    const phred_offset: Bytes = @splat(fastq.PHRED_OFFSET);
+    const maximum_score: Bytes = @splat(fastq.PHRED_MAX_SCORE);
+    const q20_score: Bytes = @splat(Q20_SCORE);
+    const q30_score: Bytes = @splat(Q30_SCORE);
     const case_mask: Bytes = @splat(0xdf);
     const a_base: Bytes = @splat('A');
     const c_base: Bytes = @splat('C');
@@ -251,13 +414,13 @@ fn payloadTotalsVector(
     const ones: Bytes = @splat(1);
     const zeros: Bytes = @splat(0);
     const lane_indices = std.simd.iota(u8, vector_len);
-    const tail_len = quality.len % vector_len;
+    const tail_len = (if (parts == .sequence) sequence.len else quality.len) % vector_len;
 
     var quality_sum: u64 = 0;
     var q20_bases: usize = 0;
     var q30_bases: usize = 0;
     var byte_index: usize = 0;
-    while (quality.len - byte_index >= vector_len) {
+    while (parts != .sequence and quality.len - byte_index >= vector_len) {
         const remaining_vectors = (quality.len - byte_index) / vector_len;
         const block_vectors = @min(remaining_vectors, vectors_per_quality_block);
         const block_start = byte_index;
@@ -336,7 +499,7 @@ fn payloadTotalsVector(
 
     var base_counts = [_]usize{0} ** 6;
     var base_index: usize = 0;
-    while (sequence.len - base_index >= vector_len) {
+    while (parts != .quality and sequence.len - base_index >= vector_len) {
         const remaining_vectors = (sequence.len - base_index) / vector_len;
         const block_vectors = @min(remaining_vectors, vectors_per_base_block);
         var a_lanes: Bytes = @splat(0);
@@ -393,8 +556,10 @@ fn payloadTotalsVector(
         base_counts[3] += sumBaseLanes(vector_len, t_lanes);
         base_counts[4] += sumBaseLanes(vector_len, n_lanes);
     }
-    base_counts[5] = sequence.len -
-        (base_counts[0] + base_counts[1] + base_counts[2] + base_counts[3] + base_counts[4]);
+    if (parts != .quality) {
+        base_counts[5] = sequence.len -
+            (base_counts[0] + base_counts[1] + base_counts[2] + base_counts[3] + base_counts[4]);
+    }
     return .{
         .base_counts = base_counts,
         .quality_sum = quality_sum,
@@ -414,8 +579,7 @@ fn rejectInvalidQualityBlock(
             return error.S006InvalidQuality;
         };
     }
-    std.debug.assert(false);
-    return error.S006InvalidQuality;
+    unreachable;
 }
 
 fn sumBaseLanes(
@@ -430,59 +594,22 @@ fn add(left: u64, right: u64) error{Overflow}!u64 {
     return std.math.add(u64, left, right);
 }
 
-fn ratio(numerator: u64, denominator: u64) ?f64 {
-    if (denominator == 0) return null;
-    return @as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(denominator));
+test "[unit] - [statistics]: quality accumulator bound is the largest score sum that fits 64 bits" {
+    const common_limit = std.math.maxInt(u64) / fastq.PHRED_MAX_SCORE;
+    const boundary: usize = @intCast(common_limit);
+    try std.testing.expectEqual(common_limit * fastq.PHRED_MAX_SCORE, maxQualitySum(boundary).?);
+    try std.testing.expect(maxQualitySum(boundary + 1) == null);
 }
 
-fn ratioWide(numerator: u128, denominator: u128) ?f64 {
-    if (denominator == 0) return null;
-    return @as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(denominator));
-}
-
-test "[unit] - [statistics]: quality accumulator width uses the checked bound" {
-    if (comptime @bitSizeOf(usize) < 64) {
-        try std.testing.expect(maxQualitySum(std.math.maxInt(usize)) != null);
-    } else {
-        const common_limit = std.math.maxInt(u64) / 93;
-        const boundary: usize = @intCast(common_limit);
-        try std.testing.expectEqual(common_limit * 93, maxQualitySum(boundary).?);
-        try std.testing.expect(maxQualitySum(boundary + 1) == null);
-    }
-}
-
-test "[property] - [statistics]: wrapped quality scores preserve the valid range" {
-    for (0..std.math.maxInt(u8) + 1) |value| {
-        const encoded: u8 = @intCast(value);
-        const wrapped_score = encoded -% 33;
-        if (fastq.decodePhred33(encoded)) |score| {
-            try std.testing.expect(wrapped_score <= 93);
-            try std.testing.expectEqual(score, wrapped_score);
-        } else |err| {
-            try std.testing.expectEqual(error.InvalidQuality, err);
-            try std.testing.expect(wrapped_score > 93);
-        }
-    }
-}
-
-test "[property] - [statistics]: vector payload kernels match the scalar path" {
-    const vector_len = std.simd.suggestVectorLength(u8) orelse return;
-    if (vector_len < 2 or
-        vector_len % 2 != 0 or
-        vector_len > std.math.maxInt(u16) / std.math.maxInt(u8)) return;
-
-    const quality_vectors_per_block: usize = std.math.maxInt(u8) - 1;
-    const quality_block_len: usize = vector_len * quality_vectors_per_block;
-    const base_block_len: usize = vector_len * std.math.maxInt(u8);
-    const max_len: usize = base_block_len + @as(usize, vector_len) + 1;
-    const lengths = [_]usize{
+fn blockBoundaryLengths(comptime vector_len: comptime_int) [14]usize {
+    const quality_block_len = vector_len * (std.math.maxInt(u8) - 1);
+    const base_block_len = vector_len * std.math.maxInt(u8);
+    return .{
         0,
         1,
         vector_len - 1,
         vector_len,
         vector_len + 1,
-        2 * vector_len - 1,
-        2 * vector_len,
         2 * vector_len + 1,
         base_block_len - 1,
         base_block_len,
@@ -493,193 +620,116 @@ test "[property] - [statistics]: vector payload kernels match the scalar path" {
         quality_block_len + 1,
         quality_block_len + vector_len,
     };
+}
+
+fn fillPayload(sequence: []u8, quality: []u8) void {
     const qualities = [_]u8{ 33, 52, 53, 62, 63, 126 };
-    const sequence = try std.testing.allocator.alloc(u8, max_len);
-    defer std.testing.allocator.free(sequence);
-    const quality = try std.testing.allocator.alloc(u8, max_len);
-    defer std.testing.allocator.free(quality);
     for (sequence, quality, 0..) |*base, *quality_byte, index| {
         base.* = @intCast(index % 256);
         quality_byte.* = qualities[index % qualities.len];
     }
+}
 
-    for (lengths) |length| {
-        var scalar_error: ?QualityError = null;
-        var vector_error: ?QualityError = null;
-        const scalar = try payloadTotalsScalar(
-            u64,
-            sequence[0..length],
-            quality[0..length],
-            &scalar_error,
-        );
-        const vector = try payloadTotals(
-            u64,
-            sequence[0..length],
-            quality[0..length],
-            &vector_error,
-        );
-        try std.testing.expectEqualDeep(scalar, vector);
-        try std.testing.expectEqualDeep(scalar_error, vector_error);
-    }
+test "[property] - [statistics]: vector payload totals match the scalar path at block boundaries" {
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |vector_len| {
+        const lengths = blockBoundaryLengths(vector_len);
+        const max_len = std.mem.max(usize, &lengths);
+        const sequence = try std.testing.allocator.alloc(u8, max_len);
+        defer std.testing.allocator.free(sequence);
+        const quality = try std.testing.allocator.alloc(u8, max_len);
+        defer std.testing.allocator.free(quality);
+        fillPayload(sequence, quality);
 
-    for (0..2 * vector_len + 1) |length| {
-        var scalar_error: ?QualityError = null;
-        var vector_error: ?QualityError = null;
-        const scalar = try payloadTotalsScalar(
-            u64,
-            sequence[0..length],
-            quality[0..length],
-            &scalar_error,
-        );
-        const vector = try payloadTotals(
-            u64,
-            sequence[0..length],
-            quality[0..length],
-            &vector_error,
-        );
-        try std.testing.expectEqualDeep(scalar, vector);
-        try std.testing.expectEqualDeep(scalar_error, vector_error);
-    }
-
-    for (1..vector_len) |remainder| {
-        const length = vector_len + remainder;
-        const invalid_indices = [_]usize{ vector_len - 1, vector_len, length - 1 };
-        for (invalid_indices) |invalid_index| {
-            const original = quality[invalid_index];
-            quality[invalid_index] = 127;
-            var scalar_error: ?QualityError = null;
-            var vector_error: ?QualityError = null;
-            try std.testing.expectError(
-                error.S006InvalidQuality,
-                payloadTotalsScalar(
-                    u64,
-                    sequence[0..length],
-                    quality[0..length],
-                    &scalar_error,
-                ),
+        for (lengths) |length| {
+            const sequence_part = sequence[0..length];
+            const quality_part = quality[0..length];
+            var quality_error: ?QualityError = null;
+            try std.testing.expectEqualDeep(
+                try payloadTotalsScalar(u64, .both, sequence_part, quality_part, &quality_error),
+                try payloadTotals(u64, sequence_part, quality_part, &quality_error),
             );
-            try std.testing.expectError(
-                error.S006InvalidQuality,
-                payloadTotals(
-                    u64,
-                    sequence[0..length],
-                    quality[0..length],
-                    &vector_error,
-                ),
-            );
-            try std.testing.expectEqualDeep(scalar_error, vector_error);
-            quality[invalid_index] = original;
+            if (length < vector_len) continue;
+            inline for (.{ Parts.both, Parts.sequence, Parts.quality }) |parts| {
+                try std.testing.expectEqualDeep(
+                    try payloadTotalsScalar(u64, parts, sequence_part, quality_part, &quality_error),
+                    try payloadTotalsVector(vector_len, parts, sequence_part, quality_part, &quality_error),
+                );
+            }
         }
     }
+}
 
-    @memset(quality[0..quality_block_len], 126);
-    var maximum_scalar_error: ?QualityError = null;
-    var maximum_vector_error: ?QualityError = null;
-    const maximum_scalar = try payloadTotalsScalar(
-        u64,
-        sequence[0..quality_block_len],
-        quality[0..quality_block_len],
-        &maximum_scalar_error,
-    );
-    const maximum_vector = try payloadTotals(
-        u64,
-        sequence[0..quality_block_len],
-        quality[0..quality_block_len],
-        &maximum_vector_error,
-    );
-    try std.testing.expectEqualDeep(maximum_scalar, maximum_vector);
-    try std.testing.expectEqualDeep(maximum_scalar_error, maximum_vector_error);
-
-    for (0..quality_vectors_per_block) |vector_index| {
-        const encoded: u8 = if (vector_index % 2 == 0) 32 else 33;
-        @memset(
-            quality[vector_index * vector_len ..][0..vector_len],
-            encoded,
-        );
-    }
-    const bound_len = quality_block_len - vector_len;
-    var bound_scalar_error: ?QualityError = null;
-    var bound_vector_error: ?QualityError = null;
-    try std.testing.expectError(
-        error.S006InvalidQuality,
-        payloadTotalsScalar(
-            u64,
-            sequence[0..bound_len],
-            quality[0..bound_len],
-            &bound_scalar_error,
-        ),
-    );
-    try std.testing.expectError(
-        error.S006InvalidQuality,
-        payloadTotals(
-            u64,
-            sequence[0..bound_len],
-            quality[0..bound_len],
-            &bound_vector_error,
-        ),
-    );
-    try std.testing.expectEqualDeep(bound_scalar_error, bound_vector_error);
-
-    for (quality, 0..) |*quality_byte, index| {
-        quality_byte.* = qualities[index % qualities.len];
-    }
-
-    const invalid_len = quality_block_len + vector_len;
-    const invalid_indices = [_]usize{
-        0,
-        vector_len - 1,
-        (quality_vectors_per_block / 2) * vector_len + vector_len / 2,
-        quality_block_len - 1,
-        quality_block_len,
-        invalid_len - 1,
-    };
-    for (invalid_indices, 0..) |invalid_index, case_index| {
-        const original = quality[invalid_index];
-        quality[invalid_index] = if (case_index % 2 == 0) 32 else 127;
-        var scalar_error: ?QualityError = null;
-        var vector_error: ?QualityError = null;
-        try std.testing.expectError(
-            error.S006InvalidQuality,
-            payloadTotalsScalar(
-                u64,
-                sequence[0..invalid_len],
-                quality[0..invalid_len],
-                &scalar_error,
-            ),
-        );
-        try std.testing.expectError(
-            error.S006InvalidQuality,
-            payloadTotals(u64, sequence[0..invalid_len], quality[0..invalid_len], &vector_error),
-        );
-        try std.testing.expectEqualDeep(scalar_error, vector_error);
-        quality[invalid_index] = original;
-    }
-
-    const first_invalid = 3 * vector_len + 1;
-    const later_invalid = quality_block_len - 1;
-    quality[later_invalid] = 127;
-    quality[first_invalid] = 32;
+fn expectFirstInvalidQuality(
+    comptime vector_len: comptime_int,
+    sequence: []const u8,
+    quality: []const u8,
+    index: usize,
+) !void {
+    const expected: ?QualityError = .{ .byte_index = index, .byte = quality[index] };
     var scalar_error: ?QualityError = null;
     var vector_error: ?QualityError = null;
     try std.testing.expectError(
         error.S006InvalidQuality,
-        payloadTotalsScalar(
-            u64,
-            sequence[0..invalid_len],
-            quality[0..invalid_len],
-            &scalar_error,
-        ),
+        payloadTotalsScalar(u64, .both, sequence, quality, &scalar_error),
     );
     try std.testing.expectError(
         error.S006InvalidQuality,
-        payloadTotals(
-            u64,
-            sequence[0..invalid_len],
-            quality[0..invalid_len],
-            &vector_error,
-        ),
+        payloadTotalsVector(vector_len, .both, sequence, quality, &vector_error),
     );
-    try std.testing.expectEqualDeep(scalar_error, vector_error);
-    quality[first_invalid] = qualities[first_invalid % qualities.len];
-    quality[later_invalid] = qualities[later_invalid % qualities.len];
+    try std.testing.expectEqualDeep(expected, scalar_error);
+    try std.testing.expectEqualDeep(expected, vector_error);
+}
+
+test "[failure] - [statistics]: vector payload totals report the first invalid quality byte" {
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |vector_len| {
+        const quality_block_len = vector_len * (std.math.maxInt(u8) - 1);
+        const block_len = quality_block_len + vector_len;
+        const sequence = try std.testing.allocator.alloc(u8, block_len);
+        defer std.testing.allocator.free(sequence);
+        const quality = try std.testing.allocator.alloc(u8, block_len);
+        defer std.testing.allocator.free(quality);
+
+        const short_len = vector_len + 1;
+        for ([_]usize{ vector_len - 1, vector_len }) |invalid_index| {
+            fillPayload(sequence, quality);
+            quality[invalid_index] = 127;
+            try expectFirstInvalidQuality(vector_len, sequence[0..short_len], quality[0..short_len], invalid_index);
+        }
+
+        const invalid_block = [_]struct { index: usize, byte: u8 }{
+            .{ .index = 0, .byte = 32 },
+            .{ .index = quality_block_len - 1, .byte = 127 },
+            .{ .index = quality_block_len, .byte = 32 },
+            .{ .index = block_len - 1, .byte = 127 },
+        };
+        for (invalid_block) |invalid| {
+            fillPayload(sequence, quality);
+            quality[invalid.index] = invalid.byte;
+            try expectFirstInvalidQuality(vector_len, sequence, quality, invalid.index);
+        }
+
+        fillPayload(sequence, quality);
+        quality[block_len - 1] = 127;
+        quality[3 * vector_len + 1] = 32;
+        try expectFirstInvalidQuality(vector_len, sequence, quality, 3 * vector_len + 1);
+    }
+}
+
+test "[edge] - [statistics]: vector payload totals at the maximum quality block" {
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |vector_len| {
+        const block_len = vector_len * (std.math.maxInt(u8) - 1);
+        const sequence = try std.testing.allocator.alloc(u8, block_len);
+        defer std.testing.allocator.free(sequence);
+        const quality = try std.testing.allocator.alloc(u8, block_len);
+        defer std.testing.allocator.free(quality);
+        @memset(sequence, 'A');
+        @memset(quality, fastq.PHRED_MAX_BYTE);
+
+        var quality_error: ?QualityError = null;
+        const totals = try payloadTotalsVector(vector_len, .both, sequence, quality, &quality_error);
+        try std.testing.expectEqual(@as(usize, block_len), totals.base_counts[0]);
+        try std.testing.expectEqual(@as(u64, block_len) * fastq.PHRED_MAX_SCORE, totals.quality_sum);
+        try std.testing.expectEqual(@as(usize, block_len), totals.q30_bases);
+        try std.testing.expectEqual(@as(?QualityError, null), quality_error);
+    }
 }

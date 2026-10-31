@@ -1,75 +1,55 @@
 # Troubleshooting
 
+Find the symptom, then the fix.
+
 ## `z-fastq` is not found
 
-Run the binary from the build output:
+The binary stays in the build tree: run `./zig-out/bin/z-fastq`, or link it into a directory on your `PATH` ([Installation](Installation)).
 
-```bash
-./zig-out/bin/z-fastq --version
-```
+## The build cannot download zipir
 
-If that works, place a copy or link in a directory on your `PATH`.
+The first build fetches the zipir release named in `build.zig.zon` and checks its hash. Build once with network access; later builds reuse the download.
 
-## The build cannot download Zipir
+## A gzip input fails
 
-The first build downloads the Zipir release archive named in `build.zig.zon` and checks it against the pinned package hash. Without network access the build stops at that step. Build once with network access; later builds reuse the downloaded package.
-
-## A gzip input fails even though the name is unusual
-
-z-fastq checks the first two bytes, not `.gz`. If those bytes identify gzip, the complete stream must have valid framing, DEFLATE data, CRC32, and uncompressed size.
-
-Check it independently:
+z-fastq decided it was gzip from its first bytes, so the whole stream must be valid. Test it on its own:
 
 ```bash
 gzip -t reads.fastq.gz
 ```
 
-## A line-limit error appears
+Trailing bytes after the last member, even zero padding, also fail ([Limits](Limits-and-Supported-Formats#gzip)).
 
-The default logical line limit is 16 MiB. Increase it only when the input really uses longer single-line fields:
+## A line is too long
 
-```bash
-z-fastq check --max-line-bytes 33554432 reads.fastq
-```
+The default limit is 16 MiB per line. Raise it only as far as the data needs, for example with `--max-line-bytes 33554432` for long reads. It does not allow wrapped records.
 
-This does not enable wrapped FASTQ.
+## Exact sampling refuses `-`
 
-## Exact sampling rejects `-`
+Exact counts read the file twice, so they need a regular file. On a pipe, use `--fraction`.
 
-That mode needs two passes. Give it a regular path:
+## Pair names do not match
 
-```bash
-z-fastq sample --count 1000 reads.fastq
-```
+Look at the first words of the two headers. The default `illumina` policy understands `/1` and `/2` and `1:N:...` markers; `exact` compares the first words byte for byte ([Paired reads](Paired-Reads)). No policy makes different read names equal.
 
-Use fraction sampling when the source is a pipe:
+## An output path is refused
 
-```bash
-gzip -dc reads.fastq.gz | z-fastq sample --fraction 0.1 -
-```
+`deinterleave` and `process` never overwrite a file. Remove the old output yourself once you are sure it is safe, or choose a new path.
 
-## Paired names do not match
+## Output was written, but the command failed
 
-Start with the default `illumina` policy. If your headers use a different convention, inspect the first tokens and try the strict policy:
+Streaming commands write records as they go, and a later failure, such as a broken record or a gzip member whose checksum fails, leaves the earlier records written. Trust the exit status ([Automation](Automation#partial-output)).
 
-```bash
-z-fastq check --paired --pair-names exact R1.fastq R2.fastq
-```
+## There is no JSON output
 
-Changing policy does not make genuinely different read identifiers equal. See [Paired reads](Paired-Reads).
+`--json` exists for `stats` and `check`; `process` writes its JSON with `--report` and `--qc-summary`. `count` prints plain numbers ([Automation](Automation#json)).
 
-## `deinterleave` refuses an output path
+## The command exits with status 4
 
-Output files are created exclusively. The command does not truncate or overwrite an existing file. Choose a new path after checking that the old output is safe to keep or remove.
+A limit was reached: the line limit, a sampling limit, or an arithmetic limit. The message names which.
 
-## A FASTQ-producing command failed after writing data
+## Related pages
 
-Sampling and interleaving stream output. A late parser, pair, input, or output failure can leave a partial stream. For gzip input this includes a CRC32 or size mismatch, which z-fastq can only detect at the end of a gzip member, after that member's records were written. Write to a temporary path and move it only after a zero exit status.
-
-## JSON is missing
-
-The current build supports `--json` only for `stats` and `check`. `count` prints decimal counts. Sampling and pair-layout commands write FASTQ. The JSON document shape is provisional; see [Automation](Automation) before depending on it.
-
-## The command returns status `4`
-
-Status `4` means z-fastq reached a configured or representable limit: a line limit, sample-selection or staging limit, or arithmetic limit. The error message identifies the relevant boundary when the command can report it.
+- [FAQ](FAQ): short answers to common questions.
+- [Automation](Automation): exit statuses in full.
+- [Validation](Validation#when-a-record-fails): what each error code means.

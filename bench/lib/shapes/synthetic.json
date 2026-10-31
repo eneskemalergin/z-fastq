@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "revision": 3,
+  "generator_revision": 2,
+  "data_root": "bench/data/synthetic",
+  "pool_root": "bench/data/real",
+  "tiers": {"tiny": 1048576, "xsmall": 10485760, "small": 104857600, "medium": 1073741824, "large": 10737418240},
+  "defaults": {"formats": ["plain", "gzip"], "paired_layout": "mates", "gzip_level": 6},
+  "sizing": {
+    "budget": "decompressed_bytes",
+    "paired_budget": "sum_of_mates",
+    "count": "floor_cap_over_nominal_then_exact_prefix_fit",
+    "record_index_max": 999999999
+  },
+  "shapes": [
+    {
+      "id": "dense", "engine": "fixed", "layout": "single",
+      "description": "Uniform 150-base LF records with bare plus lines; NovaSeq bases and binned qualities.",
+      "lengths": [150], "pool": "illumina-drr1001190/xsmall_R1.fastq",
+      "header": {"prefix": "D", "index_width": 9}, "line_endings": "lf",
+      "nominal_record_bytes": 316, "multi_gzip_members": 8
+    },
+    {
+      "id": "variable", "engine": "variable", "layout": "single",
+      "description": "Cycling short-read lengths, descriptions and annotated plus lines; MiSeq bases and qualities.",
+      "lengths": [50, 75, 100, 125, 150], "pool": "illumina-drr018439/xsmall_R1.fastq",
+      "header": {"prefix": "V", "index_width": 7}, "line_endings": "lf",
+      "nominal_record_bytes": 252
+    },
+    {
+      "id": "endings", "engine": "fixed", "layout": "single",
+      "description": "100-base records; odd absolute indices use CRLF, even indices use LF; MiSeq content.",
+      "lengths": [100], "pool": "illumina-drr018447/xsmall_R1.fastq",
+      "header": {"prefix": "E", "index_width": 9}, "line_endings": "alternating_crlf_lf",
+      "nominal_record_bytes": 218
+    },
+    {
+      "id": "paired", "engine": "paired", "layout": "paired",
+      "description": "100-base mates with /1 and /2 suffixes and Casava mate fields; real MiSeq mate pairs.",
+      "lengths": [100], "pool": "illumina-drr018447/xsmall_R1.fastq",
+      "header": {"prefix": "P", "index_width": 9, "barcode": "ACGT"}, "line_endings": "lf",
+      "nominal_record_bytes": 458
+    },
+    {
+      "id": "long", "engine": "fixed", "layout": "single",
+      "description": "300,000-base records whose sequence and quality lines cross the reader window; PromethION content.",
+      "lengths": [300000], "pool": "ont-err14758576/xsmall.fastq",
+      "header": {"prefix": "L", "index_width": 7}, "line_endings": "lf",
+      "nominal_record_bytes": 600014
+    },
+    {
+      "id": "longread", "engine": "longread", "layout": "single",
+      "description": "Variable long reads with UUID-shaped Nanopore headers and rare 300-500 kb outliers; GridION content.",
+      "lengths": [1200, 3500, 800, 15000, 2200, 30000, 950, 5200, 1800, 9800, 4100, 24000, 1600, 7200],
+      "pool": "ont-err10496769/xsmall.fastq",
+      "header": {"runid_offset": 1000000, "channels": 512, "barcodes": 4, "unclassified_every": 5, "start_time": "2025-01-13T10:45:28+00:00"},
+      "outliers": {"every": 67, "base_length": 300000, "index_multiplier": 13, "modulus": 200000},
+      "line_endings": "lf", "nominal_record_bytes": 27200
+    }
+  ]
+}

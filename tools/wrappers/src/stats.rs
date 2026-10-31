@@ -52,37 +52,27 @@ impl Stats {
             });
         }
 
-        let length = u64::try_from(sequence.len()).map_err(|_| StatsError::Overflow)?;
-        let mut a = 0_u64;
-        let mut c = 0_u64;
-        let mut g = 0_u64;
-        let mut t = 0_u64;
-        let mut n = 0_u64;
-        let mut other_bases = 0_u64;
-        let mut quality_sum = 0_u128;
-        let mut q20_bases = 0_u64;
-        let mut q30_bases = 0_u64;
-
-        for (&base, &encoded_quality) in sequence.iter().zip(quality) {
-            match base {
-                b'A' | b'a' => a += 1,
-                b'C' | b'c' => c += 1,
-                b'G' | b'g' => g += 1,
-                b'T' | b't' => t += 1,
-                b'N' | b'n' => n += 1,
-                _ => other_bases += 1,
-            }
-
-            if !(33..=126).contains(&encoded_quality) {
-                return Err(StatsError::InvalidQuality(encoded_quality));
-            }
-            let score = encoded_quality - 33;
-            quality_sum += u128::from(score);
-            q20_bases += (score >= 20) as u64;
-            q30_bases += (score >= 30) as u64;
+        if let Some(&encoded_quality) = quality.iter().find(|&&q| !(33..=126).contains(&q)) {
+            return Err(StatsError::InvalidQuality(encoded_quality));
         }
 
-        let quality_sum = u64::try_from(quality_sum).map_err(|_| StatsError::Overflow)?;
+        // One branch-free pass per counter, so each loop vectorizes; folding
+        // bit 5 makes each base test case-insensitive.
+        let length = u64::try_from(sequence.len()).map_err(|_| StatsError::Overflow)?;
+        let count = |base: u8| sequence.iter().filter(|&&b| (b | 0x20) == base).count() as u64;
+        let a = count(b'a');
+        let c = count(b'c');
+        let g = count(b'g');
+        let t = count(b't');
+        let n = count(b'n');
+        let other_bases = length - a - c - g - t - n;
+        // Scores are at most 93, so this bound keeps the plain sum exact.
+        if length > u64::MAX / 93 {
+            return Err(StatsError::Overflow);
+        }
+        let quality_sum = quality.iter().map(|&q| u64::from(q - 33)).sum::<u64>();
+        let q20_bases = quality.iter().filter(|&&q| q >= 33 + 20).count() as u64;
+        let q30_bases = quality.iter().filter(|&&q| q >= 33 + 30).count() as u64;
         let next = Self {
             reads: checked_add(self.reads, 1)?,
             bases: checked_add(self.bases, length)?,

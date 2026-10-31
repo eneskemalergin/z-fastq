@@ -2,45 +2,48 @@
 
 ## Does z-fastq repair malformed FASTQ?
 
-No. `check` reports the first failure and stops that input. It does not skip records or write a guessed correction.
+No. It reports the first problem and stops; it never skips records or guesses a fix. See [Validation](Validation).
 
-## Does it load a complete file into memory?
+## Does it load whole files into memory?
 
-The normal count, stats, validation, and streaming pair paths do not. Exact-count sampling stores selection state and reads a regular file twice. It does not retain the complete FASTQ.
+No. Every command streams, and exact-count sampling keeps only a small entry per chosen record. See [Limits](Limits-and-Supported-Formats#memory).
 
-## Does a `.gz` suffix control gzip decoding?
+## Does the `.gz` name decide gzip decoding?
 
-No. z-fastq checks the first two bytes. A valid gzip stream is decoded even when its name does not end in `.gz`.
-
-## Does z-fastq support wrapped FASTQ?
-
-No. The current record model has one logical line for each header, sequence, plus, and quality field.
-
-## Which quality encoding does it use?
-
-Phred+33 only. Quality bytes must be ASCII 33 through 126. Phred+64 is not supported.
+No, the first two bytes do. See [Input and output](Input-and-Output).
 
 ## Why does `check` print nothing on success?
 
-It is designed to act as a validation gate. A zero exit status is the success result; diagnostics appear only when something fails.
+So it can be a plain pass or fail step in a script: the exit status is the answer.
 
-## Can I use stdin for exact-count sampling?
+## Which quality encoding does it read?
 
-No. Exact-count sampling requires two passes. Use a regular path or use fraction sampling for a one-pass pipe.
+Phred+33 only, ASCII 33 to 126.
 
-## Does paired sampling select R1 and R2 independently?
+## Can I sample an exact count from a pipe?
 
-No. A pair is the selection unit. Both mates are written to the interleaved output or both are skipped.
+No, exact counts read the file twice. Use `--fraction` on a pipe. See [Sampling](Sampling).
 
-## Does z-fastq write gzip output?
+## Are paired mates ever sampled separately?
 
-No. Pipe FASTQ output through `gzip` when you need compression.
+Never. Both mates are kept or neither.
 
-## Can `deinterleave` overwrite an existing file?
+## Does it write gzip?
 
-No. It creates output paths exclusively to avoid silently truncating an existing result.
+Only `process --gzip`. Pipe the other commands' output to `gzip`.
 
-## Is z-fastq a replacement for fastp or SeqKit?
+## Can an output file be overwritten?
 
-No. It covers a narrower set of streaming FASTQ tasks. See [Choosing a FASTQ tool](Choosing-a-FASTQ-Tool).
+No. `deinterleave` and `process` create new files and fail on an existing path.
 
+## Does it support wrapped FASTQ or FASTA?
+
+Not today. See [Limits](Limits-and-Supported-Formats).
+
+## How fast is it, and how much memory does it use?
+
+On one core, faster than the other tools that do a whole job, with a few MiB of memory, and its memory does not grow with the input. Some tools that do part of a job, or use many threads, are faster in places. See [Performance](Performance).
+
+## Is z-fastq a replacement for fastp, FastQC, or SeqKit?
+
+No. It follows fastp's trimming rules and FastQC's QC definitions for the parts it covers, and does much less than any of them. See [Choosing a FASTQ tool](Choosing-a-FASTQ-Tool).

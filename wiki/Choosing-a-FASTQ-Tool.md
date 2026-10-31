@@ -1,40 +1,38 @@
 # Choosing a FASTQ tool
 
-No single FASTQ program is the right fit for every job. I think about the choice in terms of the work a pipeline needs, not a general claim that one tool is always faster.
+No FASTQ program is right for every job, and z-fastq is not trying to be. I think about the choice in terms of what a workflow needs, not which tool wins a race.
+
+## Why z-fastq exists
+
+Before the expensive steps of an analysis, a workflow usually needs plain answers to small questions:
+
+- Are these records valid, and do the two files still describe the same pairs?
+- How many reads and bases are there, and how good are they?
+- Can I take a repeatable subset without loading the file?
+- What exactly happens when a record fails halfway through?
+
+z-fastq is built for those questions: a small, fast tool whose failures are as well defined as its results. It is narrower than a general toolkit on purpose.
 
 ## Use z-fastq when
 
-- You need counting, aggregate statistics, validation, sampling, or pair layout changes.
-- Plain and gzip input should follow the same command path.
-- You want explicit behavior for paired names, validation codes, exit classes, and output creation.
-- You want a streaming command that keeps normal process state bounded.
-- You want to embed the reader, writer, statistics, or I/O adapters in a Zig program.
-- You are comfortable with the current Linux x86-64 boundary and pre-`0.1.0` interface.
+- You need counting, statistics, validation, sampling, or pair layout changes, on plain or gzip input alike.
+- You want exact behavior for pair names, error codes, exit statuses, and output files.
+- Memory should stay small and bounded on any input.
+- You want adapter, poly-G, and quality trimming with fastp's rules, and QC that MultiQC can read, from one streaming pass.
+- You want the reader, writer, or statistics inside a Zig program.
 
-z-fastq is intentionally narrower than a general sequence manipulation suite. Its value is the consistency of these core operations and the fact that their failure behavior is part of the documented interface.
+## Use another tool when
 
-## Use seqtk when
+- **[fastp](https://github.com/OpenGene/fastp)** for the full short-read preprocessing set: deduplication, base correction, pair merging, UMI handling, automatic adapter detection, and its own HTML report. z-fastq follows fastp's rules for the trims and filters it has, but does none of these.
+- **[FastQC](https://github.com/s-andrews/FastQC)** for its HTML report and interactive viewer, Kmer Content, and quality encodings other than Phred+33. z-fastq measures FastQC's modules and writes their data, not the report.
+- **[SeqKit](https://github.com/shenwei356/seqkit)** for a broad FASTA and FASTQ toolbox: many subcommands, more compression formats, threads, searching, and conversion.
+- **[seqtk](https://github.com/lh3/seqtk)** for a compact classic with conversion, subsampling, trimming, and subsequences. If a workflow already depends on its flags and output, switching may not be worth it.
 
-[seqtk](https://github.com/lh3/seqtk) is a good fit for a compact, classic FASTA/Q utility with common transformations such as conversion, subsampling, trimming, and subsequence extraction. Its README is command-first and concise. If your workflow already depends on its established flags and output, changing tools may not be worth it.
+[References](References) lists these and the other tools z-fastq is compared with, and how each comparison is made.
 
-## Use SeqKit when
+## Related pages
 
-[SeqKit](https://github.com/shenwei356/seqkit) is a better fit for a broad FASTA/Q toolbox with many subcommands, more compression formats, configurable threading, sequence searches, conversions, and larger workflow coverage. Its documentation is correspondingly broader. z-fastq does not try to reproduce that surface.
-
-## Use fastp when
-
-[fastp](https://github.com/OpenGene/fastp) is the right category of tool when the job includes short-read QC and preprocessing such as adapter handling, trimming, filtering, deduplication, and reports. z-fastq does not replace those transformations.
-
-## Why keep another focused tool?
-
-The gap I care about is smaller than a full preprocessing suite and more explicit than a minimal record loop. A workflow often needs to answer simple questions before the expensive steps begin:
-
-- Are these records structurally valid?
-- Are the sequence and quality fields internally consistent?
-- Do these two files still describe the same pairs?
-- How many records and bases are present?
-- Can I take a repeatable subset without loading the complete file?
-- What exactly should a script do when a record fails halfway through?
-
-Those questions are the reason for z-fastq. They are not a reason to claim that it replaces every tool above.
-
+- [Performance](Performance): the speed and memory comparison with each of these tools.
+- [Home](Home): what z-fastq does, command by command.
+- [Limits and supported formats](Limits-and-Supported-Formats): what is not supported today.
+- [References](References): the tools z-fastq follows and is compared with.

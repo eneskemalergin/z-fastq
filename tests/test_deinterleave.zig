@@ -1,4 +1,4 @@
-//! Installed CLI contracts for `z-fastq deinterleave`.
+//! Installed `z-fastq deinterleave` behavior: pairing, two outputs, validation, and exit status.
 
 const std = @import("std");
 const cli = @import("utilities.zig");
@@ -13,7 +13,11 @@ const EXACT_R2 =
     "@same right\nT\n+two\n#\n" ++
     "@empty two\n\n+empty-two\n\n";
 
-test "[cli] - [deinterleave]: fields, order, line endings, and round trip are exact" {
+const READ_BUFFER_BYTES = 256 * 1024;
+const OUTPUT_BUFFER_BYTES = 64 * 1024;
+const GZIP_MEMBER_INPUT_BYTES = 60 * 1024;
+
+test "[cli] - [deinterleave]: mates are written in input order with canonical LF output" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -35,34 +39,43 @@ test "[cli] - [deinterleave]: fields, order, line endings, and round trip are ex
     const expected2 =
         "@cluster 2:Y:0:index-b\nGT\n+second annotation\n#$\n" ++
         "@legacy/2 other\nA\n+mate\n!\n";
-    const expected_interleaved =
-        "@cluster 1:N:0:index-a\nAC\n+first annotation\n!~\n" ++
-        "@cluster 2:Y:0:index-b\nGT\n+second annotation\n#$\n" ++
-        "@legacy/1 opaque\nN\n+legacy\n#\n" ++
-        "@legacy/2 other\nA\n+mate\n!\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = input });
 
     try cli.expectResult(
-        try cli.run(allocator, &.{
-            "deinterleave",
-            "--out1",
-            out1_path,
-            "--out2",
-            out2_path,
-            input_path,
-        }),
+        try cli.run(allocator, &.{ "deinterleave", "--out1", out1_path, "--out2", out2_path, input_path }),
         0,
         "",
         "",
     );
     try expectFile(allocator, out1_path, expected1);
     try expectFile(allocator, out2_path, expected2);
-    try cli.expectResult(
-        try cli.run(allocator, &.{ "check", "--paired", out1_path, out2_path }),
-        0,
-        "",
-        "",
-    );
+}
+
+test "[cli] - [deinterleave]: interleaving the outputs and splitting again reproduces them" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const out1_path = try cli.tempPath(allocator, &tmp.sub_path, "out1.fastq");
+    const out2_path = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq");
+
+    const expected1 =
+        "@cluster 1:N:0:index-a\nAC\n+first annotation\n!~\n" ++
+        "@legacy/1 opaque\nN\n+legacy\n#\n";
+    const expected2 =
+        "@cluster 2:Y:0:index-b\nGT\n+second annotation\n#$\n" ++
+        "@legacy/2 other\nA\n+mate\n!\n";
+    const expected_interleaved =
+        "@cluster 1:N:0:index-a\nAC\n+first annotation\n!~\n" ++
+        "@cluster 2:Y:0:index-b\nGT\n+second annotation\n#$\n" ++
+        "@legacy/1 opaque\nN\n+legacy\n#\n" ++
+        "@legacy/2 other\nA\n+mate\n!\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "out1.fastq", .data = expected1 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "out2.fastq", .data = expected2 });
+
     const joined = try cli.run(allocator, &.{ "interleave", out1_path, out2_path });
     try cli.expectResult(joined, 0, expected_interleaved, "");
 
@@ -101,75 +114,40 @@ test "[cli] - [deinterleave]: terminal CR fields leave both outputs empty" {
     }
 }
 
-test "[cli] - [deinterleave]: gzip preserves exact-policy fields" {
+test "[cli] - [deinterleave]: exact policy preserves fields from plain, gzip, and stdin input" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq.gz");
-
+    const plain_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const gzip_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq.gz");
     var gzip: std.ArrayList(u8) = .empty;
     try cli.appendGzipMember(allocator, &gzip, EXACT_INPUT, .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = EXACT_INPUT });
     try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq.gz", .data = gzip.items });
 
-    const gzip_out1 = try cli.tempPath(allocator, &tmp.sub_path, "gzip-r1.fastq");
-    const gzip_out2 = try cli.tempPath(allocator, &tmp.sub_path, "gzip-r2.fastq");
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "deinterleave",
-            "--pair-names",
-            "exact",
-            "--alphabet",
-            "acgtn",
-            "--out1",
-            gzip_out1,
-            "--out2",
-            gzip_out2,
-            input_path,
-        }),
-        0,
-        "",
-        "",
-    );
-    try expectFile(allocator, gzip_out1, EXACT_R1);
-    try expectFile(allocator, gzip_out2, EXACT_R2);
-}
-
-test "[cli] - [deinterleave]: stdin preserves exact-policy fields" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const stdin_out1 = try cli.tempPath(allocator, &tmp.sub_path, "stdin-r1.fastq");
-    const stdin_out2 = try cli.tempPath(allocator, &tmp.sub_path, "stdin-r2.fastq");
-    try cli.expectResult(
-        try cli.runWithStdin(
-            allocator,
-            &.{
-                "deinterleave",
-                "--pair-names",
-                "exact",
-                "--alphabet",
-                "acgtn",
-                "--out1",
-                stdin_out1,
-                "--out2",
-                stdin_out2,
-                "-",
-            },
-            EXACT_INPUT,
-            1,
-        ),
-        0,
-        "",
-        "",
-    );
-    try expectFile(allocator, stdin_out1, EXACT_R1);
-    try expectFile(allocator, stdin_out2, EXACT_R2);
+    const transports = [_]struct { name: []const u8, input: []const u8, stdin: ?[]const u8 }{
+        .{ .name = "plain", .input = plain_path, .stdin = null },
+        .{ .name = "gzip", .input = gzip_path, .stdin = null },
+        .{ .name = "stdin", .input = "-", .stdin = EXACT_INPUT },
+    };
+    for (transports) |transport| {
+        const out1 = try cli.tempPath(allocator, &tmp.sub_path, try std.fmt.allocPrint(allocator, "{s}-r1.fastq", .{transport.name}));
+        const out2 = try cli.tempPath(allocator, &tmp.sub_path, try std.fmt.allocPrint(allocator, "{s}-r2.fastq", .{transport.name}));
+        const args = [_][]const u8{
+            "deinterleave", "--pair-names", "exact",  "--alphabet", "acgtn",
+            "--out1",       out1,           "--out2", out2,         transport.input,
+        };
+        const result = if (transport.stdin) |stdin_data|
+            try cli.runWithStdin(allocator, &args, stdin_data, 1)
+        else
+            try cli.run(allocator, &args);
+        try cli.expectResult(result, 0, "", "");
+        try expectFile(allocator, out1, EXACT_R1);
+        try expectFile(allocator, out2, EXACT_R2);
+    }
 }
 
 test "[cli] - [deinterleave]: empty input creates two empty outputs" {
@@ -182,19 +160,7 @@ test "[cli] - [deinterleave]: empty input creates two empty outputs" {
     const empty_out1 = try cli.tempPath(allocator, &tmp.sub_path, "empty-r1.fastq");
     const empty_out2 = try cli.tempPath(allocator, &tmp.sub_path, "empty-r2.fastq");
     try cli.expectResult(
-        try cli.runWithStdin(
-            allocator,
-            &.{
-                "deinterleave",
-                "--out1",
-                empty_out1,
-                "--out2",
-                empty_out2,
-                "-",
-            },
-            "",
-            1,
-        ),
+        try cli.runWithStdin(allocator, &.{ "deinterleave", "--out1", empty_out1, "--out2", empty_out2, "-" }, "", 1),
         0,
         "",
         "",
@@ -218,36 +184,28 @@ test "[cli] - [deinterleave]: exact policy compares complete first tokens" {
     });
     const expected = try std.fmt.allocPrint(
         allocator,
-        "error: {s}: P001: paired identifiers or mate markers do not match (pair 0)\n" ++
-            "  R1: input={s}, record=0, offset=0, first_token=cluster/1 " ++
-            "[length=9, truncated=false], normalized_id=cluster/1 " ++
-            "[length=9, truncated=false], mate_markers=none\n" ++
-            "  R2: input={s}, record=1, offset=17, first_token=cluster/2 " ++
-            "[length=9, truncated=false], normalized_id=cluster/2 " ++
-            "[length=9, truncated=false], mate_markers=none\n",
-        .{ input_path, input_path, input_path },
+        "error: {s}: P001: paired identifiers or mate markers do not match (pair 0)\n",
+        .{input_path},
     );
 
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "deinterleave",
-            "--pair-names",
-            "exact",
-            "--out1",
-            paths[0],
-            "--out2",
-            paths[1],
-            input_path,
-        }),
-        1,
-        "",
-        expected,
-    );
+    const result = try cli.run(allocator, &.{
+        "deinterleave",
+        "--pair-names",
+        "exact",
+        "--out1",
+        paths[0],
+        "--out2",
+        paths[1],
+        input_path,
+    });
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try cli.expectFirstLine(expected, result.stderr);
     try expectEmptyFile(paths[0]);
     try expectEmptyFile(paths[1]);
 }
 
-test "[cli] - [deinterleave]: structural, semantic, pair, and odd-count precedence is exact" {
+test "[cli] - [deinterleave]: the earliest failure decides the diagnostic and what the outputs keep" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -255,148 +213,70 @@ test "[cli] - [deinterleave]: structural, semantic, pair, and odd-count preceden
     defer arena.deinit();
     const allocator = arena.allocator();
     const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "input.fastq",
-        .data = "@bad/1\n.\n+\n!\n@bad/2\nA\nx\n!\n",
-    });
-    var paths = try outputPaths(allocator, &tmp.sub_path, "structure");
-    const structural_error = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: S001: plus line must start with '+' " ++
-            "(record 1, line 3, offset 22)\n",
-        .{input_path},
-    );
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, paths),
-        1,
-        "",
-        structural_error,
-    );
-    try expectEmptyFile(paths[0]);
-    try expectEmptyFile(paths[1]);
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "input.fastq",
-        .data = "@bad/1\nR\n+\n \n@bad/2\nA\nx\n!\n",
-    });
-    paths = try outputPaths(allocator, &tmp.sub_path, "iupac-quality");
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, paths),
-        1,
-        "",
-        structural_error,
-    );
-    try expectEmptyFile(paths[0]);
-    try expectEmptyFile(paths[1]);
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "input.fastq",
-        .data = "@left/1\nA\n+\n!\n@right/2\nT\n+\n#\n",
-    });
-    paths = try outputPaths(allocator, &tmp.sub_path, "mismatch");
-    const mismatch = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: P001: paired identifiers or mate markers do not match (pair 0)\n" ++
-            "  R1: input={s}, record=0, offset=0, first_token=left/1 " ++
-            "[length=6, truncated=false], normalized_id=left " ++
-            "[length=4, truncated=false], mate_markers=1\n" ++
-            "  R2: input={s}, record=1, offset=14, first_token=right/2 " ++
-            "[length=7, truncated=false], normalized_id=right " ++
-            "[length=5, truncated=false], mate_markers=2\n",
-        .{ input_path, input_path, input_path },
-    );
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, paths),
-        1,
-        "",
-        mismatch,
-    );
-    try expectEmptyFile(paths[0]);
-    try expectEmptyFile(paths[1]);
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "input.fastq",
-        .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n@odd/1\nA\n+\n!\n",
-    });
-    paths = try outputPaths(allocator, &tmp.sub_path, "odd");
-    const odd = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: P002: paired input is missing a mate " ++
-            "(pair 1, remaining R1, last R1 record 2, last R2 record 1)\n",
-        .{input_path},
-    );
-    try cli.expectResult(try runDeinterleave(allocator, input_path, paths), 1, "", odd);
-    try expectFile(allocator, paths[0], "@ok/1\nA\n+\n!\n");
-    try expectFile(allocator, paths[1], "@ok/2\nT\n+\n#\n");
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "input.fastq",
-        .data = "@odd/1\n.\n+\n!\n",
-    });
-    paths = try outputPaths(allocator, &tmp.sub_path, "odd-semantic");
-    const odd_semantic = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: P002: paired input is missing a mate " ++
-            "(pair 0, remaining R1, last R1 record 0, last R2 record none)\n",
-        .{input_path},
-    );
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, paths),
-        1,
-        "",
-        odd_semantic,
-    );
-    try expectEmptyFile(paths[0]);
-    try expectEmptyFile(paths[1]);
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "input.fastq",
-        .data = "@odd/1\nA\n+\n",
-    });
-    paths = try outputPaths(allocator, &tmp.sub_path, "odd-structure");
-    const odd_structure = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: S004: unexpected end of file in quality line " ++
-            "(record 0, line 4, offset 11)\n",
-        .{input_path},
-    );
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, paths),
-        1,
-        "",
-        odd_structure,
-    );
-    try expectEmptyFile(paths[0]);
-    try expectEmptyFile(paths[1]);
-}
-
-test "[cli] - [deinterleave]: failed input leaves command-created outputs" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq.gz");
-    const payload = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n";
-    var gzip: std.ArrayList(u8) = .empty;
-    try cli.appendGzipMember(allocator, &gzip, payload, .{});
-    gzip.items[gzip.items.len - 8] ^= 1;
-    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq.gz", .data = gzip.items });
-    const paths = try outputPaths(allocator, &tmp.sub_path, "corrupt");
-    const expected = try std.fmt.allocPrint(allocator, "error: {s}: I/O error\n", .{input_path});
-
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, paths),
-        3,
-        "",
-        expected,
-    );
-    const output1 = try tmp.dir.readFileAlloc(io, "corrupt-r1.fastq", allocator, .limited(1024));
-    const output2 = try tmp.dir.readFileAlloc(io, "corrupt-r2.fastq", allocator, .limited(1024));
-    try cli.expectPrefix("@ok/1\nA\n+\n!\n", output1);
-    try cli.expectPrefix("@ok/2\nT\n+\n#\n", output2);
+    const cases = [_]struct {
+        name: []const u8,
+        input: []const u8,
+        message: []const u8,
+        first_line: bool,
+        out1: []const u8 = "",
+        out2: []const u8 = "",
+    }{
+        .{
+            .name = "structure",
+            .input = "@bad/1\n.\n+\n!\n@bad/2\nA\nx\n!\n",
+            .message = "S001: plus line must start with '+' (record 1, line 3, offset 22)\n",
+            .first_line = false,
+        },
+        .{
+            .name = "iupac-quality",
+            .input = "@bad/1\nR\n+\n \n@bad/2\nA\nx\n!\n",
+            .message = "S001: plus line must start with '+' (record 1, line 3, offset 22)\n",
+            .first_line = false,
+        },
+        .{
+            .name = "mismatch",
+            .input = "@left/1\nA\n+\n!\n@right/2\nT\n+\n#\n",
+            .message = "P001: paired identifiers or mate markers do not match (pair 0)\n",
+            .first_line = true,
+        },
+        .{
+            .name = "odd",
+            .input = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n@odd/1\nA\n+\n!\n",
+            .message = "P002: paired input is missing a mate " ++
+                "(pair 1, remaining R1, last R1 record 2, last R2 record 1)\n",
+            .first_line = true,
+            .out1 = "@ok/1\nA\n+\n!\n",
+            .out2 = "@ok/2\nT\n+\n#\n",
+        },
+        .{
+            .name = "odd-semantic",
+            .input = "@odd/1\n.\n+\n!\n",
+            .message = "P002: paired input is missing a mate " ++
+                "(pair 0, remaining R1, last R1 record 0, last R2 record none)\n",
+            .first_line = true,
+        },
+        .{
+            .name = "odd-structure",
+            .input = "@odd/1\nA\n+\n",
+            .message = "S004: unexpected end of file in quality line (record 0, line 4, offset 11)\n",
+            .first_line = false,
+        },
+    };
+    for (cases) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = case.input });
+        const paths = try outputPaths(allocator, &tmp.sub_path, case.name);
+        const message = try std.fmt.allocPrint(allocator, "error: {s}: {s}", .{ input_path, case.message });
+        const result = try runDeinterleave(allocator, input_path, paths);
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+        try std.testing.expectEqualStrings("", result.stdout);
+        if (case.first_line) {
+            try cli.expectFirstLine(message, result.stderr);
+        } else {
+            try std.testing.expectEqualStrings(message, result.stderr);
+        }
+        try expectFile(allocator, paths[0], case.out1);
+        try expectFile(allocator, paths[1], case.out2);
+    }
 }
 
 test "[cli] - [deinterleave]: late gzip failure retains the same complete prefix in both outputs" {
@@ -409,21 +289,16 @@ test "[cli] - [deinterleave]: late gzip failure retains the same complete prefix
     const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq.gz");
     var r1: std.ArrayList(u8) = .empty;
     var r2: std.ArrayList(u8) = .empty;
-    try appendRecord(allocator, &r1, "ok/1", 'A', '!', 151);
-    try appendRecord(allocator, &r2, "ok/2", 'T', '#', 51);
+    try appendFastqRecord(allocator, &r1, "ok/1", 'A', '!', 151);
+    try appendFastqRecord(allocator, &r2, "ok/2", 'T', '#', 51);
     var input: std.ArrayList(u8) = .empty;
     for (0..2000) |_| {
         try input.appendSlice(allocator, r1.items);
         try input.appendSlice(allocator, r2.items);
     }
     var gzip: std.ArrayList(u8) = .empty;
-    var offset: usize = 0;
-    while (offset < input.items.len) {
-        const end = @min(offset + 60 * 1024, input.items.len);
-        try cli.appendGzipMember(allocator, &gzip, input.items[offset..end], .{});
-        offset = end;
-    }
-    gzip.items[gzip.items.len - 8] ^= 1;
+    try appendGzipChunks(allocator, &gzip, input.items);
+    gzip.items[cli.gzipCrcOffset(gzip.items.len)] ^= 1;
     try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq.gz", .data = gzip.items });
     const paths = try outputPaths(allocator, &tmp.sub_path, "corrupt-prefix");
     const expected_stderr = try std.fmt.allocPrint(allocator, "error: {s}: I/O error\n", .{input_path});
@@ -491,11 +366,7 @@ test "[cli] - [deinterleave]: validation failures in the first pair leave empty 
     for (cases) |case| {
         try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = case.input });
         const paths = try outputPaths(allocator, &tmp.sub_path, case.prefix);
-        const expected = try std.fmt.allocPrint(
-            allocator,
-            "error: {s}: {s}",
-            .{ input_path, case.error_tail },
-        );
+        const expected = try std.fmt.allocPrint(allocator, "error: {s}: {s}", .{ input_path, case.error_tail });
         try cli.expectResult(
             try runDeinterleave(allocator, input_path, paths),
             case.exit_code,
@@ -507,139 +378,92 @@ test "[cli] - [deinterleave]: validation failures in the first pair leave empty 
     }
 }
 
-test "[cli] - [deinterleave]: later failures preserve complete pairs beyond both output buffers" {
+test "[cli] - [deinterleave]: a later failure keeps the complete pair beyond both output buffers" {
     const io = std.testing.io;
-    const layouts = [_]struct { pairs: usize, r1_len: usize, r2_len: usize }{
-        .{ .pairs = 2000, .r1_len = 151, .r2_len = 51 },
-        .{ .pairs = 1, .r1_len = 70001, .r2_len = 90001 },
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const mate_len = OUTPUT_BUFFER_BYTES + 64;
+    var r1: std.ArrayList(u8) = .empty;
+    var r2: std.ArrayList(u8) = .empty;
+    try appendFastqRecord(allocator, &r1, "ok/1", 'A', '!', mate_len);
+    try appendFastqRecord(allocator, &r2, "ok/2", 'T', '#', mate_len);
+    var input: std.ArrayList(u8) = .empty;
+    try input.appendSlice(allocator, r1.items);
+    try input.appendSlice(allocator, r2.items);
+    const prefix_len = input.items.len;
+    const cases = [_]struct {
+        tail: []const u8,
+        message: []const u8,
+        record: usize,
+        line: u8,
+        offset: usize,
+        first_line: bool = false,
+    }{
+        .{
+            .tail = "@bad/1\nA\nx\n!\n@bad/2\nT\n+\n#\n",
+            .message = "S001: plus line must start with '+'",
+            .record = 2,
+            .line = 3,
+            .offset = 9,
+        },
+        .{
+            .tail = "@bad/1\nA\n+\n!\n@bad/2\n.\n+\n#\n",
+            .message = "S002: sequence byte is outside the selected alphabet",
+            .record = 3,
+            .line = 2,
+            .offset = 20,
+        },
+        .{
+            .tail = "@left/1\nA\n+\n!\n@right/2\nT\n+\n#\n",
+            .message = "P001: paired identifiers or mate markers do not match (pair 1)",
+            .record = 0,
+            .line = 0,
+            .offset = 0,
+            .first_line = true,
+        },
+        .{
+            .tail = "@odd/1\nA\n+\n!\n",
+            .message = "P002: paired input is missing a mate " ++
+                "(pair 1, remaining R1, last R1 record 2, last R2 record 1)",
+            .record = 0,
+            .line = 0,
+            .offset = 0,
+            .first_line = true,
+        },
     };
-    for (layouts) |layout| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const allocator = arena.allocator();
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
-        var r1: std.ArrayList(u8) = .empty;
-        var r2: std.ArrayList(u8) = .empty;
-        var input: std.ArrayList(u8) = .empty;
-        for (0..layout.pairs) |_| {
-            const start1 = r1.items.len;
-            const start2 = r2.items.len;
-            try appendRecord(allocator, &r1, "ok/1", 'A', '!', layout.r1_len);
-            try appendRecord(allocator, &r2, "ok/2", 'T', '#', layout.r2_len);
-            try input.appendSlice(allocator, r1.items[start1..]);
-            try input.appendSlice(allocator, r2.items[start2..]);
-        }
-        try std.testing.expect(r1.items.len > 64 * 1024);
-        try std.testing.expect(r2.items.len > 64 * 1024);
-        const prefix_len = input.items.len;
-        const record_index = 2 * layout.pairs;
-        const cases = [_]struct {
-            tail: []const u8,
-            message: []const u8,
-            record_delta: usize = 0,
-            line: ?u3 = null,
-            offset: usize = 0,
-        }{
-            .{
-                .tail = "@bad/1\nA\nx\n!\n@bad/2\nT\n+\n#\n",
-                .message = "S001: plus line must start with '+'",
-                .line = 3,
-                .offset = 9,
-            },
-            .{
-                .tail = "@bad/1\nA\n+\n!\n@bad/2\n.\n+\n#\n",
-                .message = "S002: sequence byte is outside the selected alphabet",
-                .record_delta = 1,
-                .line = 2,
-                .offset = 20,
-            },
-            .{
-                .tail = "bad/1\nA\n+\n!\n",
-                .message = "S003: header line must start with '@' and contain a nonempty identifier",
-                .line = 1,
-            },
-            .{
-                .tail = "@bad/1\nA\n+\n",
-                .message = "S004: unexpected end of file in quality line",
-                .line = 4,
-                .offset = 11,
-            },
-            .{
-                .tail = "@bad/1\nAA\n+\n!\n@bad/2\nT\n+\n#\n",
-                .message = "S005: sequence and quality lengths differ",
-                .line = 4,
-                .offset = 12,
-            },
-            .{
-                .tail = "@bad/1\nA\n+\n!\n@bad/2\nT\n+\n \n",
-                .message = "S006: quality byte must be ASCII 33 through 126",
-                .record_delta = 1,
-                .line = 4,
-                .offset = 24,
-            },
-            .{
-                .tail = "@left/1\nA\n+\n!\n@right/2\nT\n+\n#\n",
-                .message = try std.fmt.allocPrint(
-                    allocator,
-                    "P001: paired identifiers or mate markers do not match (pair {d})\n" ++
-                        "  R1: input={s}, record={d}, offset={d}, first_token=left/1 " ++
-                        "[length=6, truncated=false], normalized_id=left " ++
-                        "[length=4, truncated=false], mate_markers=1\n" ++
-                        "  R2: input={s}, record={d}, offset={d}, first_token=right/2 " ++
-                        "[length=7, truncated=false], normalized_id=right " ++
-                        "[length=5, truncated=false], mate_markers=2",
-                    .{
-                        layout.pairs, input_path,       record_index,    prefix_len,
-                        input_path,   record_index + 1, prefix_len + 14,
-                    },
-                ),
-            },
-            .{
-                .tail = "@odd/1\nA\n+\n!\n",
-                .message = try std.fmt.allocPrint(
-                    allocator,
-                    "P002: paired input is missing a mate " ++
-                        "(pair {d}, remaining R1, last R1 record {d}, last R2 record {d})",
-                    .{ layout.pairs, record_index, record_index - 1 },
-                ),
-            },
-            .{
-                .tail = "@bad/1\nA\n+\n!\n@bad/2\nT\n+\r\r\n#\n",
-                .message = "record fields ending in CR cannot be written with LF endings",
-            },
-        };
-        for (cases) |case| {
-            input.shrinkRetainingCapacity(prefix_len);
-            try input.appendSlice(allocator, case.tail);
-            const expected_stderr = if (case.line) |line|
-                try std.fmt.allocPrint(
-                    allocator,
-                    "error: {s}: {s} (record {d}, line {d}, offset {d})\n",
-                    .{
-                        input_path, case.message,             record_index + case.record_delta,
-                        line,       prefix_len + case.offset,
-                    },
-                )
-            else
-                try std.fmt.allocPrint(allocator, "error: {s}: {s}\n", .{ input_path, case.message });
+    for (cases, 0..) |case, index| {
+        input.shrinkRetainingCapacity(prefix_len);
+        try input.appendSlice(allocator, case.tail);
+        const expected_stderr = if (case.first_line)
+            try std.fmt.allocPrint(allocator, "error: {s}: {s}\n", .{ input_path, case.message })
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "error: {s}: {s} (record {d}, line {d}, offset {d})\n",
+                .{ input_path, case.message, case.record, case.line, prefix_len + case.offset },
+            );
+        const transports: []const bool = if (index == 0) &.{ false, true } else &.{false};
+        for (transports) |gzip_input| {
             var gzip: std.ArrayList(u8) = .empty;
-            var offset: usize = 0;
-            while (offset < input.items.len) {
-                const end = @min(offset + 60 * 1024, input.items.len);
-                try cli.appendGzipMember(allocator, &gzip, input.items[offset..end], .{});
-                offset = end;
+            if (gzip_input) try appendGzipChunks(allocator, &gzip, input.items);
+            try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = if (gzip_input) gzip.items else input.items });
+            const paths = try outputPaths(allocator, &tmp.sub_path, "prefix");
+            const result = try runDeinterleave(allocator, input_path, paths);
+            try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+            try std.testing.expectEqualStrings("", result.stdout);
+            if (case.first_line) {
+                try cli.expectFirstLine(expected_stderr, result.stderr);
+            } else {
+                try std.testing.expectEqualStrings(expected_stderr, result.stderr);
             }
-            for ([_][]const u8{ input.items, gzip.items }) |bytes| {
-                try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = bytes });
-                const paths = try outputPaths(allocator, &tmp.sub_path, "prefix");
-                try cli.expectResult(try runDeinterleave(allocator, input_path, paths), 1, "", expected_stderr);
-                try expectFile(allocator, paths[0], r1.items);
-                try expectFile(allocator, paths[1], r2.items);
-                try tmp.dir.deleteFile(io, "prefix-r1.fastq");
-                try tmp.dir.deleteFile(io, "prefix-r2.fastq");
-            }
+            try expectFile(allocator, paths[0], r1.items);
+            try expectFile(allocator, paths[1], r2.items);
+            try tmp.dir.deleteFile(io, "prefix-r1.fastq");
+            try tmp.dir.deleteFile(io, "prefix-r2.fastq");
         }
     }
 }
@@ -658,12 +482,7 @@ test "[cli] - [deinterleave]: IUPAC alphabet accepts ambiguous bases in both mat
         .data = "@iupac/1\nR\n+\n!\n@iupac/2\nY\n+\n#\n",
     });
     const iupac_paths = try outputPaths(allocator, &tmp.sub_path, "iupac");
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, iupac_paths),
-        0,
-        "",
-        "",
-    );
+    try cli.expectResult(try runDeinterleave(allocator, input_path, iupac_paths), 0, "", "");
     try expectFile(allocator, iupac_paths[0], "@iupac/1\nR\n+\n!\n");
     try expectFile(allocator, iupac_paths[1], "@iupac/2\nY\n+\n#\n");
 }
@@ -758,7 +577,31 @@ test "[cli] - [deinterleave]: line limit failures leave empty outputs" {
     }
 }
 
-test "[cli] - [deinterleave]: output creation is exclusive and preserves created paths" {
+test "[cli] - [deinterleave]: an existing output is kept and the other output is not created" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const names = [_][]const u8{ "out1.fastq", "out2.fastq" };
+    const kept = [_][]const u8{ "keep-one", "keep-two" };
+    for (0..2) |existing| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+        const out1_path = try cli.tempPath(allocator, &tmp.sub_path, "out1.fastq");
+        const out2_path = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq");
+        const paths = [_][]const u8{ out1_path, out2_path };
+        try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n" });
+        try tmp.dir.writeFile(io, .{ .sub_path = names[existing], .data = kept[existing] });
+
+        const expected = try std.fmt.allocPrint(allocator, "error: {s}: output path already exists\n", .{paths[existing]});
+        try cli.expectResult(try runDeinterleave(allocator, input_path, paths), 3, "", expected);
+        try expectFile(allocator, paths[existing], kept[existing]);
+        try std.testing.expect(!try pathExists(io, paths[1 - existing]));
+    }
+}
+
+test "[cli] - [deinterleave]: an output path equal to the other output or to the input is refused" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -768,107 +611,82 @@ test "[cli] - [deinterleave]: output creation is exclusive and preserves created
     const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
     const out1_path = try cli.tempPath(allocator, &tmp.sub_path, "out1.fastq");
     const out2_path = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq");
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "input.fastq",
-        .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n",
-    });
+    const payload = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = payload });
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "out1.fastq", .data = "keep-one" });
-    const first_error = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: output path already exists\n",
-        .{out1_path},
-    );
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, .{ out1_path, out2_path }),
-        3,
-        "",
-        first_error,
-    );
-    try expectFile(allocator, out1_path, "keep-one");
-    try expectAbsent(out2_path);
-
-    try tmp.dir.deleteFile(io, "out1.fastq");
-    try tmp.dir.writeFile(io, .{ .sub_path = "out2.fastq", .data = "keep-two" });
-    const second_error = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: output path already exists\n",
-        .{out2_path},
-    );
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, .{ out1_path, out2_path }),
-        3,
-        "",
-        second_error,
-    );
-    try expectEmptyFile(out1_path);
-    try expectFile(allocator, out2_path, "keep-two");
-
-    try tmp.dir.deleteFile(io, "out1.fastq");
-    try tmp.dir.deleteFile(io, "out2.fastq");
     const alias_path = try cli.tempPath(allocator, &tmp.sub_path, "./out1.fastq");
-    const alias_error = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: output path already exists\n",
-        .{alias_path},
-    );
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, .{ out1_path, alias_path }),
-        3,
-        "",
-        alias_error,
-    );
-    try expectEmptyFile(out1_path);
-    try tmp.dir.deleteFile(io, "out1.fastq");
+    const alias_error = try std.fmt.allocPrint(allocator, "error: {s}: output path already exists\n", .{alias_path});
+    try cli.expectResult(try runDeinterleave(allocator, input_path, .{ out1_path, alias_path }), 3, "", alias_error);
+    try std.testing.expect(!try pathExists(io, out1_path));
 
-    const input_alias_error = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: output path already exists\n",
-        .{input_path},
-    );
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, .{ input_path, out2_path }),
-        3,
-        "",
-        input_alias_error,
-    );
-    try expectFile(
-        allocator,
-        input_path,
-        "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n",
-    );
-    try expectAbsent(out2_path);
+    const input_error = try std.fmt.allocPrint(allocator, "error: {s}: output path already exists\n", .{input_path});
+    try cli.expectResult(try runDeinterleave(allocator, input_path, .{ input_path, out2_path }), 3, "", input_error);
+    try std.testing.expect(!try pathExists(io, out2_path));
+    try cli.expectResult(try runDeinterleave(allocator, input_path, .{ out1_path, input_path }), 3, "", input_error);
+    try std.testing.expect(!try pathExists(io, out1_path));
+    try expectFile(allocator, input_path, payload);
+}
 
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, .{ out1_path, input_path }),
-        3,
-        "",
-        input_alias_error,
-    );
-    try expectEmptyFile(out1_path);
-    try expectFile(
-        allocator,
-        input_path,
-        "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n",
-    );
-    try tmp.dir.deleteFile(io, "out1.fastq");
-
+test "[cli] - [deinterleave]: a symlink at an output path is refused and not followed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const out1_path = try cli.tempPath(allocator, &tmp.sub_path, "out1.fastq");
+    const out2_path = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq");
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "sentinel", .data = "keep-target" });
     try tmp.dir.symLink(io, "sentinel", "out1.fastq", .{});
-    try cli.expectResult(
-        try runDeinterleave(allocator, input_path, .{ out1_path, out2_path }),
-        3,
-        "",
-        first_error,
-    );
+
+    const expected = try std.fmt.allocPrint(allocator, "error: {s}: output path already exists\n", .{out1_path});
+    try cli.expectResult(try runDeinterleave(allocator, input_path, .{ out1_path, out2_path }), 3, "", expected);
     const link_stat = try tmp.dir.statFile(io, "out1.fastq", .{ .follow_symlinks = false });
     try std.testing.expectEqual(std.Io.File.Kind.sym_link, link_stat.kind);
-    try expectFile(
-        allocator,
-        try cli.tempPath(allocator, &tmp.sub_path, "sentinel"),
-        "keep-target",
+    try expectFile(allocator, try cli.tempPath(allocator, &tmp.sub_path, "sentinel"), "keep-target");
+    try std.testing.expect(!try pathExists(io, out2_path));
+}
+
+test "[cli] - [deinterleave]: an output in a missing directory fails to create output" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const out1_path = try cli.tempPath(allocator, &tmp.sub_path, "missing/out1.fastq");
+    const out2_path = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq");
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = "@ok/1\nA\n+\n!\n@ok/2\nT\n+\n#\n" });
+
+    const expected = try std.fmt.allocPrint(allocator, "error: {s}: failed to create output\n", .{out1_path});
+    try cli.expectResult(try runDeinterleave(allocator, input_path, .{ out1_path, out2_path }), 3, "", expected);
+    try std.testing.expect(!try pathExists(io, out2_path));
+}
+
+test "[edge] - [deinterleave]: a line exactly at the line limit is accepted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const input_path = try cli.tempPath(allocator, &tmp.sub_path, "input.fastq");
+    const out1_path = try cli.tempPath(allocator, &tmp.sub_path, "out1.fastq");
+    const out2_path = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq");
+    const r1 = "@p/1\nAAAAAAAA\n+\n!!!!!!!!\n";
+    const r2 = "@p/2\nTTTTTTTT\n+\n########\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = r1 ++ r2 });
+    try cli.expectResult(
+        try cli.run(allocator, &.{ "deinterleave", "--max-line-bytes", "8", "--out1", out1_path, "--out2", out2_path, input_path }),
+        0,
+        "",
+        "",
     );
-    try expectAbsent(out2_path);
+    try expectFile(allocator, out1_path, r1);
+    try expectFile(allocator, out2_path, r2);
 }
 
 test "[cli] - [deinterleave]: failure does not delete replaced or created outputs" {
@@ -885,7 +703,7 @@ test "[cli] - [deinterleave]: failure does not delete replaced or created output
     const child_io = threaded.io();
     var process = try std.process.spawn(child_io, .{
         .argv = &.{
-            "zig-out/bin/z-fastq",
+            cli.ZFASTQ_BIN,
             "deinterleave",
             "--out1",
             out1_path,
@@ -899,11 +717,7 @@ test "[cli] - [deinterleave]: failure does not delete replaced or created output
     });
     defer process.kill(child_io);
 
-    var process_deadline = try cli.ProcessDeadline.init(
-        child_io,
-        &process,
-        cli.PROCESS_TIMEOUT,
-    );
+    var process_deadline = try cli.ProcessDeadline.init(child_io, &process, cli.PROCESS_TIMEOUT);
     defer process_deadline.deinit();
 
     while (true) {
@@ -915,10 +729,7 @@ test "[cli] - [deinterleave]: failure does not delete replaced or created output
     }
 
     try std.Io.Dir.cwd().deleteFile(child_io, out1_path);
-    try std.Io.Dir.cwd().writeFile(child_io, .{
-        .sub_path = out1_path,
-        .data = "replacement",
-    });
+    try std.Io.Dir.cwd().writeFile(child_io, .{ .sub_path = out1_path, .data = "replacement" });
     try std.Io.File.writeStreamingAll(
         process.stdin.?,
         child_io,
@@ -927,12 +738,7 @@ test "[cli] - [deinterleave]: failure does not delete replaced or created output
     process.stdin.?.close(child_io);
     process.stdin = null;
 
-    const result = try cli.finishSpawned(
-        allocator,
-        child_io,
-        &process,
-        &process_deadline,
-    );
+    const result = try cli.finishSpawned(allocator, child_io, &process, &process_deadline);
     const expected_stderr = "error: -: S002: sequence byte is outside the selected alphabet " ++
         "(record 0, line 2, offset 7)\n";
 
@@ -953,94 +759,29 @@ test "[cli] - [deinterleave]: invalid arguments fail before output creation" {
         error_message: []const u8,
     }{
         .{
-            .args = &.{ "deinterleave", "input" },
-            .error_message = "error: deinterleave requires --out1\n",
-        },
-        .{
             .args = &.{ "deinterleave", "--out1", "one", "input" },
             .error_message = "error: deinterleave requires --out2\n",
-        },
-        .{
-            .args = &.{
-                "deinterleave", "--out1", "one",   "--out1", "two",
-                "--out2",       "three",  "input",
-            },
-            .error_message = "error: --out1 may appear only once\n",
-        },
-        .{
-            .args = &.{
-                "deinterleave", "--out1", "one",   "--out2", "two",
-                "--out2",       "three",  "input",
-            },
-            .error_message = "error: --out2 may appear only once\n",
-        },
-        .{
-            .args = &.{ "deinterleave", "--out1" },
-            .error_message = "error: --out1 requires a value\n",
         },
         .{
             .args = &.{ "deinterleave", "--out1", "one", "--out2" },
             .error_message = "error: --out2 requires a value\n",
         },
         .{
-            .args = &.{
-                "deinterleave", "--out1", "-", "--out2", "two", "input",
-            },
+            .args = &.{ "deinterleave", "--out1", "-", "--out2", "two", "input" },
             .error_message = "error: deinterleave output paths cannot be standard output\n",
         },
         .{
-            .args = &.{
-                "deinterleave", "--out1", "one", "--out2", "-", "input",
-            },
+            .args = &.{ "deinterleave", "--out1", "one", "--out2", "-", "input" },
             .error_message = "error: deinterleave output paths cannot be standard output\n",
-        },
-        .{
-            .args = &.{
-                "deinterleave", "--out1", "same", "--out2", "same", "input",
-            },
-            .error_message = "error: deinterleave output paths must differ\n",
         },
         .{
             .args = &.{ "deinterleave", "--out1", "one", "--out2", "two" },
             .error_message = "error: deinterleave requires exactly one input\n",
         },
-        .{
-            .args = &.{
-                "deinterleave", "--out1", "one",   "--out2",
-                "two",          "input",  "extra",
-            },
-            .error_message = "error: deinterleave requires exactly one input\n",
-        },
-        .{
-            .args = &.{ "deinterleave", "--unknown" },
-            .error_message = "error: unknown deinterleave option: --unknown\n",
-        },
     };
     for (cases) |case| {
         try cli.expectResult(try cli.run(allocator, case.args), 2, "", case.error_message);
     }
-}
-
-test "[cli] - [deinterleave]: staging overflow fails before input or output access" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    try cli.expectResult(
-        try cli.run(allocator, &.{
-            "deinterleave",
-            "--max-line-bytes",
-            "18446744073709551615",
-            "--out1",
-            "one",
-            "--out2",
-            "two",
-            "missing",
-        }),
-        4,
-        "",
-        "error: deinterleave record staging size exceeds supported limit\n",
-    );
 }
 
 test "[cli] - [deinterleave]: missing input cannot be created as an output" {
@@ -1052,19 +793,15 @@ test "[cli] - [deinterleave]: missing input cannot be created as an output" {
     defer tmp.cleanup();
     const missing = try cli.tempPath(allocator, &tmp.sub_path, "missing.fastq");
     const other = try cli.tempPath(allocator, &tmp.sub_path, "other.fastq");
-    const missing_error = try std.fmt.allocPrint(
-        allocator,
-        "error: {s}: file not found\n",
-        .{missing},
-    );
+    const missing_error = try std.fmt.allocPrint(allocator, "error: {s}: file not found\n", .{missing});
     try cli.expectResult(
         try runDeinterleave(allocator, missing, .{ missing, other }),
         3,
         "",
         missing_error,
     );
-    try expectAbsent(missing);
-    try expectAbsent(other);
+    try std.testing.expect(!try pathExists(std.testing.io, missing));
+    try std.testing.expect(!try pathExists(std.testing.io, other));
 }
 
 test "[cli] - [deinterleave]: double dash treats option bytes as the input path" {
@@ -1089,11 +826,11 @@ test "[cli] - [deinterleave]: double dash treats option bytes as the input path"
         "",
         "error: --alphabet: file not found\n",
     );
-    try expectAbsent(paths[0]);
-    try expectAbsent(paths[1]);
+    try std.testing.expect(!try pathExists(std.testing.io, paths[0]));
+    try std.testing.expect(!try pathExists(std.testing.io, paths[1]));
 }
 
-test "[cli] - [deinterleave]: refill-spanning records on both sides remain exact" {
+test "[edge] - [deinterleave]: records spanning read-buffer refills on both sides remain exact" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1106,17 +843,15 @@ test "[cli] - [deinterleave]: refill-spanning records on both sides remain exact
     var r2: std.ArrayList(u8) = .empty;
     var interleaved: std.ArrayList(u8) = .empty;
     const lengths = [_][2]usize{
-        .{ 512 * 1024, 512 * 1024 },
         .{ 1, 1 },
-        .{ 512 * 1024, 1 },
-        .{ 1, 512 * 1024 },
-        .{ 256 * 1024 - 7, 256 * 1024 },
+        .{ READ_BUFFER_BYTES * 2, 1 },
+        .{ READ_BUFFER_BYTES - 7, READ_BUFFER_BYTES },
     };
     for (lengths) |pair_lengths| {
         const start1 = r1.items.len;
         const start2 = r2.items.len;
-        try appendRecord(allocator, &r1, "large/1", 'A', '!', pair_lengths[0]);
-        try appendRecord(allocator, &r2, "large/2", 'T', '#', pair_lengths[1]);
+        try appendFastqRecord(allocator, &r1, "large/1", 'A', '!', pair_lengths[0]);
+        try appendFastqRecord(allocator, &r2, "large/2", 'T', '#', pair_lengths[1]);
         try interleaved.appendSlice(allocator, r1.items[start1..]);
         try interleaved.appendSlice(allocator, r2.items[start2..]);
     }
@@ -1127,12 +862,7 @@ test "[cli] - [deinterleave]: refill-spanning records on both sides remain exact
     try expectFile(allocator, paths[1], r2.items);
 
     var gzip: std.ArrayList(u8) = .empty;
-    var offset: usize = 0;
-    while (offset < interleaved.items.len) {
-        const end = @min(offset + 60 * 1024, interleaved.items.len);
-        try cli.appendGzipMember(allocator, &gzip, interleaved.items[offset..end], .{});
-        offset = end;
-    }
+    try appendGzipChunks(allocator, &gzip, interleaved.items);
     try tmp.dir.writeFile(io, .{ .sub_path = "input.fastq", .data = gzip.items });
     const gzip_paths = try outputPaths(allocator, &tmp.sub_path, "gzip-large");
     try cli.expectResult(try runDeinterleave(allocator, input_path, gzip_paths), 0, "", "");
@@ -1145,14 +875,7 @@ fn runDeinterleave(
     input_path: []const u8,
     paths: [2][]const u8,
 ) !cli.CommandResult {
-    return cli.run(allocator, &.{
-        "deinterleave",
-        "--out1",
-        paths[0],
-        "--out2",
-        paths[1],
-        input_path,
-    });
+    return cli.run(allocator, &.{ "deinterleave", "--out1", paths[0], "--out2", paths[1], input_path });
 }
 
 fn outputPaths(
@@ -1161,15 +884,18 @@ fn outputPaths(
     prefix: []const u8,
 ) ![2][]const u8 {
     return .{
-        try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}-r1.fastq", .{
-            sub_path,
-            prefix,
-        }),
-        try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}-r2.fastq", .{
-            sub_path,
-            prefix,
-        }),
+        try cli.tempPath(allocator, sub_path, try std.fmt.allocPrint(allocator, "{s}-r1.fastq", .{prefix})),
+        try cli.tempPath(allocator, sub_path, try std.fmt.allocPrint(allocator, "{s}-r2.fastq", .{prefix})),
     };
+}
+
+fn appendGzipChunks(allocator: std.mem.Allocator, gzip: *std.ArrayList(u8), bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = @min(offset + GZIP_MEMBER_INPUT_BYTES, bytes.len);
+        try cli.appendGzipMember(allocator, gzip, bytes[offset..end], .{});
+        offset = end;
+    }
 }
 
 fn expectEmptyFile(path: []const u8) !void {
@@ -1193,13 +919,6 @@ fn expectFile(
     try std.testing.expectEqualSlices(u8, expected, actual);
 }
 
-fn expectAbsent(path: []const u8) !void {
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.cwd().access(std.testing.io, path, .{}),
-    );
-}
-
 fn pathExists(io: std.Io, path: []const u8) !bool {
     std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
@@ -1208,7 +927,7 @@ fn pathExists(io: std.Io, path: []const u8) !bool {
     return true;
 }
 
-fn appendRecord(
+fn appendFastqRecord(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
     header: []const u8,

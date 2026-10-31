@@ -1,0 +1,38 @@
+# Publishes main's wiki/ to the GitHub Wiki. CI checks the pages and links on every change; the publish script
+# checks them again before it pushes.
+name: wiki
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'wiki/**'
+      - '.github/scripts/docs_check.sh'
+      - '.github/scripts/wiki_publish.sh'
+      - '.github/workflows/wiki-sync.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish GitHub Wiki
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: wiki-publish-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Check and publish wiki pages
+        env:
+          WIKI_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/wiki_publish.sh

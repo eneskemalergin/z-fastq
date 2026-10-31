@@ -1,0 +1,218 @@
+# Checks every pull request and push to main; any other branch runs on request, so no commit is tested twice.
+# The first failure stops the run: a failed lane cancels the other, and nothing is packaged after a failed test.
+#
+# - checks: seconds on one runner. Picks what the rest must run (documentation, benchmark reports, and peer-tool
+#   recipes skip the builds; without a base commit in the shallow clone, everything runs) and fails fast on format,
+#   script syntax, lint of the CI scripts, broken documentation links, and a version without its CHANGELOG.md entry.
+# - workflows: actionlint from a pinned image and zizmor, when .github/ changes.
+# - test: one lane per architecture. Each runs the tests once in Debug, which keeps every safety check at the
+#   lowest build cost; x86-64 builds for baseline x86-64, so AVX2 is reached through run-time dispatch as in the
+#   release binary. Each lane then builds its static ReleaseFast release binary and smoke-tests it; the x86-64
+#   lane also builds the source package a Zig dependent fetches and tests it from a fresh package.
+# - result: one required check for branch protection, whichever jobs ran.
+#
+# On main, the tested archives are kept for seven days; the release workflow publishes those for a tag instead of
+# building again. A commit whose push skipped the tests gets them by running this workflow on main by hand.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ZIG_VERSION: 0.16.0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checks:
+    name: Source checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tests: ${{ steps.changes.outputs.tests }}
+      workflows: ${{ steps.changes.outputs.workflows }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Select checks
+        id: changes
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          tests=true
+          workflows=true
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch && -n "$BASE" ]] &&
+            git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            tests=false
+            workflows=false
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                .github/*) tests=true; workflows=true ;;
+                *.md|LICENSE|assets/*|bench/*|tools/*|wiki/*|.gitignore) ;;
+                *) tests=true ;;
+              esac
+            done < <(git diff --no-renames --name-only -z "$BASE" HEAD)
+          fi
+          printf 'tests=%s\nworkflows=%s\n' "$tests" "$workflows" >> "$GITHUB_OUTPUT"
+
+      - name: Check version and release notes
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(bash .github/scripts/release.sh version)
+          bash .github/scripts/release.sh notes > /dev/null
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check documentation links
+        run: bash .github/scripts/docs_check.sh
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: checks
+
+      - name: Check format and scripts
+        run: |
+          set -euo pipefail
+          test "$(zig version)" = "$ZIG_VERSION"
+          zig fmt --check build.zig build.zig.zon src tests
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(git ls-files -z '*.sh')
+          shellcheck -x .github/scripts/*.sh
+          python3 -m compileall -q bench/lib tools/wiki_figures.py
+
+  workflows:
+    name: Workflow checks
+    needs: checks
+    if: needs.checks.outputs.workflows == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Check workflow syntax
+        run: >-
+          docker run --rm -v "${PWD}:/repo:ro" -w /repo
+          rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+          -color
+
+      - name: Check workflow security
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482
+        with:
+          inputs: .github/
+          advanced-security: false
+          online-audits: false
+          annotations: true
+          version: v1.30.1
+
+  test:
+    name: Test (${{ matrix.name }})
+    needs: checks
+    if: needs.checks.outputs.tests == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: x86-64
+            runner: ubuntu-24.04
+            flags: -Dcpu=baseline
+            system: linux-x86_64
+            source: true
+          - name: aarch64
+            runner: ubuntu-24.04-arm
+            flags: ""
+            system: linux-aarch64
+            source: false
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: ${{ matrix.name }}
+
+      - name: Test in Debug
+        env:
+          FLAGS: ${{ matrix.flags }}
+        run: |
+          set -euo pipefail
+          read -ra flags <<< "$FLAGS"
+          zig build test "${flags[@]}" --summary all
+
+      - name: Package and smoke-test the release binary
+        env:
+          SYSTEM: ${{ matrix.system }}
+        run: bash .github/scripts/release.sh package "$SYSTEM" "$RUNNER_TEMP/release"
+
+      - name: Build, fetch, and test the source package
+        if: matrix.source
+        run: bash .github/scripts/release.sh package source "$RUNNER_TEMP/release"
+
+      - name: Keep the tested archives
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-${{ matrix.system }}
+          path: ${{ runner.temp }}/release/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  result:
+    name: CI result
+    if: always()
+    needs: [checks, workflows, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    env:
+      CHECKS: ${{ needs.checks.result }}
+      TESTS_NEEDED: ${{ needs.checks.outputs.tests }}
+      TESTS: ${{ needs.test.result }}
+      WORKFLOWS_NEEDED: ${{ needs.checks.outputs.workflows }}
+      WORKFLOWS: ${{ needs.workflows.result }}
+    steps:
+      - name: Check required results
+        run: |
+          set -euo pipefail
+          test "$CHECKS" = success
+          for pair in "$TESTS_NEEDED:$TESTS" "$WORKFLOWS_NEEDED:$WORKFLOWS"; do
+            case "$pair" in
+              true:success|false:skipped) ;;
+              *) printf 'Required check did not pass: %s\n' "$pair" >&2; exit 1 ;;
+            esac
+          done

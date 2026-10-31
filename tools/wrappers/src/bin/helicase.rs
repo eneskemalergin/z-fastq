@@ -8,17 +8,19 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use helicase::input::FromFile;
+use helicase::input::{FromFile, FromStdin};
 use helicase::{Config, FastqParser, HelicaseParser, ParserOptions};
 
 #[path = "../stats.rs"]
 mod stats;
 
 const ENGINE_VERSION: &str = "0.2.0";
-// Default config computes headers and DNA as bytes, one Record event per
-// record. That is the same count job as z-fastq / Needletail on four-line input.
+// Count computes headers, DNA, and quality, one Record event per record, and
+// rejects a record whose quality length differs from its sequence length. That
+// catches length mismatches and a truncated last record. Helicase does not
+// expose the plus line, so a malformed plus line still counts.
 // Do not ignore_headers/ignore_dna here: that is a faster ceiling, not count.
-const COUNT_CONFIG: Config = ParserOptions::default().config();
+const COUNT_CONFIG: Config = ParserOptions::default().compute_quality().config();
 const STATS_CONFIG: Config = ParserOptions::default()
     .ignore_headers()
     .dna_string()
@@ -73,7 +75,7 @@ fn usage_error(argument: Option<OsString>) -> ! {
 }
 
 fn usage(output: &mut impl Write) -> io::Result<()> {
-    writeln!(output, "Usage: helicase-adapter <count|stats> <in.fastq>")?;
+    writeln!(output, "Usage: helicase-adapter <count|stats> <in.fastq|->")?;
     writeln!(output, "       helicase-adapter --version")
 }
 
@@ -95,40 +97,80 @@ fn version(output: &mut impl Write) -> io::Result<()> {
 }
 
 fn run_count(path: &Path) {
-    let mut parser = FastqParser::<COUNT_CONFIG, _>::from_file(path)
-        .unwrap_or_else(|error| fail_path(path, error));
-    let mut reads = 0_u64;
-    while parser.next().is_some() {
-        reads = reads
-            .checked_add(1)
-            .unwrap_or_else(|| fail_path(path, "record count overflow"));
-    }
-
+    let reads = if path == Path::new("-") {
+        count_records(
+            FastqParser::<COUNT_CONFIG, _>::from_stdin()
+                .unwrap_or_else(|error| fail_path(path, error)),
+            path,
+        )
+    } else {
+        count_records(
+            FastqParser::<COUNT_CONFIG, _>::from_file(path)
+                .unwrap_or_else(|error| fail_path(path, error)),
+            path,
+        )
+    };
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
     writeln!(output, "{reads}").unwrap_or_else(|error| fail("stdout", error));
     output.flush().unwrap_or_else(|error| fail("stdout", error));
 }
 
-fn run_stats(path: &Path) {
-    let mut parser = FastqParser::<STATS_CONFIG, _>::from_file(path)
-        .unwrap_or_else(|error| fail_path(path, error));
-    let mut aggregate = stats::Stats::default();
+fn count_records<P: HelicaseParser + Iterator>(mut parser: P, path: &Path) -> u64 {
+    let mut reads = 0_u64;
     while parser.next().is_some() {
         let quality = parser
             .get_quality()
             .unwrap_or_else(|| fail_path(path, "record has no quality"));
-        aggregate
-            .add_record(parser.get_dna_string(), quality)
-            .unwrap_or_else(|error| fail_path(path, error));
+        if quality.len() != parser.get_dna_len() {
+            fail_path(path, "sequence and quality lengths differ");
+        }
+        reads = reads
+            .checked_add(1)
+            .unwrap_or_else(|| fail_path(path, "record count overflow"));
     }
+    reads
+}
 
+fn run_stats(path: &Path) {
+    let aggregate = if path == Path::new("-") {
+        collect_stats(
+            FastqParser::<STATS_CONFIG, _>::from_stdin()
+                .unwrap_or_else(|error| fail_path(path, error)),
+            path,
+        )
+    } else {
+        collect_stats(
+            FastqParser::<STATS_CONFIG, _>::from_file(path)
+                .unwrap_or_else(|error| fail_path(path, error)),
+            path,
+        )
+    };
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
     aggregate
         .write_human(&mut output, path.display())
         .unwrap_or_else(|error| fail("stdout", error));
     output.flush().unwrap_or_else(|error| fail("stdout", error));
+}
+
+fn collect_stats<P: HelicaseParser + Iterator>(mut parser: P, path: &Path) -> stats::Stats {
+    let mut aggregate = stats::Stats::default();
+    while parser.next().is_some() {
+        let quality = parser
+            .get_quality()
+            .unwrap_or_else(|| fail_path(path, "record has no quality"));
+        // Helicase keeps the CR of a CRLF line in both fields; it is a line
+        // ending, not a base or a quality byte.
+        aggregate
+            .add_record(strip_cr(parser.get_dna_string()), strip_cr(quality))
+            .unwrap_or_else(|error| fail_path(path, error));
+    }
+    aggregate
+}
+
+fn strip_cr(field: &[u8]) -> &[u8] {
+    field.strip_suffix(b"\r").unwrap_or(field)
 }
 
 fn fail_path(path: &Path, error: impl std::fmt::Display) -> ! {

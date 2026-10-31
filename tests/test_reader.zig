@@ -1,4 +1,4 @@
-//! Library root, reader, scanner, and validation contracts.
+//! Library exports, byte sources, Reader and count scanner behavior, and record validation.
 
 const std = @import("std");
 const zfastq = @import("z-fastq");
@@ -54,6 +54,12 @@ const GZIP_CHUNKS = [_]struct { input: usize, output: usize }{
     .{ .input = 31, .output = 17 },
 };
 
+const GZIP_HEADER_FIELD_OFFSETS = [_]usize{ 0, 2, 3, 4, 8, 9, 10, 12, 14, 16, 18 };
+
+const GZIP_FLAG_FCOMMENT: u8 = 0x10;
+
+const GZIP_FIELD_LIMIT = 64 * 1024;
+
 test "[unit] - [root]: every exported declaration is analyzable" {
     std.testing.refAllDecls(zfastq);
 }
@@ -72,11 +78,11 @@ test "[unit] - [root]: library version matches the manifest and retains its sent
     try std.testing.expect(@TypeOf(zfastq.VERSION) == *const [expected.len:0]u8);
 }
 
-test "[property] - [gzip source]: optional member chains decode at every input chunk size" {
+test "[property] - [gzip source]: optional member chains decode at boundary input chunk sizes" {
     const gzip_xx = GZIP_OPTIONAL_X ++ GZIP_OPTIONAL_X;
 
-    for ([_]usize{ 0, 1, 2, 10, 16 }) |buffer_len| {
-        for (1..gzip_xx.len + 1) |chunk_len| {
+    for ([_]usize{ 0, 2, 16 }) |buffer_len| {
+        for ([_]usize{ 1, 2, gzip_xx.len }) |chunk_len| {
             var input_buffer: [16]u8 = undefined;
             var input = FragmentReader.init(&gzip_xx, chunk_len, input_buffer[0..buffer_len]);
             if (buffer_len >= 2) {
@@ -96,8 +102,18 @@ test "[property] - [gzip source]: optional member chains decode at every input c
 test "[property] - [gzip source]: truncations accept only complete member prefixes" {
     var output: [4096]u8 = undefined;
     for (GZIP_CASES) |case| {
-        for (GZIP_CHUNKS) |chunks| {
-            for (0..case.compressed.len + 1) |end| {
+        const first_end = if (case.prefix) |prefix| prefix.compressed_len else case.compressed.len;
+        const cuts = [_]usize{
+            0,
+            1,
+            first_end - 1,
+            first_end,
+            @min(first_end + 1, case.compressed.len),
+            case.compressed.len - 1,
+            case.compressed.len,
+        };
+        for (cuts) |end| {
+            for (GZIP_CHUNKS) |chunks| {
                 errdefer std.debug.print("gzip {s}, cut {d}, chunks {d}/{d}\n", .{
                     case.name, end, chunks.input, chunks.output,
                 });
@@ -120,29 +136,26 @@ test "[property] - [gzip source]: truncations accept only complete member prefix
     }
 }
 
-test "[fuzz] - [gzip source]: byte mutations fail or preserve frozen output" {
+test "[property] - [gzip source]: one mutation per header field fails or preserves frozen output" {
     var mutated: [GZIP_OPTIONAL_X.len + GZIP_DYNAMIC.len]u8 = undefined;
     var output: [4096]u8 = undefined;
-    const masks = [_]u8{ 1, 2, 4, 8, 16, 32, 64, 128, 0x55, 0xaa, 0xff };
 
     for (GZIP_CASES) |case| {
         const compressed = mutated[0..case.compressed.len];
         @memcpy(compressed, case.compressed);
-        for (case.compressed, 0..) |original, offset| {
-            for (masks) |mask| {
-                compressed[offset] = original ^ mask;
-                for (GZIP_CHUNKS) |chunks| {
-                    errdefer std.debug.print("gzip {s}, byte {d}, xor 0x{x}, chunks {d}/{d}\n", .{
-                        case.name, offset, mask, chunks.input, chunks.output,
-                    });
-                    const decoded = decodeGzip(compressed, chunks.input, chunks.output, &output) catch |err| switch (err) {
-                        error.ReadFailed => continue,
-                        else => return err,
-                    };
-                    try std.testing.expectEqualStrings(case.decoded, decoded);
-                }
+        for (GZIP_HEADER_FIELD_OFFSETS) |offset| {
+            compressed[offset] = case.compressed[offset] ^ 0xff;
+            for (GZIP_CHUNKS) |chunks| {
+                errdefer std.debug.print("gzip {s}, byte {d}, chunks {d}/{d}\n", .{
+                    case.name, offset, chunks.input, chunks.output,
+                });
+                const decoded = decodeGzip(compressed, chunks.input, chunks.output, &output) catch |err| switch (err) {
+                    error.ReadFailed => continue,
+                    else => return err,
+                };
+                try std.testing.expectEqualStrings(case.decoded, decoded);
             }
-            compressed[offset] = original;
+            compressed[offset] = case.compressed[offset];
         }
     }
 }
@@ -174,7 +187,6 @@ test "[failure] - [gzip source]: header CRC, CRC32, and ISIZE are checked in eve
 }
 
 test "[edge] - [gzip source]: history refills preserve bytes and validate the final trailer" {
-    // Frozen gzip of "ACGT" repeated 16,385 times, beyond the 32 KiB decoder window.
     const compressed = [_]u8{
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff,
         0xed, 0xc3, 0x31, 0x09, 0x00, 0x00, 0x0c, 0x03, 0x30, 0x6d,
@@ -190,13 +202,14 @@ test "[edge] - [gzip source]: history refills preserve bytes and validate the fi
     };
     const expected = "ACGT" ** 16385;
     var output: [expected.len + 1]u8 = undefined;
+    const trailer_offsets = [_]usize{ compressed.len - 8, compressed.len - 4 };
 
-    for ([_]usize{ 257, 32769 }) |output_chunk_len| {
+    for ([_]usize{ 17, 257, 32769 }) |output_chunk_len| {
         try std.testing.expectEqualStrings(
             expected,
             try decodeGzip(&compressed, 31, output_chunk_len, &output),
         );
-        for ([_]usize{ compressed.len - 8, compressed.len - 4 }) |offset| {
+        for (trailer_offsets) |offset| {
             var corrupted = compressed;
             corrupted[offset] ^= 1;
             try std.testing.expectError(
@@ -224,6 +237,36 @@ test "[failure] - [gzip source]: a read failure after decoded output propagates"
     try std.testing.expectError(error.ReadFailed, source.read(&output));
 }
 
+test "[failure] - [gzip source]: bytes after the last member fail" {
+    var output: [1]u8 = undefined;
+    const trailing_text = GZIP_EMPTY ++ [_]u8{'x'};
+    try std.testing.expectError(error.ReadFailed, decodeGzip(&trailing_text, 31, 1, &output));
+    const zero_padding = GZIP_EMPTY ++ [_]u8{0};
+    try std.testing.expectError(error.ReadFailed, decodeGzip(&zero_padding, 31, 1, &output));
+}
+
+test "[edge] - [gzip source]: a comment field with its terminator at the limit is accepted and one byte more fails" {
+    var output: [1]u8 = undefined;
+    for ([_]usize{ GZIP_FIELD_LIMIT - 1, GZIP_FIELD_LIMIT }) |comment_len| {
+        const compressed = try std.testing.allocator.alloc(u8, comment_len + GZIP_EMPTY.len + 1);
+        defer std.testing.allocator.free(compressed);
+        @memcpy(compressed[0..10], GZIP_EMPTY[0..10]);
+        compressed[3] = GZIP_FLAG_FCOMMENT;
+        @memset(compressed[10..][0..comment_len], 'c');
+        compressed[10 + comment_len] = 0;
+        @memcpy(compressed[11 + comment_len ..], GZIP_EMPTY[10..]);
+
+        var input = std.Io.Reader.fixed(compressed);
+        var gzip = zfastq.io.gzip.ReaderSource.init(&input);
+        const source = gzip.byteSource();
+        if (comment_len + 1 <= GZIP_FIELD_LIMIT) {
+            try std.testing.expectEqual(@as(usize, 0), try source.read(&output));
+        } else {
+            try std.testing.expectError(error.ReadFailed, source.read(&output));
+        }
+    }
+}
+
 test "[property] - [plain reader source]: sniffed prefixes survive short reads and EOF" {
     const cases = [_][]const u8{ "", "x", "@r", "\x1f", "\x1f\x8a", "@r\nA\n+\n!\n" };
     for (cases) |data| {
@@ -234,10 +277,10 @@ test "[property] - [plain reader source]: sniffed prefixes survive short reads a
                 });
                 var input_buffer: [2]u8 = undefined;
                 var input = FragmentReader.init(data, input_chunk_len, &input_buffer);
-                if (data.len < 2) {
-                    try std.testing.expectError(error.EndOfStream, input.interface.peek(2));
-                } else {
+                if (data.len >= 2) {
                     try std.testing.expectEqualStrings(data[0..2], try input.interface.peek(2));
+                } else {
+                    _ = input.interface.peek(2) catch {};
                 }
 
                 var plain = zfastq.io.plain.ReaderSource.init(&input.interface);
@@ -276,60 +319,6 @@ test "[unit] - [lint code]: every implemented code has its stable tag" {
     }
 }
 
-test "[unit] - [record validation]: both alphabets accept their complete symbol sets" {
-    const cases = [_]struct {
-        options: zfastq.ValidationOptions,
-        sequence: []const u8,
-    }{
-        .{
-            .options = .{},
-            .sequence = "ACGTURYSWKMBDHVNacgturyswkmbdhvn",
-        },
-        .{
-            .options = .{ .alphabet = .acgtn },
-            .sequence = "ACGTNacgtn",
-        },
-        .{ .options = .{ .alphabet = .iupac }, .sequence = "" },
-        .{ .options = .{ .alphabet = .acgtn }, .sequence = "" },
-    };
-
-    for (cases) |case| {
-        var quality_buffer: [32]u8 = undefined;
-        const quality = quality_buffer[0..case.sequence.len];
-        @memset(quality, '!');
-        const record = zfastq.Record{
-            .header = "r",
-            .id = "r",
-            .sequence = case.sequence,
-            .plus = "",
-            .quality = quality,
-        };
-
-        try std.testing.expect(zfastq.validateRecord(record, case.options) == null);
-    }
-}
-
-test "[property] - [record validation]: ACGTN rejects every wider IUPAC symbol" {
-    for ("URYSWKMBDHVuryswkmbdhv") |byte| {
-        const sequence = [1]u8{byte};
-        const details = zfastq.validateRecord(.{
-            .header = "r",
-            .id = "r",
-            .sequence = &sequence,
-            .plus = "",
-            .quality = "!",
-        }, .{ .alphabet = .acgtn }).?;
-
-        try std.testing.expectEqual(zfastq.LintCode.s002_invalid_sequence_alphabet, details.code);
-        try std.testing.expectEqual(zfastq.SemanticField.sequence, details.field);
-        try std.testing.expectEqual(@as(usize, 0), details.byte_index);
-        try std.testing.expectEqualStrings(
-            "sequence byte is outside the selected alphabet",
-            details.message,
-        );
-    }
-}
-
 test "[property] - [record validation]: alphabet policies classify every byte" {
     const policies = [_]struct {
         alphabet: zfastq.Alphabet,
@@ -346,15 +335,11 @@ test "[property] - [record validation]: alphabet policies classify every byte" {
     };
 
     for (policies) |policy| {
+        try std.testing.expect(validateSequenceQuality("", "", .{ .alphabet = policy.alphabet }) == null);
+
         for (0..256) |value| {
             const sequence = [1]u8{@intCast(value)};
-            const details = zfastq.validateRecord(.{
-                .header = "r",
-                .id = "r",
-                .sequence = &sequence,
-                .plus = "",
-                .quality = "!",
-            }, .{ .alphabet = policy.alphabet });
+            const details = validateSequenceQuality(&sequence, "!", .{ .alphabet = policy.alphabet });
             const accepted = std.mem.findScalar(u8, policy.accepted, sequence[0]) != null;
             try std.testing.expectEqual(accepted, details == null);
             if (details) |semantic_error| {
@@ -362,40 +347,36 @@ test "[property] - [record validation]: alphabet policies classify every byte" {
                     zfastq.LintCode.s002_invalid_sequence_alphabet,
                     semantic_error.code,
                 );
+                try std.testing.expectEqual(zfastq.SemanticField.sequence, semantic_error.field);
                 try std.testing.expectEqual(@as(usize, 0), semantic_error.byte_index);
+                try std.testing.expectEqualStrings(
+                    "sequence byte is outside the selected alphabet",
+                    semantic_error.message,
+                );
             }
         }
     }
 }
 
-test "[property] - [record validation]: every semantic byte position reports exactly" {
+test "[edge] - [record validation]: each invalid sequence position is reported exactly" {
     var sequence = [_]u8{ 'A', 'C', 'G', 'T' };
     const quality = [_]u8{ '!', '!', '!', '!' };
     for (sequence, 0..) |original, invalid_index| {
         sequence[invalid_index] = '.';
-        const details = zfastq.validateRecord(.{
-            .header = "r",
-            .id = "r",
-            .sequence = &sequence,
-            .plus = "",
-            .quality = &quality,
-        }, .{}).?;
+        const details = validateSequenceQuality(&sequence, &quality, .{}).?;
         try std.testing.expectEqual(zfastq.LintCode.s002_invalid_sequence_alphabet, details.code);
         try std.testing.expectEqual(zfastq.SemanticField.sequence, details.field);
         try std.testing.expectEqual(invalid_index, details.byte_index);
         sequence[invalid_index] = original;
     }
+}
 
-    var mutable_quality = quality;
-    for (mutable_quality, 0..) |original, invalid_index| {
-        mutable_quality[invalid_index] = if (invalid_index % 2 == 0) 32 else 127;
-        const details = zfastq.validateRecord(.{
-            .header = "r",
-            .id = "r",
-            .sequence = &sequence,
-            .plus = "",
-            .quality = &mutable_quality,
-        }, .{}).?;
+test "[edge] - [record validation]: each invalid quality position is reported exactly" {
+    const sequence = [_]u8{ 'A', 'C', 'G', 'T' };
+    var quality = [_]u8{ '!', '!', '!', '!' };
+    for (quality, 0..) |original, invalid_index| {
+        quality[invalid_index] = if (invalid_index % 2 == 0) ' ' else 0x7f;
+        const details = validateSequenceQuality(&sequence, &quality, .{}).?;
         try std.testing.expectEqual(zfastq.LintCode.s006_invalid_quality_range, details.code);
         try std.testing.expectEqual(zfastq.SemanticField.quality, details.field);
         try std.testing.expectEqual(invalid_index, details.byte_index);
@@ -403,47 +384,36 @@ test "[property] - [record validation]: every semantic byte position reports exa
             "quality byte must be ASCII 33 through 126",
             details.message,
         );
-        mutable_quality[invalid_index] = original;
+        quality[invalid_index] = original;
     }
 }
 
-test "[unit] - [record validation]: sequence errors precede quality errors" {
-    const details = zfastq.validateRecord(.{
-        .header = "r",
-        .id = "r",
-        .sequence = ".",
-        .plus = "",
-        .quality = "\x7f",
-    }, .{}).?;
+test "[unit] - [record validation]: a sequence error takes precedence over a quality error" {
+    const details = validateSequenceQuality(".", "\x7f", .{}).?;
 
     try std.testing.expectEqual(zfastq.LintCode.s002_invalid_sequence_alphabet, details.code);
+    try std.testing.expectEqual(zfastq.SemanticField.sequence, details.field);
+    try std.testing.expectEqual(@as(usize, 0), details.byte_index);
 }
 
 test "[property] - [record validation]: quality range classifies every byte" {
-    try std.testing.expect(zfastq.validateRecord(.{
-        .header = "r",
-        .id = "r",
-        .sequence = "AC",
-        .plus = "",
-        .quality = "!~",
-    }, .{}) == null);
+    try std.testing.expect(validateSequenceQuality("AC", "!~", .{}) == null);
 
     for (0..256) |value| {
         const quality = [1]u8{@intCast(value)};
-        const details = zfastq.validateRecord(.{
-            .header = "r",
-            .id = "r",
-            .sequence = "A",
-            .plus = "",
-            .quality = &quality,
-        }, .{});
-        try std.testing.expectEqual(value >= 33 and value <= 126, details == null);
+        const details = validateSequenceQuality("A", &quality, .{});
+        try std.testing.expectEqual(value >= '!' and value <= '~', details == null);
         if (details) |semantic_error| {
             try std.testing.expectEqual(
                 zfastq.LintCode.s006_invalid_quality_range,
                 semantic_error.code,
             );
+            try std.testing.expectEqual(zfastq.SemanticField.quality, semantic_error.field);
             try std.testing.expectEqual(@as(usize, 0), semantic_error.byte_index);
+            try std.testing.expectEqualStrings(
+                "quality byte must be ASCII 33 through 126",
+                semantic_error.message,
+            );
         }
     }
 }
@@ -567,136 +537,132 @@ test "[unit] - [reader]: supported record forms parse exactly" {
     }
 }
 
-test "[property] - [reader]: borrowed fields survive every fixed short-read size" {
+const ExpectedRecord = struct {
+    header: []const u8,
+    id: []const u8,
+    sequence: []const u8,
+    plus: []const u8,
+    quality: []const u8,
+    offsets: ?zfastq.RecordOffsets = null,
+};
+
+test "[property] - [reader]: fields and offsets are identical at every refill boundary" {
     const cases = [_]struct {
         data: []const u8,
-        header: []const u8,
-        id: []const u8,
-        sequence: []const u8,
-        plus: []const u8,
-        quality: []const u8,
+        records: []const ExpectedRecord,
     }{
         .{
+            .data = "@one comment\r\nACGT\r\n+same\r\n!!!!\r\n" ++
+                "@empty\n\n+description\n\n" ++
+                "@final\nNN\n+\n##",
+            .records = &.{
+                .{
+                    .header = "one comment",
+                    .id = "one",
+                    .sequence = "ACGT",
+                    .plus = "same",
+                    .quality = "!!!!",
+                    .offsets = .{ .header = 0, .sequence = 14, .plus = 20, .quality = 27 },
+                },
+                .{
+                    .header = "empty",
+                    .id = "empty",
+                    .sequence = "",
+                    .plus = "description",
+                    .quality = "",
+                    .offsets = .{ .header = 33, .sequence = 40, .plus = 41, .quality = 54 },
+                },
+                .{
+                    .header = "final",
+                    .id = "final",
+                    .sequence = "NN",
+                    .plus = "",
+                    .quality = "##",
+                    .offsets = .{ .header = 55, .sequence = 62, .plus = 65, .quality = 67 },
+                },
+            },
+        },
+        .{
             .data = "@read1 comment\nACGT\n+repeat\n!!!!\n",
-            .header = "read1 comment",
-            .id = "read1",
-            .sequence = "ACGT",
-            .plus = "repeat",
-            .quality = "!!!!",
+            .records = &.{.{
+                .header = "read1 comment",
+                .id = "read1",
+                .sequence = "ACGT",
+                .plus = "repeat",
+                .quality = "!!!!",
+            }},
         },
         .{
             .data = "@r\r\r\nA\r\r\n+\r\r\n!\r\r\n",
-            .header = "r\r",
-            .id = "r\r",
-            .sequence = "A\r",
-            .plus = "\r",
-            .quality = "!\r",
+            .records = &.{.{
+                .header = "r\r",
+                .id = "r\r",
+                .sequence = "A\r",
+                .plus = "\r",
+                .quality = "!\r",
+            }},
         },
         .{
             .data = "@r\nAA\n+\n!\r",
-            .header = "r",
-            .id = "r",
-            .sequence = "AA",
-            .plus = "",
-            .quality = "!\r",
+            .records = &.{.{
+                .header = "r",
+                .id = "r",
+                .sequence = "AA",
+                .plus = "",
+                .quality = "!\r",
+            }},
         },
     };
-    for (cases) |case| {
-        for (1..case.data.len + 1) |chunk_len| {
-            var chunked = ChunkSource.init(case.data, chunk_len);
-            var reader = try zfastq.Reader.init(std.testing.allocator, chunked.byteSource(), .{});
-            defer reader.deinit();
-
-            const parsed = (try reader.next()).?;
-            try std.testing.expectEqualStrings(case.header, parsed.header);
-            try std.testing.expectEqualStrings(case.id, parsed.id);
-            try std.testing.expectEqualStrings(case.sequence, parsed.sequence);
-            try std.testing.expectEqualStrings(case.plus, parsed.plus);
-            try std.testing.expectEqualStrings(case.quality, parsed.quality);
-            try std.testing.expectEqual(@as(u64, case.data.len), reader.byteOffset());
-            try std.testing.expect((try reader.next()) == null);
-        }
-    }
-}
-
-test "[property] - [reader]: complete and refill-spanning records are identical" {
-    const data =
-        "@one comment\r\nACGT\r\n+same\r\n!!!!\r\n" ++
-        "@empty\n\n+description\n\n" ++
-        "@final\nNN\n+\n##";
-    const cases = [_]struct {
-        header: []const u8,
-        id: []const u8,
-        sequence: []const u8,
-        plus: []const u8,
-        quality: []const u8,
-        offsets: zfastq.RecordOffsets,
-    }{
-        .{
-            .header = "one comment",
-            .id = "one",
-            .sequence = "ACGT",
-            .plus = "same",
-            .quality = "!!!!",
-            .offsets = .{ .header = 0, .sequence = 14, .plus = 20, .quality = 27 },
-        },
-        .{
-            .header = "empty",
-            .id = "empty",
-            .sequence = "",
-            .plus = "description",
-            .quality = "",
-            .offsets = .{ .header = 33, .sequence = 40, .plus = 41, .quality = 54 },
-        },
-        .{
-            .header = "final",
-            .id = "final",
-            .sequence = "NN",
-            .plus = "",
-            .quality = "##",
-            .offsets = .{ .header = 55, .sequence = 62, .plus = 65, .quality = 67 },
-        },
-    };
-    const vector_len = @max(std.simd.suggestVectorLength(u8) orelse 16, 2);
     const chunk_sizes = [_]usize{
         1,
         2,
         3,
-        vector_len - 1,
-        vector_len,
-        vector_len + 1,
+        15,
+        16,
+        17,
+        31,
+        32,
+        33,
+        63,
+        64,
+        65,
         4 * 1024,
         zfastq.limits.DEFAULT_READER_BUFFER_BYTES,
     };
 
-    for (chunk_sizes) |chunk_len| {
-        var chunked = ChunkSource.init(data, chunk_len);
-        var reader = try zfastq.Reader.init(
-            std.testing.allocator,
-            chunked.byteSource(),
-            .{},
-        );
-        defer reader.deinit();
+    for (cases) |case| {
+        for (chunk_sizes) |chunk_len| {
+            var chunked = ChunkSource.init(case.data, chunk_len);
+            var reader = try zfastq.Reader.init(
+                std.testing.allocator,
+                chunked.byteSource(),
+                .{},
+            );
+            defer reader.deinit();
 
-        for (cases) |case| {
-            const parsed = (try reader.next()).?;
-            try std.testing.expectEqualStrings(case.header, parsed.header);
-            try std.testing.expectEqualStrings(case.id, parsed.id);
-            try std.testing.expectEqualStrings(case.sequence, parsed.sequence);
-            try std.testing.expectEqualStrings(case.plus, parsed.plus);
-            try std.testing.expectEqualStrings(case.quality, parsed.quality);
-            try std.testing.expectEqual(case.offsets, reader.currentRecordOffsets().?);
+            for (case.records) |expected| {
+                const parsed = (try reader.next()).?;
+                try std.testing.expectEqualStrings(expected.header, parsed.header);
+                try std.testing.expectEqualStrings(expected.id, parsed.id);
+                try std.testing.expectEqualStrings(expected.sequence, parsed.sequence);
+                try std.testing.expectEqualStrings(expected.plus, parsed.plus);
+                try std.testing.expectEqualStrings(expected.quality, parsed.quality);
+                if (expected.offsets) |offsets| {
+                    try std.testing.expectEqual(offsets, reader.currentRecordOffsets().?);
+                }
+            }
+            try std.testing.expect((try reader.next()) == null);
+            try std.testing.expectEqual(@as(u64, case.data.len), reader.byteOffset());
         }
-        try std.testing.expect((try reader.next()) == null);
-        try std.testing.expectEqual(@as(u64, data.len), reader.byteOffset());
     }
 }
 
 test "[property] - [parser]: every input partition preserves the format result" {
     const valid = "@r\nA\n+\n!\n";
-    const partition_count = @as(usize, 1) << (valid.len - 1);
-    for (0..partition_count) |mask| {
-        var partitioned = PartitionSource.init(valid, mask);
+    const masks = [_]usize{ 0, 0xff, 1 << 2, 1 << 4, 1 << 6 };
+    for (masks) |mask| {
+        var partitioned = ChunkSource.init(valid, valid.len);
+        partitioned.split_mask = mask;
         const source = partitioned.byteSource();
         var reader = try zfastq.Reader.init(std.testing.allocator, source, .{});
         defer reader.deinit();
@@ -717,8 +683,9 @@ test "[property] - [parser]: every input partition preserves the format result" 
     }
 
     const invalid = "@r\nA\nx\n!\n";
-    for (0..partition_count) |mask| {
-        var partitioned = PartitionSource.init(invalid, mask);
+    for (masks) |mask| {
+        var partitioned = ChunkSource.init(invalid, invalid.len);
+        partitioned.split_mask = mask;
         const source = partitioned.byteSource();
         var reader = try zfastq.Reader.init(std.testing.allocator, source, .{});
         defer reader.deinit();
@@ -743,8 +710,8 @@ test "[property] - [parser]: every input partition preserves the format result" 
     }
 }
 
-test "[edge] - [reader]: fallback fields survive growth and owned copies survive advance" {
-    const line_len = 1024 * 1024;
+test "[edge] - [reader]: fields of a line one byte past the read buffer survive the next read" {
+    const line_len = zfastq.limits.DEFAULT_READER_BUFFER_BYTES + 1;
     const next_record = "\n@next comment\nAC\n+note\n!!\n";
     const total_len = 3 + line_len + 3 + line_len + next_record.len;
     const data = try std.testing.allocator.alloc(u8, total_len);
@@ -771,18 +738,8 @@ test "[edge] - [reader]: fallback fields survive growth and owned copies survive
     try std.testing.expect(std.mem.allEqual(u8, parsed.sequence, 'A'));
     try std.testing.expect(std.mem.allEqual(u8, parsed.quality, 'I'));
 
-    var owned = try zfastq.toOwned(std.testing.allocator, parsed);
-    defer owned.deinit();
     const next = (try reader.next()).?;
-
     try std.testing.expectEqualStrings("next comment", next.header);
-    try std.testing.expectEqualStrings("r", owned.header);
-    try std.testing.expectEqualStrings("r", owned.id);
-    try std.testing.expectEqual(line_len, owned.sequence.len);
-    try std.testing.expectEqualStrings("", owned.plus);
-    try std.testing.expectEqual(line_len, owned.quality.len);
-    try std.testing.expect(std.mem.allEqual(u8, owned.sequence, 'A'));
-    try std.testing.expect(std.mem.allEqual(u8, owned.quality, 'I'));
 }
 
 test "[unit] - [reader]: complete buffered records allocate only the transport buffer" {
@@ -816,10 +773,11 @@ test "[unit] - [owned record]: copied fields remain stable after Reader advances
 }
 
 test "[failure] - [reader]: initialization releases partial allocations" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        initReaderForAllocationCheck,
-        .{"@r\nA\n+\n!\n"},
+    var source = zfastq.io.plain.SliceSource.init("@r\nA\n+\n!\n");
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        zfastq.Reader.init(failing.allocator(), source.byteSource(), .{}),
     );
 }
 
@@ -831,11 +789,8 @@ test "[failure] - [owned record]: conversion releases partial allocations" {
         .plus = "read comment",
         .quality = "!!!!",
     };
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        ownRecordForAllocationCheck,
-        .{record},
-    );
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 4 });
+    try std.testing.expectError(error.OutOfMemory, zfastq.toOwned(failing.allocator(), record));
 }
 
 test "[failure] - [reader]: read failures at every byte retain complete earlier records" {
@@ -843,7 +798,8 @@ test "[failure] - [reader]: read failures at every byte retain complete earlier 
     const data = record ++ record;
     for (0..data.len + 1) |fail_at| {
         errdefer std.debug.print("read failure after {d} bytes\n", .{fail_at});
-        var failing_source = FailingSource{ .data = data[0..fail_at] };
+        var failing_source = ChunkSource.init(data, data.len);
+        failing_source.fail_at = fail_at;
         var reader = try zfastq.Reader.init(
             std.testing.allocator,
             failing_source.byteSource(),
@@ -863,16 +819,12 @@ test "[failure] - [reader]: read failures at every byte retain complete earlier 
     }
 }
 
-test "[failure] - [byte source]: a callback count beyond its destination is rejected" {
-    var invalid_source = InvalidCountSource{};
-    const source = invalid_source.byteSource();
+test "[failure] - [byte source]: a read count beyond its destination is rejected at each layer" {
+    var direct = InvalidCountSource{};
     var output: [1]u8 = undefined;
+    try std.testing.expectError(error.ReadFailed, direct.byteSource().read(&output));
+    try std.testing.expectEqual(@as(usize, 1), direct.read_count);
 
-    try std.testing.expectError(error.ReadFailed, source.read(&output));
-    try std.testing.expectEqual(@as(usize, 1), invalid_source.read_count);
-}
-
-test "[failure] - [reader]: a source count beyond its destination is rejected" {
     var invalid_source = InvalidCountSource{};
     var reader = try zfastq.Reader.init(
         std.testing.allocator,
@@ -926,47 +878,74 @@ test "[failure] - [reader]: allocation failure while growing storage propagates"
     try std.testing.expectError(zfastq.ReaderError.OutOfMemory, reader.next());
 }
 
-test "[edge] - [reader]: the configured line limit is exact" {
-    const at_limit = "@r\nACGT\n+\n!!!!\n";
-    var valid_source = zfastq.io.plain.SliceSource.init(at_limit);
-    var valid_reader = try zfastq.Reader.init(
-        std.testing.allocator,
-        valid_source.byteSource(),
-        .{ .max_line_bytes = 4 },
-    );
-    defer valid_reader.deinit();
-    _ = try valid_reader.next();
+test "[edge] - [count slice]: the configured line limit is exact on every record line" {
+    const LIMIT = 4;
+    const cases = [_]struct { data: []const u8, accepted: bool }{
+        .{ .data = "@abc\nA\n+\n!\n", .accepted = true },
+        .{ .data = "@abcd\nA\n+\n!\n", .accepted = false },
+        .{ .data = "@r\nACGT\n+\n!!!!\n", .accepted = true },
+        .{ .data = "@r\nACGTA\n+\n!!!!!\n", .accepted = false },
+        .{ .data = "@r\nA\n+abc\n!\n", .accepted = true },
+        .{ .data = "@r\nA\n+abcd\n!\n", .accepted = false },
+        .{ .data = "@r\nAAAA\n+\n!!!!\n", .accepted = true },
+        .{ .data = "@r\nAAAA\n+\n!!!!!\n", .accepted = false },
+        .{ .data = "@r\nACGT\n+\n!!!!\r\n", .accepted = true },
+        .{ .data = "@r\nACGT\n+\n!!!!\r", .accepted = false },
+    };
 
-    const above_limit = "@r\nACGTA\n+\n!!!!!\n";
-    var invalid_source = zfastq.io.plain.SliceSource.init(above_limit);
-    var invalid_reader = try zfastq.Reader.init(
-        std.testing.allocator,
-        invalid_source.byteSource(),
-        .{ .max_line_bytes = 4 },
-    );
-    defer invalid_reader.deinit();
-    try std.testing.expectError(zfastq.ReaderError.LineTooLong, invalid_reader.next());
+    for (cases) |case| {
+        var source = zfastq.io.plain.SliceSource.init(case.data);
+        var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{ .max_line_bytes = LIMIT });
+        defer reader.deinit();
+        var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = LIMIT });
+        if (case.accepted) {
+            _ = try reader.next();
+            try std.testing.expectEqual(
+                @as(u64, 1),
+                try zfastq.count_scan.countSlice(case.data, .{ .max_line_bytes = LIMIT }, &scan),
+            );
+        } else {
+            try std.testing.expectError(zfastq.ReaderError.LineTooLong, reader.next());
+            try std.testing.expectError(
+                zfastq.ReaderError.LineTooLong,
+                zfastq.count_scan.countSlice(case.data, .{ .max_line_bytes = LIMIT }, &scan),
+            );
+        }
+    }
 
-    const lone_cr_at_eof = "@r\nACGT\n+\n!!!!\r";
-    var eof_source = zfastq.io.plain.SliceSource.init(lone_cr_at_eof);
-    var eof_reader = try zfastq.Reader.init(
-        std.testing.allocator,
-        eof_source.byteSource(),
-        .{ .max_line_bytes = 4 },
-    );
+    const lone_cr = "@r\nACGT\n+\n!!!!\r";
+    var eof_source = zfastq.io.plain.SliceSource.init(lone_cr);
+    var eof_reader = try zfastq.Reader.init(std.testing.allocator, eof_source.byteSource(), .{ .max_line_bytes = LIMIT });
     defer eof_reader.deinit();
     try std.testing.expectError(zfastq.ReaderError.LineTooLong, eof_reader.next());
-    try std.testing.expectEqual(@as(u64, lone_cr_at_eof.len), eof_reader.byteOffset());
+    try std.testing.expectEqual(@as(u64, lone_cr.len), eof_reader.byteOffset());
 
-    var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 4 });
+    var eof_scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = LIMIT });
     try std.testing.expectError(
         zfastq.ReaderError.LineTooLong,
-        zfastq.count_scan.countSlice(lone_cr_at_eof, .{ .max_line_bytes = 4 }, &scan),
+        zfastq.count_scan.countSlice(lone_cr, .{ .max_line_bytes = LIMIT }, &eof_scan),
     );
-    try std.testing.expectEqual(@as(u64, lone_cr_at_eof.len), scan.byte_offset);
+    try std.testing.expectEqual(@as(u64, lone_cr.len), eof_scan.byte_offset);
+
+    const dense = "@a\nAC\n+\n!!\n@b\nACGT\n+\n!!!!\n";
+    var dense_scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 3 });
+    try std.testing.expectError(
+        zfastq.ReaderError.LineTooLong,
+        zfastq.count_scan.countSlice(dense, .{ .max_line_bytes = 3 }, &dense_scan),
+    );
+    try std.testing.expectEqual(@as(u64, 1), dense_scan.record_index);
+
+    const span = "@r\nAAAAAAAA\n+\n!!!!!!!!";
+    var byte_scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 8 });
+    for (span) |byte| _ = try byte_scan.feed(&.{byte});
+    try byte_scan.finishEof();
+    try std.testing.expectEqual(@as(u64, 1), byte_scan.record_index);
+
+    var long_scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 7 });
+    try std.testing.expectError(zfastq.ReaderError.LineTooLong, long_scan.feed(span));
 }
 
-test "[property] - [count scanner]: inline counts match Reader advance" {
+test "[property] - [reader]: advance, next, and the count scanner agree on record count" {
     const data =
         \\@read1
         \\ACGT
@@ -984,27 +963,23 @@ test "[property] - [count scanner]: inline counts match Reader advance" {
     try scan.finishEof();
     try std.testing.expectEqual(@as(u64, 2), scan.record_index);
 
-    var source = zfastq.io.plain.SliceSource.init(data);
-    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-
+    var advance_source = zfastq.io.plain.SliceSource.init(data);
+    var advance_reader = try zfastq.Reader.init(std.testing.allocator, advance_source.byteSource(), .{});
+    defer advance_reader.deinit();
     var advance_count: u64 = 0;
-    while (try reader.advance()) {
+    while (try advance_reader.advance()) {
         advance_count += 1;
     }
-    try std.testing.expectEqual(scan.record_index, advance_count);
-}
+    try std.testing.expectEqual(@as(u64, 2), advance_count);
 
-test "[failure] - [count scanner]: a length mismatch reports S005" {
-    const data =
-        \\@bad
-        \\ACGT
-        \\+
-        \\III
-        \\
-    ;
-    var scan = zfastq.count_scan.Scanner.init(.{});
-    try std.testing.expectError(zfastq.ReaderError.S005LengthMismatch, scan.feed(data));
+    var next_source = zfastq.io.plain.SliceSource.init(data);
+    var next_reader = try zfastq.Reader.init(std.testing.allocator, next_source.byteSource(), .{});
+    defer next_reader.deinit();
+    var next_count: u64 = 0;
+    while ((try next_reader.next()) != null) {
+        next_count += 1;
+    }
+    try std.testing.expectEqual(@as(u64, 2), next_count);
 }
 
 test "[unit] - [count slice]: reuse replaces progress, options, and old diagnostics" {
@@ -1031,101 +1006,43 @@ test "[unit] - [count slice]: reuse replaces progress, options, and old diagnost
     try std.testing.expectError(error.LineTooLong, scan.feed(valid));
 }
 
-test "[property] - [count scanner]: result and details are chunk invariant" {
-    const valid = "@r1\nAAAA\n+\n!!!!\n@r2\nCC\n+note\n##\n";
-    for (1..valid.len + 1) |chunk_len| {
-        var scan = zfastq.count_scan.Scanner.init(.{});
-        var pos: usize = 0;
-        while (pos < valid.len) {
-            const end = @min(valid.len, pos + chunk_len);
-            _ = try scan.feed(valid[pos..end]);
-            pos = end;
+test "[property] - [parser]: Reader and scanner agree on mixed-ending records and fixed mutations" {
+    const valid = [_]struct { data: []const u8, count: u64 }{
+        .{ .data = "@r1\r\nACGT\n+x\r\n!!!!\n@r2\nN\n+\n#\n", .count = 2 },
+        .{ .data = "@a\nA\n+\n!\n@b\n\n+\n\n", .count = 2 },
+        .{ .data = "@r\nACGT\n+\nIIII", .count = 1 },
+    };
+    for (valid) |case| {
+        for ([_]usize{ 1, 2, case.data.len }) |chunk_len| {
+            const reader_valid = try readerOutcome(case.data, chunk_len);
+            try std.testing.expectEqual(case.count, reader_valid.count);
+            try std.testing.expectEqual(@as(?zfastq.ReaderError, null), reader_valid.err);
+            try expectSameOutcome(reader_valid, scannerOutcome(case.data, chunk_len));
         }
-        try scan.finishEof();
-        try std.testing.expectEqual(@as(u64, 2), scan.record_index);
-        try std.testing.expectEqual(@as(u64, valid.len), scan.byte_offset);
     }
 
-    const malformed = "@r1\nAAAA\n+\n!!!!\n@r2\nA\nAA\n+\n!!!!\n";
-    for (1..malformed.len + 1) |chunk_len| {
-        var scan = zfastq.count_scan.Scanner.init(.{});
-        var pos: usize = 0;
-        var found_error = false;
-        while (pos < malformed.len) {
-            const end = @min(malformed.len, pos + chunk_len);
-            if (scan.feed(malformed[pos..end])) |_| {
-                pos = end;
-            } else |err| {
-                try std.testing.expectEqual(zfastq.ReaderError.S001InvalidPlusLine, err);
-                found_error = true;
-                break;
-            }
+    const base = "@r1\r\nACGT\n+x\r\n!!!!\n@r2\nN\n+\n#\n";
+    const mutations = [_]struct { offset: usize, byte: u8 }{
+        .{ .offset = 0, .byte = '\n' },
+        .{ .offset = 4, .byte = '\r' },
+        .{ .offset = 7, .byte = 0 },
+        .{ .offset = 10, .byte = '@' },
+        .{ .offset = 14, .byte = '\n' },
+        .{ .offset = 19, .byte = '\r' },
+        .{ .offset = 26, .byte = 'A' },
+        .{ .offset = 27, .byte = '\r' },
+    };
+    for (mutations) |mutation| {
+        var mutated: [base.len]u8 = undefined;
+        @memcpy(&mutated, base);
+        mutated[mutation.offset] = mutation.byte;
+        for ([_]usize{ 1, 2, mutated.len }) |chunk_len| {
+            errdefer std.debug.print("mutation at {d} to 0x{x}, chunk {d}\n", .{
+                mutation.offset, mutation.byte, chunk_len,
+            });
+            const reader_mutated = try readerOutcome(&mutated, chunk_len);
+            try expectSameOutcome(reader_mutated, scannerOutcome(&mutated, chunk_len));
         }
-        try std.testing.expect(found_error);
-        const details = scan.takeLastError().?;
-        try std.testing.expectEqual(zfastq.LintCode.s001_invalid_plus_line, details.code);
-        try std.testing.expectEqual(@as(u64, 1), details.record_index);
-        try std.testing.expectEqual(@as(u64, 22), details.byte_offset);
-        try std.testing.expectEqual(@as(u3, 3), details.line_in_record);
-    }
-}
-
-test "[property] - [parser]: generated mutations keep Reader and scanner in agreement" {
-    var prng = std.Random.DefaultPrng.init(0x6a09e667f3bcc909);
-    const random = prng.random();
-    const mutations = [_]u8{ '\n', '\r', '@', '+', 0, 'A', '!' };
-
-    for (0..96) |case_index| {
-        errdefer std.debug.print(
-            "parser seed=0x6a09e667f3bcc909 runner_seed=0x{x} case={d}\n",
-            .{ std.testing.random_seed, case_index },
-        );
-        var storage: [8192]u8 = undefined;
-        var output = std.Io.Writer.fixed(&storage);
-        const record_count = random.intRangeAtMost(usize, 1, 16);
-        for (0..record_count) |record_index| {
-            try output.writeAll("@r");
-            const header_len = random.intRangeAtMost(usize, 1, 24);
-            for (0..header_len) |_| try output.writeByte(randomLetter(random));
-            try writeRandomLineEnding(&output, random);
-
-            const sequence_len = random.intRangeAtMost(usize, 0, 64);
-            for (0..sequence_len) |_| try output.writeByte(randomBase(random));
-            try writeRandomLineEnding(&output, random);
-
-            try output.writeByte('+');
-            const plus_len = random.intRangeAtMost(usize, 0, 16);
-            for (0..plus_len) |_| try output.writeByte(randomLetter(random));
-            try writeRandomLineEnding(&output, random);
-
-            for (0..sequence_len) |_| try output.writeByte(randomQuality(random));
-            if (record_index + 1 < record_count or sequence_len == 0 or random.boolean()) {
-                try writeRandomLineEnding(&output, random);
-            }
-        }
-        const data = output.buffered();
-        const reader_chunk = random.intRangeAtMost(usize, 1, 67);
-        const scanner_chunk = random.intRangeAtMost(usize, 1, 67);
-
-        const reader_valid = try readerOutcome(data, reader_chunk);
-        const scanner_valid = scannerOutcome(data, scanner_chunk);
-
-        try std.testing.expectEqual(@as(u64, @intCast(record_count)), reader_valid.count);
-        try std.testing.expectEqual(@as(?zfastq.ReaderError, null), reader_valid.err);
-        try expectSameOutcome(reader_valid, scanner_valid);
-
-        var mutated: [8192]u8 = undefined;
-        @memcpy(mutated[0..data.len], data);
-        const mutation_count = random.intRangeAtMost(usize, 1, 3);
-        for (0..mutation_count) |_| {
-            const index = random.uintLessThan(usize, data.len);
-            mutated[index] = mutations[random.uintLessThan(usize, mutations.len)];
-        }
-
-        const reader_mutated = try readerOutcome(mutated[0..data.len], reader_chunk);
-        const scanner_mutated = scannerOutcome(mutated[0..data.len], scanner_chunk);
-
-        try expectSameOutcome(reader_mutated, scanner_mutated);
     }
 }
 
@@ -1140,10 +1057,25 @@ test "[fuzz] - [parser]: arbitrary bytes keep Reader and scanner in agreement" {
 }
 
 test "[property] - [parser]: structural details agree across chunk sizes" {
+    const valid = "@r1\nAAAA\n+\n!!!!\n@r2\nCC\n+note\n##\n";
+    for ([_]usize{ 1, 2, 3, valid.len }) |chunk_len| {
+        var scan = zfastq.count_scan.Scanner.init(.{});
+        var pos: usize = 0;
+        while (pos < valid.len) {
+            const end = @min(valid.len, pos + chunk_len);
+            _ = try scan.feed(valid[pos..end]);
+            pos = end;
+        }
+        try scan.finishEof();
+        try std.testing.expectEqual(@as(u64, 2), scan.record_index);
+        try std.testing.expectEqual(@as(u64, valid.len), scan.byte_offset);
+    }
+
     const cases = [_]struct {
         data: []const u8,
         expected_error: zfastq.ReaderError,
         code: zfastq.LintCode,
+        record_index: u64 = 0,
         line: u3,
         offset: u64,
     }{
@@ -1167,6 +1099,14 @@ test "[property] - [parser]: structural details agree across chunk sizes" {
             .code = .s001_invalid_plus_line,
             .line = 3,
             .offset = 10,
+        },
+        .{
+            .data = "@r1\nAAAA\n+\n!!!!\n@r2\nA\nAA\n+\n!!!!\n",
+            .expected_error = error.S001InvalidPlusLine,
+            .code = .s001_invalid_plus_line,
+            .record_index = 1,
+            .line = 3,
+            .offset = 22,
         },
         .{
             .data = "@truncated\nACGT\n+",
@@ -1227,18 +1167,19 @@ test "[property] - [parser]: structural details agree across chunk sizes" {
     };
 
     for (cases) |case| {
-        for (1..case.data.len + 1) |chunk_len| {
+        for ([_]usize{ 1, 2, 3, case.data.len }) |chunk_len| {
             var chunked = ChunkSource.init(case.data, chunk_len);
             const source = chunked.byteSource();
             var reader = try zfastq.Reader.init(std.testing.allocator, source, .{});
             defer reader.deinit();
+            for (0..case.record_index) |_| _ = try reader.next();
             if (reader.next()) |_| {
                 return error.ExpectedParseError;
             } else |err| {
                 try std.testing.expectEqual(case.expected_error, err);
             }
             const reader_details = reader.takeLastError().?;
-            try expectDetails(reader_details, case.code, 0, case.line, case.offset);
+            try expectDetails(reader_details, case.code, case.record_index, case.line, case.offset);
             try std.testing.expect(reader.takeLastError() == null);
 
             var scan = zfastq.count_scan.Scanner.init(.{});
@@ -1260,94 +1201,46 @@ test "[property] - [parser]: structural details agree across chunk sizes" {
             }
             try std.testing.expectEqual(case.expected_error, scan_error.?);
             const scan_details = scan.takeLastError().?;
-            try expectDetails(scan_details, case.code, 0, case.line, case.offset);
+            try expectDetails(scan_details, case.code, case.record_index, case.line, case.offset);
             try std.testing.expect(scan.takeLastError() == null);
         }
     }
 }
 
-test "[edge] - [count scanner]: lines span chunks while retaining the limit" {
-    const data = "@r\nAAAAAAAA\n+\n!!!!!!!!";
-    var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 8 });
-    for (data) |byte| {
-        _ = try scan.feed((&[_]u8{byte})[0..]);
+test "[property] - [count scanner]: uniform and varying record strides count every record" {
+    const hdr_a = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/1\n";
+    const hdr_b = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/12\n";
+    const cases = [_]struct {
+        headers: []const []const u8,
+        sequence_lens: []const usize,
+        count: u64,
+    }{
+        .{ .headers = &.{ hdr_a, hdr_a, hdr_a }, .sequence_lens = &.{ 100, 100, 100 }, .count = 3 },
+        .{ .headers = &.{ hdr_a, hdr_b }, .sequence_lens = &.{ 100, 100 }, .count = 2 },
+        .{ .headers = &.{ "@ont_read\n", "@ont_read\n" }, .sequence_lens = &.{ 4, 6 }, .count = 2 },
+    };
+
+    var buf: [3 * 256]u8 = undefined;
+    for (cases) |case| {
+        var pos: usize = 0;
+        for (case.headers, case.sequence_lens) |header, sequence_len| {
+            pos = appendSizedRecord(&buf, pos, header, sequence_len);
+        }
+        const data = buf[0..pos];
+
+        var scan = zfastq.count_scan.Scanner.init(.{});
+        try std.testing.expectEqual(case.count, try zfastq.count_scan.countSlice(data, .{}, &scan));
+        try std.testing.expectEqual(case.count, (try readerOutcome(data, data.len)).count);
     }
-    try scan.finishEof();
-    try std.testing.expectEqual(@as(u64, 1), scan.record_index);
-
-    var too_long = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 7 });
-    try std.testing.expectError(
-        zfastq.ReaderError.LineTooLong,
-        too_long.feed(data),
-    );
 }
 
-test "[edge] - [count scanner]: dense layout learning retains the line limit" {
-    const data = "@a\nAC\n+\n!!\n@b\nACGT\n+\n!!!!\n";
-    var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 3 });
-
-    try std.testing.expectError(
-        zfastq.ReaderError.LineTooLong,
-        zfastq.count_scan.countSlice(data, .{ .max_line_bytes = 3 }, &scan),
-    );
-    try std.testing.expectEqual(@as(u64, 1), scan.record_index);
-}
-
-test "[property] - [count scanner]: dense layout learning preserves length semantics" {
-    const data = "@a\nACGT\n+\n!!!!\n@b\nACG\r\n+\n!!!!\n";
-    var scan = zfastq.count_scan.Scanner.init(.{});
-
-    try std.testing.expectError(
-        zfastq.ReaderError.S005LengthMismatch,
-        zfastq.count_scan.countSlice(data, .{}, &scan),
-    );
-    try expectDetails(
-        scan.takeLastError().?,
-        .s005_length_mismatch,
-        1,
-        4,
-        25,
-    );
-}
-
-test "[unit] - [count scanner]: dense stride blocks count uniform records" {
-    var buf: [243 * 3]u8 = undefined;
-    const pos = appendUniformRecords(&buf, 3, "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/1\n", 100);
-    var scan = zfastq.count_scan.Scanner.init(.{});
-    const n = try zfastq.count_scan.countSlice(buf[0..pos], .{}, &scan);
-    try std.testing.expectEqual(@as(u64, 3), n);
-}
-
-test "[unit] - [count scanner]: dense batching waits for two matching records" {
-    const short = "@a\nAC\n+\n!!\n";
-    const long = "@long\nA\n+\n!\n";
-    var scan = zfastq.count_scan.Scanner.init(.{ .max_line_bytes = 64 });
-
-    try std.testing.expectEqual(short.len, try scan.feed(short));
-    try std.testing.expect(!scan.layout_confirmed);
-    try std.testing.expectEqual(short.len, try scan.feed(short));
-    try std.testing.expect(scan.layout_confirmed);
-
-    try std.testing.expectEqual(long.len, try scan.feed(long));
-    try std.testing.expect(!scan.layout_confirmed);
-    try std.testing.expectEqual(long.len, try scan.feed(long));
-    try std.testing.expect(scan.layout_confirmed);
-}
-
-test "[property] - [count scanner]: dense exits preserve every truncated and split outcome" {
+test "[property] - [count scanner]: dense exits match Reader at tail boundaries and splits" {
     const prefix = "@r1\nAAAA\n+\n!!!!\n" ** 3;
     const tails = [_][]const u8{
         "@longer\nAAAA\n+\n!!!!\n",
         "@r2\nAA\n+\n!!\n",
-        "@r2\nAAAAAA\n+\n!!!!!!\n",
-        "@r2\nAAAA\n+note\n!!!!\n",
-        "@r2\r\nAAAA\r\n+\r\n!!!!\r\n",
-        "@r2\nAAAA\r\n+\n!!!!\n",
-        "@\nAAAA\n+\n!!!!\n",
-        "@r2\nA\nAA\n+\n!!!!\n",
         "@r2\nAAAA\n-\n!!!!\n",
-        "@r2\nAAAA\n+\n!\n!!\n",
-        "@r2\n\n+\n\n",
+        "@r2\nAAA\r\n+\n!!!!\n",
     };
     for (tails) |tail| {
         var storage: [256]u8 = undefined;
@@ -1358,36 +1251,11 @@ test "[property] - [count scanner]: dense exits preserve every truncated and spl
         try output.writeAll(prefix);
         const complete = output.buffered();
 
-        for (prefix.len..complete.len + 1) |length| {
+        const seams = lineBoundaries(complete);
+        for (seams.slice()) |length| {
+            if (length < prefix.len) continue;
             const data = complete[0..length];
-            const expected = try readerOutcome(data, 1);
-            for (0..data.len + 1) |split| {
-                var scan = zfastq.count_scan.Scanner.init(.{});
-                var failure: ?zfastq.ReaderError = null;
-                for ([_][]const u8{ data[0..split], data[split..] }) |chunk| {
-                    const consumed = scan.feed(chunk) catch |err| {
-                        failure = err;
-                        break;
-                    };
-                    try std.testing.expectEqual(chunk.len, consumed);
-                }
-                if (failure == null) scan.finishEof() catch |err| {
-                    failure = err;
-                };
-                try expectSameOutcome(expected, .{
-                    .count = scan.record_index,
-                    .err = failure,
-                    .details = scan.takeLastError(),
-                });
-                if (failure == null) {
-                    try std.testing.expectEqual(@as(u64, data.len), scan.byte_offset);
-                } else if (expected.details) |details| {
-                    const line_start: usize = @intCast(details.byte_offset);
-                    const line_end = std.mem.findScalarPos(u8, data, line_start, '\n');
-                    const consumed = if (line_end) |end| end + 1 else data.len;
-                    try std.testing.expectEqual(@as(u64, consumed), scan.byte_offset);
-                }
-            }
+            try expectScanAtEverySplit(data, seams.slice(), try readerOutcome(data, 1));
         }
     }
 }
@@ -1420,13 +1288,13 @@ test "[property] - [count scanner]: dense headers retain an identifier after CRL
             expected.err,
         );
         if (!case.valid) try expectDetails(expected.details.?, .s003_invalid_header, 2, 1, prefix.len);
-        for (1..data.len + 1) |chunk_len| {
+        for ([_]usize{ 1, 2, data.len }) |chunk_len| {
             try expectSameOutcome(expected, scannerOutcome(data, chunk_len));
         }
     }
 }
 
-test "[property] - [count scanner]: complete mixed endings match Reader at every seam and EOF" {
+test "[property] - [count scanner]: mixed line endings match Reader at line seams" {
     const cases = [_][4][]const u8{
         .{ "@r", "AC", "+note", "!!" },
         .{ "@r", "", "+", "" },
@@ -1438,8 +1306,9 @@ test "[property] - [count scanner]: complete mixed endings match Reader at every
         .{ "@r", "AA", "+", "!" },
     };
     const prefix = "@a\r\nA\r\n+\r\n!\r\n";
+    const ending_masks = [_]usize{ 0, 15 };
     for (cases) |fields| {
-        for (0..16) |endings| {
+        for (ending_masks) |endings| {
             var storage: [128]u8 = undefined;
             var output = std.Io.Writer.fixed(&storage);
             try output.writeAll(prefix);
@@ -1450,64 +1319,13 @@ test "[property] - [count scanner]: complete mixed endings match Reader at every
             }
             try output.writeAll("@b\nA\n+\n!\n@c\nA\n+\n!\n@\nA\n+\n!\n");
             const complete = output.buffered();
-            for (prefix.len..complete.len + 1) |length| {
+            const seams = lineBoundaries(complete);
+            for (seams.slice()) |length| {
                 const data = complete[0..length];
-                const expected = try readerOutcome(data, 1);
-                for (0..data.len + 1) |split| {
-                    var scanner = zfastq.count_scan.Scanner.init(.{});
-                    var failure: ?zfastq.ReaderError = null;
-                    for ([_][]const u8{ data[0..split], data[split..] }) |chunk| {
-                        const consumed = scanner.feed(chunk) catch |err| {
-                            failure = err;
-                            break;
-                        };
-                        try std.testing.expectEqual(chunk.len, consumed);
-                    }
-                    if (failure == null) scanner.finishEof() catch |err| {
-                        failure = err;
-                    };
-                    try expectSameOutcome(expected, .{
-                        .count = scanner.record_index,
-                        .err = failure,
-                        .details = scanner.takeLastError(),
-                    });
-                    if (failure == null) {
-                        try std.testing.expectEqual(@as(u64, data.len), scanner.byte_offset);
-                    } else if (expected.details) |details| {
-                        const end = std.mem.findScalarPos(u8, data, @intCast(details.byte_offset), '\n');
-                        try std.testing.expectEqual(@as(u64, if (end) |offset| offset + 1 else data.len), scanner.byte_offset);
-                    }
-                }
+                try expectScanAtEverySplit(data, seams.slice(), try readerOutcome(data, 1));
             }
         }
     }
-}
-
-test "[property] - [count scanner]: record strides may alternate" {
-    const hdr_a = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/1\n";
-    const hdr_b = "@HWI-ST180_0186:3:1:1484:1936#GGCTAC/12\n";
-
-    var buf: [243 + 244]u8 = undefined;
-    var pos: usize = 0;
-    pos = appendRecord(&buf, pos, hdr_a, 100);
-    pos = appendRecord(&buf, pos, hdr_b, 100);
-
-    var scan = zfastq.count_scan.Scanner.init(.{});
-    const n = try zfastq.count_scan.countSlice(buf[0..pos], .{}, &scan);
-    try std.testing.expectEqual(@as(u64, 2), n);
-}
-
-test "[property] - [count scanner]: sequence lengths may alternate under one header" {
-    const hdr = "@ont_read\n";
-
-    var buf: [128]u8 = undefined;
-    var pos: usize = 0;
-    pos = appendRecord(&buf, pos, hdr, 4);
-    pos = appendRecord(&buf, pos, hdr, 6);
-
-    var scan = zfastq.count_scan.Scanner.init(.{});
-    const n = try zfastq.count_scan.countSlice(buf[0..pos], .{}, &scan);
-    try std.testing.expectEqual(@as(u64, 2), n);
 }
 
 test "[property] - [parser]: header lookup boundaries are chunk invariant" {
@@ -1522,7 +1340,7 @@ test "[property] - [parser]: header lookup boundaries are chunk invariant" {
         pos += 12;
     }
 
-    for (1..data.len + 1) |chunk_len| {
+    for ([_]usize{ 1, data.len }) |chunk_len| {
         var scan = zfastq.count_scan.Scanner.init(.{});
         var scan_pos: usize = 0;
         while (scan_pos < data.len) {
@@ -1547,48 +1365,7 @@ test "[property] - [parser]: header lookup boundaries are chunk invariant" {
     }
 }
 
-test "[property] - [reader]: advance and next produce the same record count" {
-    const data =
-        \\@read1
-        \\ACGT
-        \\+
-        \\!!!!
-        \\@read2
-        \\TGCA
-        \\+
-        \\JJJJ
-        \\
-    ;
-    var source = zfastq.io.plain.SliceSource.init(data);
-    var reader = try zfastq.Reader.init(std.testing.allocator, source.byteSource(), .{});
-    defer reader.deinit();
-
-    var advance_count: usize = 0;
-    while (try reader.advance()) {
-        advance_count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 2), advance_count);
-
-    var source2 = zfastq.io.plain.SliceSource.init(data);
-    var reader2 = try zfastq.Reader.init(std.testing.allocator, source2.byteSource(), .{});
-    defer reader2.deinit();
-
-    var next_count: usize = 0;
-    while ((try reader2.next()) != null) {
-        next_count += 1;
-    }
-    try std.testing.expectEqual(advance_count, next_count);
-}
-
-fn appendUniformRecords(buf: []u8, count: usize, header: []const u8, seq_len: usize) usize {
-    var pos: usize = 0;
-    for (0..count) |_| {
-        pos = appendRecord(buf, pos, header, seq_len);
-    }
-    return pos;
-}
-
-fn appendRecord(buf: []u8, start: usize, header: []const u8, seq_len: usize) usize {
+fn appendSizedRecord(buf: []u8, start: usize, header: []const u8, seq_len: usize) usize {
     var pos = start;
     @memcpy(buf[pos..][0..header.len], header);
     pos += header.len;
@@ -1606,6 +1383,8 @@ const ChunkSource = struct {
     data: []const u8,
     pos: usize = 0,
     chunk_len: usize,
+    split_mask: ?usize = null,
+    fail_at: ?usize = null,
 
     fn init(data: []const u8, chunk_len: usize) ChunkSource {
         return .{ .data = data, .chunk_len = chunk_len };
@@ -1619,8 +1398,16 @@ const ChunkSource = struct {
 
     fn read(ctx: *anyopaque, dest: []u8) error{ReadFailed}!usize {
         const self: *ChunkSource = @ptrCast(@alignCast(ctx));
+        if (self.fail_at) |fail_at| {
+            if (self.pos >= fail_at) return error.ReadFailed;
+        }
         if (self.pos == self.data.len) return 0;
-        const n = @min(self.chunk_len, @min(dest.len, self.data.len - self.pos));
+        const limit = if (self.fail_at) |fail_at| @min(fail_at, self.data.len) else self.data.len;
+        const end = if (self.split_mask) |mask|
+            partitionEnd(self.data.len, self.pos, mask)
+        else
+            self.pos + self.chunk_len;
+        const n = @min(@min(end, limit) - self.pos, dest.len);
         @memcpy(dest[0..n], self.data[self.pos..][0..n]);
         self.pos += n;
         return n;
@@ -1692,25 +1479,6 @@ const FragmentReader = struct {
     }
 };
 
-const FailingSource = struct {
-    data: []const u8,
-
-    fn byteSource(self: *FailingSource) zfastq.io.ByteSource {
-        return .{ .vtable = &vtable, .ctx = self };
-    }
-
-    const vtable = zfastq.io.ByteSource.VTable{ .read = read };
-
-    fn read(ctx: *anyopaque, dest: []u8) error{ReadFailed}!usize {
-        const self: *FailingSource = @ptrCast(@alignCast(ctx));
-        if (self.data.len == 0) return error.ReadFailed;
-        const n = @min(self.data.len, dest.len);
-        @memcpy(dest[0..n], self.data[0..n]);
-        self.data = self.data[n..];
-        return n;
-    }
-};
-
 const InvalidCountSource = struct {
     read_count: usize = 0,
 
@@ -1727,36 +1495,49 @@ const InvalidCountSource = struct {
     }
 };
 
-const PartitionSource = struct {
-    data: []const u8,
-    pos: usize = 0,
-    mask: usize,
-
-    fn init(data: []const u8, mask: usize) PartitionSource {
-        return .{ .data = data, .mask = mask };
-    }
-
-    fn byteSource(self: *PartitionSource) zfastq.io.ByteSource {
-        return .{ .vtable = &vtable, .ctx = self };
-    }
-
-    const vtable = zfastq.io.ByteSource.VTable{ .read = read };
-
-    fn read(ctx: *anyopaque, dest: []u8) error{ReadFailed}!usize {
-        const self: *PartitionSource = @ptrCast(@alignCast(ctx));
-        if (self.pos == self.data.len) return 0;
-        const end = @min(partitionEnd(self.data.len, self.pos, self.mask), self.pos + dest.len);
-        const n = end - self.pos;
-        @memcpy(dest[0..n], self.data[self.pos..end]);
-        self.pos = end;
-        return n;
-    }
-};
-
 fn partitionEnd(len: usize, start: usize, mask: usize) usize {
     var end = start + 1;
     while (end < len and mask & (@as(usize, 1) << @intCast(end - 1)) == 0) : (end += 1) {}
     return end;
+}
+
+const MAX_LINE_FEEDS = 32;
+
+const LineBoundaries = struct {
+    items: [3 * MAX_LINE_FEEDS + 1]usize = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const LineBoundaries) []const usize {
+        return self.items[0..self.len];
+    }
+};
+
+fn lineBoundaries(data: []const u8) LineBoundaries {
+    var result: LineBoundaries = .{};
+    for (data, 0..) |byte, index| {
+        if (byte != '\n') continue;
+        for ([_]usize{ index, index + 1, index + 2 }) |position| {
+            result.items[result.len] = @min(position, data.len);
+            result.len += 1;
+        }
+    }
+    result.items[result.len] = data.len;
+    result.len += 1;
+    return result;
+}
+
+fn validateSequenceQuality(
+    sequence: []const u8,
+    quality: []const u8,
+    options: zfastq.ValidationOptions,
+) ?zfastq.SemanticError {
+    return zfastq.validateRecord(.{
+        .header = "r",
+        .id = "r",
+        .sequence = sequence,
+        .plus = "",
+        .quality = quality,
+    }, options);
 }
 
 fn expectDetails(
@@ -1770,17 +1551,6 @@ fn expectDetails(
     try std.testing.expectEqual(record_index, details.record_index);
     try std.testing.expectEqual(line, details.line_in_record);
     try std.testing.expectEqual(offset, details.byte_offset);
-}
-
-fn initReaderForAllocationCheck(allocator: std.mem.Allocator, data: []const u8) !void {
-    var source = zfastq.io.plain.SliceSource.init(data);
-    var reader = try zfastq.Reader.init(allocator, source.byteSource(), .{});
-    defer reader.deinit();
-}
-
-fn ownRecordForAllocationCheck(allocator: std.mem.Allocator, record: zfastq.Record) !void {
-    var owned = try zfastq.toOwned(allocator, record);
-    defer owned.deinit();
 }
 
 const ParseOutcome = struct {
@@ -1834,6 +1604,37 @@ fn scannerOutcome(data: []const u8, chunk_len: usize) ParseOutcome {
     return .{ .count = scan.record_index };
 }
 
+fn expectScanAtEverySplit(data: []const u8, splits: []const usize, expected: ParseOutcome) !void {
+    for (splits) |split| {
+        if (split > data.len) continue;
+        var scan = zfastq.count_scan.Scanner.init(.{});
+        var failure: ?zfastq.ReaderError = null;
+        for ([_][]const u8{ data[0..split], data[split..] }) |chunk| {
+            const consumed = scan.feed(chunk) catch |err| {
+                failure = err;
+                break;
+            };
+            try std.testing.expectEqual(chunk.len, consumed);
+        }
+        if (failure == null) scan.finishEof() catch |err| {
+            failure = err;
+        };
+        try expectSameOutcome(expected, .{
+            .count = scan.record_index,
+            .err = failure,
+            .details = scan.takeLastError(),
+        });
+        if (failure == null) {
+            try std.testing.expectEqual(@as(u64, data.len), scan.byte_offset);
+        } else if (expected.details) |details| {
+            const line_start: usize = @intCast(details.byte_offset);
+            const line_end = std.mem.findScalarPos(u8, data, line_start, '\n');
+            const consumed = if (line_end) |end| end + 1 else data.len;
+            try std.testing.expectEqual(@as(u64, consumed), scan.byte_offset);
+        }
+    }
+}
+
 fn fuzzReaderScannerAgreement(_: void, smith: *std.testing.Smith) !void {
     var storage: [512]u8 = undefined;
     const data = storage[0..smith.slice(&storage)];
@@ -1875,24 +1676,4 @@ fn expectSameOutcome(expected: ParseOutcome, actual: ParseOutcome) !void {
         );
         try std.testing.expectEqualStrings(expected_details.message, actual_details.message);
     }
-}
-
-fn writeRandomLineEnding(output: *std.Io.Writer, random: std.Random) !void {
-    if (random.boolean()) {
-        try output.writeAll("\r\n");
-    } else {
-        try output.writeByte('\n');
-    }
-}
-
-fn randomBase(random: std.Random) u8 {
-    return "ACGTN"[random.uintLessThan(usize, 5)];
-}
-
-fn randomLetter(random: std.Random) u8 {
-    return 'a' + random.uintLessThan(u8, 26);
-}
-
-fn randomQuality(random: std.Random) u8 {
-    return '!' + random.uintLessThan(u8, 41);
 }

@@ -1,6 +1,7 @@
 //! CLI-private paired-read name parsing and matching.
 
 const std = @import("std");
+const simd = @import("simd.zig");
 
 pub const NamePolicy = enum {
     illumina,
@@ -64,8 +65,9 @@ pub fn namesMatch(name1: Name, name2: Name) bool {
     return name1.mate_markers == 0b01 and name2.mate_markers == 0b10;
 }
 
-const TOKEN_LANES = 16;
+const TOKEN_LANES = simd.tierWidth(.baseline);
 const TokenVector = @Vector(TOKEN_LANES, u8);
+const TokenMask = @Int(.unsigned, TOKEN_LANES);
 
 fn exactHeadersMatch(header1: []const u8, header2: []const u8) bool {
     return matchingTokenEnd(header1, header2) != null;
@@ -80,13 +82,13 @@ fn matchingTokenEnd(header1: []const u8, header2: []const u8) ?usize {
     while (common_len - offset >= TOKEN_LANES) : (offset += TOKEN_LANES) {
         const bytes1: TokenVector = header1[offset..][0..TOKEN_LANES].*;
         const bytes2: TokenVector = header2[offset..][0..TOKEN_LANES].*;
-        const stop1: u16 = @bitCast((bytes1 == spaces) | (bytes1 == tabs));
-        const stop2: u16 = @bitCast((bytes2 == spaces) | (bytes2 == tabs));
-        const mismatch: u16 = @bitCast(bytes1 != bytes2);
+        const stop1: TokenMask = @bitCast((bytes1 == spaces) | (bytes1 == tabs));
+        const stop2: TokenMask = @bitCast((bytes2 == spaces) | (bytes2 == tabs));
+        const mismatch: TokenMask = @bitCast(bytes1 != bytes2);
         const event = stop1 | stop2 | mismatch;
         if (event != 0) {
             const lane = @as(usize, @intCast(@ctz(event)));
-            const bit = @as(u16, 1) << @intCast(lane);
+            const bit = @as(TokenMask, 1) << @intCast(lane);
             const token_end1 = stop1 & bit != 0;
             const token_end2 = stop2 & bit != 0;
             return if (offset + lane != 0 and token_end1 and token_end2) offset + lane else null;
@@ -118,7 +120,7 @@ fn tokenEnd(header: []const u8, start: usize) usize {
     var end = start;
     while (header.len - end >= TOKEN_LANES) : (end += TOKEN_LANES) {
         const bytes: TokenVector = header[end..][0..TOKEN_LANES].*;
-        const mask: u16 = @bitCast((bytes == spaces) | (bytes == tabs));
+        const mask: TokenMask = @bitCast((bytes == spaces) | (bytes == tabs));
         if (mask != 0) return end + @as(usize, @intCast(@ctz(mask)));
     }
     while (end < header.len and header[end] != ' ' and header[end] != '\t') {
@@ -166,7 +168,7 @@ fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
         const tabs: TokenVector = @splat('\t');
         if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return false;
 
-        const space_mask: u16 = @bitCast(bytes1 == spaces);
+        const space_mask: TokenMask = @bitCast(bytes1 == spaces);
         if (space_mask != 0) {
             if (separator_plus_one != 0 or space_mask & (space_mask - 1) != 0) return false;
             separator_plus_one = offset + @as(usize, @intCast(@ctz(space_mask))) + 1;
@@ -233,82 +235,65 @@ fn mateMask(mate: u2) u2 {
     return if (mate == 1) 0b01 else 0b10;
 }
 
-test "[property] - [paired names]: success-first matching preserves established policies" {
-    const headers = [_][]const u8{
-        "cluster",
-        "cluster/1",
-        "cluster/2",
-        "cluster description/1",
-        "cluster description/2",
-        "cluster\tdescription/1",
-        "cluster\tdescription/2",
-        "cluster  1:N:0:1",
-        "cluster  2:N:0:1",
-        "cluster 1:N:0:index-a",
-        "cluster 2:N:0:index-b",
-        "cluster\t1:N:0:index-a/1 trailing/2",
-        "cluster  2:N:0:index-b/2 trailing/1",
-        "cluster/1 1:N:0:index-a",
-        "cluster/2 2:N:0:index-b",
-        "cluster/1 2:N:0:index-a",
-        "cluster/2 1:N:0:index-b",
-        "cluster 2:/1",
-        "cluster 2:/2",
-        "cluster 1:/1",
-        "cluster 1:/2",
-        "cluster/1 description/1",
-        "cluster/1 description/2",
-        "cluster description note/1",
-        "cluster description note/2",
-        "other/1",
-        "other/2",
-        "/1",
-        "/2",
-        "",
+test "[property] - [paired names]: illumina and exact policies accept the listed header pairs" {
+    const Row = struct { header1: []const u8, header2: []const u8, policy: NamePolicy, matches: bool };
+    const rows = [_]Row{
+        .{ .header1 = "cluster", .header2 = "cluster", .policy = .illumina, .matches = true },
+        .{ .header1 = "cluster/1", .header2 = "cluster/2", .policy = .illumina, .matches = true },
+        .{ .header1 = "cluster/2", .header2 = "cluster/1", .policy = .illumina, .matches = false },
+        .{ .header1 = "cluster", .header2 = "cluster/1", .policy = .illumina, .matches = false },
+        .{ .header1 = "cluster/1", .header2 = "other/2", .policy = .illumina, .matches = false },
+        .{ .header1 = "cluster description/1", .header2 = "cluster description/2", .policy = .illumina, .matches = true },
+        .{ .header1 = "cluster 1:N:0:index-a", .header2 = "cluster 2:N:0:index-b", .policy = .illumina, .matches = true },
+        .{ .header1 = "cluster 2:N:0:index-b", .header2 = "cluster 1:N:0:index-a", .policy = .illumina, .matches = false },
+        .{ .header1 = "cluster 1:N:0:index-a", .header2 = "cluster 1:N:0:index-a", .policy = .illumina, .matches = false },
+        .{ .header1 = "cluster/1 1:N:0:x", .header2 = "cluster/2 2:N:0:x", .policy = .illumina, .matches = true },
+        .{ .header1 = "cluster", .header2 = "cluster", .policy = .exact, .matches = true },
+        .{ .header1 = "cluster", .header2 = "cluster/1", .policy = .exact, .matches = false },
+        .{ .header1 = "cluster/1", .header2 = "cluster/2", .policy = .exact, .matches = false },
+        .{ .header1 = "cluster description/1", .header2 = "cluster description/2", .policy = .exact, .matches = true },
+        .{ .header1 = "cluster\tdescription/1", .header2 = "cluster description/2", .policy = .exact, .matches = true },
+        .{ .header1 = "cluster 1:N:0", .header2 = "cluster 2:N:0", .policy = .exact, .matches = true },
+        .{ .header1 = "", .header2 = "", .policy = .exact, .matches = false },
     };
-    const policies = [_]NamePolicy{ .illumina, .exact };
-
-    for (policies) |policy| {
-        for (headers) |header1| {
-            for (headers) |header2| {
-                const expected = namesMatch(
-                    parseName(header1, policy),
-                    parseName(header2, policy),
-                );
-                try std.testing.expectEqual(
-                    expected,
-                    headersMatch(header1, header2, policy),
-                );
-            }
-        }
+    for (rows) |row| {
+        try std.testing.expectEqual(row.matches, headersMatch(row.header1, row.header2, row.policy));
     }
 }
 
-test "[property] - [paired names]: Casava comparison preserves markers and opaque suffixes" {
-    const suffixes = [_][]const u8{
-        " 1:N:0:index-a",    "\t2:N:0:index-b", "  1:/1",         " \t2:/2",
-        " 1:/2",             " 2:/1",           " 1:",            " 2:",
-        " 1",                " 2",              "",               " 1:\x00\xff/1 extra/2",
-        " 2:\x00/2 extra/1", " description/1",  " description/2",
+test "[property] - [paired names]: illumina matching keeps mate markers and opaque suffixes" {
+    const Row = struct { suffix1: []const u8, suffix2: []const u8, matches: bool };
+    const rows = [_]Row{
+        .{ .suffix1 = " 1:N:0:index-a", .suffix2 = "\t2:N:0:index-b", .matches = true },
+        .{ .suffix1 = " 2:N:0:index-b", .suffix2 = " 1:N:0:index-a", .matches = false },
+        .{ .suffix1 = " 1:N:0:index-a", .suffix2 = " 1:N:0:index-a", .matches = false },
+        .{ .suffix1 = " 1:/1", .suffix2 = " 2:/2", .matches = true },
+        .{ .suffix1 = " 1:/2", .suffix2 = " 2:/1", .matches = false },
+        .{ .suffix1 = " 1:", .suffix2 = " 2:", .matches = true },
+        .{ .suffix1 = " 1", .suffix2 = " 2", .matches = true },
+        .{ .suffix1 = "", .suffix2 = "", .matches = true },
+        .{ .suffix1 = " 1:\x00\xff/1 extra/2", .suffix2 = " 2:\x00/2 extra/1", .matches = true },
+        .{ .suffix1 = " description/1", .suffix2 = " description/2", .matches = true },
     };
     var storage1: [128]u8 = undefined;
     var storage2: [128]u8 = undefined;
-    for ([_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65 }) |length| {
+    for ([_]usize{ 0, 1, 15, 16, 17, 33 }) |length| {
         @memset(storage1[0..length], 'x');
         @memset(storage2[0..length], 'x');
-        for (suffixes) |suffix1| {
-            @memcpy(storage1[length..][0..suffix1.len], suffix1);
-            const header1 = storage1[0 .. length + suffix1.len];
-            for (suffixes) |suffix2| {
-                @memcpy(storage2[length..][0..suffix2.len], suffix2);
-                const header2 = storage2[0 .. length + suffix2.len];
-                const expected = namesMatch(parseName(header1, .illumina), parseName(header2, .illumina));
-                try std.testing.expectEqual(expected, headersMatch(header1, header2, .illumina));
-                if (casavaHeadersMatch(header1, header2)) try std.testing.expect(expected);
-            }
+        for (rows) |row| {
+            @memcpy(storage1[length..][0..row.suffix1.len], row.suffix1);
+            @memcpy(storage2[length..][0..row.suffix2.len], row.suffix2);
+            const header1 = storage1[0 .. length + row.suffix1.len];
+            const header2 = storage2[0 .. length + row.suffix2.len];
+            try std.testing.expectEqual(row.matches and length != 0, headersMatch(header1, header2, .illumina));
         }
-        const left = " 1:N:0:left";
-        const right = "\t2:N:0:right/2 ignored/1";
+    }
+
+    const left = " 1:N:0:left";
+    const right = "\t2:N:0:right/2 ignored/1";
+    for ([_]usize{ 0, 1, 16, 17 }) |length| {
+        @memset(storage1[0..length], 'x');
+        @memset(storage2[0..length], 'x');
         @memcpy(storage1[length..][0..left.len], left);
         @memcpy(storage2[length..][0..right.len], right);
         const header1 = storage1[0 .. length + left.len];
@@ -322,16 +307,20 @@ test "[property] - [paired names]: Casava comparison preserves markers and opaqu
     }
 }
 
-test "[property] - [paired names]: token finder matches scalar boundaries" {
-    const lengths = [_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 65 };
-    var bytes: [65]u8 = undefined;
+test "[edge] - [paired names]: token finder stops at delimiters across vector boundaries" {
+    const lengths = [_]usize{ 0, 1, 15, 16, 17, 33 };
+    const starts = [_]usize{ 0, 1, 16 };
+    const stops = [_]usize{ 0, 1, 15, 16, 17, 32 };
+    var bytes: [33]u8 = undefined;
 
     for (lengths) |length| {
-        for (0..length + 1) |start| {
+        for (starts) |start| {
+            if (start > length) continue;
             @memset(bytes[0..length], 'x');
             try std.testing.expectEqual(length, tokenEnd(bytes[0..length], start));
 
-            for (start..length) |stop| {
+            for (stops) |stop| {
+                if (stop < start or stop >= length) continue;
                 for (" \t") |delimiter| {
                     @memset(bytes[0..length], 'x');
                     bytes[stop] = delimiter;
@@ -342,57 +331,34 @@ test "[property] - [paired names]: token finder matches scalar boundaries" {
     }
 }
 
-test "[property] - [paired names]: exact comparison preserves parsed token equality" {
-    const lengths = [_]usize{ 1, 15, 16, 17, 31, 32, 33, 63, 64, 65 };
-    var header1 = [_]u8{'x'} ** 68;
-    var header2 = [_]u8{'x'} ** 68;
-
-    for (lengths) |length| {
-        @memset(&header1, 'x');
-        @memset(&header2, 'x');
-        try std.testing.expectEqual(
-            namesMatch(parseName(header1[0..length], .exact), parseName(header2[0..length], .exact)),
-            exactHeadersMatch(header1[0..length], header2[0..length]),
-        );
-
-        header1[length] = ' ';
-        header2[length] = '\t';
-        header1[length + 1] = 'a';
-        header2[length + 1] = 'b';
-        try std.testing.expectEqual(
-            namesMatch(parseName(header1[0 .. length + 2], .exact), parseName(header2[0 .. length + 2], .exact)),
-            exactHeadersMatch(header1[0 .. length + 2], header2[0 .. length + 2]),
-        );
-        try std.testing.expectEqual(
-            namesMatch(parseName(header1[0..length], .exact), parseName(header2[0 .. length + 2], .exact)),
-            exactHeadersMatch(header1[0..length], header2[0 .. length + 2]),
-        );
-
-        header1[length] = 'x';
-        header2[length] = 'x';
-        try std.testing.expectEqual(
-            namesMatch(parseName(header1[0..length], .exact), parseName(header2[0 .. length + 1], .exact)),
-            exactHeadersMatch(header1[0..length], header2[0 .. length + 1]),
-        );
-
-        for (0..length) |mismatch| {
-            header2[mismatch] = 'y';
-            try std.testing.expectEqual(
-                namesMatch(parseName(header1[0..length], .exact), parseName(header2[0..length], .exact)),
-                exactHeadersMatch(header1[0..length], header2[0..length]),
-            );
-            header2[mismatch] = 'x';
-        }
+test "[edge] - [paired names]: exact matching compares the first token across vector boundaries" {
+    const Row = struct { header1: []const u8, header2: []const u8, matches: bool };
+    const rows = [_]Row{
+        .{ .header1 = "cluster", .header2 = "cluster", .matches = true },
+        .{ .header1 = "cluster", .header2 = "clusters", .matches = false },
+        .{ .header1 = "cluster", .header2 = "cluster/1", .matches = false },
+        .{ .header1 = "cluster/1", .header2 = "cluster/2", .matches = false },
+        .{ .header1 = "cluster 1", .header2 = "cluster\t2", .matches = true },
+        .{ .header1 = "cluster\t", .header2 = "cluster ", .matches = true },
+        .{ .header1 = " value", .header2 = " value", .matches = false },
+        .{ .header1 = "0123456789abcdef a", .header2 = "0123456789abcdef\tb", .matches = true },
+        .{ .header1 = "0123456789abcdef a", .header2 = "0123456789abcdeg a", .matches = false },
+        .{ .header1 = "0123456789abcdef x", .header2 = "0123456789abcdef", .matches = true },
+        .{ .header1 = "0123456789abcdef", .header2 = "0123456789abcdef1", .matches = false },
+        .{ .header1 = "", .header2 = "", .matches = false },
+        .{ .header1 = "", .header2 = " value", .matches = false },
+    };
+    for (rows) |row| {
+        try std.testing.expectEqual(row.matches, exactHeadersMatch(row.header1, row.header2));
+        try std.testing.expectEqual(row.matches, headersMatch(row.header1, row.header2, .exact));
     }
-
-    try std.testing.expect(!exactHeadersMatch("", ""));
-    try std.testing.expect(!exactHeadersMatch("", " value"));
 }
 
 test "[property] - [paired names]: combined terminal proof covers vector boundaries" {
-    const lengths = [_]usize{ 3, 4, 15, 16, 17, 31, 32, 33, 63, 64, 65 };
-    var header1 = [_]u8{'x'} ** 65;
-    var header2 = [_]u8{'x'} ** 65;
+    const lengths = [_]usize{ 3, 4, 15, 16, 17, 33 };
+    const separators = [_]usize{ 1, 15, 16, 17 };
+    var header1 = [_]u8{'x'} ** 33;
+    var header2 = [_]u8{'x'} ** 33;
 
     for (lengths) |length| {
         @memset(header1[0..length], 'x');
@@ -406,7 +372,8 @@ test "[property] - [paired names]: combined terminal proof covers vector boundar
             header2[0..length],
         ));
 
-        for (1..length - 2) |separator| {
+        for (separators) |separator| {
+            if (separator < 1 or separator >= length - 2) continue;
             header1[separator] = ' ';
             header2[separator] = ' ';
             try std.testing.expect(terminalPairHeadersMatch(

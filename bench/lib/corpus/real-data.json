@@ -1,0 +1,99 @@
+{
+  "tiers": {"tiny": 1048576, "xsmall": 10485760, "small": 104857600, "medium": 1073741824, "large": 10737418240},
+  "sources": [
+    {
+      "id": "illumina-drr018447", "accession": "DRR018447", "platform": "illumina", "instrument": "MiSeq",
+      "organism": "Escherichia coli", "layout": "paired", "lengths": "fixed 151",
+      "tiers": ["tiny", "xsmall", "small"],
+      "files": [
+        {"name": "DRR018447_1.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/fastq/DRR018/DRR018447/DRR018447_1.fastq.gz", "bytes": 36560583, "md5": "9a9c20fbe648eb5845c117d62ceefa47"},
+        {"name": "DRR018447_2.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/fastq/DRR018/DRR018447/DRR018447_2.fastq.gz", "bytes": 36960845, "md5": "73056208eca2d366c4b40ce604f576e1"}
+      ]
+    },
+    {
+      "id": "illumina-drr018439", "accession": "DRR018439", "platform": "illumina", "instrument": "MiSeq",
+      "organism": "Escherichia coli", "layout": "paired", "lengths": "variable 35-151",
+      "tiers": ["tiny", "xsmall", "small"],
+      "files": [
+        {"name": "DRR018439_1.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/fastq/DRR018/DRR018439/DRR018439_1.fastq.gz", "bytes": 43639356, "md5": "3b567d4790eab1955d5623eb6c7e0cab"},
+        {"name": "DRR018439_2.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/fastq/DRR018/DRR018439/DRR018439_2.fastq.gz", "bytes": 50041258, "md5": "6ac2808ee484924374319ec6f18075cb"}
+      ]
+    },
+    {
+      "id": "pacbio-err10472470", "accession": "ERR10472470", "platform": "pacbio", "instrument": "Sequel II CCS",
+      "organism": "Klebsiella oxytoca", "layout": "single", "lengths": "variable 403-31646",
+      "tiers": ["tiny", "xsmall", "small"],
+      "files": [
+        {"name": "ERR10472470.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR104/070/ERR10472470/ERR10472470.fastq.gz", "bytes": 63397201, "md5": "9003787785983a3b01d98be5d2c7055f"}
+      ]
+    },
+    {
+      "id": "ont-err10496769", "accession": "ERR10496769", "platform": "ont", "instrument": "GridION",
+      "organism": "Escherichia coli", "layout": "single", "lengths": "variable 110-92287",
+      "tiers": ["tiny", "xsmall", "small"],
+      "files": [
+        {"name": "run96barcode23.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/run/ERR104/ERR10496769/run96barcode23.fastq.gz", "bytes": 79503223, "md5": "4b1c62947be8f860bb140d95c93169d7"}
+      ]
+    },
+    {
+      "id": "illumina-drr1001190", "accession": "DRR1001190", "platform": "illumina", "instrument": "NovaSeq 6000",
+      "organism": "feces metagenome", "layout": "paired", "lengths": "fixed 150",
+      "tiers": ["tiny", "xsmall", "small", "medium", "large"],
+      "files": [
+        {"name": "DRR1001190_1.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/fastq/DRR100/000/DRR1001190/DRR1001190_1.fastq.gz", "bytes": 1257789764, "md5": "4f5d1956da4ce4aa9d040c7852d8c4b1"},
+        {"name": "DRR1001190_2.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/fastq/DRR100/000/DRR1001190/DRR1001190_2.fastq.gz", "bytes": 1260767295, "md5": "fee6e04bde7e36be0d69620a10d51473"}
+      ]
+    },
+    {
+      "id": "ont-err14758576", "accession": "ERR14758576", "platform": "ont", "instrument": "PromethION",
+      "organism": "Homo sapiens", "layout": "single", "lengths": "variable 30000-291910",
+      "tiers": ["tiny", "xsmall", "small", "medium", "large"],
+      "files": [
+        {"name": "D_1_PGXXXX240596.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/run/ERR147/ERR14758576/D_1_PGXXXX240596.fastq.gz", "bytes": 4436048387, "md5": "80e15674a75d06663967597118e7d6aa"}
+      ]
+    },
+    {
+      "id": "pacbio-srr29396856", "accession": "SRR29396856", "platform": "pacbio", "instrument": "Revio HiFi",
+      "organism": "Homo sapiens", "layout": "single", "lengths": "variable, about 16 kb", "qualities": "binned",
+      "tiers": ["tiny", "xsmall", "small", "medium", "large"],
+      "files": [
+        {"name": "SRR29396856_subreads.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR293/056/SRR29396856/SRR29396856_subreads.fastq.gz", "bytes": 3000000000, "md5": "f559d6c01cc5ab106736bbc03ed86cac", "prefix_of": 5705359764}
+      ]
+    },
+    {
+      "id": "illumina-drr147610", "accession": "DRR147610", "platform": "illumina", "instrument": "HiSeq 3000 miRNA-Seq",
+      "organism": "Coturnix japonica", "layout": "single", "lengths": "fixed 36",
+      "tiers": ["tiny", "xsmall", "small", "medium", "large"],
+      "files": [
+        {"name": "DRR147610.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/fastq/DRR147/DRR147610/DRR147610.fastq.gz", "bytes": 1350000000, "md5": "d501cbd9d4cfc23c47560a946f0d4017", "prefix_of": 2538586792}
+      ]
+    },
+    {
+      "id": "illumina-srr19571648", "accession": "SRR19571648", "platform": "illumina", "instrument": "NovaSeq 6000 single-cell",
+      "organism": "Mus musculus", "layout": "paired", "lengths": "R1 28, R2 150", "mate_suffixes": "/3 /4",
+      "tiers": ["tiny", "xsmall", "small", "medium", "large"],
+      "files": [
+        {"name": "SRR19571648_1.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR195/048/SRR19571648/SRR19571648_1.fastq.gz", "bytes": 620606124, "md5": "c24d2e5fa9b6ed574371248218a9dc43"},
+        {"name": "SRR19571648_2.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR195/048/SRR19571648/SRR19571648_2.fastq.gz", "bytes": 2085135083, "md5": "e46ea7985032b88a68ec00181f460968"}
+      ]
+    },
+    {
+      "id": "mgi-err10448913", "accession": "ERR10448913", "platform": "mgi", "instrument": "BGISEQ-500",
+      "organism": "Mus musculus", "layout": "paired", "lengths": "fixed 100", "headers": "native MGI",
+      "tiers": ["tiny", "xsmall", "small", "medium"],
+      "files": [
+        {"name": "DP8400009880BL_L01_568_1.fq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/run/ERR104/ERR10448913/DP8400009880BL_L01_568_1.fq.gz", "bytes": 250000000, "md5": "9e578e3686d94760dfb2e47b405fc4bb", "prefix_of": 2380621508},
+        {"name": "DP8400009880BL_L01_568_2.fq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/run/ERR104/ERR10448913/DP8400009880BL_L01_568_2.fq.gz", "bytes": 250000000, "md5": "0421f490be78e7719552284a8c0aca59", "prefix_of": 2391382922}
+      ]
+    },
+    {
+      "id": "illumina-err4686103", "accession": "ERR4686103", "platform": "illumina", "instrument": "NovaSeq 6000",
+      "organism": "Homo sapiens", "layout": "paired", "lengths": "variable", "headers": "native Casava 1.8",
+      "tiers": ["tiny", "xsmall", "small", "medium"],
+      "files": [
+        {"name": "NG-25029_scSQ_2572_lib394322_6763_S2_L002_R1_001.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/run/ERR468/ERR4686103/NG-25029_scSQ_2572_lib394322_6763_S2_L002_R1_001.fastq.gz", "bytes": 120000000, "md5": "47eac80bfd62de1f96221aefddc3b16f", "prefix_of": 2264047460},
+        {"name": "NG-25029_scSQ_2572_lib394322_6763_S2_L002_R2_001.fastq.gz", "url": "https://ftp.sra.ebi.ac.uk/vol1/run/ERR468/ERR4686103/NG-25029_scSQ_2572_lib394322_6763_S2_L002_R2_001.fastq.gz", "bytes": 120000000, "md5": "75cf9dcf80d5ce66f17d578e0aaeb001", "prefix_of": 2240086369}
+      ]
+    }
+  ]
+}
