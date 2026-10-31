@@ -22,7 +22,7 @@ The build needs nothing beyond Zig itself: no C compiler, no NASM, and no system
 
 - Linux on x86-64 or aarch64.
 - [Zig](https://ziglang.org/download/) 0.16.0.
-- Network access for the first build, which downloads z-fastq's one package dependency, [zipir](https://github.com/eneskemalergin/zipir) 0.2.1. Later builds reuse it.
+- Network access for the first build, which downloads z-fastq's one package dependency, [zipir](https://github.com/eneskemalergin/zipir) 0.3.0. Later builds reuse it.
 
 From the repository root:
 

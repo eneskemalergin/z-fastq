@@ -4,6 +4,12 @@
 
 All notable changes to z-fastq will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **Speed.** gzip input decodes through Zipir 0.3.0, whose rebuilt DEFLATE decoder takes 10 to 13% less time for `count`, `stats`, and `check` on gzip input, and about 2% less for `process` with gzip input and output. Output bytes, JSON documents, exit statuses, and peak memory are unchanged.
+
 ## [0.2.0]
 
 A `process` command that validates, trims, and filters paired reads into two plain or gzip outputs with a JSON report, faster record handling in every command, AVX2 kernels selected at run time on CPUs that have them, bounded memory for `stats` and paired sampling on long reads, and stricter handling of standard input and output. Output bytes, JSON documents, and exit classes are unchanged except where a fix below says so.

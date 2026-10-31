@@ -11,7 +11,7 @@ z-fastq follows these tools' rules and file formats for the parts listed. It doe
 - **[FastQC-Rust](https://github.com/ewels/FastQC-Rust) 1.1.0**: the QC tables are checked byte for byte against its output.
 - **[MultiQC](https://github.com/MultiQC/MultiQC) 1.33** [4]: reads the QC tables with its FastQC module and the QC summary with its fastp module.
 
-z-fastq itself is built with [Zig](https://ziglang.org) 0.16.0 and [zipir](https://github.com/eneskemalergin/zipir) 0.2.1 for gzip.
+z-fastq itself is built with [Zig](https://ziglang.org) 0.16.0 and [zipir](https://github.com/eneskemalergin/zipir) 0.3.0 for gzip.
 
 ## Tools z-fastq is compared with
 
