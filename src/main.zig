@@ -4574,7 +4574,7 @@ const QcTables = struct {
 };
 
 fn loadContaminants(io: std.Io, allocator: std.mem.Allocator, path: []const u8, list: *?qc.ContaminantList) ?u8 {
-    const text = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(qc.CONTAMINANT_FILE_LIMIT)) catch |err| {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(qc.CONTAMINANT_FILE_LIMIT + 1)) catch |err| {
         const failure: CommandFailure = switch (err) {
             error.OutOfMemory => OUT_OF_MEMORY,
             error.StreamTooLong => CommandFailure.plain("file_limit", "contaminant list exceeds 1 MiB", 4),
