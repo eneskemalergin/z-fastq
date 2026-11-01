@@ -452,6 +452,41 @@ test "[cli] - [process]: a failed run removes the QC table folders it created an
     try tmp.dir.deleteDir(std.testing.io, "kept");
 }
 
+test "[cli] - [process]: pair names, the alphabet, and the line limit apply as in check" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const p = try Paths.init(allocator, &tmp);
+    const r1 = "@p1/1\nACGR\n+\nIIII\n";
+    const r2 = "@p1/2\nACGT\n+\nIIII\n";
+    try writeInputs(&tmp, r1, r2);
+    const mismatch = try std.fmt.allocPrint(allocator,
+        \\error: {0s} + {1s}: P001: paired identifiers or mate markers do not match (pair 0)
+        \\  R1: input={0s}, record=0, offset=0, first_token=p1/1 [length=4, truncated=false], normalized_id=p1/1 [length=4, truncated=false], mate_markers=none
+        \\  R2: input={1s}, record=0, offset=0, first_token=p1/2 [length=4, truncated=false], normalized_id=p1/2 [length=4, truncated=false], mate_markers=none
+        \\
+    , .{ p.r1, p.r2 });
+
+    const Case = struct { options: []const []const u8, exit_code: u8, stderr: []const u8 };
+    const cases = [_]Case{
+        .{ .options = &.{ "--pair-names", "exact" }, .exit_code = 1, .stderr = mismatch },
+        .{ .options = &.{ "--alphabet", "acgtn" }, .exit_code = 1, .stderr = try std.fmt.allocPrint(allocator, "error: {s}: S002: sequence byte is outside the selected alphabet (record 0, line 2, offset 9)\n", .{p.r1}) },
+        .{ .options = &.{ "--max-line-bytes", "4" }, .exit_code = 4, .stderr = try std.fmt.allocPrint(allocator, "error: {s}: line length limit exceeded\n", .{p.r1}) },
+        .{ .options = &.{ "--max-line-bytes", "5" }, .exit_code = 0, .stderr = "" },
+    };
+    for (cases, 0..) |case, index| {
+        errdefer std.debug.print("case {d}\n", .{index});
+        const out1 = try std.fmt.allocPrint(allocator, "{s}.{d}", .{ p.out1, index });
+        const out2 = try std.fmt.allocPrint(allocator, "{s}.{d}", .{ p.out2, index });
+        const args = try std.mem.concat(allocator, []const u8, &.{ &.{"process"}, case.options, &.{ "--out1", out1, "--out2", out2, p.r1, p.r2 } });
+        try cli.expectResult(try cli.run(allocator, args), case.exit_code, "", case.stderr);
+        try std.testing.expectEqualStrings(if (case.exit_code == 0) r1 else "", try readPath(allocator, out1));
+        try std.testing.expectEqualStrings(if (case.exit_code == 0) r2 else "", try readPath(allocator, out2));
+    }
+}
+
 test "[cli] - [process]: a failing pair keeps the earlier pairs and the report names the failure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
