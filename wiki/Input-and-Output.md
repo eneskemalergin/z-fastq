@@ -4,7 +4,7 @@
 
 Every command reads plain FASTQ and gzip through the same path. z-fastq looks at the first two bytes to decide: a file called `reads.fastq` that holds gzip is read as gzip, and `reads.gz` that holds plain text is read as text.
 
-Once the first bytes say gzip, the whole stream must be valid gzip; a damaged stream is an error and is never retried as text. Concatenated gzip members are read in order, and each one's CRC-32 and length are checked. Those checks sit at the end of a member, so a command may already have written records from a member before it finds the member damaged ([Automation](Automation#partial-output)).
+Once the first bytes say gzip, the whole stream must be valid gzip; a damaged stream is an error and is never retried as text. Concatenated gzip members are read in order, and each one's CRC-32 and length are checked. Those checks sit at the end of a member, so a command may already have written records from a member before it finds the member damaged ([Automation](Automation#partial-output)). Damage inside the compressed data can also turn the decoded text into a malformed record first, so a damaged member can fail with a record code and status `1` instead of a gzip error and status `3`.
 
 ## Standard input
 
@@ -18,7 +18,7 @@ A command reads standard input at most once. A pipe can be read only once, so ot
 
 ## Writing
 
-Results, JSON, and FASTQ go to standard output; messages go to standard error. FASTQ is always written as four lines per record with LF endings.
+Results, JSON, and FASTQ go to standard output; messages go to standard error. FASTQ is always written as four lines per record with LF endings. A field that ends in a carriage return of its own, beyond the CR of a CRLF ending, cannot be written that way and read back the same, so a command fails with status `1` when it would write such a record; `check`, which writes no FASTQ, accepts it, and `sample` fails only when it selects one.
 
 | Command                                       | Reads              | Writes                       |
 | --------------------------------------------- | ------------------ | ---------------------------- |
@@ -28,6 +28,8 @@ Results, JSON, and FASTQ go to standard output; messages go to standard error. F
 | `interleave`                                  | two inputs         | standard output              |
 | `deinterleave`                                | one input          | two new files                |
 | `process`                                     | two inputs         | two new files, plain or gzip |
+
+- `check` writes to standard output only with `--json`; otherwise it prints nothing on success.
 
 Only `process --gzip` writes gzip; for the other commands, pipe the output to `gzip`. New output files are never overwritten: an existing path fails before anything is written.
 

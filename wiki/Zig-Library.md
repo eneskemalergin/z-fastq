@@ -35,7 +35,7 @@ It is registered from `src/root.zig` and targets Zig 0.16.0 on Linux, x86-64 or 
 | `LintCode`, `codeTag`, `Alphabet`, `ValidationOptions`                | validation rules and codes           |
 | `SemanticField`, `SemanticError`, `validateRecord`                    | checking one record                  |
 | `Stats`, `StatsResult`, `StatsError`, `QualityError`, `decodePhred33` | statistics                           |
-| `io.ByteSource`, `io.ByteSink`, and adapters                          | plain, file, writer, and gzip I/O    |
+| `io.ByteSource`, `io.ByteSink`, and adapters                          | plain, file, writer I/O; gzip input  |
 | `count_scan`                                                          | counting records without allocating  |
 | `limits`, `VERSION`                                                   | default sizes and the version string |
 
@@ -51,7 +51,7 @@ var owned = try zfastq.toOwned(allocator, record);
 defer owned.deinit();
 ```
 
-A record's `id` is the first space- or tab-separated word of its `header`, in the same bytes.
+A record's `id` is the first space- or tab-separated word of its `header`; in a record from `Reader`, it is a slice of the header's bytes.
 
 ## Writing
 
@@ -69,7 +69,7 @@ The caller opens and closes files; the adapters only borrow them. `ByteSource` a
 
 - A read fills part of the destination and returns its length; zero for a nonempty destination means the end.
 - A write consumes the whole slice; a sink without a flush callback treats `flush` as a no-op.
-- `FileSink` writes whole pages and keeps a partial last page until the next write or `flush`.
+- With a buffer of at least one page, `FileSink` writes whole pages and keeps a partial last page until the next write or `flush`; with a smaller buffer, it writes everything it holds.
 
 After an error, read the diagnostic with `takeLastError` and stop: do not call `next`, `feed`, or `finishEof` again, because the position may reflect a half-read record.
 

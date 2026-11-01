@@ -15,6 +15,8 @@ This page is for scripts and workflow engines. The one rule to remember: **trust
 
 `count`, `stats`, and `check` on several independent inputs carry on past a failed input and exit with the highest status seen. Pair commands and `process` stop at the first failure.
 
+z-fastq does not catch SIGINT or SIGTERM: the signal ends it, and the shell reports `130` or `143`. A program that waits for z-fastq directly sees the signal, not an exit status.
+
 ## Data and messages
 
 Data goes to standard output and messages to standard error, so capture them separately:
@@ -30,7 +32,7 @@ An invalid command line (status `2`) is reported on standard error before anythi
 
 ## Partial output
 
-Commands that write FASTQ stream it: records go out as they are read. A failure later in the input, such as a malformed record or a damaged gzip member, leaves the earlier records written. An interrupted run leaves its output in place too, and `deinterleave` keeps both files.
+Commands that write FASTQ stream it: records go out as they are read. A failure later in the input, such as a malformed record or a damaged gzip member, leaves the earlier records written; the two files of `deinterleave` then end with the same complete pairs. A failed write, such as a full disk, can leave an output ending inside a record, and the two files of `deinterleave` with different numbers of records. An interrupted run leaves its output in place too, and `deinterleave` keeps both files.
 
 Write to a temporary path and move it into place only after a zero status:
 

@@ -91,7 +91,7 @@ I would like to support more than Linux. For now z-fastq is built and tested on 
 
 One core is a choice, not a limit I am waiting to lift. It keeps every run's cost known before it starts, so a pipeline can run one sample per core side by side. The price is one large file on an otherwise idle machine: a tool that spreads it over many cores can finish sooner, and z-fastq does not split a file across cores yet.
 
-gzip output uses a fast preset by default, which writes files about 15% larger than fastp's at its default level. `--gzip-preset even` or `dense` makes them smaller, more slowly.
+gzip output uses a fast preset by default, which writes files about 16% larger than fastp's at its default level. `--gzip-preset even` or `dense` makes them smaller, more slowly.
 
 z-fastq writes data, not pages: its QC comes out as FastQC-style tables and a JSON summary for MultiQC to render, with no HTML report of its own.
 

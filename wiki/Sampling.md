@@ -68,7 +68,7 @@ Because the file is read twice, it must not change in between. z-fastq compares 
 
 ## Output
 
-The output is plain FASTQ; pipe it to `gzip` for compression. Records are written as they are chosen, so a malformed record late in the input fails the run after earlier records were written. Write to a temporary file and keep it only on success ([Automation](Automation#partial-output)).
+The output is plain FASTQ; pipe it to `gzip` for compression. With `--fraction`, records are written as they are chosen, so a malformed record late in the input fails the run after earlier records were written. With `--count`, the first pass reads the whole input, so a malformed record fails the run before anything is written. Write to a temporary file and keep it only on success ([Automation](Automation#partial-output)).
 
 ## Related pages
 

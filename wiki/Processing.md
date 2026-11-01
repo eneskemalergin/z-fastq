@@ -74,11 +74,11 @@ The trims run in this order on every pair, after the UMI, each only when its opt
 </p>
 <p align="center"><sub><b>Figure 2.</b> Quality-tail trimming with a 4-base window and Q = 20. Windows are tried from the 3' end; the first whose mean reaches Q is marked, and the read keeps everything up to that window's first base.</sub></p>
 
-W is 1 to 1000 and Q is 1 to 30, given together. A read no longer than W is emptied, and a read with no passing window keeps one base. When either mate ends up empty, the pair is not trimmed further and is dropped.
+W is 1 to 1000 and Q is 1 to 30, given together. A read no longer than W is emptied, and a read with no passing window keeps one base, even when its first W bases are high quality, because the window at the 5' end is never tested. When either mate ends up empty, the pair is not trimmed further and is dropped.
 
 ### Poly-G
 
-`--trim-poly-g N` removes the run of `G` that two-colour instruments write when the signal ends; N is at least 1. Bases are scanned from the 3' end; the scan stops after more than 5 other bases, or, from the Nth base on, when other bases exceed one in eight. If at least N bases were scanned, the read is cut before the leftmost `G` seen. A shorter run can still go when the scan carries past it: with N = 10, a read ending in nine `G` loses them.
+`--trim-poly-g N` removes the run of `G` that two-colour instruments write when the signal ends; N is at least 1. Bases are scanned from the 3' end; the scan stops after more than 5 other bases, or, from the Nth base on, when other bases exceed one in eight. If at least N bases come before the base that stopped the scan, or the scan reaches the 5' end of a read of N bases or more, the read is cut before the leftmost `G` seen. A shorter run can still go when the scan carries past it: with N = 10, a read ending in nine `G` loses them.
 
 ### Adapters
 
@@ -96,7 +96,7 @@ W is 1 to 1000 and Q is 1 to 30, given together. A read no longer than W is empt
 1. **By overlap.** Mate 1 is compared with the reverse complement of mate 2 at each offset in turn. The first offset where the overlap has at most 5 mismatches in its first 50 positions, and no more than one per 5 bases, wins; more than 30 bases must overlap. When mate 2 then starts before mate 1, the insert is shorter than the reads, and both mates are cut to the overlap.
 2. **By sequence.** Otherwise each mate is searched for its own adapter: a full copy, or at least 5 bases of its start at the read's 3' end, with one mismatch per 8 bases. For an adapter of 16 bases or more the search begins 4 bases before the read (3 for 12 to 15 bases, 2 for 8 to 11), so a read that starts with the tail of an adapter is emptied. If nothing is found, a copy with one inserted or deleted base is tried. Like fastp, this last test compares the adapter with the start of the read, so it can also cut near the 3' end where no adapter is present.
 
-Adapters are 4 to 128 uppercase bases of `A`, `C`, `G`, and `T`. Comparisons are exact bytes: a lowercase base never matches.
+Adapters are 4 to 128 uppercase bases of `A`, `C`, `G`, and `T`. The adapter search compares exact bytes, so a lowercase base never matches an adapter. The overlap search complements mate 2 into uppercase, as fastp does, so there only mate 1's lowercase bases fail to match.
 
 ## Filtering
 
@@ -147,7 +147,7 @@ fastp    --umi --umi_loc per_read --umi_len 8 --umi_skip 4
 
 ## When a run fails
 
-A failure stops the run and exits with a nonzero status: `1` for invalid input, `2` for a usage error, `3` for I/O or memory, `4` for a limit. Pairs written before the failure stay in the outputs. The report is still written, with `"status": "error"` and the reason, unless the report itself cannot be written, in which case it is removed; the [MultiQC-compatible files](Quality-Control#multiqc-compatible-outputs) are written only when the run succeeds.
+A failure stops the run and exits with a nonzero status: `1` for invalid input, `2` for a usage error, `3` for I/O or memory, `4` for a limit. Pairs written before the failure stay in the outputs: after an input failure both files end with the same complete pairs, but after a failed write to an output, such as a full disk, the files can end inside a record and hold different numbers of pairs. The report is still written, with `"status": "error"` and the reason, unless the report itself cannot be written, in which case it is removed; the [MultiQC-compatible files](Quality-Control#multiqc-compatible-outputs) are written only when the run succeeds.
 
 Treat a run as complete only when it exits with `0`.
 

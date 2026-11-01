@@ -39,7 +39,8 @@ z-fastq check --interleaved interleaved.fastq.gz
 Writes a reproducible subset to standard output, by fraction or by exact count. Exact counts need regular files. See [Sampling](Sampling).
 
 ```bash
-z-fastq sample (--fraction P | --count K) [--seed S] <path|->
+z-fastq sample --fraction P [--seed S] <path|->
+z-fastq sample --count K [--seed S] path
 z-fastq sample --paired --count 100000 --seed 7 R1.fastq.gz R2.fastq.gz > sample.fastq
 ```
 

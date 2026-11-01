@@ -32,7 +32,7 @@ The default, `--alphabet iupac`, accepts the IUPAC nucleotide letters in either 
 
 ## When a record fails
 
-`check` reports the first failure with a code, the record number and the byte offset in the decompressed stream (both counted from 0), and the line within the record (counted from 1).
+`check` reports the first failure with a code, the record number and the byte offset in the decompressed stream (both counted from 0), and the line within the record (counted from 1). A line over the `--max-line-bytes` limit is reported with the file name only.
 
 | Code   | Problem                                              |
 | ------ | ---------------------------------------------------- |

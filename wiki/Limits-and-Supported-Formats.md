@@ -42,13 +42,13 @@ What a command keeps decides its memory, and the line limit bounds it.
 | `sample --count K`                      | about 4 bytes per chosen record                             |
 | `process`                               | the same, plus the QC tables below when QC is requested     |
 
-With 15 MiB lines, `count`, `check`, and `stats` peak near 5 MiB, `check --paired` near 37 MiB, `sample` near 50 MiB, and `interleave` near 100 MiB, so raise `--max-line-bytes` only as far as the data needs.
+With 15 MiB lines, `count`, `check`, and `stats` stay under 1 MiB. `check --paired` peaks near 31 MiB when the headers are that long, and near 1 MiB when only sequence and quality are; `sample` near 46 MiB, and `interleave` and `deinterleave` near 91 MiB, when header, sequence, and quality are all 15 MiB (61 MiB for `interleave` with short headers). Raise `--max-line-bytes` only as far as the data needs.
 
 When `process` measures QC, per mate and per population (raw and retained) it keeps up to 800 KiB of quality tables, 48 KiB of adapter counters, up to 5 MB for the 100,000 sequence keys behind duplication, and 8 bytes per tile and cycle for per-tile quality: about 0.7 MB for 600 tiles of 151-base reads, at most 21 MB. `--pair-duplication` adds about 10 bytes per pair, at most 1 GiB. Trimming itself uses under 16 KiB at any read length.
 
 ## gzip
 
-- A gzip header field (file name, comment, or extra field) may be at most 64 KiB.
+- The optional fields of a gzip header (file name, comment, and extra field) may hold at most 64 KiB together, counting the extra field's two length bytes and the zero byte that ends a name or comment.
 - Bytes after the last gzip member are an error, even zero padding that `gzip -dc` accepts.
 
 ## Related pages

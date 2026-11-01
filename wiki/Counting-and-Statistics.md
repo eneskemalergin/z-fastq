@@ -8,7 +8,7 @@ Two commands answer the first question asked of any FASTQ file: what is in it? `
 z-fastq count lane1.fastq.gz lane2.fastq.gz
 ```
 
-It prints one number per input, in the order given. `count` checks that every record is well formed: four lines, the `@` and `+`, and a quality line as long as the sequence. It does not check the letters or the quality bytes; [`check`](Validation) does.
+It prints one number per input, in the order given; an input that fails prints no number, so check the exit status before pairing numbers with inputs. `count` checks that every record is well formed: four lines, the `@` and `+`, and a quality line as long as the sequence. It does not check the letters or the quality bytes; [`check`](Validation) does.
 
 <p align="center">
   <picture>
@@ -27,9 +27,9 @@ z-fastq stats reads.fastq.gz
 
 Each result starts with an `input` line naming the file, followed by these fields.
 
-**Reads and bases.** `reads` counts records and `bases` counts sequence letters. `min_length`, `max_length`, and `mean_length` describe read lengths. An empty record still counts as a read, so the two can tell different stories.
+**Reads and bases.** `reads` counts records and `bases` counts sequence bytes. `min_length`, `max_length`, and `mean_length` describe read lengths. An empty record still counts as a read, so the two can tell different stories.
 
-**Composition.** `a`, `c`, `g`, `t`, and `n` count each base, upper or lower case, and `other_bases` counts any other letter. GC is measured only among the four definite bases, because z-fastq does not guess what an ambiguous base would have been:
+**Composition.** `a`, `c`, `g`, `t`, and `n` count each base, upper or lower case, and `other_bases` counts any other byte. `stats` checks the record structure and the quality bytes but not the sequence alphabet, so a `-` or a digit counts here; [`check`](Validation) rejects them. GC is measured only among the four definite bases, because z-fastq does not guess what an ambiguous base would have been:
 
 ```math
 \text{gc\_fraction} = \frac{g + c}{a + c + g + t}

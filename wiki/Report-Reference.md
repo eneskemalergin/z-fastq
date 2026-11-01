@@ -10,7 +10,7 @@ Both documents begin with the same three fields:
 - `tool` gives the `name` and `version` of the z-fastq build that wrote it.
 - `byte_strings` names how paths and the command line are written, `escaped-bytes-v1`: a byte outside printable ASCII becomes `\xHH` and a backslash becomes `\\`, before the usual JSON escaping, so any file name survives the trip.
 
-A value that cannot be computed, such as a mean over zero reads, is `null`. Version 0.1.0 froze the `stats` and `check` documents ([Automation](Automation#json)); these two are new in 0.2.0.
+A value that cannot be computed, such as a mean over zero reads, is `null`, except `pair_duplication.rate` and the QC summary's rates and means, which are `0` then. Version 0.1.0 froze the `stats` and `check` documents ([Automation](Automation#json)); these two are new in 0.2.0.
 
 ## Report
 
@@ -101,7 +101,7 @@ Lists and objects are cut to their first entries; a real report holds both mates
 
 - **`umi`**, with the UMI options only: `ambiguous_pairs`, the pairs read whose UMI holds a base other than `A`, `C`, `G`, or `T` in either case, and `short_pairs`, the pairs in which a UMI mate had no base left after the UMI and spacer. Short pairs are dropped and counted as `too_short` under `filtering` too.
 - **`trimming`**: one object per mate, with one entry per step: `quality_tail`, `poly_g`, `overlap`, and `adapter`. Each gives the `reads` that step shortened and the `bases` it removed, or `null` when the step is off. Pairs dropped later are counted too.
-- **`filtering`**: `dropped_pairs`, counted by the pair's reason, and `failed_reads`, one object per mate counted by each read's own reason; a passing mate of a dropped pair is not counted there. Both use `too_many_n`, `too_short`, `low_quality`, and `adapter_dimer`. `null` without a UMI, trim, or filter option.
+- **`filtering`**: `dropped_pairs`, counted by the pair's reason, and `failed_reads`, one object per mate counted by each read's own reason; a passing mate of a dropped pair is not counted there, except for an adapter dimer, which is a property of the pair and counts on both mates. Both use `too_many_n`, `too_short`, `low_quality`, and `adapter_dimer`. `null` without a UMI, trim, or filter option.
 - **`inserts`**, with adapters only: `pairs` that reached the overlap step, `overlapping` pairs with an overlap found, `unknown` for no overlap or an insert of 512 or more, the most frequent size `peak` (the lowest on a tie, 0 when none), the `median` known size, and a `histogram` of 512 counts for sizes 0 to 511.
 - **`pair_duplication`**, with `--pair-duplication` only: the `pairs` read, the `duplicates` among them, and their ratio, `rate`.
 

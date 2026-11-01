@@ -41,7 +41,7 @@ zig build test -Dstatic=true -Doptimize=ReleaseFast --summary all
 
 - The runs share `zig-out/bin/z-fastq`, so run them in sequence; parallel runs need separate checkouts.
 - The tests use small tracked files only, no downloads or other tools. They need `pidfd_open`, `/proc`, FIFOs, and hard and symbolic links.
-- No test is expected to skip; investigate any skip.
+- On x86-64 no test is expected to skip; on aarch64 the x86-64 CPU-detection test skips. Investigate any other skip.
 - Debug builds target the host CPU; the release runs target generic x86-64 and are the ones that test the run-time AVX2 kernels against their scalar versions. A timing is never proof of correct output.
 
 ## Continuous integration
