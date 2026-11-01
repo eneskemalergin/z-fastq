@@ -4471,6 +4471,11 @@ const QC_TABLE_FILE = "fastqc_data.txt";
 const QC_TABLE_SUFFIXES = [_][]const u8{ ".gz", ".bz2", ".txt", ".fastq", ".fq", ".csfastq", ".sam", ".bam", ".ubam" };
 const QC_TABLE_VERSION = "z-fastq " ++ zfastq.VERSION;
 
+fn pathExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
 const QcTable = struct {
     retained: bool,
     mate: u1,
@@ -4479,6 +4484,7 @@ const QcTable = struct {
     file: ?std.Io.File = null,
     written: bool = false,
     unavailable: ?[]const u8 = null,
+    created_folder: bool = false,
 
     fn remove(self: *QcTable, io: std.Io) void {
         self.written = false;
@@ -4492,6 +4498,8 @@ const QcTable = struct {
 const QcTables = struct {
     files: [4]QcTable = undefined,
     count: usize = 0,
+    dir: []const u8 = "",
+    outermost_created: ?usize = null,
 
     fn deinit(self: *QcTables, io: std.Io, allocator: std.mem.Allocator) void {
         for (self.files[0..self.count]) |*entry| {
@@ -4509,6 +4517,7 @@ const QcTables = struct {
         outputs: [2][]const u8,
         changes_reads: bool,
     ) ?u8 {
+        self.dir = dir;
         const sources = [4][]const u8{ inputs[0], inputs[1], outputs[0], outputs[1] };
         for (sources[0..if (changes_reads) 4 else 2], 0..) |source, index| {
             const filename = if (namesStdin(source)) "stdin" else std.fs.path.basename(source);
@@ -4536,8 +4545,16 @@ const QcTables = struct {
     }
 
     fn create(self: *QcTables, io: std.Io) ?u8 {
+        self.outermost_created = null;
+        var ancestor: ?[]const u8 = self.dir;
+        while (ancestor) |path| : (ancestor = std.fs.path.dirname(path)) {
+            if (pathExists(io, path)) break;
+            self.outermost_created = path.len;
+        }
         for (self.files[0..self.count]) |*entry| {
-            std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(entry.path).?) catch {
+            const folder = std.fs.path.dirname(entry.path).?;
+            entry.created_folder = !pathExists(io, folder);
+            std.Io.Dir.cwd().createDirPath(io, folder) catch {
                 printPathError(io, entry.path, "failed to create directory");
                 return self.abandon(io, 3);
             };
@@ -4556,6 +4573,21 @@ const QcTables = struct {
 
     fn abandon(self: *QcTables, io: std.Io, exit_code: u8) u8 {
         for (self.files[0..self.count]) |*entry| entry.remove(io);
+        var index = self.count;
+        while (index > 0) {
+            index -= 1;
+            const entry = &self.files[index];
+            if (entry.created_folder) std.Io.Dir.cwd().deleteDir(io, std.fs.path.dirname(entry.path).?) catch {};
+            entry.created_folder = false;
+        }
+        if (self.outermost_created) |outermost| {
+            var ancestor: ?[]const u8 = self.dir;
+            while (ancestor) |path| : (ancestor = std.fs.path.dirname(path)) {
+                if (path.len < outermost) break;
+                std.Io.Dir.cwd().deleteDir(io, path) catch break;
+            }
+        }
+        self.outermost_created = null;
         return exit_code;
     }
 

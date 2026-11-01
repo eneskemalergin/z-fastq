@@ -430,6 +430,28 @@ test "[cli] - [process]: an existing output fails and removes the outputs this r
     }
 }
 
+test "[cli] - [process]: a failed run removes the QC table folders it created and keeps an existing one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const p = try Paths.init(allocator, &tmp);
+    try writeInputs(&tmp, "@p1/1\nACGT\n+\nIIII\n", "@p1/2\nACGT\n+\nIII\n");
+    try tmp.dir.createDirPath(std.testing.io, "kept");
+    const stderr = try std.fmt.allocPrint(allocator, "error: {s}: S005: sequence and quality lengths differ (record 0, line 4, offset 13)\n", .{p.r2});
+
+    for ([_][]const u8{ "new/sub", "kept" }, 0..) |name, index| {
+        const tables = try cli.tempPath(allocator, &tmp.sub_path, name);
+        const out1 = try std.fmt.allocPrint(allocator, "{s}.{d}", .{ p.out1, index });
+        const out2 = try std.fmt.allocPrint(allocator, "{s}.{d}", .{ p.out2, index });
+        const result = try cli.run(allocator, &.{ "process", "--min-length", "1", "--qc-tables", tables, "--out1", out1, "--out2", out2, p.r1, p.r2 });
+        try cli.expectResult(result, 1, "", stderr);
+    }
+    try std.testing.expect(!pathExists(try cli.tempPath(allocator, &tmp.sub_path, "new")));
+    try tmp.dir.deleteDir(std.testing.io, "kept");
+}
+
 test "[cli] - [process]: a failing pair keeps the earlier pairs and the report names the failure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
