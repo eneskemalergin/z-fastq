@@ -1043,12 +1043,11 @@ test "[edge] - [process]: a contaminant list of 1 MiB is read and one byte more 
     try writeInputs(&tmp, "@a/1\nACGT\n+\nIIII\n", "@a/2\nACGT\n+\nIIII\n");
     const limit = 1 << 20;
     for ([_]usize{ limit, limit + 1 }) |size| {
-        // One comment line of SIZE bytes, which the list skips.
-        const text = try allocator.alloc(u8, size);
-        @memset(text, 'x');
-        text[0] = '#';
-        text[size - 1] = '\n';
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "list.txt", .data = text });
+        const comment_line = try allocator.alloc(u8, size);
+        @memset(comment_line, 'x');
+        comment_line[0] = '#';
+        comment_line[size - 1] = '\n';
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "list.txt", .data = comment_line });
         const list = try cli.tempPath(allocator, &tmp.sub_path, "list.txt");
         const result = try cli.run(allocator, &.{ "process", "--report", p.report, "--contaminants", list, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 });
         if (size == limit) {

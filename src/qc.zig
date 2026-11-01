@@ -17,7 +17,8 @@
 //! in FastQC's text layout and Java number format, each module graded pass, warn, or fail by
 //! FastQC's rules at its default limits, without Kmer Content. Basic Statistics names the
 //! Sanger / Illumina 1.9 encoding, the only one z-fastq reads. As a read section of fastp 1.1.0's
-//! JSON it writes fastp's totals and per-cycle mean quality and base content curves.
+//! JSON it writes fastp's totals and per-cycle mean quality and base content curves; a population
+//! that feeds only that summary collects only those totals and curves, and no FastQC module.
 
 const std = @import("std");
 const fastq = @import("fastq.zig");
@@ -294,7 +295,6 @@ pub const MatePopulations = struct {
 };
 
 pub const MateQc = struct {
-    // Summary output consumes cycle counts and totals, but no FastQC modules.
     detailed: bool = true,
     quality: std.ArrayList(QualityCounts) = .empty,
     bases: std.ArrayList(BaseCounts) = .empty,
@@ -354,8 +354,6 @@ pub const MateQc = struct {
             const previous_g = self.long_stats.g;
             try self.long_stats.addRecord(.{ .header = "", .id = "", .sequence = sequence, .plus = "", .quality = quality });
             if (!self.detailed) return .{};
-            // Stats already counted this read. Subtract the excluded tail to
-            // recover FastQC's truncated-prefix GC count.
             const gc_length = gcKeptLength(sequence.len);
             const gc_total = (self.long_stats.c - previous_c) + (self.long_stats.g - previous_g);
             const facts: ReadFacts = .{
@@ -1672,7 +1670,6 @@ const SequenceCounts = struct {
     }
 
     fn finishOverrepresented(self: *SequenceCounts) void {
-        // Duplication levels are finalized; the lookup slots can now hold row indices.
         var row_count: usize = 0;
         for (self.records.items, 0..) |record, index| {
             if (!(self.percentage(record.reads) > OVERREPRESENTED_PERCENT)) continue;
@@ -1697,7 +1694,6 @@ const SequenceCounts = struct {
     }
 
     fn prepareSources(self: *SequenceCounts, contaminants: *const ContaminantList) void {
-        // Cache only what fits after the finalized row indices; no allocation is needed.
         const storage = self.sourceStorage();
         self.source_count = @min(storage.len, self.overrepresented_count);
         self.source_list = contaminants;
