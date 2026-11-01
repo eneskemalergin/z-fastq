@@ -95,12 +95,13 @@ Lists and objects are cut to their first entries; a real report holds both mates
 
 ### The reads
 
-- **`mates`**: per-mate statistics with the fields of `stats --json` ([Counting and statistics](Counting-and-Statistics#stats)), under `raw` for the reads as they were read and `retained` for the reads as written, each a list of mate 1 then mate 2. Without a trim or filter option the two are the same.
+- **`mates`**: per-mate statistics with the fields of `stats --json` ([Counting and statistics](Counting-and-Statistics#stats)), under `raw` for the reads as they were read and `retained` for the reads as written, each a list of mate 1 then mate 2. Without a UMI, trim, or filter option the two are the same.
 
 ### What trimming and filtering did
 
+- **`umi`**, with the UMI options only: `ambiguous_pairs`, the pairs read whose UMI holds a base other than `A`, `C`, `G`, or `T` in either case, and `short_pairs`, the pairs in which a UMI mate had no base left after the UMI and spacer. Short pairs are dropped and counted as `too_short` under `filtering` too.
 - **`trimming`**: one object per mate, with one entry per step: `quality_tail`, `poly_g`, `overlap`, and `adapter`. Each gives the `reads` that step shortened and the `bases` it removed, or `null` when the step is off. Pairs dropped later are counted too.
-- **`filtering`**: `dropped_pairs`, counted by the pair's reason, and `failed_reads`, one object per mate counted by each read's own reason; a passing mate of a dropped pair is not counted there. Both use `too_many_n`, `too_short`, `low_quality`, and `adapter_dimer`. `null` without a trim or filter option.
+- **`filtering`**: `dropped_pairs`, counted by the pair's reason, and `failed_reads`, one object per mate counted by each read's own reason; a passing mate of a dropped pair is not counted there. Both use `too_many_n`, `too_short`, `low_quality`, and `adapter_dimer`. `null` without a UMI, trim, or filter option.
 - **`inserts`**, with adapters only: `pairs` that reached the overlap step, `overlapping` pairs with an overlap found, `unknown` for no overlap or an insert of 512 or more, the most frequent size `peak` (the lowest on a tie, 0 when none), the `median` known size, and a `histogram` of 512 counts for sizes 0 to 511.
 - **`pair_duplication`**, with `--pair-duplication` only: the `pairs` read, the `duplicates` among them, and their ratio, `rate`.
 

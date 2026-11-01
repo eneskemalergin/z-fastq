@@ -1,10 +1,11 @@
 # Processing paired reads
 
-`process` reads two mate files side by side, checks every pair as `check --paired` does, and writes the pairs it keeps to two new files. On the way it can trim adapters, overlaps, poly-G runs, and low-quality ends, and drop pairs that fail quality, `N`, or length filters. Each trim and each filter is off until you ask for it, so a plain `process` run validates and copies, and nothing else.
+`process` reads two mate files side by side, checks every pair as `check --paired` does, and writes the pairs it keeps to two new files. On the way it can move a UMI from the start of the reads into their names, trim adapters, overlaps, poly-G runs, and low-quality ends, and drop pairs that fail quality, `N`, or length filters. Each trim and each filter is off until you ask for it, so a plain `process` run validates and copies, and nothing else.
 
 ```mermaid
 flowchart LR
-    R[Read a pair<br/>validate both mates] --> T[Trim<br/>quality tail, poly-G, adapters]
+    R[Read a pair<br/>validate both mates] --> U[Move the UMI<br/>into both names]
+    U --> T[Trim<br/>quality tail, poly-G, adapters]
     T --> F[Filter<br/>quality, N, length, dimers]
     F -->|both mates pass| W[Write the pair]
     F -->|a mate fails| D[Drop the pair<br/>count the reason]
@@ -28,14 +29,37 @@ This trims the Illumina TruSeq adapters, drops pairs with a mate shorter than 15
 ## Outputs
 
 - `--out1` and `--out2` must be new files; an existing path, an input included, fails before anything is written.
-- Mate 1 goes to `--out1` and mate 2 to `--out2`, in input order. Headers and plus lines are copied as they are; trims shorten the sequence and quality together.
+- Mate 1 goes to `--out1` and mate 2 to `--out2`, in input order. Headers and plus lines are copied as they are, apart from the UMI that `--umi-length` adds to the names; trims shorten the sequence and quality together.
 - `--gzip` compresses both outputs with Zipir's `fast` preset. `--gzip-preset even` or `dense` gives smaller files for more CPU time: on a 1.5 million pair NovaSeq sample the whole run took 5.8 s with `fast` and 14.0 s with `even`, for 216 MB and 180 MB. The output carries no time stamp, so the same inputs give the same bytes.
 - One input may be standard input; outputs are always files.
 - `--max-pairs N` stops after the first N pairs, and the report records that the inputs were not read to the end. Use `check --paired` to validate whole files. It cannot be combined with the MultiQC-compatible outputs, which cannot say that only part of a file was read.
 
+## UMIs
+
+Some libraries start each read with a unique molecular identifier (UMI): a few random bases that tell apart two molecules that start at the same place. Left in the read, an aligner treats them as part of the insert, and duplicate marking cannot use them. `--umi-length N --umi-mates M` cuts the first N bases from mate 1, mate 2, or both (`1`, `2`, or `both`) and adds them to the names of both mates; `--umi-skip S` also removes the S spacer bases that follow the UMI. N is 1 to 100 and S is 0 to 100, as in fastp.
+
+```bash
+z-fastq process --umi-length 8 --umi-skip 4 --umi-mates both \
+  --out1 R1.umi.fastq --out2 R2.umi.fastq R1.fastq.gz R2.fastq.gz
+```
+
+A pair whose mates begin with `AACCGGTT` and `TTGGCCAA`, each followed by a 4-base spacer, is written with these names:
+
+```text
+@A00123:8:HFLKW:1:1101:1000:2000:AACCGGTT_TTGGCCAA 1:N:0:ACGT
+@A00123:8:HFLKW:1:1101:1000:2000:AACCGGTT_TTGGCCAA 2:N:0:ACGT
+```
+
+- The name takes fastp's form: a `:` and the UMI at the end of the read's identifier, with the two mates' UMIs joined by `_`, mate 1 first. Both mates carry the same UMI, so `check --paired` still pairs them. UMI-tools reads the UMI with `--umi-separator=:`. `samtools markdup --barcode-name` reads the eighth `:` field, which is the UMI on Illumina names of seven fields, as above; for other names, such as SRA's `SRR7646915.1`, give it `--barcode-rgx` instead.
+- The identifier ends at the first space or tab, before a trailing `/1` or `/2`: `@r7/1 x` becomes `@r7:AACCGGTT_TTGGCCAA/1 x`. A plus line that repeats the header gets the new name as well.
+- The UMI is removed first, so trimming, filters, and insert sizes see only the bases after the spacer. The raw statistics and the pair duplication rate describe the reads as read, UMI included; the retained statistics and QC tables describe the reads as written. fastp counts them the same way.
+- A pair in which a UMI mate has no base left after the UMI and spacer is dropped as too short. The report counts those pairs under `umi`, with the pairs whose UMI holds a base other than `A`, `C`, `G`, or `T` in either case, such as `N`.
+
+A UMI at the 3' end of a read or in the index read is not supported yet.
+
 ## Trimming
 
-The trims run in this order on every pair, each only when its options are given.
+The trims run in this order on every pair, after the UMI, each only when its options are given.
 
 ### Quality tail
 
@@ -109,6 +133,15 @@ fastp    --adapter_sequence A1 --adapter_sequence_r2 A2 --disable_trim_poly_g
 ```
 
 fastp 1.4.0 keeps the same records, except on mate 2 reads with the IUPAC letters `S`, `W`, or `D`, where its result depends on the CPU. fastp's automatic adapter detection, automatic poly-G mode, and its other filters are not part of z-fastq.
+
+UMI options add to any line above, and fastp writes the same records with its own:
+
+```text
+z-fastq  --umi-length 8 --umi-skip 4 --umi-mates both
+fastp    --umi --umi_loc per_read --umi_len 8 --umi_skip 4
+```
+
+`--umi-mates 1` or `2` matches `--umi_loc read1` or `read2`. The names differ in three cases: fastp adds the UMI after a trailing `/1` or `/2`, so its two mates no longer share a name, and aligners that cut names at `/`, such as STAR by default, lose the UMI; fastp looks only for a space, so in a name with a tab before any space its UMI lands after the comment; and fastp leaves a header repeated on the plus line unchanged. fastp also keeps one base of a read shorter than the UMI and spacer, where z-fastq drops the pair.
 
 </details>
 

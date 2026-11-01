@@ -173,6 +173,8 @@ test "[cli] - [process]: pairs pass through with LF endings and the report count
     try std.testing.expectEqual(std.json.Value.null, report.get("options").?.object.get("min_length").?);
     try std.testing.expectEqual(std.json.Value.null, report.get("filtering").?);
     try std.testing.expectEqual(std.json.Value.null, report.get("inserts").?);
+    try std.testing.expectEqual(std.json.Value.null, report.get("options").?.object.get("umi_length").?);
+    try std.testing.expectEqual(std.json.Value.null, report.get("umi").?);
     try cli.expectJsonInteger(report.get("pairs").?.object.get("dropped"), 0);
     try std.testing.expectEqual(std.json.Value.null, report.get("error").?);
     try std.testing.expectEqual(std.json.Value.null, report.get("failed_input").?);
@@ -302,6 +304,14 @@ test "[cli] - [process]: invalid invocations fail before any input is read or ou
         .{ .args = &.{ "process", "--gzip-preset", "even", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --gzip-preset requires --gzip\n" },
         .{ .args = &.{ "process", "--gzip", "--gzip-preset", "level9", "--out1", gz1, "--out2", gz2, p.r1, p.r2 }, .stderr = "error: --gzip-preset must be fast, even, or dense\n" },
         .{ .args = &.{ "process", "--gzip", "--gzip-preset", "fast", "--gzip-preset", "fast", "--out1", gz1, "--out2", gz2, p.r1, p.r2 }, .stderr = "error: --gzip-preset may appear only once\n" },
+        .{ .args = &.{ "process", "--umi-length", "8", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --umi-length and --umi-mates must be given together\n" },
+        .{ .args = &.{ "process", "--umi-mates", "both", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --umi-length and --umi-mates must be given together\n" },
+        .{ .args = &.{ "process", "--umi-skip", "4", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .stderr = "error: --umi-skip requires --umi-length and --umi-mates\n" },
+        .{ .args = &.{ "process", "--umi-length", "0", p.r1, p.r2 }, .stderr = "error: --umi-length must be 1 to 100\n" },
+        .{ .args = &.{ "process", "--umi-length", "101", p.r1, p.r2 }, .stderr = "error: --umi-length must be 1 to 100\n" },
+        .{ .args = &.{ "process", "--umi-skip", "101", p.r1, p.r2 }, .stderr = "error: --umi-skip must be 0 to 100\n" },
+        .{ .args = &.{ "process", "--umi-mates", "3", p.r1, p.r2 }, .stderr = "error: --umi-mates must be 1, 2, or both\n" },
+        .{ .args = &.{ "process", "--umi-length", "8", "--umi-mates", "1", "--out1", p.out1, "--out2", p.out2, p.r1 }, .stderr = "error: process requires exactly two inputs\n" },
     };
     for (cases, 0..) |case, index| {
         errdefer std.debug.print("case {d}\n", .{index});
@@ -678,6 +688,61 @@ test "[cli] - [process]: a trimmed record keeps its header and plus field and th
     const lengths = report.get("qc").?.object.get("retained").?.array.items[0].object.get("length_distribution").?.array.items;
     try cli.expectJsonInteger(lengths[lengths.len - 1].object.get("count"), 1);
     try cli.expectJsonString(lengths[lengths.len - 1].object.get("length"), "30");
+}
+
+test "[cli] - [process]: a UMI moves from the 5' end into both names before trimming and filtering" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const p = try Paths.init(allocator, &tmp);
+    const insert = "ACCTTAATGGGCGTGGACGTCTCTTGCTTG";
+    const mate2 = "CGATTCAAATGACGGCAGCAGGCCGGGAGTCCCTGAGAGG";
+    const r1 = "@a/1 x\nAACCGGTTGACT" ++ insert ++ FF ++ "\n+\n" ++ "I" ** 61 ++ "\n" ++
+        "@b 1:N:0:ACGT\nNACCGGTTGACTACGTACGT\n+b 1:N:0:ACGT\n" ++ "I" ** 20 ++ "\n" ++
+        "@c/1\nACGTACGTACGT\n+\n" ++ "I" ** 12 ++ "\n";
+    const r2 = "@a/2 x\nTTGGCCAAGACT" ++ mate2 ++ "\n+\n" ++ "I" ** 52 ++ "\n" ++
+        "@b 2:N:0:ACGT\nTTGGCCAAGACTTTTTCCCC\n+b 2:N:0:ACGT\n" ++ "I" ** 20 ++ "\n" ++
+        "@c/2\nTTGGCCAAGACTGGGG\n+\n" ++ "I" ** 16 ++ "\n";
+    try writeInputs(&tmp, r1, r2);
+
+    const result = try cli.run(allocator, &.{ "process", "--report", "-", "--umi-length", "8", "--umi-skip", "4", "--umi-mates", "both", "--adapter1", FF, "--adapter2", FF, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 });
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("@a:AACCGGTT_TTGGCCAA/1 x\n" ++ insert ++ "\n+\n" ++ "I" ** 30 ++ "\n" ++
+        "@b:NACCGGTT_TTGGCCAA 1:N:0:ACGT\nACGTACGT\n+b:NACCGGTT_TTGGCCAA 1:N:0:ACGT\nIIIIIIII\n", try readPath(allocator, p.out1));
+    try std.testing.expectEqualStrings("@a:AACCGGTT_TTGGCCAA/2 x\n" ++ mate2 ++ "\n+\n" ++ "I" ** 40 ++ "\n" ++
+        "@b:NACCGGTT_TTGGCCAA 2:N:0:ACGT\nTTTTCCCC\n+b:NACCGGTT_TTGGCCAA 2:N:0:ACGT\nIIIIIIII\n", try readPath(allocator, p.out2));
+    try cli.expectResult(try cli.run(allocator, &.{ "check", "--paired", p.out1, p.out2 }), 0, "", "");
+
+    const report = try parseReport(allocator, result.stdout);
+    const options = report.get("options").?.object;
+    try cli.expectJsonInteger(options.get("umi_length"), 8);
+    try cli.expectJsonInteger(options.get("umi_skip"), 4);
+    try cli.expectJsonString(options.get("umi_mates"), "both");
+    try cli.expectJsonInteger(report.get("umi").?.object.get("ambiguous_pairs"), 1);
+    try cli.expectJsonInteger(report.get("umi").?.object.get("short_pairs"), 1);
+    try cli.expectJsonInteger(report.get("pairs").?.object.get("dropped"), 1);
+    const filtering = report.get("filtering").?.object;
+    try cli.expectJsonInteger(filtering.get("dropped_pairs").?.object.get("too_short"), 1);
+    try cli.expectJsonInteger(filtering.get("failed_reads").?.array.items[0].object.get("too_short"), 1);
+    try cli.expectJsonInteger(filtering.get("failed_reads").?.array.items[1].object.get("too_short"), 0);
+    try expectTrimStep(report, 0, "adapter", 1, FF.len);
+    try cli.expectJsonInteger(mate(report, "raw", 0).get("bases"), 93);
+    try cli.expectJsonInteger(mate(report, "retained", 0).get("bases"), 38);
+    try cli.expectJsonInteger(mate(report, "retained", 1).get("max_length"), 40);
+    const lengths = report.get("qc").?.object.get("retained").?.array.items[0].object.get("length_distribution").?.array.items;
+    try cli.expectJsonString(lengths[lengths.len - 1].object.get("length"), "30");
+
+    const gz1 = try cli.tempPath(allocator, &tmp.sub_path, "out1.fastq.gz");
+    const gz2 = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq.gz");
+    try cli.expectResult(try cli.run(allocator, &.{ "process", "--gzip", "--umi-length", "8", "--umi-mates", "2", "--out1", gz1, "--out2", gz2, p.r1, p.r2 }), 0, "", "");
+    try std.testing.expectEqualStrings("@a:TTGGCCAA/1 x\nAACCGGTTGACT" ++ insert ++ FF ++ "\n+\n" ++ "I" ** 61 ++ "\n" ++
+        "@b:TTGGCCAA 1:N:0:ACGT\nNACCGGTTGACTACGTACGT\n+b:TTGGCCAA 1:N:0:ACGT\n" ++ "I" ** 20 ++ "\n" ++
+        "@c:TTGGCCAA/1\nACGTACGTACGT\n+\n" ++ "I" ** 12 ++ "\n", try gunzipPath(allocator, gz1));
+    try std.testing.expectEqualStrings("@a:TTGGCCAA/2 x\nGACT" ++ mate2 ++ "\n+\n" ++ "I" ** 44 ++ "\n" ++
+        "@b:TTGGCCAA 2:N:0:ACGT\nGACTTTTTCCCC\n+b:TTGGCCAA 2:N:0:ACGT\n" ++ "I" ** 12 ++ "\n" ++
+        "@c:TTGGCCAA/2\nGACTGGGG\n+\n" ++ "I" ** 8 ++ "\n", try gunzipPath(allocator, gz2));
 }
 
 test "[cli] - [process]: filters drop whole pairs, count each reason, and keep the exit status" {

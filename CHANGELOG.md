@@ -6,6 +6,11 @@ All notable changes to z-fastq will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **UMIs.** `process --umi-length N --umi-mates 1|2|both` moves an N-base unique molecular identifier from the start of mate 1, mate 2, or both into the names of both mates, in fastp's `@NAME:UMI1_UMI2` form, and `--umi-skip S` removes the S spacer bases that follow it. Trimming, filters, insert sizes, and the retained statistics see the read after the spacer; the raw statistics and the pair duplication rate see it as read. A pair in which a UMI mate has no base left is dropped as too short. The written records are those fastp 1.4.0 writes with `--umi --umi_loc per_read` (or `read1`, `read2`), except that z-fastq places the UMI before a trailing `/1` or `/2` and before a tab, updates a header repeated on the plus line, and drops a pair that fastp keeps as a one-base read.
+  - The `z-fastq/process-v1` report gains the options `umi_length`, `umi_skip`, and `umi_mates`, and a `umi` object with the pairs whose UMI holds a base other than A, C, G, or T in either case and the short pairs; each is `null` without the options. Without them, outputs, QC tables, and the QC summary are unchanged.
+
 ### Changed
 
 - **Speed.** gzip input decodes through Zipir 0.3.0, whose rebuilt DEFLATE decoder takes 10 to 13% less time for `count`, `stats`, and `check` on gzip input, and about 2% less for `process` with gzip input and output. Output bytes, JSON documents, exit statuses, and peak memory are unchanged.

@@ -2448,6 +2448,32 @@ pub fn writeRecordUnchecked(writer: *Writer, record: Record) WriteError!void {
     try writer.sink.writeVec(&fields);
 }
 
+pub fn writeRecordWithNameTag(writer: *Writer, record: Record, at: usize, tag: []const u8) WriteError!void {
+    const head = record.header[0..at];
+    const rest = record.header[at..];
+    if (record.plus.len == 0) {
+        const fields = [_][]const u8{ "@", head, tag, rest, "\n", record.sequence, "\n+\n", record.quality, "\n" };
+        return writer.sink.writeVec(&fields);
+    }
+    const repeats_header = std.mem.eql(u8, record.plus, record.header);
+    const fields = [_][]const u8{
+        "@",
+        head,
+        tag,
+        rest,
+        "\n",
+        record.sequence,
+        "\n+",
+        if (repeats_header) head else record.plus,
+        if (repeats_header) tag else "",
+        if (repeats_header) rest else "",
+        "\n",
+        record.quality,
+        "\n",
+    };
+    try writer.sink.writeVec(&fields);
+}
+
 fn isWritableField(bytes: []const u8) bool {
     return std.mem.findScalar(u8, bytes, '\n') == null and
         (bytes.len == 0 or bytes[bytes.len - 1] != '\r');

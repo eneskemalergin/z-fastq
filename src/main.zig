@@ -58,6 +58,9 @@ const USAGE =
     \\  --qc-summary PATH    Write a MultiQC-compatible JSON summary of the run
     \\  --contaminants PATH  Name overrepresented sequences from a contaminant list
     \\  --pair-duplication   Report the pair duplication rate (up to 1 GiB of memory)
+    \\  --umi-length N       Move an N-base UMI from the 5' end to the read name (with mates)
+    \\  --umi-mates M        Take the UMI from mate 1, 2, or both (with length)
+    \\  --umi-skip N         Remove N spacer bases after the UMI (with length)
     \\  --adapter1 SEQ       Trim mate 1 adapters and mate overlaps (with --adapter2)
     \\  --adapter2 SEQ       Trim mate 2 adapters and mate overlaps (with --adapter1)
     \\  --trim-poly-g N      Trim 3' poly-G runs, scanning at least N bases
@@ -97,7 +100,7 @@ const USAGE =
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
     \\Process usage:
-    \\  z-fastq process [--gzip] [--gzip-preset fast|even|dense] [--max-pairs N] [--report PATH] [--qc-tables DIR] [--qc-summary PATH] [--contaminants PATH] [--pair-duplication] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
+    \\  z-fastq process [--gzip] [--gzip-preset fast|even|dense] [--max-pairs N] [--report PATH] [--qc-tables DIR] [--qc-summary PATH] [--contaminants PATH] [--pair-duplication] [--umi-length N --umi-mates 1|2|both [--umi-skip N]] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 
@@ -139,6 +142,9 @@ const GivenOptions = struct {
     contaminants: bool = false,
     gzip_preset: bool = false,
     max_pairs: bool = false,
+    umi_length: bool = false,
+    umi_skip: bool = false,
+    umi_mates: bool = false,
     adapter1: bool = false,
     adapter2: bool = false,
     trim_poly_g: bool = false,
@@ -200,6 +206,9 @@ fn rangeOption(
 }
 
 const ReadOptionValues = struct {
+    umi_length: ?u8 = null,
+    umi_skip: ?u8 = null,
+    umi_mates: ?preprocess.UmiMates = null,
     adapters: [2]?[]const u8 = .{ null, null },
     poly_g: ?u32 = null,
     tail_window: ?u16 = null,
@@ -211,6 +220,12 @@ const ReadOptionValues = struct {
 };
 
 fn processReadOptions(io: std.Io, values: ReadOptionValues) preprocess.Options {
+    if ((values.umi_length == null) != (values.umi_mates == null)) {
+        argumentError(io, "error: --umi-length and --umi-mates must be given together\n", 2);
+    }
+    if (values.umi_skip != null and values.umi_length == null) {
+        argumentError(io, "error: --umi-skip requires --umi-length and --umi-mates\n", 2);
+    }
     if ((values.adapters[0] == null) != (values.adapters[1] == null)) {
         argumentError(io, "error: --adapter1 and --adapter2 must be given together\n", 2);
     }
@@ -221,6 +236,7 @@ fn processReadOptions(io: std.Io, values: ReadOptionValues) preprocess.Options {
         argumentError(io, "error: --low-quality and --max-low-quality-percent must be given together\n", 2);
     }
     return .{
+        .umi = if (values.umi_length) |length| .{ .length = length, .skip = values.umi_skip orelse 0, .mates = values.umi_mates.? } else null,
         .adapters = if (values.adapters[0]) |adapter1| .{ adapter1, values.adapters[1].? } else null,
         .poly_g = values.poly_g,
         .tail = if (values.tail_window) |window| .{ .window = window, .quality = values.tail_quality.? } else null,
@@ -481,6 +497,21 @@ pub fn main(init: std.process.Init) !void {
                 error.InvalidCharacter => {
                     argumentError(io, "error: invalid --max-pairs value\n", 2);
                 },
+            };
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--umi-length")) {
+            read_options.umi_length = rangeOption(io, &args, &given.umi_length, u8, "--umi-length", 1, preprocess.MAX_UMI_BASES);
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--umi-skip")) {
+            read_options.umi_skip = rangeOption(io, &args, &given.umi_skip, u8, "--umi-skip", 0, preprocess.MAX_UMI_SKIP);
+            continue;
+        }
+        if (command == .process and std.mem.eql(u8, arg, "--umi-mates")) {
+            const value = optionValue(io, &args, &given.umi_mates, "--umi-mates");
+            read_options.umi_mates = std.meta.stringToEnum(preprocess.UmiMates, value) orelse {
+                argumentError(io, "error: --umi-mates must be 1, 2, or both\n", 2);
             };
             continue;
         }
@@ -1373,6 +1404,10 @@ fn writeCheckedRecord(
     } else {
         try fastq.writeRecordUnchecked(writer, record);
     }
+}
+
+fn writeTaggedRecord(writer: *zfastq.Writer, record: zfastq.Record, tag: []const u8) error{WriteFailed}!void {
+    try fastq.writeRecordWithNameTag(writer, record, pairing.idEnd(record.header), tag);
 }
 
 fn spanIsWritable(span: fastq.RecordSpan) bool {
@@ -4225,6 +4260,7 @@ fn runProcess(
         .trimming = &collectors.trimming,
         .filtering = &collectors.filtering,
         .inserts = &collectors.inserts,
+        .umi = &collectors.umi,
         .contaminants = if (contaminants) |*list| list else null,
         .pair_duplication = collectors.pair_duplication,
         .qc_table_files = if (options.qc_tables != null) &qc_table_files else null,
@@ -4253,6 +4289,7 @@ const ProcessCollectors = struct {
     trimming: [2]preprocess.MateCounts = .{ .{}, .{} },
     filtering: preprocess.FilterCounts = .{},
     inserts: preprocess.InsertCounts = .{},
+    umi: preprocess.UmiCounts = .{},
     pair_duplication: ?*preprocess.PairDuplication = null,
 
     fn deinit(self: *ProcessCollectors, allocator: std.mem.Allocator) void {
@@ -4748,9 +4785,18 @@ const ProcessPairs = struct {
         records: [2]zfastq.Record,
         spans: [2]?[]const u8,
     ) (DeinterleaveWriteError || error{TrimFailed})!void {
+        var reads = records;
+        const umi_cut: ?preprocess.UmiCut = if (self.trimmer.options.umi) |umi| preprocess.cutUmi(umi, .{ records[0].sequence, records[1].sequence }) else null;
+        if (umi_cut) |*cut| {
+            self.collectors.umi.add(cut);
+            for (&reads, cut.starts) |*read, start| {
+                read.sequence = read.sequence[start..];
+                read.quality = read.quality[start..];
+            }
+        }
         const result = self.trimmer.trimPair(
-            .{ records[0].sequence, records[1].sequence },
-            .{ records[0].quality, records[1].quality },
+            .{ reads[0].sequence, reads[1].sequence },
+            .{ reads[0].quality, reads[1].quality },
         );
         self.collectors.inserts.add(&result) catch {
             self.trim_failure = pairCommandFailure(0, STATISTICS_LIMIT);
@@ -4765,8 +4811,8 @@ const ProcessPairs = struct {
         const decision = preprocess.decide(
             self.trimmer.options,
             &result,
-            .{ records[0].sequence[0..result.kept[0]], records[1].sequence[0..result.kept[1]] },
-            .{ records[0].quality[0..result.kept[0]], records[1].quality[0..result.kept[1]] },
+            .{ reads[0].sequence[0..result.kept[0]], reads[1].sequence[0..result.kept[1]] },
+            .{ reads[0].quality[0..result.kept[0]], reads[1].quality[0..result.kept[1]] },
         );
         if (decision.pair != null) {
             self.collectors.filtering.add(decision) catch {
@@ -4782,19 +4828,23 @@ const ProcessPairs = struct {
             self.counts.dropped += 1;
             return;
         }
-        var trimmed = records;
         var trimmed_spans = spans;
-        for (&trimmed, &trimmed_spans, result.kept, 0..) |*record, *span, kept, index| {
+        for (&reads, &trimmed_spans, result.kept, records, 0..) |*read, *span, kept, record, index| {
             if (self.collect_qc) self.collectors.qc[index].addRetained(self.allocator, record.header, record.sequence, record.quality, kept) catch |err| {
                 self.trim_failure = pairCommandFailure(@intCast(index), qcFailure(err));
                 return error.TrimFailed;
             };
-            if (kept != record.sequence.len) span.* = null;
-            record.sequence = record.sequence[0..kept];
-            record.quality = record.quality[0..kept];
+            if (kept != read.sequence.len) span.* = null;
+            read.sequence = read.sequence[0..kept];
+            read.quality = read.quality[0..kept];
         }
-        writeCheckedRecord(self.writers[0], trimmed[0], trimmed_spans[0]) catch return error.Output1WriteFailed;
-        writeCheckedRecord(self.writers[1], trimmed[1], trimmed_spans[1]) catch return error.Output2WriteFailed;
+        if (umi_cut) |*cut| {
+            writeTaggedRecord(self.writers[0], reads[0], cut.tag()) catch return error.Output1WriteFailed;
+            writeTaggedRecord(self.writers[1], reads[1], cut.tag()) catch return error.Output2WriteFailed;
+        } else {
+            writeCheckedRecord(self.writers[0], reads[0], trimmed_spans[0]) catch return error.Output1WriteFailed;
+            writeCheckedRecord(self.writers[1], reads[1], trimmed_spans[1]) catch return error.Output2WriteFailed;
+        }
         self.counts.written += 1;
     }
 };
@@ -4845,7 +4895,7 @@ fn processSources(
         }
     }
     if (options.collectsQc() and options.trim.changesReads()) {
-        for (&collectors.qc) |*populations| populations.enableRetained();
+        for (&collectors.qc, 0..) |*populations, mate| populations.enableRetained(if (options.trim.umi) |umi| umi.start(mate) else 0);
     }
     const reader_options: fastq.ReaderOptions = .{ .max_line_bytes = options.max_line_bytes };
     var reader1 = fastq.initStreamReader(allocator, sources[0], reader_options);
@@ -4923,6 +4973,7 @@ const ProcessReport = struct {
     trimming: *const [2]preprocess.MateCounts,
     filtering: *const preprocess.FilterCounts,
     inserts: *const preprocess.InsertCounts,
+    umi: *const preprocess.UmiCounts,
     contaminants: ?*const qc.ContaminantList = null,
     pair_duplication: ?*const preprocess.PairDuplication = null,
     qc_table_files: ?*const QcTables = null,
@@ -4947,6 +4998,12 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
     try json.objectField("max_line_bytes");
     try json.write(report.options.max_line_bytes);
     const trim = report.options.trim;
+    try json.objectField("umi_length");
+    try json.write(if (trim.umi) |umi| umi.length else null);
+    try json.objectField("umi_skip");
+    try json.write(if (trim.umi) |umi| umi.skip else null);
+    try json.objectField("umi_mates");
+    try json.write(if (trim.umi) |umi| @tagName(umi.mates) else null);
     try json.objectField("adapter1");
     try json.write(if (trim.adapters) |adapters| adapters[0] else null);
     try json.objectField("adapter2");
@@ -5035,6 +5092,8 @@ fn writeProcessReport(json: *std.json.Stringify, report: ProcessReport) !void {
         try json.endArray();
     }
     try json.endObject();
+    try json.objectField("umi");
+    if (trim.umi != null) try writeUmiCounts(json, report.umi) else try json.write(null);
     try json.objectField("trimming");
     try json.beginArray();
     for (report.trimming) |*mate_counts| try writeTrimCounts(json, trim, mate_counts);
@@ -5093,6 +5152,15 @@ fn writeTrimCounts(
         try json.write(step_counts.bases);
         try json.endObject();
     }
+    try json.endObject();
+}
+
+fn writeUmiCounts(json: *std.json.Stringify, counts: *const preprocess.UmiCounts) !void {
+    try json.beginObject();
+    try json.objectField("ambiguous_pairs");
+    try json.write(counts.ambiguous_pairs);
+    try json.objectField("short_pairs");
+    try json.write(counts.short_pairs);
     try json.endObject();
 }
 
@@ -7669,7 +7737,7 @@ test "[failure] - [process]: QC table completion cleans failed sets and preserve
         for (&collectors, 0..) |*collector, mate| {
             const sequence = if (case.long_mate and mate == 1) "A" ** 1025 else "ACGT";
             const quality = if (case.long_mate and mate == 1) "I" ** 1025 else "IIII";
-            collector.enableRetained();
+            collector.enableRetained(0);
             try collector.addRead(allocator, "r", sequence, quality);
             try collector.addRetained(allocator, "r", sequence, quality, sequence.len);
             collector.finish();
@@ -7739,6 +7807,7 @@ test "[failure] - [process]: summary write failures retain their path and preser
                 .trimming = &collectors.trimming,
                 .filtering = &collectors.filtering,
                 .inserts = &collectors.inserts,
+                .umi = &collectors.umi,
                 .input_failure = failure,
                 .failed_output = null,
             };
@@ -7813,6 +7882,7 @@ test "[failure] - [process]: exhausted allocation permits QC finalization and co
                 .trimming = &collectors.trimming,
                 .filtering = &collectors.filtering,
                 .inserts = &collectors.inserts,
+                .umi = &collectors.umi,
                 .input_failure = failure,
                 .failed_output = null,
             });

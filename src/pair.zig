@@ -49,6 +49,11 @@ pub fn parseName(header: []const u8, policy: NamePolicy) Name {
     };
 }
 
+pub fn idEnd(header: []const u8) usize {
+    const end = firstTokenEnd(header);
+    return if (terminalMateMarker(header[0..end]) != null) end - 2 else end;
+}
+
 pub fn headersMatch(header1: []const u8, header2: []const u8, policy: NamePolicy) bool {
     return switch (policy) {
         .exact => exactHeadersMatch(header1, header2),

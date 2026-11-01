@@ -97,6 +97,7 @@ Outputs:
 
 Trims, each off unless given:
 
+- `--umi-length N --umi-mates 1|2|both`, `--umi-skip S`: move an N-base UMI from the read starts into both names, and remove S spacer bases after it.
 - `--adapter1 A1 --adapter2 A2`: adapters and mate overlaps.
 - `--trim-poly-g N`: poly-G tails, scanning at least N bases.
 - `--trim-tail-window W --trim-tail-quality Q`: low-quality 3' ends.

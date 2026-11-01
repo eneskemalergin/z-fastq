@@ -1,5 +1,7 @@
-//! Paired read trimming and pair retention with fastp 1.1.0's rules: the 3' quality window,
-//! poly-G tails, adapters found by mate overlap or by adapter sequence, then the empty-read,
+//! Paired read trimming and pair retention with fastp 1.1.0's rules. First, as fastp's per-read
+//! UMI location does, a fixed-length UMI and spacer are cut from the 5' end of the selected mates,
+//! and the UMI bases, joined with an underscore, name the pair. Then come the 3' quality window,
+//! poly-G tails, adapters found by mate overlap or by adapter sequence, and the empty-read,
 //! adapter-dimer, quality, N, and length checks. Every trim keeps a prefix of the read, so a
 //! result is one kept length per mate; sequence and quality are cut together by the caller.
 //! The overlap and adapter searches score a block of consecutive offsets per pass over the
@@ -28,6 +30,8 @@ pub const MAX_TAIL_QUALITY = 30;
 pub const MAX_N_LIMIT = 50;
 pub const MAX_LOW_QUALITY = fastq.PHRED_MAX_SCORE;
 pub const MAX_LOW_QUALITY_PERCENT = 100;
+pub const MAX_UMI_BASES = 100;
+pub const MAX_UMI_SKIP = 100;
 
 const PHRED_OFFSET = fastq.PHRED_OFFSET;
 const OVERLAP_REQUIRE = 30;
@@ -64,7 +68,28 @@ pub const LowQuality = struct {
     percent: u8,
 };
 
+pub const UmiMates = enum { @"1", @"2", both };
+
+pub const Umi = struct {
+    length: u8,
+    skip: u8 = 0,
+    mates: UmiMates,
+
+    fn takes(self: Umi, mate: usize) bool {
+        return switch (self.mates) {
+            .@"1" => mate == 0,
+            .@"2" => mate == 1,
+            .both => true,
+        };
+    }
+
+    pub fn start(self: Umi, mate: usize) usize {
+        return if (self.takes(mate)) @as(usize, self.length) + self.skip else 0;
+    }
+};
+
 pub const Options = struct {
+    umi: ?Umi = null,
     adapters: ?[2][]const u8 = null,
     poly_g: ?u32 = null,
     tail: ?Tail = null,
@@ -81,7 +106,52 @@ pub const Options = struct {
     }
 
     pub fn changesReads(self: Options) bool {
-        return self.trims() or self.filters();
+        return self.umi != null or self.trims() or self.filters();
+    }
+};
+
+pub const UmiCut = struct {
+    name_bytes: [1 + 2 * MAX_UMI_BASES + 1]u8 = undefined,
+    name_len: usize = 0,
+    starts: [2]usize = .{ 0, 0 },
+    ambiguous: bool = false,
+    short: bool = false,
+
+    pub fn tag(self: *const UmiCut) []const u8 {
+        return self.name_bytes[0..self.name_len];
+    }
+};
+
+pub fn cutUmi(umi: Umi, sequences: [2][]const u8) UmiCut {
+    var cut: UmiCut = .{};
+    cut.name_bytes[0] = ':';
+    cut.name_len = 1;
+    for (sequences, &cut.starts, 0..) |sequence, *mate_start, mate| {
+        if (!umi.takes(mate)) continue;
+        if (cut.name_len > 1) {
+            cut.name_bytes[cut.name_len] = '_';
+            cut.name_len += 1;
+        }
+        const bases = sequence[0..@min(sequence.len, umi.length)];
+        @memcpy(cut.name_bytes[cut.name_len..][0..bases.len], bases);
+        cut.name_len += bases.len;
+        for (bases) |base| switch (base) {
+            'A', 'C', 'G', 'T', 'a', 'c', 'g', 't' => {},
+            else => cut.ambiguous = true,
+        };
+        cut.short = cut.short or sequence.len <= umi.start(mate);
+        mate_start.* = @min(sequence.len, umi.start(mate));
+    }
+    return cut;
+}
+
+pub const UmiCounts = struct {
+    ambiguous_pairs: u64 = 0,
+    short_pairs: u64 = 0,
+
+    pub fn add(self: *UmiCounts, cut: *const UmiCut) void {
+        self.ambiguous_pairs += @intFromBool(cut.ambiguous);
+        self.short_pairs += @intFromBool(cut.short);
     }
 };
 

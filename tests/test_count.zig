@@ -58,6 +58,9 @@ const EXPECTED_USAGE =
     \\  --qc-summary PATH    Write a MultiQC-compatible JSON summary of the run
     \\  --contaminants PATH  Name overrepresented sequences from a contaminant list
     \\  --pair-duplication   Report the pair duplication rate (up to 1 GiB of memory)
+    \\  --umi-length N       Move an N-base UMI from the 5' end to the read name (with mates)
+    \\  --umi-mates M        Take the UMI from mate 1, 2, or both (with length)
+    \\  --umi-skip N         Remove N spacer bases after the UMI (with length)
     \\  --adapter1 SEQ       Trim mate 1 adapters and mate overlaps (with --adapter2)
     \\  --adapter2 SEQ       Trim mate 2 adapters and mate overlaps (with --adapter1)
     \\  --trim-poly-g N      Trim 3' poly-G runs, scanning at least N bases
@@ -97,7 +100,7 @@ const EXPECTED_USAGE =
     \\  z-fastq deinterleave [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <path|->
     \\
     \\Process usage:
-    \\  z-fastq process [--gzip] [--gzip-preset fast|even|dense] [--max-pairs N] [--report PATH] [--qc-tables DIR] [--qc-summary PATH] [--contaminants PATH] [--pair-duplication] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
+    \\  z-fastq process [--gzip] [--gzip-preset fast|even|dense] [--max-pairs N] [--report PATH] [--qc-tables DIR] [--qc-summary PATH] [--contaminants PATH] [--pair-duplication] [--umi-length N --umi-mates 1|2|both [--umi-skip N]] [--adapter1 SEQ --adapter2 SEQ] [--trim-poly-g N] [--trim-tail-window W --trim-tail-quality Q] [--min-length N] [--max-n N] [--low-quality Q --max-low-quality-percent P] [--pair-names illumina|exact] [--alphabet iupac|acgtn] [--max-line-bytes N] --out1 R1 --out2 R2 <R1|-> <R2|->
     \\
 ;
 
