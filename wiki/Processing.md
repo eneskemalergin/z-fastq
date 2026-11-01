@@ -147,7 +147,7 @@ fastp    --umi --umi_loc per_read --umi_len 8 --umi_skip 4
 
 ## When a run fails
 
-A failure stops the run and exits with a nonzero status: `1` for invalid input, `2` for a usage error, `3` for I/O or memory, `4` for a limit. Pairs written before the failure stay in the outputs. The report is still written, with `"status": "error"` and the reason; the [MultiQC-compatible files](Quality-Control#multiqc-compatible-outputs) are written only when the run succeeds.
+A failure stops the run and exits with a nonzero status: `1` for invalid input, `2` for a usage error, `3` for I/O or memory, `4` for a limit. Pairs written before the failure stay in the outputs. The report is still written, with `"status": "error"` and the reason, unless the report itself cannot be written, in which case it is removed; the [MultiQC-compatible files](Quality-Control#multiqc-compatible-outputs) are written only when the run succeeds.
 
 Treat a run as complete only when it exits with `0`.
 

@@ -4656,6 +4656,7 @@ fn reportFailed(io: std.Io, path: []const u8, to_stdout: bool, exit_code: u8, ta
     _ = tables.abandon(io, exit_code);
     if (summary) |summary_path| std.Io.Dir.cwd().deleteFile(io, summary_path) catch {};
     if (to_stdout) return stdoutFailed(io, exit_code);
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
     printPathError(io, path, IO_FAILURE.message);
     return @max(exit_code, IO_FAILURE.exit_code);
 }
@@ -7797,6 +7798,25 @@ test "[failure] - [deinterleave]: a failed output still writes the records buffe
     try std.testing.expectEqual(@as(u8, 3), deinterleaveWriteFailed(io, &outputs[0], &outputs[1]));
     var buffer: [64]u8 = undefined;
     try std.testing.expectEqualStrings("@a/2\nACGT\n+\nIIII\n", try tmp.dir.readFile(io, "out2.fq", &buffer));
+}
+
+test "[failure] - [process]: a failed report write removes the report and the QC summary" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const report = try testTempPath(allocator, &tmp.sub_path, "report.json");
+    defer allocator.free(report);
+    const summary = try testTempPath(allocator, &tmp.sub_path, "summary.json");
+    defer allocator.free(summary);
+    for ([_][]const u8{ "report.json", "summary.json" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "{\"schema\":" });
+    var tables: QcTables = .{};
+    defer tables.deinit(io, allocator);
+
+    try std.testing.expectEqual(@as(u8, 3), reportFailed(io, report, false, 0, &tables, summary));
+    for ([_][]const u8{ "report.json", "summary.json" }) |name| {
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, name, .{}));
+    }
 }
 
 test "[failure] - [process]: summary write failures retain their path and preserve earlier errors" {

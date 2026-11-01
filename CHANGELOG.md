@@ -17,7 +17,7 @@ All notable changes to z-fastq will be documented in this file.
 
 ### Fixed
 
-- **Outputs after a failed write.** When a write to one `deinterleave` output fails, the records already buffered for the other output are written before the command exits with status `3`, as `process` does; they were dropped.
+- **Outputs after a failed write.** When a write to one `deinterleave` output fails, the records already buffered for the other output are written before the command exits with status `3`, as `process` does; they were dropped. When the `process` report itself cannot be written, the incomplete file is removed, as the QC summary is, instead of being left as truncated JSON.
 
 ## [0.2.0]
 
