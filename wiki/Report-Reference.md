@@ -22,7 +22,7 @@ The report records what was asked, what was read, what was done, and what was me
 ```json
 {
   "schema": "z-fastq/process-v1",
-  "tool": { "name": "z-fastq", "version": "0.2.0" },
+  "tool": { "name": "z-fastq", "version": "0.2.1" },
   "byte_strings": "escaped-bytes-v1",
   "options": {
     "gzip": false,

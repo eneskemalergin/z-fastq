@@ -4,7 +4,9 @@
 
 All notable changes to z-fastq will be documented in this file.
 
-## [Unreleased]
+## [0.2.1]
+
+Faster gzip input, from Zipir 0.3.0's rebuilt DEFLATE decoder: `count`, `stats`, and `check` take 15 to 18% less CPU time on gzip files. `process` can now move a UMI from the start of the reads into their names, as fastp does. Output bytes, JSON documents, and exit statuses are unchanged, apart from the report fields the UMI options add and the fixes below.
 
 ### Added
 
@@ -13,7 +15,7 @@ All notable changes to z-fastq will be documented in this file.
 
 ### Changed
 
-- **Speed.** gzip input decodes through Zipir 0.3.0, whose rebuilt DEFLATE decoder takes 10 to 13% less time for `count`, `stats`, and `check` on gzip input, and about 2% less for `process` with gzip input and output. Output bytes, JSON documents, exit statuses, and peak memory are unchanged.
+- **Speed.** gzip input decodes through Zipir 0.3.0, whose rebuilt DEFLATE decoder takes 15 to 18% less CPU time for `count`, `stats`, and `check` on gzip input. `process` with gzip input and output takes about the same time as before, because compression and trimming dominate it. Output bytes, JSON documents, exit statuses, and peak memory are unchanged.
 
 ### Fixed
 
