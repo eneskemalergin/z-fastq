@@ -3757,6 +3757,12 @@ const RecordOutput = struct {
     }
 };
 
+fn deinterleaveWriteFailed(io: std.Io, failed: *RecordOutput, other: *RecordOutput) u8 {
+    printPathError(io, failed.path, IO_FAILURE.message);
+    other.finish() catch printPathError(io, other.path, IO_FAILURE.message);
+    return IO_FAILURE.exit_code;
+}
+
 fn runDeinterleave(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -3813,9 +3819,10 @@ fn runDeinterleave(
         staging_limit,
         options,
     ) catch |err| {
-        const failed_output = if (err == error.Output1WriteFailed) &output1 else &output2;
-        printPathError(io, failed_output.path, "I/O error");
-        return 3;
+        return if (err == error.Output1WriteFailed)
+            deinterleaveWriteFailed(io, &output1, &output2)
+        else
+            deinterleaveWriteFailed(io, &output2, &output1);
     };
     if (failure) |details| {
         printPairCommandFailure(io, inputs, .interleaved, details);
@@ -7772,6 +7779,24 @@ test "[failure] - [process]: QC table completion cleans failed sets and preserve
         }
         try tmp.dir.access(io, "unrelated.txt", .{});
     }
+}
+
+test "[failure] - [deinterleave]: a failed output still writes the records buffered for the other" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = [2][]u8{ try testTempPath(allocator, &tmp.sub_path, "out1.fq"), try testTempPath(allocator, &tmp.sub_path, "out2.fq") };
+    defer for (paths) |path| allocator.free(path);
+    var outputs = [2]RecordOutput{ .init(paths[0]), .init(paths[1]) };
+    defer for (&outputs) |*output| output.close(io);
+    for (&outputs) |*output| try std.testing.expectEqual(@as(?CommandFailure, null), output.create(io));
+    const record: zfastq.Record = .{ .header = "a/2", .id = "a/2", .sequence = "ACGT", .plus = "", .quality = "IIII" };
+    try fastq.writeRecordUnchecked(&outputs[1].writer, record);
+
+    try std.testing.expectEqual(@as(u8, 3), deinterleaveWriteFailed(io, &outputs[0], &outputs[1]));
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("@a/2\nACGT\n+\nIIII\n", try tmp.dir.readFile(io, "out2.fq", &buffer));
 }
 
 test "[failure] - [process]: summary write failures retain their path and preserve earlier errors" {
