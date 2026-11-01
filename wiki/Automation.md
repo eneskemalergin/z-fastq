@@ -56,6 +56,20 @@ fi
 
 Check the `schema` field before reading a document; `tool.name` and `tool.version` say which build wrote it. Version 0.1.0 froze the `stats-v1` and `check-v1` shapes. Results follow the order of the inputs, and an input that failed has its error inside its own entry. Still check the exit status: a document can hold failed inputs, and an output failure can cut it short.
 
+### The `stats` and `check` documents
+
+Each is one JSON object on one line. After `schema`, `tool`, and `byte_strings` ([Report reference](Report-Reference#shared-conventions)), `results` holds one entry per input:
+
+```json
+{"schema":"z-fastq/check-v1","tool":{"name":"z-fastq","version":"0.2.1"},"byte_strings":"escaped-bytes-v1","results":[{"input":"ok.fq","status":"ok"},{"input":"bad.fq","status":"error","error":{"code":"S002","message":"sequence byte is outside the selected alphabet","record_index":0,"byte_offset":5,"line_in_record":2}}]}
+```
+
+- **`input`**: the path as given, or **`inputs`**, the two paths, for `check --paired`.
+- **`status`**: `ok` or `error`. A `stats-v1` entry with `ok` also holds every field of [`stats`](Counting-and-Statistics#stats), with `null` where the text output prints `-`.
+- **`error`**: the failure's `code`, `message`, and position. A record failure (`S001` to `S006`) gives `record_index`, `byte_offset`, and `line_in_record`; a failure with no position in the records, such as `io_error` for a missing file, gives the same fields as `null`.
+- **`failed_input`**: in a failed `check --paired` entry, the input whose record failed.
+- A pair failure in `check --paired` or `--interleaved` gives `pair_index` and `record_indexes`, one per mate: in `--paired`, the last record read on each side; in `--interleaved`, `null` for a mate that does not exist. `P001` (names differ) adds `byte_offsets`, and `first_tokens` and `normalized_ids`, each mate's as `prefix`, `length`, and `truncated`, and `mate_markers`; `P002` (a missing mate) adds `remaining_side`, `R1` or `R2`.
+
 ## Related pages
 
 - [Input and output](Input-and-Output): where data and messages go.
