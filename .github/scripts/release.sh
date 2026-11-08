@@ -7,8 +7,8 @@
 #   release.sh package SYSTEM OUTPUT_DIR   write z-fastq-VERSION-SYSTEM.tar.gz and smoke-test the unpacked binary
 #
 # SYSTEM is linux-x86_64, linux-aarch64, macos-x86_64, or macos-aarch64, and must be the machine's own: the
-# binary it packages is the one it smoke-tests. Linux binaries are static; macOS binaries link only libSystem. Work directories are made under RUNNER_TEMP (or /var/tmp) and left in place; nothing is
-# deleted.
+# binary it packages is the one it smoke-tests. Linux binaries are static; macOS binaries link only libSystem.
+# Work directories are made under RUNNER_TEMP (or /var/tmp) and left in place; nothing is deleted.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
