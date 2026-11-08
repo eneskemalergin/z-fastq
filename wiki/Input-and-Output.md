@@ -14,7 +14,7 @@ Standard input is read only when you write `-`; leaving out the path is an error
 gzip -dc reads.fastq.gz | z-fastq stats -
 ```
 
-A command reads standard input at most once. A pipe can be read only once, so other names for it, such as `/dev/stdin`, count as the same input. Exact-count sampling needs a regular file, because it reads twice.
+A command reads standard input at most once. A pipe can be read only once, so other names for it, such as `/dev/stdin`, count as the same input. On macOS, `/dev/stdin` and `/dev/fd/N` share the read position of the descriptor they name, so they count as the same input even when standard input is a regular file; on Linux, they open a regular file again, from its start. Exact-count sampling needs a regular file, because it reads twice.
 
 ## Writing
 

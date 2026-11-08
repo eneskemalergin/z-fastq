@@ -6,9 +6,9 @@
 #   release.sh package source OUTPUT_DIR   write z-fastq-VERSION-source.tar.gz and test it from an outside package
 #   release.sh package SYSTEM OUTPUT_DIR   write z-fastq-VERSION-SYSTEM.tar.gz and smoke-test the unpacked binary
 #
-# SYSTEM is linux-x86_64 or linux-aarch64, and must be the machine's own: the binary it packages is the one it
-# smoke-tests. Work directories are made under RUNNER_TEMP (or /var/tmp) and left in place; nothing is
-# deleted.
+# SYSTEM is linux-x86_64, linux-aarch64, macos-x86_64, or macos-aarch64, and must be the machine's own: the
+# binary it packages is the one it smoke-tests. Linux binaries are static; macOS binaries link only libSystem.
+# Work directories are made under RUNNER_TEMP (or /var/tmp) and left in place; nothing is deleted.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
@@ -109,23 +109,43 @@ ZIG
     printf 'tested %s\n' "$output/$name.tar.gz"
 }
 
+host_system() {
+    case "$(uname -s)-$(uname -m)" in
+        Linux-x86_64) printf 'linux-x86_64\n' ;;
+        Linux-aarch64) printf 'linux-aarch64\n' ;;
+        Darwin-x86_64) printf 'macos-x86_64\n' ;;
+        Darwin-arm64) printf 'macos-aarch64\n' ;;
+        *) printf '%s-%s\n' "$(uname -s)" "$(uname -m)" ;;
+    esac
+}
+
+check_macos_binary() {
+    local binary="$1" machine="$2" libraries
+    [[ "$(file -b "$binary")" == *"Mach-O 64-bit executable $machine"* ]] || return 1
+    libraries=$(otool -L "$binary" | sed 1d | awk '{ print $1 }')
+    [[ "$libraries" == /usr/lib/libSystem.B.dylib ]] || return 1
+    ! otool -l "$binary" | grep -q 'segname __DWARF'
+}
+
 package_binary() {
-    local system="$1" output="$2" work stage name binary machine
+    local system="$1" output="$2" work stage name binary
     case "$system" in
-        linux-x86_64) machine=x86-64 ;;
-        linux-aarch64) machine='ARM aarch64' ;;
+        linux-x86_64 | linux-aarch64 | macos-x86_64 | macos-aarch64) ;;
         *) die "unknown system: $system" ;;
     esac
-    [[ "$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)" == "$system" ]] ||
-        die "$system must be packaged on $system, not on $(uname -s)-$(uname -m)"
+    [[ "$(host_system)" == "$system" ]] || die "$system must be packaged on $system, not on $(host_system)"
     work=$(workdir)
     name="z-fastq-$version-$system"
     zig build -Doptimize=ReleaseFast --prefix "$work/install"
     stage="$work/$name"
     mkdir "$stage"
     cp "$work/install/bin/z-fastq" LICENSE "$stage/"
-    file -b "$stage/z-fastq" | grep -q "$machine.*statically linked.*stripped" ||
-        die "release binary is not a static, stripped $machine executable: $(file -b "$stage/z-fastq")"
+    case "$system" in
+        linux-x86_64) file -b "$stage/z-fastq" | grep -q "x86-64.*statically linked.*stripped" ;;
+        linux-aarch64) file -b "$stage/z-fastq" | grep -q "ARM aarch64.*statically linked.*stripped" ;;
+        macos-x86_64) check_macos_binary "$stage/z-fastq" x86_64 ;;
+        macos-aarch64) check_macos_binary "$stage/z-fastq" arm64 ;;
+    esac || die "release binary is not a stripped $system executable with the expected linking: $(file -b "$stage/z-fastq")"
     tar -czf "$work/$name.tar.gz" -C "$work" "$name"
 
     mkdir "$work/smoke"

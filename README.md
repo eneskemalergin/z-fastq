@@ -7,11 +7,11 @@
     <source media="(prefers-color-scheme: light)" srcset="assets/tagline-light.svg">
     <img src="assets/tagline-light.svg" alt="Lightning FASTQ work without the toolchain sprawl" width="700">
   </picture>
-  <p><strong>Count, check, sample, interleave, and trim paired FASTQ with one static executable built in Zig.</strong></p>
+  <p><strong>Count, check, sample, interleave, and trim paired FASTQ with one self-contained executable built in Zig.</strong></p>
   <p>
     <a href="https://github.com/eneskemalergin/z-fastq/releases/latest"><img src="https://img.shields.io/github/v/release/eneskemalergin/z-fastq?style=flat-square&amp;label=release" alt="Latest release"></a>
     <a href="https://github.com/eneskemalergin/z-fastq/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/eneskemalergin/z-fastq/ci.yml?branch=main&amp;style=flat-square&amp;label=CI&amp;logo=githubactions&amp;logoColor=white" alt="CI status"></a>
-    <a href="https://github.com/eneskemalergin/z-fastq/wiki/Installation"><img src="https://img.shields.io/badge/Linux-x86--64%20%7C%20aarch64-64748b?style=flat-square&amp;logo=linux&amp;logoColor=white" alt="Linux on x86-64 and aarch64"></a>
+    <a href="https://github.com/eneskemalergin/z-fastq/wiki/Installation"><img src="https://img.shields.io/badge/Linux%20%7C%20macOS-x86--64%20%7C%20aarch64-64748b?style=flat-square" alt="Linux and macOS on x86-64 and aarch64"></a>
     <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-16a34a?style=flat-square" alt="MIT License"></a>
     <br>
@@ -34,7 +34,7 @@ I built z-fastq for the FASTQ work that comes before alignment: the steps that r
 - [`process`](https://github.com/eneskemalergin/z-fastq/wiki/Processing): Trim and filter paired reads with fastp's rules into plain or gzip files, with [FastQC-compatible QC](https://github.com/eneskemalergin/z-fastq/wiki/Quality-Control) that MultiQC reads, in one pass.
 - [Zig package](https://github.com/eneskemalergin/z-fastq/wiki/Zig-Library): the reader, writer, validation, and statistics give other Zig programs the same rules without the CLI.
 
-z-fastq reads plain and gzip FASTQ and writes plain FASTQ, gzip from `process`, and text or JSON reports. It runs on Linux, on x86-64 and aarch64.
+z-fastq reads plain and gzip FASTQ and writes plain FASTQ, gzip from `process`, and text or JSON reports. It runs on Linux and macOS, on x86-64 and aarch64.
 
 ## Speed and memory
 
@@ -87,7 +87,7 @@ fastp and FastQC-Rust can use many threads, and with enough of them they match z
 
 ## A few honest tradeoffs
 
-I would like to support more than Linux. For now z-fastq is built and tested on Linux, on x86-64 and aarch64; native Windows and macOS builds are not there yet. If you use Windows, WSL is the way to try it. The benchmarks run on x86-64, where AVX2 code is picked at run time; on aarch64, z-fastq uses its portable vector code, and its speed there is not measured yet.
+z-fastq is built and tested on Linux and macOS, each on x86-64 and aarch64; a native Windows build is not there yet, so on Windows, WSL is the way to try it. The benchmarks run on Linux x86-64, where AVX2 code is picked at run time, as it is on Intel Macs; on aarch64, z-fastq uses its portable vector code, and its speed there and on macOS is not measured yet.
 
 One core is a choice, not a limit I am waiting to lift. It keeps every run's cost known before it starts, so a pipeline can run one sample per core side by side. The price is one large file on an otherwise idle machine: a tool that spreads it over many cores can finish sooner, and z-fastq does not split a file across cores yet.
 
@@ -97,10 +97,10 @@ z-fastq writes data, not pages: its QC comes out as FastQC-style tables and a JS
 
 ## Start
 
-Download the static Linux binary for x86-64 or aarch64 from the [latest release](https://github.com/eneskemalergin/z-fastq/releases/latest), or build it from source with [Zig 0.16.0](https://ziglang.org/download/); the [installation page](https://github.com/eneskemalergin/z-fastq/wiki/Installation) covers both.
+Download the binary for Linux or macOS, on x86-64 or aarch64, from the [latest release](https://github.com/eneskemalergin/z-fastq/releases/latest), or build it from source with [Zig 0.16.0](https://ziglang.org/download/); the [installation page](https://github.com/eneskemalergin/z-fastq/wiki/Installation) covers both.
 
 ```bash
-zig build -Dstatic=true -Doptimize=ReleaseFast    # zig-out/bin/z-fastq; put it on your PATH
+zig build -Doptimize=ReleaseFast    # zig-out/bin/z-fastq; put it on your PATH
 z-fastq check --paired reads_R1.fastq.gz reads_R2.fastq.gz
 z-fastq stats reads_R1.fastq.gz
 z-fastq sample --fraction 0.1 --seed 11 reads_R1.fastq.gz > sample.fastq

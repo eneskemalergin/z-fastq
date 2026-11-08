@@ -27,7 +27,7 @@ This page maps the code, the tests, and the wiki onto each other, so a change to
 
 ## Tests
 
-Run these from the repository root, one after another, with Zig 0.16.0 on Linux x86-64; on aarch64, the portable run repeats the first, since there is nothing to dispatch:
+Run these from the repository root, one after another, with Zig 0.16.0 on Linux x86-64; on aarch64, the portable run repeats the first, since there is nothing to dispatch, and on macOS the last two runs drop `-Dstatic=true`:
 
 ```bash
 zig fmt --check src tests build.zig
@@ -40,17 +40,17 @@ zig build test -Dstatic=true -Doptimize=ReleaseFast --summary all
 `zig build test-<suite>` runs one test binary while you work: `test-src` for the tests inside `src/`, or a file in `tests/` without its `test_` prefix, such as `test-reader`. `zig build -l` lists them.
 
 - The runs share `zig-out/bin/z-fastq`, so run them in sequence; parallel runs need separate checkouts.
-- The tests use small tracked files only, no downloads or other tools. They need `pidfd_open`, `/proc`, FIFOs, and hard and symbolic links.
+- The tests use small tracked files only, no downloads or other tools. They need FIFOs and hard and symbolic links, plus `pidfd_open` and `/proc` on Linux, or kqueue and `/dev/fd` on macOS.
 - On x86-64 no test is expected to skip; on aarch64 the x86-64 CPU-detection test skips. Investigate any other skip.
 - Debug builds target the host CPU; the release runs target generic x86-64 and are the ones that test the run-time AVX2 kernels against their scalar versions. A timing is never proof of correct output.
 
 ## Continuous integration
 
-GitHub Actions checks every pull request and every push to `main`, and any branch when started by hand, on x86-64 and on an ARM runner. A change that touches only documentation, benchmark reports, or tool recipes skips the builds. The first failure stops the run. The runs above stay the local check before a commit; CI repeats only what a separate machine adds.
+GitHub Actions checks every pull request and every push to `main`, and any branch when started by hand, on Linux and macOS runners, each on x86-64 and ARM. A change that touches only documentation, benchmark reports, or tool recipes skips the builds. The first failure stops the run. The runs above stay the local check before a commit; CI repeats only what a separate machine adds.
 
 - **Source checks:** formatting, the syntax of every shell script, shellcheck on the CI scripts, the benchmark Python, and `.github/scripts/docs_check.sh`, which fails on a link, image, or heading anchor that does not exist in the README, the reports, or the wiki.
-- **Tests:** one Debug run per architecture; on x86-64 it targets generic x86-64, so the AVX2 kernels run through run-time dispatch as in the release binary.
-- **Release binaries:** each architecture's static ReleaseFast binary, packaged and smoke-tested on every command from the unpacked archive, with Zig off `PATH`.
+- **Tests:** one Debug run per system; on x86-64 it targets generic x86-64 (`core2` on macOS), so the AVX2 kernels run through run-time dispatch as in the release binary.
+- **Release binaries:** each system's ReleaseFast binary, static on Linux and linked only to `libSystem` on macOS, packaged and smoke-tested on every command from the unpacked archive, with Zig off `PATH`.
 - **Source package:** the files under `.paths` in `build.zig.zon`, fetched into a fresh Zig package and tested through the public module.
 - **Workflows:** actionlint and zizmor, when `.github/` changes.
 

@@ -1,6 +1,6 @@
 # Installation
 
-Each [release](https://github.com/eneskemalergin/z-fastq/releases) has a ready-made static binary for Linux on x86-64 and on aarch64; anything else is built from source with Zig.
+Each [release](https://github.com/eneskemalergin/z-fastq/releases) has a ready-made binary for Linux and for macOS, each on x86-64 and on aarch64; anything else is built from source with Zig.
 
 ## Download a release
 
@@ -12,41 +12,45 @@ tar -xzf z-fastq-0.2.1-linux-x86_64.tar.gz
 ./z-fastq-0.2.1-linux-x86_64/z-fastq --version
 ```
 
-On an ARM machine, use `linux-aarch64` in place of `linux-x86_64`. The archive holds the binary and its license. It needs no libraries, so copy it into a directory on your `PATH`. With the [GitHub CLI](https://cli.github.com/), `gh attestation verify z-fastq-0.2.1-linux-x86_64.tar.gz --repo eneskemalergin/z-fastq` also confirms the archive was built by this repository's release workflow.
+On an ARM machine, use `linux-aarch64` in place of `linux-x86_64`; on a Mac, use `macos-aarch64` (Apple Silicon) or `macos-x86_64` (Intel), and check the archive with `grep macos-aarch64 SHA256SUMS | shasum -a 256 --check`. The archive holds the binary and its license. The Linux binary is static and the macOS binary needs only the system library every Mac has, so copy it into a directory on your `PATH`. With the [GitHub CLI](https://cli.github.com/), `gh attestation verify z-fastq-0.2.1-linux-x86_64.tar.gz --repo eneskemalergin/z-fastq` also confirms the archive was built by this repository's release workflow.
+
+The macOS binary is not notarized. An archive fetched with `curl`, as above, runs as it is; macOS blocks a binary unpacked from an archive downloaded in a browser until its quarantine attribute is removed with `xattr -d com.apple.quarantine z-fastq`.
 
 ## Build from source
 
-The build needs nothing beyond Zig itself: no C compiler, no NASM, and no system zlib, and the release build below is fully static.
+The build needs nothing beyond Zig itself: no C compiler, no NASM, and no system zlib. The release build below is fully static on Linux; on macOS it links only the system library, `libSystem`.
 
 **You need**
 
-- Linux on x86-64 or aarch64.
+- Linux on x86-64 or aarch64, or macOS 13 or later on Apple Silicon or Intel.
 - [Zig](https://ziglang.org/download/) 0.16.0.
 - Network access for the first build, which downloads z-fastq's one package dependency, [zipir](https://github.com/eneskemalergin/zipir) 0.3.0. Later builds reuse it.
 
 From the repository root:
 
 ```bash
-zig build -Dstatic=true -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast
 ./zig-out/bin/z-fastq --version
 ```
 
 The second line prints `z-fastq 0.2.1`.
 
 - `-Doptimize=ReleaseSafe` keeps Zig's safety checks in the release build.
+- `-Dstatic=true` confirms a static Linux release build; it stops with a message on macOS, where no build is static.
+- `-Dcpu` names the CPU a release build targets, such as `-Dcpu=x86_64_v3`; the binary then runs only on CPUs with that CPU's features. Without it, a Linux release build targets generic x86-64 or ARMv8-A, and a macOS release build targets Zig's macOS defaults, `core2` (Intel) or `apple_m1` (Apple Silicon).
 - A plain `zig build` gives a debug build, for working on the code.
 
 The binary stays in `zig-out/bin/`; there is no package-manager install yet. Copy or link it into a directory on your `PATH` to call it as `z-fastq`.
 
 ## Faster code on newer CPUs
 
-The x86-64 release binary runs on any x86-64 CPU and switches to faster code where the CPU allows: PCLMUL and SSE4.1 for the gzip checksum, and AVX2 for line search, validation, and base and quality counting on records of 1 KiB or more. The output is identical either way. The aarch64 release binary runs on any ARMv8-A CPU and selects nothing at run time.
+The x86-64 release binaries, for Linux and for macOS, run on any x86-64 CPU and switch to faster code where the CPU allows: PCLMUL and SSE4.1 for the gzip checksum, and AVX2 for line search, validation, and base and quality counting on records of 1 KiB or more. The output is identical either way. The aarch64 release binaries select nothing at run time: the Linux one runs on any ARMv8-A CPU, the macOS one on any Apple Silicon Mac.
 
 <details>
 <summary>Build without run-time selection</summary>
 
 ```bash
-zig build -Dstatic=true -Doptimize=ReleaseFast -Dkernel-backend=portable
+zig build -Doptimize=ReleaseFast -Dkernel-backend=portable
 ```
 
 This build uses only the instructions of its target CPU. The default is `-Dkernel-backend=dispatch`, and the tests pass with both.

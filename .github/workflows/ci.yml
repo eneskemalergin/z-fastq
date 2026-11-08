@@ -1,14 +1,15 @@
 # Checks every pull request and push to main; any other branch runs on request, so no commit is tested twice.
-# The first failure stops the run: a failed lane cancels the other, and nothing is packaged after a failed test.
+# The first failure stops the run: a failed lane cancels the others, and nothing is packaged after a failed test.
 #
 # - checks: seconds on one runner. Picks what the rest must run (documentation, benchmark reports, and peer-tool
 #   recipes skip the builds; without a base commit in the shallow clone, everything runs) and fails fast on format,
 #   script syntax, lint of the CI scripts, broken documentation links, and a version without its CHANGELOG.md entry.
 # - workflows: actionlint from a pinned image and zizmor, when .github/ changes.
-# - test: one lane per architecture. Each runs the tests once in Debug, which keeps every safety check at the
-#   lowest build cost; x86-64 builds for baseline x86-64, so AVX2 is reached through run-time dispatch as in the
-#   release binary. Each lane then builds its static ReleaseFast release binary and smoke-tests it; the x86-64
-#   lane also builds the source package a Zig dependent fetches and tests it from a fresh package.
+# - test: one lane per system, Linux and macOS on x86-64 and aarch64. Each runs the tests once in Debug, which
+#   keeps every safety check at the lowest build cost; the x86-64 lanes build for generic x86-64 (core2 on macOS),
+#   so AVX2 is reached through run-time dispatch as in the release binary. Each lane then builds its ReleaseFast
+#   release binary (static on Linux) and smoke-tests it; the Linux x86-64 lane also builds the source package a
+#   Zig dependent fetches and tests it from a fresh package.
 # - result: one required check for branch protection, whichever jobs ran.
 #
 # On main, the tested archives are kept for seven days; the release workflow publishes those for a tag instead of
@@ -153,6 +154,16 @@ jobs:
             flags: ""
             system: linux-aarch64
             source: false
+          - name: macos-x86-64
+            runner: macos-15-intel
+            flags: -Dcpu=baseline
+            system: macos-x86_64
+            source: false
+          - name: macos-aarch64
+            runner: macos-15
+            flags: ""
+            system: macos-aarch64
+            source: false
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -171,7 +182,7 @@ jobs:
         run: |
           set -euo pipefail
           read -ra flags <<< "$FLAGS"
-          zig build test "${flags[@]}" --summary all
+          zig build test ${flags[@]+"${flags[@]}"} --summary all
 
       - name: Package and smoke-test the release binary
         env:
