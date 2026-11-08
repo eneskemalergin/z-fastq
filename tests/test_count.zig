@@ -878,11 +878,12 @@ test "[cli] - [output]: a pipe closed by its reader exits with I/O status" {
         &.{ "sample", "--fraction", "1", "tests/data/synthetic/basic_valid.fastq" },
         &.{ "sample", "--count", "1", "tests/data/synthetic/basic_valid.fastq" },
     }) |args| {
-        var ends: [2]i32 = undefined;
-        try std.testing.expectEqual(@as(usize, 0), std.os.linux.pipe2(&ends, .{ .CLOEXEC = true }));
-        _ = std.os.linux.close(ends[0]);
+        var ends: [2]std.c.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&ends));
+        _ = std.c.close(ends[0]);
         const write_end: std.Io.File = .{ .handle = ends[1], .flags = .{ .nonblocking = false } };
-        defer _ = std.os.linux.close(ends[1]);
+        defer _ = std.c.close(ends[1]);
+        try std.testing.expect(std.c.fcntl(ends[1], std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) != -1);
         try cli.expectResult(try cli.runWithStdoutFile(allocator, args, write_end, null), 3, "", OUTPUT_FAILURE);
     }
 }
@@ -952,12 +953,9 @@ test "[unit] - [test runner]: captured streams stop at the caller's limit and le
             try std.testing.expectEqual(error.StreamTooLong, err);
         }
 
-        var children: [128]u8 = undefined;
-        try std.testing.expectEqualStrings("", try std.Io.Dir.cwd().readFile(
-            std.testing.io,
-            "/proc/thread-self/children",
-            &children,
-        ));
+        const waited = std.c.waitpid(-1, null, std.c.W.NOHANG);
+        try std.testing.expectEqual(@as(std.c.pid_t, -1), waited);
+        try std.testing.expectEqual(std.c.E.CHILD, std.c.errno(waited));
     }
 }
 

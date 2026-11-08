@@ -20,28 +20,33 @@ pub fn build(b: *std.Build) void {
         },
     }
     const arch = requested_target.result.cpu.arch;
-    if ((arch != .x86_64 and arch != .aarch64) or requested_target.result.os.tag != .linux) {
+    const os = requested_target.result.os.tag;
+    if ((arch != .x86_64 and arch != .aarch64) or (os != .linux and os != .macos)) {
         std.debug.print(
-            "error: z-fastq currently supports Linux x86-64 and aarch64 builds only\n",
+            "error: z-fastq supports x86-64 and aarch64 builds for Linux and macOS only\n",
             .{},
         );
         std.process.exit(1);
     }
     const release_build = optimize == .ReleaseSafe or optimize == .ReleaseFast;
-    if (b.option(bool, "static", "Confirm a static release build")) |requested_static| {
-        if (requested_static != release_build) {
-            std.debug.print(
-                "error: Debug is native; ReleaseSafe and ReleaseFast are always static\n",
-                .{},
-            );
+    const static_build = release_build and os == .linux;
+    if (b.option(bool, "static", "Confirm a static Linux release build")) |requested_static| {
+        if (requested_static != static_build) {
+            std.debug.print("error: {s}\n", .{if (os == .macos)
+                "macOS builds link libSystem dynamically and are never static"
+            else
+                "Debug is native; ReleaseSafe and ReleaseFast are always static"});
             std.process.exit(1);
         }
     }
     const target = if (release_build)
         b.resolveTargetQuery(.{
             .cpu_arch = arch,
-            .os_tag = .linux,
-            .abi = .musl,
+            .cpu_model = requested_target.query.cpu_model,
+            .cpu_features_add = requested_target.query.cpu_features_add,
+            .cpu_features_sub = requested_target.query.cpu_features_sub,
+            .os_tag = os,
+            .abi = if (os == .linux) .musl else null,
         })
     else
         requested_target;

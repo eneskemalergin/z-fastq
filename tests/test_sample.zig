@@ -526,12 +526,7 @@ test "[cli] - [sample]: a FIFO is rejected by paired exact-count runs without wa
     const allocator = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.mknodat(
-        tmp.dir.handle,
-        "input.fifo",
-        std.os.linux.S.IFIFO | 0o600,
-        0,
-    )));
+    try cli.makeFifo(tmp.dir, "input.fifo");
     try tmp.dir.symLink(io, "input.fifo", "link.fastq", .{});
 
     for ([_][]const u8{ "input.fifo", "link.fastq" }) |name| {

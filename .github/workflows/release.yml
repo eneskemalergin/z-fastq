@@ -123,11 +123,11 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/assets"
-          for name in source linux-x86_64 linux-aarch64; do
+          for name in source linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
             test -s "z-fastq-$VERSION-$name.tar.gz" || { echo "missing tested archive: z-fastq-$VERSION-$name.tar.gz" >&2; exit 1; }
           done
           count=$(find . -maxdepth 1 -type f | wc -l)
-          test "$count" -eq 3 || { echo "expected the 3 tested archives, found $count files: $(ls)" >&2; exit 1; }
+          test "$count" -eq 5 || { echo "expected the 5 tested archives, found $count files: $(ls)" >&2; exit 1; }
           sha256sum ./*.tar.gz > SHA256SUMS
           sha256sum --check SHA256SUMS
           cd "$GITHUB_WORKSPACE"
