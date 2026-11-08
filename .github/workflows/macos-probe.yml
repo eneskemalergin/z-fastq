@@ -1,6 +1,6 @@
-# Records the macOS runner facts the macOS build and its tests depend on: CPU features, Rosetta, the bash and
-# binary tools on PATH, pipe and FIFO capacity, FIFO poll results, /dev/stdin identity, and kqueue process
-# events. It builds nothing and changes nothing.
+# Records the macOS runner facts the macOS build and its tests depend on: how a FIFO reader learns that a
+# writer connected or left, and what /dev/stdin resolves to and shares with standard input. It builds nothing
+# and changes nothing.
 name: macos-probe
 
 on:
@@ -8,141 +8,114 @@ on:
 
 permissions: {}
 
-defaults:
-  run:
-    shell: bash
-
 jobs:
   probe:
-    name: Probe (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
+    name: Probe (macos-15)
+    runs-on: macos-15
     timeout-minutes: 5
     permissions: {}
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [macos-15-intel, macos-15]
     steps:
-      - name: Record the system and tools
-        run: |
-          set -u
-          sw_vers
-          uname -a
-          sysctl -n machdep.cpu.brand_string
-          sysctl hw.optional | grep -E -i 'avx|neon|crc|arm' || true
-          printf 'bash on PATH: %s %s\n' "$(command -v bash)" "$BASH_VERSION"
-          /bin/bash --version | head -n 1
-          for tool in file otool python3 cc; do
-            printf '%s: %s\n' "$tool" "$(command -v "$tool")"
-          done
-          if [ "$(uname -m)" = arm64 ]; then
-            if arch -x86_64 /usr/bin/true; then
-              printf 'Rosetta AVX2: %s\n' "$(arch -x86_64 /usr/sbin/sysctl -n hw.optional.avx2_0 2>&1)"
-              printf 'Rosetta AVX2 with ROSETTA_ADVERTISE_AVX=1: %s\n' \
-                "$(ROSETTA_ADVERTISE_AVX=1 arch -x86_64 /usr/sbin/sysctl -n hw.optional.avx2_0 2>&1)"
-            else
-              echo 'Rosetta is not installed'
-            fi
-          fi
-          work=$(mktemp -d "$RUNNER_TEMP/probe.XXXXXX")
-          printf 'int main(void) { return 0; }\n' > "$work/hello.c"
-          cc -O2 -o "$work/hello" "$work/hello.c"
-          file -b "$work/hello"
-          otool -L "$work/hello"
-          otool -l "$work/hello" | grep segname | sort -u
-
-      - name: Record pipes, FIFOs, standard input, and process events
+      - name: Record FIFO waits and /dev/stdin
         shell: python3 {0}
         run: |
           import errno, os, select, subprocess, sys, tempfile, threading, time
 
           root = tempfile.mkdtemp(dir=os.environ["RUNNER_TEMP"])
+          made = []
 
-          def fill(fd, chunk):
-              data = b"x" * chunk
-              total = 0
-              while True:
-                  try:
-                      total += os.write(fd, data)
-                  except BlockingIOError:
-                      return total
-
-          for chunk in (1, 512, 4096, 65536):
-              r, w = os.pipe()
-              os.set_blocking(w, False)
-              print(f"pipe capacity with {chunk}-byte writes: {fill(w, chunk)}")
-              os.close(r)
-              os.close(w)
-
-          for chunk in (1, 512, 4096, 65536):
-              path = os.path.join(root, f"fill-{chunk}")
+          def fifo():
+              path = os.path.join(root, f"fifo-{len(made)}")
               os.mkfifo(path)
-              r = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-              w = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
-              print(f"FIFO capacity with {chunk}-byte writes: {fill(w, chunk)}")
-              os.close(w)
-              os.close(r)
+              made.append(path)
+              return path
 
-          for size in (6154, 12310, 200000):
-              path = os.path.join(root, f"blocking-{size}")
-              os.mkfifo(path)
-              r = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-              w = os.open(path, os.O_WRONLY)
-              threading.Thread(target=os.write, args=(w, b"x" * size), daemon=True).start()
-              time.sleep(1)
-              print(f"FIFO bytes buffered by one blocking {size}-byte write: {len(os.read(r, 1 << 20))}")
+          def nonblocking_read(fd):
+              try:
+                  return repr(os.read(fd, 16))
+              except BlockingIOError:
+                  return "EAGAIN"
 
-          path = os.path.join(root, "poll")
-          os.mkfifo(path)
-          r = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-          poller = select.poll()
-          poller.register(r, select.POLLIN)
-          print(f"POLLIN={select.POLLIN} POLLERR={select.POLLERR} POLLHUP={select.POLLHUP} POLLNVAL={select.POLLNVAL}")
-          print(f"FIFO poll before any writer: {poller.poll(500)}")
-          w = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
-          print(f"FIFO poll with a writer and no data: {poller.poll(500)}")
-          os.write(w, b"abc")
-          print(f"FIFO poll after a write: {poller.poll(500)}")
-          os.read(r, 16)
-          os.close(w)
-          print(f"FIFO poll after the writer closed: {poller.poll(500)}")
+          def blocking_read(fd, seconds):
+              result = []
+              thread = threading.Thread(target=lambda: result.append(os.read(fd, 16)), daemon=True)
+              thread.start()
+              thread.join(seconds)
+              return repr(result[0]) if result else "still blocked"
 
-          path = os.path.join(root, "read-write")
-          os.mkfifo(path)
-          try:
-              os.close(os.open(path, os.O_RDWR | os.O_NONBLOCK))
-              print("FIFO opens with O_RDWR | O_NONBLOCK")
-          except OSError as error:
-              print(f"FIFO O_RDWR open fails: {errno.errorcode.get(error.errno, error.errno)}")
+          def open_and_close_writer(path, data=b""):
+              writer = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+              if data:
+                  os.write(writer, data)
+              os.close(writer)
 
-          compare = (
-              "import os; a = os.fstat(0); b = os.stat('/dev/stdin'); "
-              "print((a.st_dev, a.st_ino) == (b.st_dev, b.st_ino), a.st_dev, a.st_ino, b.st_dev, b.st_ino)"
+          def reader(path, blocking):
+              fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+              os.set_blocking(fd, blocking)
+              return fd
+
+          print("nonblocking read, no writer yet:", nonblocking_read(reader(fifo(), False)))
+          print("blocking read, no writer yet, after 1 s:", blocking_read(reader(fifo(), True), 1))
+          path = fifo()
+          fd = reader(path, False)
+          open_and_close_writer(path)
+          print("nonblocking read after a writer opened and closed:", nonblocking_read(fd))
+          os.set_blocking(fd, True)
+          print("blocking read after a writer opened and closed:", blocking_read(fd, 1))
+          for data in (b"", b"abc"):
+              path = fifo()
+              fd = reader(path, True)
+              threading.Timer(0.3, open_and_close_writer, (path, data)).start()
+              print(f"blocking read while a writer opens, writes {data!r}, and closes:", blocking_read(fd, 1.5))
+
+          def poll_wait(fd, seconds):
+              poller = select.poll()
+              poller.register(fd, select.POLLIN)
+              return poller.poll(int(seconds * 1000))
+
+          def select_wait(fd, seconds):
+              return select.select([fd], [], [], seconds)[0]
+
+          def kqueue_wait(fd, seconds):
+              queue = select.kqueue()
+              queue.control([select.kevent(fd, filter=select.KQ_FILTER_READ, flags=select.KQ_EV_ADD)], 0, 0)
+              return [f"flags=0x{event.flags:x} data={event.data}" for event in queue.control(None, 1, seconds)]
+
+          print(f"EV_EOF=0x{select.KQ_EV_EOF:x} POLLIN={select.POLLIN} POLLHUP={select.POLLHUP}")
+          for name, wait in (("poll", poll_wait), ("select", select_wait), ("kqueue", kqueue_wait)):
+              path = fifo()
+              fd = reader(path, False)
+              print(f"{name}, no writer yet:", wait(fd, 0.5))
+              path = fifo()
+              fd = reader(path, False)
+              open_and_close_writer(path)
+              print(f"{name} after a writer opened and closed:", wait(fd, 0.5))
+              for data in (b"", b"abc"):
+                  path = fifo()
+                  fd = reader(path, False)
+                  threading.Timer(0.3, open_and_close_writer, (path, data)).start()
+                  print(f"{name} while a writer opens, writes {data!r}, and closes:", wait(fd, 1.5))
+
+          resolve = r'''
+          import ctypes
+          libc = ctypes.CDLL(None, use_errno=True)
+          for symbol in ("realpath", "realpath$DARWIN_EXTSN"):
+              function = getattr(libc, symbol)
+              function.restype = ctypes.c_char_p
+              function.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+              for path in ("/dev/stdin", "/dev/fd/0", "/dev/fd/1"):
+                  buffer = ctypes.create_string_buffer(1024)
+                  print(symbol, path, function(path.encode(), buffer), ctypes.get_errno())
+          '''
+          shared = (
+              "import os; os.read(0, 2); fd = os.open('/dev/stdin', os.O_RDONLY); "
+              "print('after 2 bytes from fd 0, /dev/stdin reads', os.read(fd, 16))"
           )
           regular = os.path.join(root, "input.fastq")
           with open(regular, "w") as handle:
               handle.write("@a\nA\n+\n!\n")
-          with open(regular) as handle:
-              result = subprocess.run([sys.executable, "-c", compare], stdin=handle, capture_output=True, text=True)
-          print(f"/dev/stdin equals a regular-file standard input: {result.stdout.strip()} {result.stderr.strip()}")
-          result = subprocess.run([sys.executable, "-c", compare], input="x", capture_output=True, text=True)
-          print(f"/dev/stdin equals a pipe standard input: {result.stdout.strip()} {result.stderr.strip()}")
-          print(f"/dev/fd entries: {sorted(os.listdir('/dev/fd'))}")
-
-          def watch(pid):
-              queue = select.kqueue()
-              event = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
-              queue.control([event], 0, 0)
-              return queue
-
-          child = subprocess.Popen(["/bin/sleep", "0.3"])
-          print(f"kqueue exit event of a running child: {watch(child.pid).control(None, 1, 5)}")
-          child.wait()
-          child = subprocess.Popen(["/usr/bin/true"])
-          time.sleep(0.5)
-          try:
-              queue = watch(child.pid)
-              print(f"kqueue watch of an exited, unreaped child: registered, then {queue.control(None, 1, 0.5)}")
-          except OSError as error:
-              print(f"kqueue watch of an exited, unreaped child fails: {errno.errorcode.get(error.errno, error.errno)}")
-          child.wait()
+          for code in (resolve, shared):
+              with open(regular) as handle:
+                  result = subprocess.run([sys.executable, "-c", code], stdin=handle, capture_output=True, text=True)
+              print("regular-file standard input:", result.stdout.strip(), result.stderr.strip())
+              result = subprocess.run([sys.executable, "-c", code], input="@a\nA\n+\n!\n", capture_output=True, text=True)
+              print("pipe standard input:", result.stdout.strip(), result.stderr.strip())
