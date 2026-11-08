@@ -7,6 +7,8 @@
 //! have AVX2. On aarch64 the baseline tier's 16 lanes are one NEON register.
 //! Kernels whose work per call outweighs the call at any length, such as
 //! fastp's pair sum in preprocess.zig, use the AVX2 object whenever it applies.
+//! `selectTier` lowers the run-time choice to any tier from the compiled one to
+//! the CPU's best; the CLI sets it once from `ZFASTQ_TIER` before any kernel runs.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -34,11 +36,25 @@ const AVX2_MIN_BYTES = 1024;
 const SELECT_AT_RUN_TIME = build_options.avx2_object;
 
 pub inline fn useAvx2(len: usize) bool {
-    return SELECT_AT_RUN_TIME and len >= AVX2_MIN_BYTES and cpuHasAvx2();
+    return SELECT_AT_RUN_TIME and len >= AVX2_MIN_BYTES and runTimeTier() == .avx2;
 }
 
 pub inline fn avx2Selected() bool {
-    return SELECT_AT_RUN_TIME and cpuHasAvx2();
+    return SELECT_AT_RUN_TIME and runTimeTier() == .avx2;
+}
+
+pub const TierRange = struct { lowest: Tier, highest: Tier };
+
+pub fn tierRange() TierRange {
+    return .{ .lowest = INLINE_TIER, .highest = bestTier() };
+}
+
+pub fn selectTier(tier: Tier) error{TierUnavailable}!void {
+    const range = tierRange();
+    if (@intFromEnum(tier) < @intFromEnum(range.lowest) or @intFromEnum(tier) > @intFromEnum(range.highest)) {
+        return error.TierUnavailable;
+    }
+    run_time_tier.store(tierState(tier), .monotonic);
 }
 
 pub fn exportKernel(comptime name: []const u8, comptime function: anytype) void {
@@ -104,14 +120,23 @@ fn containsNewlineExport(first: [*]const u8, second: ?[*]const u8, len: usize) c
     return containsNewlineFor(INLINE_LANES, first, second, len);
 }
 
-var avx2_state: std.atomic.Value(u8) = .init(0);
+var run_time_tier: std.atomic.Value(u8) = .init(0);
 
-fn cpuHasAvx2() bool {
-    const state = avx2_state.load(.monotonic);
-    if (state != 0) return state == 2;
-    const detected = detectAvx2();
-    avx2_state.store(if (detected) 2 else 1, .monotonic);
-    return detected;
+fn tierState(tier: Tier) u8 {
+    return @as(u8, @intFromEnum(tier)) + 1;
+}
+
+fn runTimeTier() Tier {
+    const state = run_time_tier.load(.monotonic);
+    if (state != 0) return @enumFromInt(state - 1);
+    const best = bestTier();
+    run_time_tier.store(tierState(best), .monotonic);
+    return best;
+}
+
+fn bestTier() Tier {
+    if (SELECT_AT_RUN_TIME and detectAvx2()) return .avx2;
+    return INLINE_TIER;
 }
 
 fn detectAvx2() bool {
@@ -357,29 +382,58 @@ test "[edge] - [newline kernels]: masks set the bit of each LF at every width" {
     }
 }
 
-test "[property] - [newline kernels]: the run-time selected path is exact around its length gate" {
+test "[property] - [newline kernels]: the run-time selected path is exact around its length gate in every available tier" {
+    const saved = run_time_tier.load(.monotonic);
+    defer run_time_tier.store(saved, .monotonic);
     var storage: [5 * AVX2_MIN_BYTES]u8 = undefined;
     const lengths = [_]usize{ AVX2_MIN_BYTES - 1, AVX2_MIN_BYTES, AVX2_MIN_BYTES + 1, 2 * AVX2_MIN_BYTES + 5 };
     const positions = [_]usize{ 0, AVX2_MIN_BYTES - 1, AVX2_MIN_BYTES, AVX2_MIN_BYTES + 31, 2 * AVX2_MIN_BYTES };
-    for ([_]usize{ 0, 1 }) |alignment| {
-        for (lengths) |len| {
-            const bytes = storage[alignment..][0..len];
-            for (positions) |first_lf| {
-                @memset(&storage, 'A');
-                storage[alignment + len] = '\n';
-                for ([_]usize{ first_lf, first_lf + 1, first_lf + 100, first_lf + 700 }) |index| {
-                    if (index < len) bytes[index] = '\n';
+    const range = tierRange();
+    for (std.enums.values(Tier)) |tier| {
+        if (@intFromEnum(tier) < @intFromEnum(range.lowest) or @intFromEnum(tier) > @intFromEnum(range.highest)) continue;
+        try selectTier(tier);
+        for ([_]usize{ 0, 1 }) |alignment| {
+            for (lengths) |len| {
+                const bytes = storage[alignment..][0..len];
+                for (positions) |first_lf| {
+                    @memset(&storage, 'A');
+                    storage[alignment + len] = '\n';
+                    for ([_]usize{ first_lf, first_lf + 1, first_lf + 100, first_lf + 700 }) |index| {
+                        if (index < len) bytes[index] = '\n';
+                    }
+                    const quiet = storage[alignment + len + 1 ..][0..len];
+                    @memset(quiet, 'C');
+                    try expectNewlineSearch(bytes, quiet);
+                    try expectNewlineSearch(quiet, bytes);
                 }
-                const quiet = storage[alignment + len + 1 ..][0..len];
-                @memset(quiet, 'C');
-                try expectNewlineSearch(bytes, quiet);
-                try expectNewlineSearch(quiet, bytes);
             }
         }
     }
 }
 
+test "[unit] - [tier]: selection accepts exactly the tiers from the compiled one to the CPU's best" {
+    const saved = run_time_tier.load(.monotonic);
+    defer run_time_tier.store(saved, .monotonic);
+    const range = tierRange();
+    try std.testing.expectEqual(INLINE_TIER, range.lowest);
+    try std.testing.expectEqual(if (SELECT_AT_RUN_TIME and detectAvx2()) Tier.avx2 else INLINE_TIER, range.highest);
+    for (std.enums.values(Tier)) |tier| {
+        const before = runTimeTier();
+        if (@intFromEnum(tier) < @intFromEnum(range.lowest) or @intFromEnum(tier) > @intFromEnum(range.highest)) {
+            try std.testing.expectError(error.TierUnavailable, selectTier(tier));
+            try std.testing.expectEqual(before, runTimeTier());
+            continue;
+        }
+        try selectTier(tier);
+        try std.testing.expectEqual(tier, runTimeTier());
+        try std.testing.expectEqual(SELECT_AT_RUN_TIME and tier == .avx2, useAvx2(AVX2_MIN_BYTES));
+        try std.testing.expectEqual(SELECT_AT_RUN_TIME and tier == .avx2, avx2Selected());
+        try std.testing.expect(!useAvx2(AVX2_MIN_BYTES - 1));
+    }
+    try std.testing.expectError(error.TierUnavailable, selectTier(.avx512));
+}
+
 test "[unit] - [cpu]: detection agrees with the AVX2 guarantee of the build target" {
     if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
-    if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) try std.testing.expect(cpuHasAvx2());
+    if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) try std.testing.expect(detectAvx2());
 }

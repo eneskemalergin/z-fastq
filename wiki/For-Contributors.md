@@ -43,6 +43,7 @@ zig build test -Dstatic=true -Doptimize=ReleaseFast --summary all
 - The tests use small tracked files only, no downloads or other tools. They need FIFOs and hard and symbolic links, plus `pidfd_open` and `/proc` on Linux, or kqueue and `/dev/fd` on macOS.
 - On x86-64 no test is expected to skip; on aarch64 the x86-64 CPU-detection test skips. Investigate any other skip.
 - Debug builds target the host CPU; the release runs target generic x86-64 and are the ones that test the run-time AVX2 kernels against their scalar versions. A timing is never proof of correct output.
+- `ZFASTQ_TIER=baseline` or `avx2` makes the CLI run that kernel tier instead of the one it would pick, when the binary can run it on this CPU; any other value stops it with status 2 and names the tiers it can run. Set it for `zig build test` to run every installed-CLI test on one tier. A Debug build compiles the host's tier in, so on an AVX2 machine only the release runs and `-Dcpu=baseline` can run both tiers. Zipir's gzip kernels are not affected; `-Dkernel-backend=portable` selects its portable ones.
 
 ## Continuous integration
 

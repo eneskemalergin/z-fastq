@@ -10,6 +10,7 @@ const sampling = @import("sample.zig");
 const statistics = @import("stats.zig");
 const qc = @import("qc.zig");
 const preprocess = @import("preprocess.zig");
+const simd = @import("simd.zig");
 
 pub const std_options: std.Options = .{ .networking = false };
 
@@ -108,6 +109,30 @@ const USAGE =
 fn argumentError(io: std.Io, message: []const u8, exit_code: u8) noreturn {
     std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
     std.process.exit(exit_code);
+}
+
+const TIER_VARIABLE = "ZFASTQ_TIER";
+
+fn selectKernelTier(io: std.Io, value: []const u8) void {
+    const tier = std.meta.stringToEnum(simd.Tier, value) orelse
+        argumentError(io, "error: " ++ TIER_VARIABLE ++ " must be baseline, avx2, or avx512\n", 2);
+    simd.selectTier(tier) catch {
+        var buffer: [128]u8 = undefined;
+        var message: std.Io.Writer = .fixed(&buffer);
+        writeUnavailableTier(&message, tier, simd.tierRange()) catch unreachable;
+        argumentError(io, message.buffered(), 2);
+    };
+}
+
+fn writeUnavailableTier(message: *std.Io.Writer, tier: simd.Tier, range: simd.TierRange) std.Io.Writer.Error!void {
+    try message.print("error: {s}={s} is not available; this binary runs ", .{ TIER_VARIABLE, @tagName(tier) });
+    const lowest = @intFromEnum(range.lowest);
+    const count = @intFromEnum(range.highest) - lowest + 1;
+    for (0..count) |index| {
+        if (index > 0) try message.writeAll(if (count == 2) " or " else if (index == count - 1) ", or " else ", ");
+        try message.writeAll(@tagName(@as(simd.Tier, @enumFromInt(lowest + index))));
+    }
+    try message.writeAll(" here\n");
 }
 
 fn printUsageAndExit(io: std.Io) noreturn {
@@ -279,6 +304,8 @@ pub fn main(init: std.process.Init) !void {
         .mask = std.posix.sigemptyset(),
         .flags = 0,
     }, null);
+
+    if (init.environ_map.get(TIER_VARIABLE)) |value| selectKernelTier(io, value);
 
     var args = std.process.Args.Iterator.initAllocator(init.minimal.args, gpa) catch {
         argumentError(io, OUT_OF_MEMORY_LINE, 3);

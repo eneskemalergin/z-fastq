@@ -46,6 +46,8 @@ The binary stays in `zig-out/bin/`; there is no package-manager install yet. Cop
 
 The x86-64 release binaries, for Linux and for macOS, run on any x86-64 CPU and switch to faster code where the CPU allows: PCLMUL and SSE4.1 for the gzip checksum, and AVX2 for line search, validation, and base and quality counting on records of 1 KiB or more. The output is identical either way. The aarch64 release binaries select nothing at run time: the Linux one runs on any ARMv8-A CPU, the macOS one on any Apple Silicon Mac.
 
+To run the slower kernels on a CPU that has AVX2, for example to compare speeds or to rule the AVX2 code out, set `ZFASTQ_TIER=baseline`; `ZFASTQ_TIER=avx2` names the default on such a CPU. A tier the binary cannot run on the CPU, or any other value, stops the command with status 2 and names the tiers it can run. Unset, z-fastq picks the fastest tier.
+
 <details>
 <summary>Build without run-time selection</summary>
 

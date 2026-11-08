@@ -552,6 +552,7 @@ pub const RunOptions = struct {
     stderr: StderrMode = .capture,
     timeout: std.Io.Duration = PROCESS_TIMEOUT,
     output_limit: usize = PROCESS_OUTPUT_LIMIT,
+    environ_map: ?*const std.process.Environ.Map = null,
 };
 
 pub fn runWith(
@@ -570,6 +571,7 @@ pub fn runWith(
 
     var proc = try std.process.spawn(io, .{
         .argv = argv.items,
+        .environ_map = options.environ_map,
         .stdin = switch (options.stdin) {
             .closed => .close,
             .stalled, .data => .pipe,

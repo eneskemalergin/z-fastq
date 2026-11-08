@@ -446,6 +446,145 @@ test "[cli] - [input]: /dev/stdin rereads a regular standard input on Linux and 
     }
 }
 
+const TIER_NAMES = [_][]const u8{ "baseline", "avx2", "avx512" };
+const TIER_ERROR = "error: ZFASTQ_TIER must be baseline, avx2, or avx512\n";
+const TIER_ADAPTER1 = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
+const TIER_ADAPTER2 = "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT";
+
+fn runWithTier(allocator: std.mem.Allocator, args: []const []const u8, tier: ?[]const u8) !CommandResult {
+    var environ: std.process.Environ.Map = .init(allocator);
+    defer environ.deinit();
+    if (tier) |name| try environ.put("ZFASTQ_TIER", name);
+    return cli.runWith(allocator, args, .{ .environ_map = &environ });
+}
+
+fn availableTiers(allocator: std.mem.Allocator, buffer: *[TIER_NAMES.len][]const u8) ![]const []const u8 {
+    var count: usize = 0;
+    for (TIER_NAMES) |name| {
+        const result = try runWithTier(allocator, &.{"--version"}, name);
+        if (result.exit_code != 0) continue;
+        buffer[count] = name;
+        count += 1;
+    }
+    return buffer[0..count];
+}
+
+fn tierRecord(allocator: std.mem.Allocator, state: *u32, index: usize, mate: u8, len: usize) ![]const u8 {
+    var record: std.ArrayList(u8) = .empty;
+    try record.appendSlice(allocator, try std.fmt.allocPrint(allocator, "@pair{d}/{d}\n", .{ index, mate }));
+    const adapter = if (mate == 1) TIER_ADAPTER1 else TIER_ADAPTER2;
+    const insert = if (index % 3 == 0) len - adapter.len else len;
+    for (0..len) |position| {
+        if (position >= insert) {
+            try record.append(allocator, adapter[position - insert]);
+            continue;
+        }
+        state.* = state.* *% 1103515245 +% 12345;
+        try record.append(allocator, "ACGTACGTACGTACGN"[(state.* >> 16) & 15]);
+    }
+    try record.appendSlice(allocator, "\n+\n");
+    for (0..len) |_| {
+        state.* = state.* *% 1103515245 +% 12345;
+        try record.append(allocator, @intCast('#' + (state.* >> 16) % 40));
+    }
+    try record.append(allocator, '\n');
+    return record.items;
+}
+
+test "[cli] - [kernel tier]: ZFASTQ_TIER accepts only a tier this binary runs and is read before the command" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var buffer: [TIER_NAMES.len][]const u8 = undefined;
+    const available = try availableTiers(allocator, &buffer);
+    try std.testing.expect(available.len > 0);
+    var list: std.ArrayList(u8) = .empty;
+    for (available, 0..) |name, index| {
+        if (index > 0) try list.appendSlice(allocator, if (available.len == 2) " or " else if (index == available.len - 1) ", or " else ", ");
+        try list.appendSlice(allocator, name);
+    }
+    for (TIER_NAMES) |name| {
+        const runs = for (available) |tier| {
+            if (std.mem.eql(u8, tier, name)) break true;
+        } else false;
+        if (runs) continue;
+        const diagnostic = try std.fmt.allocPrint(allocator, "error: ZFASTQ_TIER={s} is not available; this binary runs {s} here\n", .{ name, list.items });
+        try cli.expectResult(try runWithTier(allocator, &.{ "count", "missing.fastq" }, name), 2, "", diagnostic);
+    }
+    for ([_][]const u8{ "", "AVX2", "scalar", "avx2 " }) |value| {
+        try cli.expectResult(try runWithTier(allocator, &.{ "count", "missing.fastq" }, value), 2, "", TIER_ERROR);
+        try cli.expectResult(try runWithTier(allocator, &.{"--help"}, value), 2, "", TIER_ERROR);
+    }
+}
+
+test "[cli] - [kernel tier]: every tier this binary runs writes the bytes automatic selection writes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var r1: std.ArrayList(u8) = .empty;
+    var r2: std.ArrayList(u8) = .empty;
+    var pairs: std.ArrayList(u8) = .empty;
+    var state: u32 = 11;
+    for (0..48) |index| {
+        const len: usize = if (index % 4 == 0) 1500 else 151;
+        const mate1 = try tierRecord(allocator, &state, index, 1, len);
+        const mate2 = try tierRecord(allocator, &state, index, 2, len);
+        try r1.appendSlice(allocator, mate1);
+        try r2.appendSlice(allocator, mate2);
+        try pairs.appendSlice(allocator, mate1);
+        try pairs.appendSlice(allocator, mate2);
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1.fastq", .data = r1.items });
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2.fastq", .data = r2.items });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pairs.fastq", .data = pairs.items });
+    const in1 = try cli.tempPath(allocator, &tmp.sub_path, "r1.fastq");
+    const in2 = try cli.tempPath(allocator, &tmp.sub_path, "r2.fastq");
+    const interleaved = try cli.tempPath(allocator, &tmp.sub_path, "pairs.fastq");
+    const out1 = try cli.tempPath(allocator, &tmp.sub_path, "out1.fastq");
+    const out2 = try cli.tempPath(allocator, &tmp.sub_path, "out2.fastq");
+    const summary = try cli.tempPath(allocator, &tmp.sub_path, "summary.json");
+    const Command = struct { args: []const []const u8, outputs: []const []const u8 = &.{} };
+    const commands = [_]Command{
+        .{ .args = &.{ "count", in1, in2 } },
+        .{ .args = &.{ "stats", "--json", in1 } },
+        .{ .args = &.{ "check", "--json", "--paired", in1, in2 } },
+        .{ .args = &.{ "sample", "--fraction", "0.5", "--seed", "3", in1 } },
+        .{ .args = &.{ "interleave", in1, in2 } },
+        .{ .args = &.{ "deinterleave", "--out1", out1, "--out2", out2, interleaved }, .outputs = &.{ "out1.fastq", "out2.fastq" } },
+        .{
+            .args = &.{ "process", "--adapter1", TIER_ADAPTER1, "--adapter2", TIER_ADAPTER2, "--min-length", "15", "--pair-duplication", "--qc-summary", summary, "--report", "-", "--out1", out1, "--out2", out2, in1, in2 },
+            .outputs = &.{ "out1.fastq", "out2.fastq", "summary.json" },
+        },
+    };
+
+    var buffer: [TIER_NAMES.len][]const u8 = undefined;
+    const available = try availableTiers(allocator, &buffer);
+    for (commands) |command| {
+        var automatic: ?[]const u8 = null;
+        for (0..available.len + 1) |run| {
+            const tier: ?[]const u8 = if (run == 0) null else available[run - 1];
+            const result = try runWithTier(allocator, command.args, tier);
+            try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+            try std.testing.expectEqualStrings("", result.stderr);
+            var written: std.ArrayList(u8) = .empty;
+            try written.appendSlice(allocator, result.stdout);
+            for (command.outputs) |name| {
+                try written.appendSlice(allocator, try tmp.dir.readFileAlloc(io, name, allocator, .limited(1 << 20)));
+                try tmp.dir.deleteFile(io, name);
+            }
+            if (automatic) |expected| {
+                try std.testing.expectEqualStrings(expected, written.items);
+            } else {
+                automatic = written.items;
+            }
+        }
+    }
+}
+
 test "[cli] - [arguments]: a double dash ends options before the path" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
