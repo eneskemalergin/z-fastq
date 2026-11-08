@@ -19,6 +19,7 @@
 //! memory follows the pairs read instead of fastp's fixed 1 GiB. The pair sum has an AVX2 kernel.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const fastq = @import("fastq.zig");
 const simd = @import("simd.zig");
@@ -284,7 +285,7 @@ pub const PairDuplication = struct {
             sumsScalar(&self.primes, read2, read1.len, &sums);
         } else if (simd.callKernel("pair_sums", &pairSumsExport)) |kernel| {
             kernel(&self.primes, read1.ptr, read1.len, read2.ptr, read2.len, &sums);
-        } else if (simd.INLINE_TIER != .baseline) {
+        } else if (simd.INLINE_TIER != .baseline or builtin.cpu.arch == .aarch64) {
             pairSumsVector(&self.primes, read1, read2, &sums);
         } else {
             sumsScalar(&self.primes, read1, 0, &sums);

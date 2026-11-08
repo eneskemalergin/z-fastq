@@ -765,11 +765,8 @@ fn scanSequenceLineFor(
     var block_start: usize = 0;
     while (bytes.len - block_start >= simd.BLOCK_BYTES) {
         const block: Bytes = bytes[block_start..][0..simd.BLOCK_BYTES].*;
-        const invalid: u64 = @bitCast(invalidSequenceVector(
-            simd.BLOCK_BYTES,
-            alphabet,
-            block,
-        ));
+        const invalid_lanes = invalidSequenceVector(simd.BLOCK_BYTES, alphabet, block);
+        const invalid = simd.movemask(simd.BLOCK_BYTES, invalid_lanes);
         if (invalid != 0) {
             const stop = block_start + @as(usize, @intCast(@ctz(invalid)));
             if (bytes[stop] == '\n') return .{ .line_end = stop };

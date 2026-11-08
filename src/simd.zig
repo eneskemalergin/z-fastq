@@ -223,13 +223,44 @@ fn xgetbv0() u32 {
         : .{ .ecx = true, .edx = true });
 }
 
+pub inline fn movemask(comptime width: usize, matches: @Vector(width, bool)) @Int(.unsigned, width) {
+    if (comptime builtin.cpu.arch != .aarch64 or (width != 32 and width != 64)) return @bitCast(matches);
+    return neonMovemask(width, matches);
+}
+
+const NeonBytes = @Vector(16, u8);
+
+extern fn @"llvm.aarch64.neon.addp.v16i8"(NeonBytes, NeonBytes) NeonBytes;
+
+inline fn neonMovemask(comptime width: usize, matches: @Vector(width, bool)) @Int(.unsigned, width) {
+    const weights = std.simd.repeat(width, NeonBytes{ 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128 });
+    const weighted: @Vector(width, u8) = @select(u8, matches, weights, @as(@Vector(width, u8), @splat(0)));
+    const addp = @"llvm.aarch64.neon.addp.v16i8";
+    const sums = if (width == 64) wide: {
+        const quarters = addp(addp(neonPart(width, weighted, 0), neonPart(width, weighted, 1)), addp(neonPart(width, weighted, 2), neonPart(width, weighted, 3)));
+        break :wide addp(quarters, quarters);
+    } else narrow: {
+        const pairs = addp(neonPart(width, weighted, 0), neonPart(width, weighted, 1));
+        const quads = addp(pairs, pairs);
+        break :narrow addp(quads, quads);
+    };
+    const lanes: @Vector(2, u64) = @bitCast(sums);
+    return @truncate(lanes[0]);
+}
+
+inline fn neonPart(comptime width: usize, weighted: @Vector(width, u8), comptime index: usize) NeonBytes {
+    const lanes = comptime std.simd.iota(i32, 16) + @as(@Vector(16, i32), @splat(index * 16));
+    return @shuffle(u8, weighted, undefined, lanes);
+}
+
 pub inline fn newlineMask(comptime width: usize, block: *const [width]u8) @Int(.unsigned, width) {
     const Bytes = @Vector(width, u8);
     const bytes: Bytes = block.*;
-    return @bitCast(bytes == @as(Bytes, @splat('\n')));
+    return movemask(width, bytes == @as(Bytes, @splat('\n')));
 }
 
 inline fn blockMask(comptime width: usize, block: *const [BLOCK_BYTES]u8) u64 {
+    if (comptime builtin.cpu.arch == .aarch64) return newlineMask(BLOCK_BYTES, block);
     var mask: u64 = 0;
     inline for (0..BLOCK_BYTES / width) |i| {
         mask |= @as(u64, newlineMask(width, block[i * width ..][0..width])) << @intCast(i * width);
@@ -411,6 +442,26 @@ test "[property] - [newline kernels]: every search matches a scalar scan at vect
             for (run..run + 4) |pos| bytes[pos] = '\n';
             try expectNewlineSearch(bytes, second);
         }
+    }
+}
+
+test "[property] - [masks]: movemask sets bit i exactly when lane i matches, at every width" {
+    var state: u32 = 5;
+    inline for (.{ 16, 32, 64 }) |width| {
+        const Mask = @Int(.unsigned, width);
+        for (0..200) |_| {
+            var expected: Mask = 0;
+            var lanes: [width]bool = undefined;
+            for (&lanes, 0..) |*lane, index| {
+                state = state *% 1103515245 +% 12345;
+                lane.* = (state >> 16) % 3 == 0;
+                if (lane.*) expected |= @as(Mask, 1) << @intCast(index);
+            }
+            const matches: @Vector(width, bool) = lanes;
+            try std.testing.expectEqual(expected, movemask(width, matches));
+        }
+        try std.testing.expectEqual(@as(Mask, 0), movemask(width, @as(@Vector(width, bool), @splat(false))));
+        try std.testing.expectEqual(~@as(Mask, 0), movemask(width, @as(@Vector(width, bool), @splat(true))));
     }
 }
 
