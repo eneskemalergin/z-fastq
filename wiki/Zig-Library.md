@@ -23,7 +23,7 @@ and in the code:
 const zfastq = @import("z-fastq");
 ```
 
-It is registered from `src/root.zig` and targets Zig 0.16.0 on Linux, x86-64 or aarch64.
+It is registered from `src/root.zig` and targets Zig 0.16.0 on Linux or macOS, x86-64 or aarch64.
 
 ## What it exports
 
