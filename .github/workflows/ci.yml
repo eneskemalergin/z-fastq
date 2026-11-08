@@ -144,16 +144,6 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - name: x86-64
-            runner: ubuntu-24.04
-            flags: -Dcpu=baseline
-            system: linux-x86_64
-            source: true
-          - name: aarch64
-            runner: ubuntu-24.04-arm
-            flags: ""
-            system: linux-aarch64
-            source: false
           - name: macos-x86-64
             runner: macos-15-intel
             flags: -Dcpu=baseline
