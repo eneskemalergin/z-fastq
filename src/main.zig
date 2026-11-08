@@ -1297,6 +1297,11 @@ const platform_files = switch (builtin.os.tag) {
             return RecordFileStat.init(@as(u64, buffer.dev_major) << 32 | buffer.dev_minor, buffer.ino, buffer.mode);
         }
 
+        fn descriptorAlias(path: [*:0]const u8) ?std.posix.fd_t {
+            _ = path;
+            return null;
+        }
+
         fn clearStatusFlags(handle: std.posix.fd_t) linux.E {
             return linux.errno(linux.fcntl(handle, linux.F.SETFL, 0));
         }
@@ -1314,6 +1319,14 @@ const platform_files = switch (builtin.os.tag) {
 
         fn recordFileStat(buffer: *const Buffer) ?RecordFileStat {
             return RecordFileStat.init(@as(u32, @bitCast(buffer.dev)), buffer.ino, buffer.mode);
+        }
+
+        fn descriptorAlias(path: [*:0]const u8) ?std.posix.fd_t {
+            var resolved_buffer: [std.c.PATH_MAX]u8 = undefined;
+            const resolved = std.mem.span(std.c.realpath(path, &resolved_buffer) orelse return null);
+            const prefix = "/dev/fd/";
+            if (!std.mem.startsWith(u8, resolved, prefix)) return null;
+            return std.fmt.parseInt(std.posix.fd_t, resolved[prefix.len..], 10) catch null;
         }
 
         fn clearStatusFlags(handle: std.posix.fd_t) std.c.E {
@@ -1355,8 +1368,17 @@ fn checkedStdoutIdentity(io: std.Io) error{Reported}!?FileIdentity {
     };
 }
 
-fn pathIdentity(io: std.Io, path: []const u8) ?FileIdentity {
+const PathIdentity = struct {
+    identity: FileIdentity,
+    descriptor_alias: bool,
+};
+
+fn pathIdentity(io: std.Io, path: []const u8) ?PathIdentity {
     const path_z = std.posix.toPosixPath(path) catch return null;
+    if (platform_files.descriptorAlias(&path_z)) |descriptor| {
+        const stat = statRecordFile(io, .{ .handle = descriptor, .flags = .{ .nonblocking = false } }) catch return null;
+        return .{ .identity = stat.identity, .descriptor_alias = true };
+    }
     var buffer: platform_files.Buffer = undefined;
     while (true) switch (platform_files.statPath(&path_z, &buffer)) {
         .SUCCESS => break,
@@ -1364,7 +1386,7 @@ fn pathIdentity(io: std.Io, path: []const u8) ?FileIdentity {
         else => return null,
     };
     const stat = platform_files.recordFileStat(&buffer) orelse return null;
-    return stat.identity;
+    return .{ .identity = stat.identity, .descriptor_alias = false };
 }
 
 fn inputAliasFailure(io: std.Io, inputs: []const []const u8, output_identity: ?FileIdentity) ?u8 {
@@ -1373,9 +1395,12 @@ fn inputAliasFailure(io: std.Io, inputs: []const []const u8, output_identity: ?F
     const stdin_is_stream = if (stdin_stat) |stat| stat.kind != .regular else false;
     var stdin_uses: usize = 0;
     for (inputs) |label| {
-        const identity = if (namesStdin(label)) stdin_identity else pathIdentity(io, label);
-        const reads_stdin = namesStdin(label) or
-            (stdin_is_stream and identity != null and std.meta.eql(identity.?, stdin_identity.?));
+        const path = if (namesStdin(label)) null else pathIdentity(io, label);
+        const identity = if (namesStdin(label)) stdin_identity else if (path) |found| found.identity else null;
+        const same_file_as_stdin = identity != null and stdin_identity != null and
+            std.meta.eql(identity.?, stdin_identity.?);
+        const shares_stdin_offset = stdin_is_stream or (path != null and path.?.descriptor_alias);
+        const reads_stdin = namesStdin(label) or (same_file_as_stdin and shares_stdin_offset);
         if (reads_stdin) {
             stdin_uses += 1;
             if (stdin_uses > 1) {

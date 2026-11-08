@@ -1,6 +1,7 @@
 //! Installed `z-fastq count` results, stream output, options, and exit precedence.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zfastq = @import("z-fastq");
 const cli = @import("utilities.zig");
 const CommandResult = cli.CommandResult;
@@ -427,7 +428,7 @@ test "[cli] - [count]: stdin is explicit and duplicate use fails before input pr
     }
 }
 
-test "[cli] - [input]: a regular file on standard input is read from its start under each name" {
+test "[cli] - [input]: /dev/stdin rereads a regular standard input on Linux and counts as its second use on macOS" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -437,12 +438,12 @@ test "[cli] - [input]: a regular file on standard input is read from its start u
     try tmp.dir.writeFile(io, .{ .sub_path = "in.fastq", .data = "@r\nA\n+\n!\n" });
     const stdin_file = try tmp.dir.openFile(io, "in.fastq", .{});
     defer stdin_file.close(io);
-    try cli.expectResult(
-        try cli.runWithStdinFile(allocator, &.{ "count", "-", "/dev/stdin" }, stdin_file),
-        0,
-        "1\n1\n",
-        "",
-    );
+    const result = try cli.runWithStdinFile(allocator, &.{ "count", "-", "/dev/stdin" }, stdin_file);
+    switch (builtin.os.tag) {
+        .linux => try cli.expectResult(result, 0, "1\n1\n", ""),
+        .macos => try cli.expectResult(result, 2, "", "error: standard input may appear at most once\n"),
+        else => @compileError("standard input tests run on Linux and macOS only"),
+    }
 }
 
 test "[cli] - [arguments]: a double dash ends options before the path" {
