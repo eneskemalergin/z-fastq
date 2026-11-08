@@ -1,0 +1,58 @@
+# Rough speed of every kernel tier on each GitHub runner type, run only on request: by hand, or by adding the
+# simd-smoke label to a pull request. On each runner, .github/scripts/smoke.py builds this checkout, a
+# -Dcpu=native build, the base (the pull request's, or the base input), and every commit since the base that
+# changed the source or build, checks that all of them and every tier
+# the CPU runs (ZFASTQ_TIER) write the same bytes, and times them on small generated inputs. Shared runners make
+# the times rough; the tables land in the job summary.
+name: smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Revision to compare against
+        default: main
+  pull_request:
+    types: [labeled]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  smoke:
+    name: Smoke (${{ matrix.runner }})
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'simd-smoke'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+    env:
+      BASE: ${{ github.event.pull_request.base.sha || inputs.base }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: smoke
+
+      - name: Check and time every tier
+        run: |
+          set -euo pipefail
+          read -ra revisions <<< "$(git log --reverse --format=%h "$BASE..HEAD" -- src build.zig build.zig.zon | tr '\n' ' ')"
+          python3 .github/scripts/smoke.py "$RUNNER_TEMP/smoke" "$BASE" ${revisions[@]+"${revisions[@]}"}
