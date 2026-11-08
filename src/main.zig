@@ -1261,15 +1261,7 @@ fn openNonblockingRecordFile(label: []const u8) std.posix.OpenError!std.Io.File 
 
 fn prepareRecordFile(io: std.Io, file: *std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!void {
     const stat = try statRecordFile(io, file.*);
-    if (stat.kind == .fifo) {
-        var poll_fd = [1]std.posix.pollfd{.{ .fd = file.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-        while (true) switch (std.posix.errno(std.posix.system.poll(&poll_fd, 1, -1))) {
-            .SUCCESS => break,
-            .INTR => try io.checkCancel(),
-            else => return error.Io,
-        };
-        if (poll_fd[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) return error.Io;
-    }
+    if (stat.kind == .fifo) try platform_files.waitForFifoWriter(io, file.handle);
     while (true) switch (platform_files.clearStatusFlags(file.handle)) {
         .SUCCESS => break,
         .INTR => try io.checkCancel(),
@@ -1297,9 +1289,19 @@ const platform_files = switch (builtin.os.tag) {
             return RecordFileStat.init(@as(u64, buffer.dev_major) << 32 | buffer.dev_minor, buffer.ino, buffer.mode);
         }
 
-        fn descriptorAlias(path: [*:0]const u8) ?std.posix.fd_t {
+        fn namesDescriptor(path: [*:0]const u8) bool {
             _ = path;
-            return null;
+            return false;
+        }
+
+        fn waitForFifoWriter(io: std.Io, handle: std.posix.fd_t) (std.Io.Cancelable || error{Io})!void {
+            var poll_fd = [1]linux.pollfd{.{ .fd = handle, .events = linux.POLL.IN, .revents = 0 }};
+            while (true) switch (linux.errno(linux.poll(&poll_fd, 1, -1))) {
+                .SUCCESS => break,
+                .INTR => try io.checkCancel(),
+                else => return error.Io,
+            };
+            if (poll_fd[0].revents & (linux.POLL.ERR | linux.POLL.NVAL) != 0) return error.Io;
         }
 
         fn clearStatusFlags(handle: std.posix.fd_t) linux.E {
@@ -1321,12 +1323,34 @@ const platform_files = switch (builtin.os.tag) {
             return RecordFileStat.init(@as(u32, @bitCast(buffer.dev)), buffer.ino, buffer.mode);
         }
 
-        fn descriptorAlias(path: [*:0]const u8) ?std.posix.fd_t {
-            var resolved_buffer: [std.c.PATH_MAX]u8 = undefined;
-            const resolved = std.mem.span(std.c.realpath(path, &resolved_buffer) orelse return null);
-            const prefix = "/dev/fd/";
-            if (!std.mem.startsWith(u8, resolved, prefix)) return null;
-            return std.fmt.parseInt(std.posix.fd_t, resolved[prefix.len..], 10) catch null;
+        fn namesDescriptor(path: [*:0]const u8) bool {
+            var resolved: [std.c.PATH_MAX]u8 = undefined;
+            const real_path = std.c.realpath(path, &resolved) orelse return false;
+            return std.mem.startsWith(u8, std.mem.span(real_path), "/dev/fd/");
+        }
+
+        const FD_SETSIZE = 1024;
+        const FdSet = extern struct { bits: [FD_SETSIZE / 32]u32 };
+        extern "c" fn @"select$DARWIN_EXTSN"(
+            count: c_int,
+            readable: ?*FdSet,
+            writable: ?*FdSet,
+            failed: ?*FdSet,
+            timeout: ?*std.c.timeval,
+        ) c_int;
+
+        fn waitForFifoWriter(io: std.Io, handle: std.posix.fd_t) (std.Io.Cancelable || error{Io})!void {
+            const index = std.math.cast(usize, handle) orelse return error.Io;
+            if (index >= FD_SETSIZE) return error.Io;
+            while (true) {
+                var readable: FdSet = .{ .bits = @splat(0) };
+                readable.bits[index / 32] = @as(u32, 1) << @intCast(index % 32);
+                switch (std.c.errno(@"select$DARWIN_EXTSN"(handle + 1, &readable, null, null, null))) {
+                    .SUCCESS => return,
+                    .INTR => try io.checkCancel(),
+                    else => return error.Io,
+                }
+            }
         }
 
         fn clearStatusFlags(handle: std.posix.fd_t) std.c.E {
@@ -1375,8 +1399,15 @@ const PathIdentity = struct {
 
 fn pathIdentity(io: std.Io, path: []const u8) ?PathIdentity {
     const path_z = std.posix.toPosixPath(path) catch return null;
-    if (platform_files.descriptorAlias(&path_z)) |descriptor| {
-        const stat = statRecordFile(io, .{ .handle = descriptor, .flags = .{ .nonblocking = false } }) catch return null;
+    if (platform_files.namesDescriptor(&path_z)) {
+        const handle = std.posix.openat(std.Io.Dir.cwd().handle, path, .{
+            .ACCMODE = .RDONLY,
+            .CLOEXEC = true,
+            .NOCTTY = true,
+        }, 0) catch return null;
+        const duplicate: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
+        defer duplicate.close(io);
+        const stat = statRecordFile(io, duplicate) catch return null;
         return .{ .identity = stat.identity, .descriptor_alias = true };
     }
     var buffer: platform_files.Buffer = undefined;
