@@ -1,0 +1,148 @@
+# Records the macOS runner facts the macOS build and its tests depend on: CPU features, Rosetta, the bash and
+# binary tools on PATH, pipe and FIFO capacity, FIFO poll results, /dev/stdin identity, and kqueue process
+# events. It builds nothing and changes nothing.
+name: macos-probe
+
+on:
+  pull_request:
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probe:
+    name: Probe (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15-intel, macos-15]
+    steps:
+      - name: Record the system and tools
+        run: |
+          set -u
+          sw_vers
+          uname -a
+          sysctl -n machdep.cpu.brand_string
+          sysctl hw.optional | grep -E -i 'avx|neon|crc|arm' || true
+          printf 'bash on PATH: %s %s\n' "$(command -v bash)" "$BASH_VERSION"
+          /bin/bash --version | head -n 1
+          for tool in file otool python3 cc; do
+            printf '%s: %s\n' "$tool" "$(command -v "$tool")"
+          done
+          if [ "$(uname -m)" = arm64 ]; then
+            if arch -x86_64 /usr/bin/true; then
+              printf 'Rosetta AVX2: %s\n' "$(arch -x86_64 /usr/sbin/sysctl -n hw.optional.avx2_0 2>&1)"
+              printf 'Rosetta AVX2 with ROSETTA_ADVERTISE_AVX=1: %s\n' \
+                "$(ROSETTA_ADVERTISE_AVX=1 arch -x86_64 /usr/sbin/sysctl -n hw.optional.avx2_0 2>&1)"
+            else
+              echo 'Rosetta is not installed'
+            fi
+          fi
+          work=$(mktemp -d "$RUNNER_TEMP/probe.XXXXXX")
+          printf 'int main(void) { return 0; }\n' > "$work/hello.c"
+          cc -O2 -o "$work/hello" "$work/hello.c"
+          file -b "$work/hello"
+          otool -L "$work/hello"
+          otool -l "$work/hello" | grep segname | sort -u
+
+      - name: Record pipes, FIFOs, standard input, and process events
+        shell: python3 {0}
+        run: |
+          import errno, os, select, subprocess, sys, tempfile, threading, time
+
+          root = tempfile.mkdtemp(dir=os.environ["RUNNER_TEMP"])
+
+          def fill(fd, chunk):
+              data = b"x" * chunk
+              total = 0
+              while True:
+                  try:
+                      total += os.write(fd, data)
+                  except BlockingIOError:
+                      return total
+
+          for chunk in (1, 512, 4096, 65536):
+              r, w = os.pipe()
+              os.set_blocking(w, False)
+              print(f"pipe capacity with {chunk}-byte writes: {fill(w, chunk)}")
+              os.close(r)
+              os.close(w)
+
+          for chunk in (1, 512, 4096, 65536):
+              path = os.path.join(root, f"fill-{chunk}")
+              os.mkfifo(path)
+              r = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+              w = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+              print(f"FIFO capacity with {chunk}-byte writes: {fill(w, chunk)}")
+              os.close(w)
+              os.close(r)
+
+          for size in (6154, 12310, 200000):
+              path = os.path.join(root, f"blocking-{size}")
+              os.mkfifo(path)
+              r = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+              w = os.open(path, os.O_WRONLY)
+              threading.Thread(target=os.write, args=(w, b"x" * size), daemon=True).start()
+              time.sleep(1)
+              print(f"FIFO bytes buffered by one blocking {size}-byte write: {len(os.read(r, 1 << 20))}")
+
+          path = os.path.join(root, "poll")
+          os.mkfifo(path)
+          r = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+          poller = select.poll()
+          poller.register(r, select.POLLIN)
+          print(f"POLLIN={select.POLLIN} POLLERR={select.POLLERR} POLLHUP={select.POLLHUP} POLLNVAL={select.POLLNVAL}")
+          print(f"FIFO poll before any writer: {poller.poll(500)}")
+          w = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+          print(f"FIFO poll with a writer and no data: {poller.poll(500)}")
+          os.write(w, b"abc")
+          print(f"FIFO poll after a write: {poller.poll(500)}")
+          os.read(r, 16)
+          os.close(w)
+          print(f"FIFO poll after the writer closed: {poller.poll(500)}")
+
+          path = os.path.join(root, "read-write")
+          os.mkfifo(path)
+          try:
+              os.close(os.open(path, os.O_RDWR | os.O_NONBLOCK))
+              print("FIFO opens with O_RDWR | O_NONBLOCK")
+          except OSError as error:
+              print(f"FIFO O_RDWR open fails: {errno.errorcode.get(error.errno, error.errno)}")
+
+          compare = (
+              "import os; a = os.fstat(0); b = os.stat('/dev/stdin'); "
+              "print((a.st_dev, a.st_ino) == (b.st_dev, b.st_ino), a.st_dev, a.st_ino, b.st_dev, b.st_ino)"
+          )
+          regular = os.path.join(root, "input.fastq")
+          with open(regular, "w") as handle:
+              handle.write("@a\nA\n+\n!\n")
+          with open(regular) as handle:
+              result = subprocess.run([sys.executable, "-c", compare], stdin=handle, capture_output=True, text=True)
+          print(f"/dev/stdin equals a regular-file standard input: {result.stdout.strip()} {result.stderr.strip()}")
+          result = subprocess.run([sys.executable, "-c", compare], input="x", capture_output=True, text=True)
+          print(f"/dev/stdin equals a pipe standard input: {result.stdout.strip()} {result.stderr.strip()}")
+          print(f"/dev/fd entries: {sorted(os.listdir('/dev/fd'))}")
+
+          def watch(pid):
+              queue = select.kqueue()
+              event = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
+              queue.control([event], 0, 0)
+              return queue
+
+          child = subprocess.Popen(["/bin/sleep", "0.3"])
+          print(f"kqueue exit event of a running child: {watch(child.pid).control(None, 1, 5)}")
+          child.wait()
+          child = subprocess.Popen(["/usr/bin/true"])
+          time.sleep(0.5)
+          try:
+              queue = watch(child.pid)
+              print(f"kqueue watch of an exited, unreaped child: registered, then {queue.control(None, 1, 0.5)}")
+          except OSError as error:
+              print(f"kqueue watch of an exited, unreaped child fails: {errno.errorcode.get(error.errno, error.errno)}")
+          child.wait()
