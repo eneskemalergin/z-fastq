@@ -2,11 +2,11 @@
 //!
 //! Every byte kernel has a scalar reference and one generic vector body over a
 //! comptime lane count. Inline code uses the widest tier the compile target
-//! guarantees. When an x86-64 target lacks AVX2, the same bodies are also
-//! compiled into a separate AVX2 object, and long spans call it on CPUs that
-//! have AVX2. On aarch64 the baseline tier's 16 lanes are one NEON register.
-//! Kernels whose work per call outweighs the call at any length, such as
-//! fastp's pair sum in preprocess.zig, use the AVX2 object whenever it applies.
+//! guarantees. When an x86-64 target lacks AVX2 or AVX-512, the same bodies are
+//! also compiled into separate AVX2 and AVX-512 objects, and long spans call the
+//! best one the CPU runs. On aarch64 the baseline tier's 16 lanes are one NEON
+//! register. Kernels whose work per call outweighs the call at any length, such
+//! as fastp's pair sum in preprocess.zig, use an object whenever one applies.
 //! `selectTier` lowers the run-time choice to any tier from the compiled one to
 //! the CPU's best; the CLI sets it once from `ZFASTQ_TIER` before any kernel runs.
 
@@ -24,23 +24,52 @@ pub fn tierWidth(comptime tier: Tier) comptime_int {
     };
 }
 
-pub const INLINE_TIER: Tier = if (builtin.cpu.arch == .x86_64 and
-    std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) .avx2 else .baseline;
+pub const INLINE_TIER: Tier = if (builtin.cpu.arch != .x86_64)
+    .baseline
+else if (targetHas(&.{ .avx512f, .avx512bw, .avx512vl, .avx512dq }))
+    .avx512
+else if (targetHas(&.{.avx2}))
+    .avx2
+else
+    .baseline;
 pub const INLINE_LANES = tierWidth(INLINE_TIER);
 const BASELINE_LANES = tierWidth(.baseline);
 
 pub const BLOCK_BYTES = 64;
 
-const AVX2_MIN_BYTES = 1024;
+const OBJECT_MIN_BYTES = 1024;
 
-const SELECT_AT_RUN_TIME = build_options.avx2_object;
+const AVX2_OBJECT = build_options.avx2_object;
+const AVX512_OBJECT = build_options.avx512_object;
+const SELECT_AT_RUN_TIME = AVX2_OBJECT or AVX512_OBJECT;
 
-pub inline fn useAvx2(len: usize) bool {
-    return SELECT_AT_RUN_TIME and len >= AVX2_MIN_BYTES and runTimeTier() == .avx2;
+fn targetHas(comptime features: []const std.Target.x86.Feature) bool {
+    for (features) |feature| {
+        if (!std.Target.x86.featureSetHas(builtin.cpu.features, feature)) return false;
+    }
+    return true;
 }
 
-pub inline fn avx2Selected() bool {
-    return SELECT_AT_RUN_TIME and runTimeTier() == .avx2;
+pub inline fn spanKernel(comptime name: []const u8, comptime function: anytype, len: usize) ?*const @TypeOf(function.*) {
+    if (!SELECT_AT_RUN_TIME or len < OBJECT_MIN_BYTES) return null;
+    return objectKernel(name, function);
+}
+
+pub inline fn callKernel(comptime name: []const u8, comptime function: anytype) ?*const @TypeOf(function.*) {
+    if (!SELECT_AT_RUN_TIME) return null;
+    return objectKernel(name, function);
+}
+
+inline fn objectKernel(comptime name: []const u8, comptime function: anytype) ?*const @TypeOf(function.*) {
+    return switch (runTimeTier()) {
+        .avx512 => if (AVX512_OBJECT) objectSymbol(.avx512, name, function) else null,
+        .avx2 => if (AVX2_OBJECT) objectSymbol(.avx2, name, function) else null,
+        .baseline => null,
+    };
+}
+
+fn objectSymbol(comptime tier: Tier, comptime name: []const u8, comptime function: anytype) *const @TypeOf(function.*) {
+    return @extern(*const @TypeOf(function.*), .{ .name = symbol(tier, name) });
 }
 
 pub const TierRange = struct { lowest: Tier, highest: Tier };
@@ -61,10 +90,6 @@ pub fn exportKernel(comptime name: []const u8, comptime function: anytype) void 
     if (build_options.simd_object) @export(function, .{ .name = symbol(INLINE_TIER, name) });
 }
 
-pub fn avx2Kernel(comptime name: []const u8, comptime function: anytype) *const @TypeOf(function.*) {
-    return @extern(*const @TypeOf(function.*), .{ .name = symbol(.avx2, name) });
-}
-
 fn symbol(comptime tier: Tier, comptime name: []const u8) []const u8 {
     return "zfq_" ++ @tagName(tier) ++ "_" ++ name;
 }
@@ -82,28 +107,30 @@ comptime {
 
 pub inline fn findNewline(bytes: []const u8) ?usize {
     if (!SELECT_AT_RUN_TIME) return @call(.always_inline, findNewlineFor, .{ INLINE_LANES, bytes });
-    const head = @min(bytes.len, AVX2_MIN_BYTES);
-    if (@call(.always_inline, findNewlineFor, .{ BASELINE_LANES, bytes[0..head] })) |index| return index;
+    const head = @min(bytes.len, OBJECT_MIN_BYTES);
+    if (@call(.always_inline, findNewlineFor, .{ INLINE_LANES, bytes[0..head] })) |index| return index;
     if (head == bytes.len) return null;
-    if (!useAvx2(bytes.len)) return if (findNewlineFor(BASELINE_LANES, bytes[head..])) |index| head + index else null;
-    const rest = avx2Kernel("find_newline", &findNewlineExport)(bytes.ptr + head, bytes.len - head);
+    const kernel = spanKernel("find_newline", &findNewlineExport, bytes.len) orelse
+        return if (findNewlineFor(INLINE_LANES, bytes[head..])) |index| head + index else null;
+    const rest = kernel(bytes.ptr + head, bytes.len - head);
     return if (rest == bytes.len - head) null else head + rest;
 }
 
 pub inline fn findNewlines(bytes: []const u8, ends: *[4]usize) bool {
     if (!SELECT_AT_RUN_TIME) return @call(.always_inline, collectNewlines, .{ INLINE_LANES, bytes, 0, ends, 0 }) == ends.len;
-    const head = @min(bytes.len, AVX2_MIN_BYTES);
-    const count = @call(.always_inline, collectNewlines, .{ BASELINE_LANES, bytes[0..head], 0, ends, 0 });
+    const head = @min(bytes.len, OBJECT_MIN_BYTES);
+    const count = @call(.always_inline, collectNewlines, .{ INLINE_LANES, bytes[0..head], 0, ends, 0 });
     if (count == ends.len or head == bytes.len) return count == ends.len;
-    if (!useAvx2(bytes.len)) return collectNewlines(BASELINE_LANES, bytes[head..], head, ends, count) == ends.len;
-    return avx2Kernel("collect_newlines", &collectNewlinesExport)(bytes.ptr + head, bytes.len - head, head, ends, count) == ends.len;
+    const kernel = spanKernel("collect_newlines", &collectNewlinesExport, bytes.len) orelse
+        return collectNewlines(INLINE_LANES, bytes[head..], head, ends, count) == ends.len;
+    return kernel(bytes.ptr + head, bytes.len - head, head, ends, count) == ends.len;
 }
 
 pub inline fn containsNewline(first: []const u8, second: ?[]const u8) bool {
     std.debug.assert(second == null or second.?.len == first.len);
     const second_ptr: ?[*]const u8 = if (second) |s| s.ptr else null;
-    if (useAvx2(first.len)) {
-        return avx2Kernel("contains_newline", &containsNewlineExport)(first.ptr, second_ptr, first.len);
+    if (spanKernel("contains_newline", &containsNewlineExport, first.len)) |kernel| {
+        return kernel(first.ptr, second_ptr, first.len);
     }
     return @call(.always_inline, containsNewlineFor, .{ INLINE_LANES, first.ptr, second_ptr, first.len });
 }
@@ -135,7 +162,8 @@ fn runTimeTier() Tier {
 }
 
 fn bestTier() Tier {
-    if (SELECT_AT_RUN_TIME and detectAvx2()) return .avx2;
+    if (AVX512_OBJECT and detectAvx512()) return .avx512;
+    if (AVX2_OBJECT and detectAvx2()) return .avx2;
     return INLINE_TIER;
 }
 
@@ -147,6 +175,25 @@ fn detectAvx2() bool {
     const has_avx = leaf1.ecx & (1 << 28) != 0;
     if (!has_osxsave or !has_avx or xgetbv0() & 0x6 != 0x6) return false;
     return cpuid(7).ebx & (1 << 5) != 0;
+}
+
+fn detectAvx512() bool {
+    if (comptime builtin.cpu.arch != .x86_64) return false;
+    if (!detectAvx2()) return false;
+    const leaf1_ecx = bits(&.{ 9, 12, 13, 19, 20, 22, 23, 26, 29 });
+    const leaf7_ebx = bits(&.{ 3, 8, 16, 17, 28, 30, 31 });
+    if (cpuid(1).ecx & leaf1_ecx != leaf1_ecx) return false;
+    if (cpuid(7).ebx & leaf7_ebx != leaf7_ebx) return false;
+    if (cpuid(0x80000000).eax < 0x80000001) return false;
+    const extended_ecx = bits(&.{ 0, 5 });
+    if (cpuid(0x80000001).ecx & extended_ecx != extended_ecx) return false;
+    return xgetbv0() & 0xe6 == 0xe6;
+}
+
+fn bits(comptime positions: []const u5) u32 {
+    var mask: u32 = 0;
+    for (positions) |position| mask |= @as(u32, 1) << position;
+    return mask;
 }
 
 const Cpuid = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
@@ -385,9 +432,9 @@ test "[edge] - [newline kernels]: masks set the bit of each LF at every width" {
 test "[property] - [newline kernels]: the run-time selected path is exact around its length gate in every available tier" {
     const saved = run_time_tier.load(.monotonic);
     defer run_time_tier.store(saved, .monotonic);
-    var storage: [5 * AVX2_MIN_BYTES]u8 = undefined;
-    const lengths = [_]usize{ AVX2_MIN_BYTES - 1, AVX2_MIN_BYTES, AVX2_MIN_BYTES + 1, 2 * AVX2_MIN_BYTES + 5 };
-    const positions = [_]usize{ 0, AVX2_MIN_BYTES - 1, AVX2_MIN_BYTES, AVX2_MIN_BYTES + 31, 2 * AVX2_MIN_BYTES };
+    var storage: [5 * OBJECT_MIN_BYTES]u8 = undefined;
+    const lengths = [_]usize{ OBJECT_MIN_BYTES - 1, OBJECT_MIN_BYTES, OBJECT_MIN_BYTES + 1, 2 * OBJECT_MIN_BYTES + 5 };
+    const positions = [_]usize{ 0, OBJECT_MIN_BYTES - 1, OBJECT_MIN_BYTES, OBJECT_MIN_BYTES + 31, 2 * OBJECT_MIN_BYTES };
     const range = tierRange();
     for (std.enums.values(Tier)) |tier| {
         if (@intFromEnum(tier) < @intFromEnum(range.lowest) or @intFromEnum(tier) > @intFromEnum(range.highest)) continue;
@@ -416,7 +463,8 @@ test "[unit] - [tier]: selection accepts exactly the tiers from the compiled one
     defer run_time_tier.store(saved, .monotonic);
     const range = tierRange();
     try std.testing.expectEqual(INLINE_TIER, range.lowest);
-    try std.testing.expectEqual(if (SELECT_AT_RUN_TIME and detectAvx2()) Tier.avx2 else INLINE_TIER, range.highest);
+    const best: Tier = if (AVX512_OBJECT and detectAvx512()) .avx512 else if (AVX2_OBJECT and detectAvx2()) .avx2 else INLINE_TIER;
+    try std.testing.expectEqual(best, range.highest);
     for (std.enums.values(Tier)) |tier| {
         const before = runTimeTier();
         if (@intFromEnum(tier) < @intFromEnum(range.lowest) or @intFromEnum(tier) > @intFromEnum(range.highest)) {
@@ -426,14 +474,18 @@ test "[unit] - [tier]: selection accepts exactly the tiers from the compiled one
         }
         try selectTier(tier);
         try std.testing.expectEqual(tier, runTimeTier());
-        try std.testing.expectEqual(SELECT_AT_RUN_TIME and tier == .avx2, useAvx2(AVX2_MIN_BYTES));
-        try std.testing.expectEqual(SELECT_AT_RUN_TIME and tier == .avx2, avx2Selected());
-        try std.testing.expect(!useAvx2(AVX2_MIN_BYTES - 1));
+        const object = tier != INLINE_TIER;
+        try std.testing.expectEqual(object, spanKernel("find_newline", &findNewlineExport, OBJECT_MIN_BYTES) != null);
+        try std.testing.expectEqual(object, callKernel("find_newline", &findNewlineExport) != null);
+        try std.testing.expect(spanKernel("find_newline", &findNewlineExport, OBJECT_MIN_BYTES - 1) == null);
     }
-    try std.testing.expectError(error.TierUnavailable, selectTier(.avx512));
 }
 
-test "[unit] - [cpu]: detection agrees with the AVX2 guarantee of the build target" {
+test "[unit] - [cpu]: detection agrees with the AVX2 and AVX-512 guarantees of the build target" {
     if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
-    if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) try std.testing.expect(detectAvx2());
+    if (comptime targetHas(&.{.avx2})) try std.testing.expect(detectAvx2());
+    if (comptime targetHas(&.{ .avx512f, .avx512bw, .avx512cd, .avx512dq, .avx512vl, .bmi, .bmi2, .fma, .f16c, .lzcnt, .movbe })) {
+        try std.testing.expect(detectAvx512());
+    }
+    if (detectAvx512()) try std.testing.expect(detectAvx2());
 }

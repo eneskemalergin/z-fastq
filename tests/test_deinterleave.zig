@@ -702,15 +702,7 @@ test "[cli] - [deinterleave]: failure does not delete replaced or created output
     defer threaded.deinit();
     const child_io = threaded.io();
     var process = try std.process.spawn(child_io, .{
-        .argv = &.{
-            cli.ZFASTQ_BIN,
-            "deinterleave",
-            "--out1",
-            out1_path,
-            "--out2",
-            out2_path,
-            "-",
-        },
+        .argv = try cli.cliArgv(allocator, &.{ "deinterleave", "--out1", out1_path, "--out2", out2_path, "-" }),
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,

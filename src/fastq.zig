@@ -371,8 +371,8 @@ fn validateRecordVector(
         return null;
     }
 
-    const invalid: InvalidFields = if (simd.useAvx2(record.sequence.len))
-        @bitCast(simd.avx2Kernel("invalid_fields", &invalidFieldsExport)(record.sequence.ptr, record.quality.ptr, record.sequence.len, @intFromEnum(alphabet)))
+    const invalid: InvalidFields = if (simd.spanKernel("invalid_fields", &invalidFieldsExport, record.sequence.len)) |kernel|
+        @bitCast(kernel(record.sequence.ptr, record.quality.ptr, record.sequence.len, @intFromEnum(alphabet)))
     else
         invalidFieldsVector(vector_len, alphabet, record.sequence, record.quality);
     if (invalid.sequence) {
@@ -803,8 +803,8 @@ fn classifySemanticBytes(
     start_index: usize,
 ) error{ArithmeticLimit}!void {
     if (failure.* != null) return;
-    const relative = if (simd.useAvx2(bytes.len))
-        avx2FirstInvalid(field, alphabet, use_full_iupac, bytes)
+    const relative = if (simd.spanKernel("first_invalid", &firstInvalidExport, bytes.len)) |kernel|
+        objectFirstInvalid(kernel, field, alphabet, use_full_iupac, bytes)
     else
         firstInvalidChunk(field, alphabet, use_full_iupac, bytes);
     failure.* = std.math.add(usize, start_index, relative orelse return) catch
@@ -823,8 +823,14 @@ fn firstInvalidChunk(
     };
 }
 
-fn avx2FirstInvalid(field: SemanticField, alphabet: Alphabet, use_full_iupac: *bool, bytes: []const u8) ?usize {
-    const index = simd.avx2Kernel("first_invalid", &firstInvalidExport)(@intFromEnum(field), @intFromEnum(alphabet), use_full_iupac, bytes.ptr, bytes.len);
+fn objectFirstInvalid(
+    kernel: *const @TypeOf(firstInvalidExport),
+    field: SemanticField,
+    alphabet: Alphabet,
+    use_full_iupac: *bool,
+    bytes: []const u8,
+) ?usize {
+    const index = kernel(@intFromEnum(field), @intFromEnum(alphabet), use_full_iupac, bytes.ptr, bytes.len);
     return if (index == bytes.len) null else index;
 }
 
@@ -876,9 +882,9 @@ inline fn scanCompleteRecord(
     initial_full_iupac: bool,
     sequence_len_hint: usize,
 ) ?CompleteRecord {
-    if (simd.useAvx2(sequence_len_hint)) {
+    if (simd.spanKernel("scan_complete_record", &scanCompleteRecordExport, sequence_len_hint)) |kernel| {
         var checked: CompleteRecord = undefined;
-        if (!simd.avx2Kernel("scan_complete_record", &scanCompleteRecordExport)(buffer.ptr, buffer.len, start, line_feeds, max_line_bytes, @intFromEnum(alphabet), initial_full_iupac, &checked)) return null;
+        if (!kernel(buffer.ptr, buffer.len, start, line_feeds, max_line_bytes, @intFromEnum(alphabet), initial_full_iupac, &checked)) return null;
         return checked;
     }
     return scanCompleteRecordInline(buffer, start, line_feeds, max_line_bytes, alphabet, initial_full_iupac);

@@ -10,6 +10,11 @@
 #   so AVX2 is reached through run-time dispatch as in the release binary. Each lane then builds its ReleaseFast
 #   release binary (static on Linux) and smoke-tests it; the Linux x86-64 lane also builds the source package a
 #   Zig dependent fetches and tests it from a fresh package.
+# - avx512: on an emulated AVX-512 CPU (Intel SDE, pinned by version and checksum), so the AVX-512 kernels run
+#   whatever CPU the runner has: the source tests in Debug, then every command of a ReleaseFast build on generated
+#   reads, whose output must match the baseline tier byte for byte. The suites that start many CLI processes are
+#   too slow under the emulator. Then, on the runner's own CPU, ReleaseFast builds for -Dcpu=x86_64_v3 and
+#   -Dcpu=native must refuse ZFASTQ_TIER=baseline, which the default build accepts: release builds keep -Dcpu.
 # - result: one required check for branch protection, whichever jobs ran.
 #
 # On main, the tested archives are kept for seven days; the release workflow publishes those for a tag instead of
@@ -203,10 +208,107 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  avx512:
+    name: Test (x86-64 AVX-512 under Intel SDE)
+    needs: checks
+    if: needs.checks.outputs.tests == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      SDE_URL: https://downloadmirror.intel.com/924984/sde-external-10.13.1-2026-07-28-lin.tar.xz
+      SDE_SHA256: 94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: avx512
+
+      - name: Install Intel SDE
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/sde.tar.xz" "$SDE_URL"
+          printf '%s  %s\n' "$SDE_SHA256" "$RUNNER_TEMP/sde.tar.xz" | sha256sum --check
+          mkdir "$RUNNER_TEMP/sde"
+          tar -xJf "$RUNNER_TEMP/sde.tar.xz" -C "$RUNNER_TEMP/sde" --strip-components=1
+
+      - name: Test in Debug with the AVX-512 kernels
+        run: |
+          set -euo pipefail
+          sde="$RUNNER_TEMP/sde/sde64"
+          grep -m1 'model name' /proc/cpuinfo
+          zig build test-src -Dcpu=baseline -Dtest-exec="$sde" -Dtest-exec=-spr -Dtest-exec=-- --test-timeout 5m --summary all
+
+      - name: Compare every command across the tiers
+        run: |
+          set -euo pipefail
+          sde="$RUNNER_TEMP/sde/sde64"
+          work="$RUNNER_TEMP/tiers"
+          mkdir "$work"
+          zig build -Doptimize=ReleaseFast --prefix "$work/release"
+          binary="$work/release/bin/z-fastq"
+          for mate in 1 2; do
+            awk -v mate="$mate" 'BEGIN {
+              srand(6 + mate)
+              for (i = 0; i < 3000; i++) {
+                n = (i % 3 == 0) ? 2000 : 150; s = ""; q = ""
+                for (j = 0; j < n; j++) {
+                  s = s substr("ACGTN", int(rand() * 5) + 1, 1)
+                  q = q sprintf("%c", 35 + int(rand() * 40))
+                }
+                if (i % 4 == 0) s = substr(s, 1, n - 33) (mate == 1 ? "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA" : "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT")
+                printf "@r%d/%d\n%s\n+\n%s\n", i, mate, s, q
+              }
+            }' > "$work/r$mate.fastq"
+          done
+          r1="$work/r1.fastq"
+          r2="$work/r2.fastq"
+          run() {
+            local tier="$1"
+            shift
+            ZFASTQ_TIER="$tier" "$sde" -spr -- "$binary" "$@"
+          }
+          for tier in baseline avx2 avx512; do
+            {
+              run "$tier" count "$r1" "$r2"
+              run "$tier" stats --json "$r1"
+              run "$tier" check --json --paired "$r1" "$r2"
+              run "$tier" sample --fraction 0.5 --seed 3 "$r1"
+              run "$tier" interleave "$r1" "$r2"
+              rm -f "$work/out1.fastq" "$work/out2.fastq"
+              run "$tier" process --adapter1 AGATCGGAAGAGCACACGTCTGAACTCCAGTCA --adapter2 AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT \
+                --pair-duplication --report - --out1 "$work/out1.fastq" --out2 "$work/out2.fastq" "$r1" "$r2"
+              cat "$work/out1.fastq" "$work/out2.fastq"
+            } | cksum > "$work/$tier.sum"
+            printf '%s: %s\n' "$tier" "$(cat "$work/$tier.sum")"
+          done
+          cmp "$work/baseline.sum" "$work/avx2.sum"
+          cmp "$work/baseline.sum" "$work/avx512.sum"
+
+      - name: Check that release builds keep -Dcpu
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/tiers"
+          ZFASTQ_TIER=baseline "$work/release/bin/z-fastq" --version
+          for cpu in x86_64_v3 native; do
+            zig build -Doptimize=ReleaseFast -Dcpu="$cpu" --prefix "$work/$cpu"
+            if ZFASTQ_TIER=baseline "$work/$cpu/bin/z-fastq" --version; then
+              echo "error: the -Dcpu=$cpu release build still runs the baseline tier"
+              exit 1
+            fi
+          done
+
   result:
     name: CI result
     if: always()
-    needs: [checks, workflows, test]
+    needs: [checks, workflows, test, avx512]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     permissions: {}
@@ -214,6 +316,7 @@ jobs:
       CHECKS: ${{ needs.checks.result }}
       TESTS_NEEDED: ${{ needs.checks.outputs.tests }}
       TESTS: ${{ needs.test.result }}
+      AVX512: ${{ needs.avx512.result }}
       WORKFLOWS_NEEDED: ${{ needs.checks.outputs.workflows }}
       WORKFLOWS: ${{ needs.workflows.result }}
     steps:
@@ -221,7 +324,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$CHECKS" = success
-          for pair in "$TESTS_NEEDED:$TESTS" "$WORKFLOWS_NEEDED:$WORKFLOWS"; do
+          for pair in "$TESTS_NEEDED:$TESTS" "$TESTS_NEEDED:$AVX512" "$WORKFLOWS_NEEDED:$WORKFLOWS"; do
             case "$pair" in
               true:success|false:skipped) ;;
               *) printf 'Required check did not pass: %s\n' "$pair" >&2; exit 1 ;;

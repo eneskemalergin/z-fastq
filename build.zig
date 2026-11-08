@@ -65,28 +65,17 @@ pub fn build(b: *std.Build) void {
     const package_version = @import("build.zig.zon").version;
     const build_options = b.addOptions();
     build_options.addOption([:0]const u8, "version", package_version);
-    const link_avx2_object = kernel_backend == .dispatch and arch == .x86_64 and
-        !std.Target.x86.featureSetHas(target.result.cpu.features, .avx2);
+    const x86_dispatch = kernel_backend == .dispatch and arch == .x86_64;
+    const target_features = target.result.cpu.features;
+    const link_avx2_object = x86_dispatch and !std.Target.x86.featureSetHas(target_features, .avx2);
+    const link_avx512_object = x86_dispatch and
+        !std.Target.x86.featureSetHasAll(target_features, .{ .avx512f, .avx512bw, .avx512vl, .avx512dq });
     build_options.addOption(bool, "avx2_object", link_avx2_object);
+    build_options.addOption(bool, "avx512_object", link_avx512_object);
     build_options.addOption(bool, "simd_object", false);
-    const avx2_object: ?*std.Build.Step.Compile = if (!link_avx2_object) null else blk: {
-        var query = target.query;
-        query.cpu_model = .baseline;
-        query.cpu_features_add = .empty;
-        query.cpu_features_sub = .empty;
-        query.cpu_features_add.addFeature(@intFromEnum(std.Target.x86.Feature.avx2));
-        const object_options = b.addOptions();
-        object_options.addOption(bool, "simd_object", true);
-        object_options.addOption(bool, "avx2_object", false);
-        const module = b.createModule(.{
-            .root_source_file = b.path("src/simd.zig"),
-            .target = b.resolveTargetQuery(query),
-            .optimize = optimize,
-            .single_threaded = true,
-            .strip = strip,
-        });
-        module.addOptions("build_options", object_options);
-        break :blk b.addObject(.{ .name = "simd_avx2", .root_module = module, .use_llvm = true });
+    const kernel_objects = [_]?*std.Build.Step.Compile{
+        if (link_avx2_object) kernelObject(b, target, optimize, strip, "simd_avx2", .baseline, &.{.avx2}, &.{}) else null,
+        if (link_avx512_object) kernelObject(b, target, optimize, strip, "simd_avx512", .{ .explicit = &std.Target.x86.cpu.x86_64_v4 }, &.{}, &.{.prefer_256_bit}) else null,
     };
 
     const lib_module = b.addModule("z-fastq", .{
@@ -126,11 +115,23 @@ pub fn build(b: *std.Build) void {
 
     for ([_]*std.Build.Module{ lib_module, exe.root_module }) |module| {
         module.addImport("zipir", zipir);
-        if (avx2_object) |object| module.addObject(object);
+        for (kernel_objects) |kernel_object| if (kernel_object) |object| module.addObject(object);
     }
 
+    const test_exec = b.option(
+        []const []const u8,
+        "test-exec",
+        "Run each test binary, and each CLI process the tests start, through this command (one argument per option)",
+    ) orelse &.{};
+    const test_exec_cmd: []const ?[]const u8 = blk: {
+        const cmd = b.allocator.alloc(?[]const u8, test_exec.len + 1) catch @panic("OOM");
+        for (test_exec, 0..) |arg, index| cmd[index] = arg;
+        cmd[test_exec.len] = null;
+        break :blk cmd;
+    };
     const test_options = b.addOptions();
     test_options.addOption([]const u8, "package_version", package_version);
+    test_options.addOption([]const []const u8, "cli_exec", test_exec);
     const sample_internal_module = b.createModule(.{
         .root_source_file = b.path("src/sample.zig"),
         .target = target,
@@ -154,7 +155,9 @@ pub fn build(b: *std.Build) void {
     };
 
     const test_step = b.step("test", "Run unit tests");
-    const source_tests = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module, .use_llvm = true }));
+    const source_test = b.addTest(.{ .root_module = exe.root_module, .use_llvm = true });
+    if (test_exec.len > 0) source_test.setExecCmd(test_exec_cmd);
+    const source_tests = b.addRunArtifact(source_test);
     test_step.dependOn(&source_tests.step);
     b.step("test-src", "Run the in-file tests of src/").dependOn(&source_tests.step);
     for (suites) |suite| {
@@ -165,7 +168,9 @@ pub fn build(b: *std.Build) void {
             .imports = suite.imports,
         });
         module.addOptions("test_options", test_options);
-        const run = b.addRunArtifact(b.addTest(.{ .root_module = module, .use_llvm = true }));
+        const suite_test = b.addTest(.{ .root_module = module, .use_llvm = true });
+        if (test_exec.len > 0) suite_test.setExecCmd(test_exec_cmd);
+        const run = b.addRunArtifact(suite_test);
         if (suite.runs_binary) {
             module.link_libc = true;
             run.step.dependOn(b.getInstallStep());
@@ -174,4 +179,35 @@ pub fn build(b: *std.Build) void {
         const name = std.fs.path.stem(suite.path)["test_".len..];
         b.step(b.fmt("test-{s}", .{name}), b.fmt("Run {s}", .{suite.path})).dependOn(&run.step);
     }
+}
+
+fn kernelObject(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    strip: bool,
+    name: []const u8,
+    cpu_model: std.Target.Query.CpuModel,
+    add: []const std.Target.x86.Feature,
+    sub: []const std.Target.x86.Feature,
+) *std.Build.Step.Compile {
+    var query = target.query;
+    query.cpu_model = cpu_model;
+    query.cpu_features_add = .empty;
+    query.cpu_features_sub = .empty;
+    for (add) |feature| query.cpu_features_add.addFeature(@intFromEnum(feature));
+    for (sub) |feature| query.cpu_features_sub.addFeature(@intFromEnum(feature));
+    const object_options = b.addOptions();
+    object_options.addOption(bool, "simd_object", true);
+    object_options.addOption(bool, "avx2_object", false);
+    object_options.addOption(bool, "avx512_object", false);
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/simd.zig"),
+        .target = b.resolveTargetQuery(query),
+        .optimize = optimize,
+        .single_threaded = true,
+        .strip = strip,
+    });
+    module.addOptions("build_options", object_options);
+    return b.addObject(.{ .name = name, .root_module = module, .use_llvm = true });
 }

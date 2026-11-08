@@ -9,6 +9,7 @@ pub const FIXTURE_DIR = "tests/data/synthetic";
 
 pub const EXPECTED_VERSION = @import("test_options").package_version;
 pub const ZFASTQ_BIN = "zig-out/bin/z-fastq";
+pub const CLI_EXEC: []const []const u8 = @import("test_options").cli_exec;
 pub const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
 pub const PROCESS_TIMEOUT = std.Io.Duration.fromSeconds(30);
 
@@ -555,6 +556,10 @@ pub const RunOptions = struct {
     environ_map: ?*const std.process.Environ.Map = null,
 };
 
+pub fn cliArgv(allocator: std.mem.Allocator, command_args: []const []const u8) ![]const []const u8 {
+    return std.mem.concat(allocator, []const u8, &.{ CLI_EXEC, &.{ZFASTQ_BIN}, command_args });
+}
+
 pub fn runWith(
     allocator: std.mem.Allocator,
     command_args: []const []const u8,
@@ -564,13 +569,11 @@ pub fn runWith(
     defer threaded.deinit();
     const io = threaded.io();
 
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, ZFASTQ_BIN);
-    try argv.appendSlice(allocator, command_args);
+    const argv = try cliArgv(allocator, command_args);
+    defer allocator.free(argv);
 
     var proc = try std.process.spawn(io, .{
-        .argv = argv.items,
+        .argv = argv,
         .environ_map = options.environ_map,
         .stdin = switch (options.stdin) {
             .closed => .close,

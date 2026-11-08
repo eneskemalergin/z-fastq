@@ -10,7 +10,8 @@ All notable changes to z-fastq will be documented in this file.
 
 - **macOS.** z-fastq builds and runs on macOS 13 or later, on Apple Silicon and on Intel, and each release gains `macos-aarch64` and `macos-x86_64` archives, tested and smoke-tested on GitHub's macOS runners as the Linux archives are. The Intel build picks its AVX2 code at run time, as the Linux x86-64 build does; Apple Silicon runs the portable vector code. macOS binaries link only the system library, `libSystem`; Linux binaries stay static. Outputs, JSON documents, and exit statuses are the same on both systems, except one case of standard input:
   - On macOS, `/dev/stdin` and `/dev/fd/N` share the read position of the descriptor they name, so naming standard input twice, such as `count - /dev/stdin`, fails with status `2` even when standard input is a regular file. Linux opens the file again and reads it twice, as before.
-- **`ZFASTQ_TIER`.** Set to `baseline` or `avx2`, the variable makes z-fastq run that SIMD kernel tier instead of the fastest one the CPU has, to compare tiers or rule one out; a tier the binary cannot run on that CPU, or any other value, stops the command with status `2`. Unset, nothing changes. Zipir's gzip kernels are not affected.
+- **AVX-512.** x86-64 builds carry a third copy of the SIMD kernels, compiled for AVX-512 (the x86-64-v4 set), and select it at run time on CPUs that have it and an operating system that enables it, in place of AVX2. Output is the same on every tier.
+- **`ZFASTQ_TIER`.** Set to `baseline`, `avx2`, or `avx512`, the variable makes z-fastq run that SIMD kernel tier instead of the fastest one the CPU has, to compare tiers or rule one out; a tier the binary cannot run on that CPU, or any other value, stops the command with status `2`. Unset, nothing changes. Zipir's gzip kernels are not affected.
 
 ### Changed
 

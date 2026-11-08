@@ -282,9 +282,9 @@ pub const PairDuplication = struct {
         if (read1.len + read2.len >= VECTOR_LENGTH_LIMIT) {
             sumsScalar(&self.primes, read1, 0, &sums);
             sumsScalar(&self.primes, read2, read1.len, &sums);
-        } else if (simd.INLINE_TIER == .baseline and simd.avx2Selected()) {
-            simd.avx2Kernel("pair_sums", &pairSumsExport)(&self.primes, read1.ptr, read1.len, read2.ptr, read2.len, &sums);
-        } else if (simd.INLINE_TIER == .avx2) {
+        } else if (simd.callKernel("pair_sums", &pairSumsExport)) |kernel| {
+            kernel(&self.primes, read1.ptr, read1.len, read2.ptr, read2.len, &sums);
+        } else if (simd.INLINE_TIER != .baseline) {
             pairSumsVector(&self.primes, read1, read2, &sums);
         } else {
             sumsScalar(&self.primes, read1, 0, &sums);
