@@ -864,9 +864,6 @@ want_of() { # paths truth
     done
     printf '%s\n' "${out%;}"
 }
-same_answer() { # got want
-    if [[ -n "$AGREE_LANE" ]]; then [[ -z "$(field_diff "$1" "$2")" ]]; else [[ "$1" == "$2" ]]; fi
-}
 CHECKS="$RESULTS/checks.tsv"
 declare -A CHECK_STATUS CHECK_VALUE
 # Appends each case's input identity (every path's fileid, joined by ",") as
@@ -1647,8 +1644,10 @@ quick_check() { # name fam id fmt paths truth bytes params [bin]
     [[ "${FAM_STDIN[$fam]}" == 0 ]] || form=stdin
     truth="$(want_of "$paths" "$6")" || die "no truth for $id: run.sh check first"
     if [[ -n "$bin" ]]; then
-        out="$($(build_cmd "$bin" "$paths" "$fam" "$params") 2>/dev/null | LANE=z-fastq FAMILY="$fam" IN="$paths" TRUTH="$6" PARAMS="$params" fact | paste -sd';' -)" || die "$name failed on $id"
-        same_answer "$out" "$truth" || die "$name printed a wrong answer on $id"
+        # Another build runs the z-fastq lane's full check, exit status and
+        # output files included; its row is read here, not cached.
+        out="$(ZFASTQ="$bin" check_one z-fastq "$form" "$fam" "$id" "$4" "$paths" "$truth" "$7" "$params" "$6")" || die "$name failed on $id"
+        [[ "$(cut -f2 <<<"$out")" == pass ]] || die "$name printed a wrong answer on $id"
         return 0
     fi
     local key
