@@ -70,7 +70,7 @@ pub const Stats = struct {
     q30_bases: u64 = 0,
     last_quality_error: ?QualityError = null,
 
-    pub fn addRecord(self: *Stats, record: fastq.Record) StatsError!void {
+    pub fn addRecord(self: *Stats, record: fastq.Record) align(4096) StatsError!void {
         self.last_quality_error = null;
         var quality_error: ?QualityError = null;
         const delta = recordTotals(record, &quality_error) catch |err| {

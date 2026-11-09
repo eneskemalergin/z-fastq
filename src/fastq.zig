@@ -571,18 +571,31 @@ fn firstInvalidSequenceScalar(
     return null;
 }
 
-fn firstInvalidQuality(quality: []const u8) align(HOT_LOOP_ALIGNMENT) ?usize {
-    return firstInvalidQualityVector(simd.INLINE_LANES, quality);
+inline fn firstInvalidQuality(quality: []const u8) ?usize {
+    if (!hasInvalidQuality(quality)) return null;
+    return @call(.never_inline, firstInvalidQualityScalar, .{ quality, 0 });
+}
+
+fn hasInvalidQuality(quality: []const u8) align(HOT_LOOP_ALIGNMENT) bool {
+    return hasInvalidQualityVector(simd.INLINE_LANES, quality);
 }
 
 fn firstInvalidQualityVector(
     comptime vector_len: comptime_int,
     quality: []const u8,
 ) ?usize {
+    if (!hasInvalidQualityVector(vector_len, quality)) return null;
+    return firstInvalidQualityScalar(quality, 0);
+}
+
+fn hasInvalidQualityVector(
+    comptime vector_len: comptime_int,
+    quality: []const u8,
+) bool {
     const Bytes = @Vector(vector_len, u8);
     const Mask = @Vector(vector_len, bool);
 
-    if (quality.len < vector_len) return firstInvalidQualityScalar(quality, 0);
+    if (quality.len < vector_len) return firstInvalidQualityScalar(quality, 0) != null;
 
     var invalid: Mask = @splat(false);
     var byte_index: usize = 0;
@@ -601,8 +614,7 @@ fn firstInvalidQualityVector(
         const bytes: Bytes = quality[quality.len - vector_len ..][0..vector_len].*;
         invalid |= invalidQualityVector(vector_len, bytes);
     }
-    if (!@reduce(.Or, invalid)) return null;
-    return firstInvalidQualityScalar(quality, 0);
+    return @reduce(.Or, invalid);
 }
 
 fn invalidQualityVector(
@@ -948,7 +960,7 @@ fn scanCompleteRecordInline(
     const quality_end = quality_start + sequence_len;
     const quality_lf = quality_end + @intFromBool(data[quality_end] == '\r');
     if (quality_lf >= data.len or data[quality_lf] != '\n') return null;
-    if (firstInvalidQuality(data[quality_start..quality_end]) != null) return null;
+    if (hasInvalidQuality(data[quality_start..quality_end])) return null;
 
     return .{
         .line_ends = .{ header_end, plus_start - 1, quality_start - 1, quality_lf },

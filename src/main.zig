@@ -1892,7 +1892,7 @@ fn statsInput(
     allocator: std.mem.Allocator,
     label: []const u8,
     options: InputOptions,
-) align(64) StatsOutcome {
+) align(4096) StatsOutcome {
     var input: RecordInput = undefined;
     if (initRecordInput(&input, io, label, null)) |failure| return .{ .failure = failure };
     defer input.deinit(io);
