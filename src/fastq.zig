@@ -911,7 +911,7 @@ inline fn scanCompleteRecord(
         if (!kernel(buffer.ptr, buffer.len, start, line_feeds, max_line_bytes, @intFromEnum(alphabet), initial_full_iupac, &checked)) return null;
         return checked;
     }
-    return scanCompleteRecordInline(buffer, start, line_feeds, max_line_bytes, alphabet, initial_full_iupac);
+    return @call(.always_inline, scanCompleteRecordInline, .{ buffer, start, line_feeds, max_line_bytes, alphabet, initial_full_iupac });
 }
 
 comptime {
