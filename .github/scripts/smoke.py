@@ -3,7 +3,9 @@
 
 Usage: smoke.py WORK_DIR [REV...]
 
-Builds this checkout's ReleaseFast binary, a -Dcpu=native build, and the ReleaseFast binary of each REV that
+Builds this checkout's ReleaseFast binary, a -Dcpu=native build, a build for each CPU level this machine runs
+(x86-64-v3 and x86-64-v4 on x86-64 when the release binary accepts ZFASTQ_TIER=avx2 or avx512; neoverse_n1 on
+Linux aarch64 with that level's features; generic on macOS aarch64), and the ReleaseFast binary of each REV that
 builds here (oldest first, so a slowdown can be pinned to the commit that brought it), each with its own Zig
 cache directory, since a local cache shared across worktrees can hand one worktree's binary to another with the
 same build script, and lists each binary's hash. It generates fixed inputs of 60 to 330 MB (a block of reads repeated, so each run takes
@@ -47,6 +49,21 @@ def build(source, prefix, *flags):
 def file_digest(path):
     with open(path, "rb") as built:
         return hashlib.sha256(built.read()).hexdigest()[:12]
+
+
+def cpu_levels(binary):
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        levels = [("x86_64_v3", "avx2"), ("x86_64_v4", "avx512")]
+        return [level for level, tier in levels if invoke(binary, tier, ["--version"], subprocess.DEVNULL) == 0]
+    if machine in ("aarch64", "arm64"):
+        if platform.system() == "Darwin":
+            return ["generic"]
+        with open("/proc/cpuinfo") as info:
+            features = set(next((line.split(":", 1)[1].split() for line in info if line.startswith("Features")), []))
+        if {"asimddp", "atomics", "lrcpc", "fphp"} <= features:
+            return ["neoverse_n1"]
+    return []
 
 
 def cpu_name():
@@ -146,6 +163,10 @@ def main():
     for tier in TIERS:
         if invoke(binary, tier, ["--version"], subprocess.DEVNULL) == 0:
             variants[f"release, ZFASTQ_TIER={tier}"] = (binary, tier)
+    for level in cpu_levels(binary):
+        built = build(".", os.path.join(work, level), f"-Dcpu={level}")
+        if built:
+            variants[f"-Dcpu={level}"] = (built, None)
     native = build(".", os.path.join(work, "native"), "-Dcpu=native")
     if native:
         variants["-Dcpu=native"] = (native, None)

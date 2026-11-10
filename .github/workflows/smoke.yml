@@ -1,9 +1,8 @@
-# Rough speed of every kernel tier on each GitHub runner type, run only on request: by hand, or by adding the
-# simd-smoke label to a pull request. On each runner, .github/scripts/smoke.py builds this checkout, a
-# -Dcpu=native build, the base (the pull request's, or the base input), and every commit since the base that
-# changed the source or build, checks that all of them and every tier
-# the CPU runs (ZFASTQ_TIER) write the same bytes, and times them on small generated inputs. Shared runners make
-# the times rough; the tables land in the job summary.
+# Rough speed of every kernel tier and CPU level on each GitHub runner type, run only on request: by hand, or by
+# adding the simd-smoke label to a pull request. On each runner, .github/scripts/smoke.py builds this checkout, a
+# build for each CPU level the runner's CPU runs, a -Dcpu=native build, and the base (the pull request's, or the
+# base input), checks that all of them and every tier the CPU runs (ZFASTQ_TIER) write the same bytes, and times
+# them on generated inputs. Shared runners make the times rough; the tables land in the job summary.
 name: smoke
 
 on:
@@ -51,8 +50,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
           cache-key: smoke
 
-      - name: Check and time every tier
+      - name: Check and time every tier and CPU level
         run: |
           set -euo pipefail
-          read -ra revisions <<< "$(git log --reverse --format=%h "$BASE..HEAD" -- src build.zig build.zig.zon | tr '\n' ' ')"
-          python3 .github/scripts/smoke.py "$RUNNER_TEMP/smoke" "$BASE" ${revisions[@]+"${revisions[@]}"}
+          python3 .github/scripts/smoke.py "$RUNNER_TEMP/smoke" "$BASE"
