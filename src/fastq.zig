@@ -724,7 +724,7 @@ fn firstInvalidNarrowIupacSequence(
     };
 }
 
-fn firstValidCheckSequenceLineEnd(
+inline fn firstValidCheckSequenceLineEnd(
     bytes: []const u8,
     alphabet: Alphabet,
     use_full_iupac: *bool,
@@ -738,7 +738,7 @@ fn firstValidCheckSequenceLineEnd(
     };
 }
 
-fn firstValidNarrowIupacSequenceLineEnd(
+inline fn firstValidNarrowIupacSequenceLineEnd(
     bytes: []const u8,
     use_full_iupac: *bool,
 ) ?usize {
@@ -882,6 +882,20 @@ const CompleteRecord = extern struct {
     line_ends: [4]usize,
     use_full_iupac: bool,
 };
+
+fn kernelRecord(
+    kernel: *const @TypeOf(scanCompleteRecordExport),
+    buffer: []const u8,
+    start: usize,
+    line_feeds: *LineFeedSearch,
+    max_line_bytes: usize,
+    alphabet: Alphabet,
+    initial_full_iupac: bool,
+) ?CompleteRecord {
+    var checked: CompleteRecord = undefined;
+    if (!kernel(buffer.ptr, buffer.len, start, line_feeds, max_line_bytes, @intFromEnum(alphabet), initial_full_iupac, &checked)) return null;
+    return checked;
+}
 
 inline fn scanCompleteRecord(
     buffer: []const u8,
@@ -2527,18 +2541,48 @@ pub const CheckScanner = struct {
 
     pub fn feed(self: *CheckScanner, data: []const u8) CheckScannerError!usize {
         var consumed: usize = 0;
-        var boundary_proved = false;
         var line_feeds: LineFeedSearch = .{};
         while (consumed < data.len) {
-            if (self.consumeCompleteRecord(data, consumed, &line_feeds, boundary_proved)) |record_len| {
-                boundary_proved = true;
-                consumed += record_len;
-                continue;
+            if (self.atRecordBoundary()) {
+                consumed += self.consumeCompleteRecords(data, consumed, &line_feeds);
+                if (consumed == data.len) break;
             }
-            boundary_proved = false;
             consumed += try self.consumeIncrementalRecord(data, consumed, &line_feeds);
         }
         return data.len;
+    }
+
+    fn consumeCompleteRecords(
+        self: *CheckScanner,
+        data: []const u8,
+        start: usize,
+        line_feeds: *LineFeedSearch,
+    ) usize {
+        const kernel = simd.spanKernel("scan_complete_record", &scanCompleteRecordExport, self.machine.sequence_len);
+        var end = start;
+        var records: u64 = 0;
+        var use_full_iupac = self.use_full_iupac;
+        while (true) {
+            const complete = if (kernel) |scan| kernelRecord(scan, data, end, line_feeds, self.max_line_bytes, self.alphabet, use_full_iupac) else @call(
+                .always_inline,
+                scanCompleteRecordInline,
+                .{ data, end, line_feeds, self.max_line_bytes, self.alphabet, use_full_iupac },
+            );
+            const record = complete orelse break;
+            end += record.line_ends[3] + 1;
+            use_full_iupac = record.use_full_iupac;
+            records += 1;
+        }
+        if (records == 0) return 0;
+        const next_offset = progressAfter(self.byte_offset, end - start) catch
+            return self.consumeCompleteRecord(data, start, line_feeds, true) orelse 0;
+        const next_record_index = std.math.add(u64, self.record_index, records) catch
+            return self.consumeCompleteRecord(data, start, line_feeds, true) orelse 0;
+        self.use_full_iupac = use_full_iupac;
+        self.record_index = next_record_index;
+        self.byte_offset = next_offset;
+        self.line_start_offset = next_offset;
+        return end - start;
     }
 
     fn consumeCompleteRecord(
