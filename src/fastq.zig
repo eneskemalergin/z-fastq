@@ -282,8 +282,9 @@ const LineFeedSearch = extern struct {
         ends: *[line_count]usize,
     ) bool {
         var offset = start;
-        for (ends) |*end| {
-            const line_end = self.find(simd.INLINE_LANES, bytes, offset) orelse
+        for (ends, 0..) |*end, line| {
+            const bare_plus = line == 2 and bytes.len - offset >= 2 and bytes[offset] == '+' and bytes[offset + 1] == '\n';
+            const line_end = if (bare_plus) offset + 1 else self.find(simd.INLINE_LANES, bytes, offset) orelse
                 return false;
             end.* = line_end - start;
             offset = line_end + 1;
@@ -948,8 +949,10 @@ fn scanCompleteRecordInline(
     if (sequence_len > max_line_bytes) return null;
 
     const plus_start = sequence_start + sequence_raw_len + 1;
-    const plus_raw_len = (line_feeds.find(simd.BLOCK_BYTES, buffer, start + plus_start) orelse
-        return null) - start - plus_start;
+    const plus_raw_len = if (data.len - plus_start >= 2 and data[plus_start] == '+' and data[plus_start + 1] == '\n')
+        1
+    else
+        (line_feeds.find(simd.BLOCK_BYTES, buffer, start + plus_start) orelse return null) - start - plus_start;
     const plus_len = lineContentLen(data[plus_start..][0..plus_raw_len]);
     const plus = data[plus_start..][0..plus_len];
     if (plus.len > max_line_bytes) return null;
