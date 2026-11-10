@@ -1558,6 +1558,24 @@ fn writeRecordSpan(writer: *zfastq.Writer, span: fastq.RecordSpan) error{WriteFa
     return fastq.writeRecordUnchecked(writer, span.record());
 }
 
+fn spanPairMismatch(
+    reader: *const zfastq.Reader,
+    mate1: fastq.RecordSpan,
+    mate2: fastq.RecordSpan,
+    offset1: u64,
+    policy: pairing.NamePolicy,
+) PairCommandFailure {
+    const record_index2 = reader.recordIndex() - 1;
+    return headerNameMismatch(
+        mate1.header(),
+        mate2.header(),
+        policy,
+        interleavedPairIndex(record_index2 - 1),
+        .{ record_index2 - 1, record_index2 },
+        .{ offset1, reader.currentRecordOffsets().?.header },
+    );
+}
+
 fn headerNameMismatch(
     header1: []const u8,
     header2: []const u8,
@@ -2266,7 +2284,10 @@ fn checkInterleavedSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        switch (verifyInterleavedPair(allocator, &reader, &validator, &stored_name, options.pair_name_policy, null)) {
+        var span1: ?fastq.RecordSpan = null;
+        if (checkSpanPairs(allocator, &reader, &validator, options.pair_name_policy, exact_selector, &span1)) |failure| return failure;
+        const first: ?fastq.ValidatedHeader = if (span1) |mate1| .{ .header = mate1.header(), .semantic_error = null } else null;
+        switch (verifyInterleavedPair(allocator, &reader, &validator, &stored_name, options.pair_name_policy, first)) {
             .end => return null,
             .failure => |failure| return failure,
             .pair => {},
@@ -2277,6 +2298,30 @@ fn checkInterleavedSource(
             };
         }
     }
+}
+
+noinline fn checkSpanPairs(
+    allocator: std.mem.Allocator,
+    reader: *zfastq.Reader,
+    validator: *fastq.AdaptiveRecordValidator,
+    policy: pairing.NamePolicy,
+    exact_selector: ?*sampling.ExactSelector,
+    pending1: *?fastq.RecordSpan,
+) ?PairCommandFailure {
+    while (fastq.nextRecordSpan(reader, validator)) |mate1| {
+        const offset1 = reader.currentRecordOffsets().?.header;
+        const mate2 = fastq.nextRecordSpan(reader, validator) orelse {
+            pending1.* = mate1;
+            return null;
+        };
+        if (!pairing.headersMatch(mate1.header(), mate2.header(), policy)) return spanPairMismatch(reader, mate1, mate2, offset1, policy);
+        if (exact_selector) |selector| {
+            selector.considerRecord(allocator, reader.recordIndex() / 2) catch |err| {
+                return exactPairSelectionFailure(err);
+            };
+        }
+    }
+    return null;
 }
 
 inline fn verifyInterleavedPair(
@@ -4188,17 +4233,7 @@ noinline fn splitSpanPairs(
             pending1.* = mate1;
             return null;
         };
-        if (!pairing.headersMatch(mate1.header(), mate2.header(), policy)) {
-            const record_index2 = reader.recordIndex() - 1;
-            return headerNameMismatch(
-                mate1.header(),
-                mate2.header(),
-                policy,
-                interleavedPairIndex(record_index2 - 1),
-                .{ record_index2 - 1, record_index2 },
-                .{ offset1, reader.currentRecordOffsets().?.header },
-            );
-        }
+        if (!pairing.headersMatch(mate1.header(), mate2.header(), policy)) return spanPairMismatch(reader, mate1, mate2, offset1, policy);
         if (!selection.selectPair()) continue;
         if (!spanIsWritable(mate1) or !spanIsWritable(mate2)) {
             return pairCommandFailure(0, unwritableRecordFailure());
