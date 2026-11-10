@@ -98,6 +98,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addOptions("build_options", build_options);
+    if (arch == .x86_64 and os == .linux and
+        std.Target.x86.featureSetHasAll(target_features, .{ .avx2, .bmi, .bmi2, .fma, .f16c, .lzcnt, .movbe }))
+    {
+        const require_x86_64_v4 = std.Target.x86.featureSetHasAll(target_features, .{ .avx512f, .avx512bw, .avx512vl, .avx512dq });
+        exe.root_module.addObject(x86_64Entry(b, target, optimize, strip, require_x86_64_v4));
+        exe.entry = .{ .symbol_name = "zfq_x86_64_entry" };
+    }
 
     b.installArtifact(exe);
 
@@ -179,6 +186,33 @@ pub fn build(b: *std.Build) void {
         const name = std.fs.path.stem(suite.path)["test_".len..];
         b.step(b.fmt("test-{s}", .{name}), b.fmt("Run {s}", .{suite.path})).dependOn(&run.step);
     }
+}
+
+fn x86_64Entry(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    strip: bool,
+    require_x86_64_v4: bool,
+) *std.Build.Step.Compile {
+    var query = target.query;
+    query.cpu_model = .baseline;
+    query.cpu_features_add = .empty;
+    query.cpu_features_sub = .empty;
+    const entry_options = b.addOptions();
+    entry_options.addOption(bool, "simd_object", false);
+    entry_options.addOption(bool, "avx2_object", false);
+    entry_options.addOption(bool, "avx512_object", false);
+    entry_options.addOption(bool, "require_x86_64_v4", require_x86_64_v4);
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/x86_64_entry.zig"),
+        .target = b.resolveTargetQuery(query),
+        .optimize = optimize,
+        .single_threaded = true,
+        .strip = strip,
+    });
+    module.addOptions("build_options", entry_options);
+    return b.addObject(.{ .name = "x86_64_entry", .root_module = module, .use_llvm = true });
 }
 
 fn kernelObject(

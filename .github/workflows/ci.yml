@@ -15,6 +15,7 @@
 #   reads, whose output must match the baseline tier byte for byte. The suites that start many CLI processes are
 #   too slow under the emulator. Then, on the runner's own CPU, ReleaseFast builds for -Dcpu=x86_64_v3 and
 #   -Dcpu=native must refuse ZFASTQ_TIER=baseline, which the default build accepts: release builds keep -Dcpu.
+#   Last, the -Dcpu=x86_64_v3 build must run on an emulated Haswell and stop with its message on a Sandy Bridge.
 # - result: one required check for branch protection, whichever jobs ran.
 #
 # On main, the tested archives are kept for seven days; the release workflow publishes those for a tag instead of
@@ -304,6 +305,18 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Check that x86-64-v3 builds stop on an older CPU
+        run: |
+          set -euo pipefail
+          sde="$RUNNER_TEMP/sde/sde64"
+          binary="$RUNNER_TEMP/tiers/x86_64_v3/bin/z-fastq"
+          "$sde" -hsw -- "$binary" --version
+          if "$sde" -snb -- "$binary" --version 2>"$RUNNER_TEMP/older-cpu.err"; then
+            echo "error: the x86-64-v3 build ran on a CPU without AVX2"
+            exit 1
+          fi
+          grep -q 'needs an x86-64 CPU with the x86-64-v3 set' "$RUNNER_TEMP/older-cpu.err"
 
   result:
     name: CI result

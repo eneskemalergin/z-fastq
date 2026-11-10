@@ -15,6 +15,7 @@ All notable changes to z-fastq will be documented in this file.
 
 ### Changed
 
+- **x86-64 release binaries need x86-64-v3.** The Linux and macOS x86-64 archives are built for the x86-64-v3 set (AVX2, BMI2, FMA), so short reads use AVX2 code too, not only records of 1 KiB or more: on a Zen 2 CPU, trimming with `process` is about 20% faster, `stats` 14%, `check` 8 to 10%, the other `process` modes about 9%, with the same output and the same memory. On a CPU without the set, the Linux binary stops with status `2` and a message instead of running; z-fastq is then built from source, whose default build still targets any x86-64 CPU.
 - **`-Dcpu` in release builds.** ReleaseSafe and ReleaseFast builds compile for the CPU that `-Dcpu` names, such as `-Dcpu=x86_64_v3`, instead of ignoring it. Without `-Dcpu`, Linux release builds target generic x86-64 or ARMv8-A, as before, and macOS release builds target Zig's macOS defaults, `core2` and `apple_m1`. `-Dstatic=true` confirms a static Linux release build and stops with a message on macOS.
 
 ## [0.2.1]

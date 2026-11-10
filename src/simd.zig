@@ -177,16 +177,30 @@ fn detectAvx2() bool {
     return cpuid(7).ebx & (1 << 5) != 0;
 }
 
-fn detectAvx512() bool {
+pub fn cpuHasX86V3() bool {
+    return detectX86V3();
+}
+
+pub fn cpuHasX86V4() bool {
+    return detectAvx512();
+}
+
+fn detectX86V3() bool {
     if (comptime builtin.cpu.arch != .x86_64) return false;
     if (!detectAvx2()) return false;
     const leaf1_ecx = bits(&.{ 9, 12, 13, 19, 20, 22, 23, 26, 29 });
-    const leaf7_ebx = bits(&.{ 3, 8, 16, 17, 28, 30, 31 });
+    const leaf7_ebx = bits(&.{ 3, 8 });
     if (cpuid(1).ecx & leaf1_ecx != leaf1_ecx) return false;
     if (cpuid(7).ebx & leaf7_ebx != leaf7_ebx) return false;
     if (cpuid(0x80000000).eax < 0x80000001) return false;
     const extended_ecx = bits(&.{ 0, 5 });
-    if (cpuid(0x80000001).ecx & extended_ecx != extended_ecx) return false;
+    return cpuid(0x80000001).ecx & extended_ecx == extended_ecx;
+}
+
+fn detectAvx512() bool {
+    if (!detectX86V3()) return false;
+    const leaf7_ebx = bits(&.{ 16, 17, 28, 30, 31 });
+    if (cpuid(7).ebx & leaf7_ebx != leaf7_ebx) return false;
     return xgetbv0() & 0xe6 == 0xe6;
 }
 

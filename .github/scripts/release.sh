@@ -8,6 +8,7 @@
 #
 # SYSTEM is linux-x86_64, linux-aarch64, macos-x86_64, or macos-aarch64, and must be the machine's own: the
 # binary it packages is the one it smoke-tests. Linux binaries are static; macOS binaries link only libSystem.
+# x86-64 binaries are built for the x86-64-v3 set (AVX2); the Linux one stops with a message on an older CPU.
 # Work directories are made under RUNNER_TEMP (or /var/tmp) and left in place; nothing is deleted.
 
 set -euo pipefail
@@ -136,7 +137,9 @@ package_binary() {
     [[ "$(host_system)" == "$system" ]] || die "$system must be packaged on $system, not on $(host_system)"
     work=$(workdir)
     name="z-fastq-$version-$system"
-    zig build -Doptimize=ReleaseFast --prefix "$work/install"
+    local cpu=()
+    case "$system" in *-x86_64) cpu=(-Dcpu=x86_64_v3) ;; esac
+    zig build -Doptimize=ReleaseFast ${cpu[@]+"${cpu[@]}"} --prefix "$work/install"
     stage="$work/$name"
     mkdir "$stage"
     cp "$work/install/bin/z-fastq" LICENSE "$stage/"
