@@ -65,7 +65,7 @@ where $`\ell_1`$ and $`\ell_2`$ are the mate lengths. Pairs with no overlap, or 
 
 ### Pair duplication
 
-`--pair-duplication` adds fastp's duplication rate for whole pairs: the share of pairs whose sequence, mate 1 followed by mate 2, was seen before. Like fastp, it hashes each pair to one bit in each of two large bit arrays, and a pair whose bits were both set already is a duplicate, so a rare hash collision counts too. fastp keeps a fixed 1 GiB for this; z-fastq keeps only the bits that are set, about 10 bytes per pair, and at most about 1 GiB. It needs `--report` or `--qc-summary`.
+`--pair-duplication` adds fastp's duplication rate for whole pairs: the share of pairs whose sequence, mate 1 followed by mate 2, was seen before. Like fastp, it hashes each pair to one bit in each of two large bit arrays, and a pair whose bits were both set already is a duplicate, so a rare hash collision counts too. fastp keeps a fixed 1 GiB for this; z-fastq keeps only the bits that are set, about 4 to 6 bytes per pair, and at most about 1 GiB. It needs `--report` or `--qc-summary`.
 
 ## MultiQC-compatible outputs
 
