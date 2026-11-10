@@ -282,8 +282,9 @@ const LineFeedSearch = extern struct {
         ends: *[line_count]usize,
     ) bool {
         var offset = start;
-        for (ends) |*end| {
-            const line_end = self.find(simd.INLINE_LANES, bytes, offset) orelse
+        for (ends, 0..) |*end, line| {
+            const bare_plus = line == 2 and bytes.len - offset >= 2 and bytes[offset] == '+' and bytes[offset + 1] == '\n';
+            const line_end = if (bare_plus) offset + 1 else self.find(simd.INLINE_LANES, bytes, offset) orelse
                 return false;
             end.* = line_end - start;
             offset = line_end + 1;
@@ -371,8 +372,8 @@ fn validateRecordVector(
         return null;
     }
 
-    const invalid: InvalidFields = if (simd.useAvx2(record.sequence.len))
-        @bitCast(simd.avx2Kernel("invalid_fields", &invalidFieldsExport)(record.sequence.ptr, record.quality.ptr, record.sequence.len, @intFromEnum(alphabet)))
+    const invalid: InvalidFields = if (simd.spanKernel("invalid_fields", &invalidFieldsExport, record.sequence.len)) |kernel|
+        @bitCast(kernel(record.sequence.ptr, record.quality.ptr, record.sequence.len, @intFromEnum(alphabet)))
     else
         invalidFieldsVector(vector_len, alphabet, record.sequence, record.quality);
     if (invalid.sequence) {
@@ -571,18 +572,31 @@ fn firstInvalidSequenceScalar(
     return null;
 }
 
-fn firstInvalidQuality(quality: []const u8) align(HOT_LOOP_ALIGNMENT) ?usize {
-    return firstInvalidQualityVector(simd.INLINE_LANES, quality);
+inline fn firstInvalidQuality(quality: []const u8) ?usize {
+    if (!hasInvalidQuality(quality)) return null;
+    return @call(.never_inline, firstInvalidQualityScalar, .{ quality, 0 });
+}
+
+fn hasInvalidQuality(quality: []const u8) align(HOT_LOOP_ALIGNMENT) bool {
+    return hasInvalidQualityVector(simd.INLINE_LANES, quality);
 }
 
 fn firstInvalidQualityVector(
     comptime vector_len: comptime_int,
     quality: []const u8,
 ) ?usize {
+    if (!hasInvalidQualityVector(vector_len, quality)) return null;
+    return firstInvalidQualityScalar(quality, 0);
+}
+
+fn hasInvalidQualityVector(
+    comptime vector_len: comptime_int,
+    quality: []const u8,
+) bool {
     const Bytes = @Vector(vector_len, u8);
     const Mask = @Vector(vector_len, bool);
 
-    if (quality.len < vector_len) return firstInvalidQualityScalar(quality, 0);
+    if (quality.len < vector_len) return firstInvalidQualityScalar(quality, 0) != null;
 
     var invalid: Mask = @splat(false);
     var byte_index: usize = 0;
@@ -601,8 +615,7 @@ fn firstInvalidQualityVector(
         const bytes: Bytes = quality[quality.len - vector_len ..][0..vector_len].*;
         invalid |= invalidQualityVector(vector_len, bytes);
     }
-    if (!@reduce(.Or, invalid)) return null;
-    return firstInvalidQualityScalar(quality, 0);
+    return @reduce(.Or, invalid);
 }
 
 fn invalidQualityVector(
@@ -711,7 +724,7 @@ fn firstInvalidNarrowIupacSequence(
     };
 }
 
-fn firstValidCheckSequenceLineEnd(
+inline fn firstValidCheckSequenceLineEnd(
     bytes: []const u8,
     alphabet: Alphabet,
     use_full_iupac: *bool,
@@ -725,7 +738,7 @@ fn firstValidCheckSequenceLineEnd(
     };
 }
 
-fn firstValidNarrowIupacSequenceLineEnd(
+inline fn firstValidNarrowIupacSequenceLineEnd(
     bytes: []const u8,
     use_full_iupac: *bool,
 ) ?usize {
@@ -765,11 +778,8 @@ fn scanSequenceLineFor(
     var block_start: usize = 0;
     while (bytes.len - block_start >= simd.BLOCK_BYTES) {
         const block: Bytes = bytes[block_start..][0..simd.BLOCK_BYTES].*;
-        const invalid: u64 = @bitCast(invalidSequenceVector(
-            simd.BLOCK_BYTES,
-            alphabet,
-            block,
-        ));
+        const invalid_lanes = invalidSequenceVector(simd.BLOCK_BYTES, alphabet, block);
+        const invalid = simd.movemask(simd.BLOCK_BYTES, invalid_lanes);
         if (invalid != 0) {
             const stop = block_start + @as(usize, @intCast(@ctz(invalid)));
             if (bytes[stop] == '\n') return .{ .line_end = stop };
@@ -803,8 +813,8 @@ fn classifySemanticBytes(
     start_index: usize,
 ) error{ArithmeticLimit}!void {
     if (failure.* != null) return;
-    const relative = if (simd.useAvx2(bytes.len))
-        avx2FirstInvalid(field, alphabet, use_full_iupac, bytes)
+    const relative = if (simd.spanKernel("first_invalid", &firstInvalidExport, bytes.len)) |kernel|
+        objectFirstInvalid(kernel, field, alphabet, use_full_iupac, bytes)
     else
         firstInvalidChunk(field, alphabet, use_full_iupac, bytes);
     failure.* = std.math.add(usize, start_index, relative orelse return) catch
@@ -823,8 +833,14 @@ fn firstInvalidChunk(
     };
 }
 
-fn avx2FirstInvalid(field: SemanticField, alphabet: Alphabet, use_full_iupac: *bool, bytes: []const u8) ?usize {
-    const index = simd.avx2Kernel("first_invalid", &firstInvalidExport)(@intFromEnum(field), @intFromEnum(alphabet), use_full_iupac, bytes.ptr, bytes.len);
+fn objectFirstInvalid(
+    kernel: *const @TypeOf(firstInvalidExport),
+    field: SemanticField,
+    alphabet: Alphabet,
+    use_full_iupac: *bool,
+    bytes: []const u8,
+) ?usize {
+    const index = kernel(@intFromEnum(field), @intFromEnum(alphabet), use_full_iupac, bytes.ptr, bytes.len);
     return if (index == bytes.len) null else index;
 }
 
@@ -867,6 +883,20 @@ const CompleteRecord = extern struct {
     use_full_iupac: bool,
 };
 
+fn kernelRecord(
+    kernel: *const @TypeOf(scanCompleteRecordExport),
+    buffer: []const u8,
+    start: usize,
+    line_feeds: *LineFeedSearch,
+    max_line_bytes: usize,
+    alphabet: Alphabet,
+    initial_full_iupac: bool,
+) ?CompleteRecord {
+    var checked: CompleteRecord = undefined;
+    if (!kernel(buffer.ptr, buffer.len, start, line_feeds, max_line_bytes, @intFromEnum(alphabet), initial_full_iupac, &checked)) return null;
+    return checked;
+}
+
 inline fn scanCompleteRecord(
     buffer: []const u8,
     start: usize,
@@ -876,12 +906,12 @@ inline fn scanCompleteRecord(
     initial_full_iupac: bool,
     sequence_len_hint: usize,
 ) ?CompleteRecord {
-    if (simd.useAvx2(sequence_len_hint)) {
+    if (simd.spanKernel("scan_complete_record", &scanCompleteRecordExport, sequence_len_hint)) |kernel| {
         var checked: CompleteRecord = undefined;
-        if (!simd.avx2Kernel("scan_complete_record", &scanCompleteRecordExport)(buffer.ptr, buffer.len, start, line_feeds, max_line_bytes, @intFromEnum(alphabet), initial_full_iupac, &checked)) return null;
+        if (!kernel(buffer.ptr, buffer.len, start, line_feeds, max_line_bytes, @intFromEnum(alphabet), initial_full_iupac, &checked)) return null;
         return checked;
     }
-    return scanCompleteRecordInline(buffer, start, line_feeds, max_line_bytes, alphabet, initial_full_iupac);
+    return @call(.always_inline, scanCompleteRecordInline, .{ buffer, start, line_feeds, max_line_bytes, alphabet, initial_full_iupac });
 }
 
 comptime {
@@ -933,8 +963,10 @@ fn scanCompleteRecordInline(
     if (sequence_len > max_line_bytes) return null;
 
     const plus_start = sequence_start + sequence_raw_len + 1;
-    const plus_raw_len = (line_feeds.find(simd.BLOCK_BYTES, buffer, start + plus_start) orelse
-        return null) - start - plus_start;
+    const plus_raw_len = if (data.len - plus_start >= 2 and data[plus_start] == '+' and data[plus_start + 1] == '\n')
+        1
+    else
+        (line_feeds.find(simd.BLOCK_BYTES, buffer, start + plus_start) orelse return null) - start - plus_start;
     const plus_len = lineContentLen(data[plus_start..][0..plus_raw_len]);
     const plus = data[plus_start..][0..plus_len];
     if (plus.len > max_line_bytes) return null;
@@ -945,7 +977,7 @@ fn scanCompleteRecordInline(
     const quality_end = quality_start + sequence_len;
     const quality_lf = quality_end + @intFromBool(data[quality_end] == '\r');
     if (quality_lf >= data.len or data[quality_lf] != '\n') return null;
-    if (firstInvalidQuality(data[quality_start..quality_end]) != null) return null;
+    if (hasInvalidQuality(data[quality_start..quality_end])) return null;
 
     return .{
         .line_ends = .{ header_end, plus_start - 1, quality_start - 1, quality_lf },
@@ -2509,18 +2541,48 @@ pub const CheckScanner = struct {
 
     pub fn feed(self: *CheckScanner, data: []const u8) CheckScannerError!usize {
         var consumed: usize = 0;
-        var boundary_proved = false;
         var line_feeds: LineFeedSearch = .{};
         while (consumed < data.len) {
-            if (self.consumeCompleteRecord(data, consumed, &line_feeds, boundary_proved)) |record_len| {
-                boundary_proved = true;
-                consumed += record_len;
-                continue;
+            if (self.atRecordBoundary()) {
+                consumed += self.consumeCompleteRecords(data, consumed, &line_feeds);
+                if (consumed == data.len) break;
             }
-            boundary_proved = false;
             consumed += try self.consumeIncrementalRecord(data, consumed, &line_feeds);
         }
         return data.len;
+    }
+
+    fn consumeCompleteRecords(
+        self: *CheckScanner,
+        data: []const u8,
+        start: usize,
+        line_feeds: *LineFeedSearch,
+    ) usize {
+        const kernel = simd.spanKernel("scan_complete_record", &scanCompleteRecordExport, self.machine.sequence_len);
+        var end = start;
+        var records: u64 = 0;
+        var use_full_iupac = self.use_full_iupac;
+        while (true) {
+            const complete = if (kernel) |scan| kernelRecord(scan, data, end, line_feeds, self.max_line_bytes, self.alphabet, use_full_iupac) else @call(
+                .always_inline,
+                scanCompleteRecordInline,
+                .{ data, end, line_feeds, self.max_line_bytes, self.alphabet, use_full_iupac },
+            );
+            const record = complete orelse break;
+            end += record.line_ends[3] + 1;
+            use_full_iupac = record.use_full_iupac;
+            records += 1;
+        }
+        if (records == 0) return 0;
+        const next_offset = progressAfter(self.byte_offset, end - start) catch
+            return self.consumeCompleteRecord(data, start, line_feeds, true) orelse 0;
+        const next_record_index = std.math.add(u64, self.record_index, records) catch
+            return self.consumeCompleteRecord(data, start, line_feeds, true) orelse 0;
+        self.use_full_iupac = use_full_iupac;
+        self.record_index = next_record_index;
+        self.byte_offset = next_offset;
+        self.line_start_offset = next_offset;
+        return end - start;
     }
 
     fn consumeCompleteRecord(

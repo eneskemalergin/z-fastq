@@ -910,7 +910,10 @@ test "[cli] - [process]: contaminant paths use escaped byte strings" {
         const allocator = arena.allocator();
         const paths = try Paths.init(allocator, &tmp);
         try writeInputs(&tmp, R1, R2);
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = case[0], .data = "adapter\tACGTACGT\n" });
+        tmp.dir.writeFile(std.testing.io, .{ .sub_path = case[0], .data = "adapter\tACGTACGT\n" }) catch |err| {
+            if (err == error.BadPathName and !std.unicode.utf8ValidateSlice(case[0])) continue;
+            return err;
+        };
         const contaminants = try cli.tempPath(allocator, &tmp.sub_path, case[0]);
         const expected = try cli.tempPath(allocator, &tmp.sub_path, case[1]);
         const result = try cli.run(allocator, &.{ "process", "--report", "-", "--contaminants", contaminants, "--out1", paths.out1, "--out2", paths.out2, paths.r1, paths.r2 });

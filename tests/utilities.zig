@@ -1,6 +1,7 @@
 //! Shared utilities for installed CLI tests.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const JSON_OUTPUT_BUFFER_BYTES = 16 * 1024;
 
@@ -8,6 +9,7 @@ pub const FIXTURE_DIR = "tests/data/synthetic";
 
 pub const EXPECTED_VERSION = @import("test_options").package_version;
 pub const ZFASTQ_BIN = "zig-out/bin/z-fastq";
+pub const CLI_EXEC: []const []const u8 = @import("test_options").cli_exec;
 pub const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
 pub const PROCESS_TIMEOUT = std.Io.Duration.fromSeconds(30);
 
@@ -68,7 +70,7 @@ pub const ProcessDeadline = struct {
     io: std.Io,
     process: *std.process.Child,
     deadline: std.Io.Clock.Timestamp,
-    pid_file: std.Io.File,
+    exit_watch: ExitWatch,
     finished: bool = false,
 
     pub fn init(
@@ -76,12 +78,6 @@ pub const ProcessDeadline = struct {
         process: *std.process.Child,
         duration: std.Io.Duration,
     ) !ProcessDeadline {
-        const raw_pid_fd = std.os.linux.pidfd_open(process.id.?, 0);
-        const pid_fd = switch (std.os.linux.errno(raw_pid_fd)) {
-            .SUCCESS => std.math.cast(std.posix.fd_t, raw_pid_fd) orelse
-                return error.ChildProcessControlFailed,
-            else => return error.ChildProcessControlFailed,
-        };
         return .{
             .io = io,
             .process = process,
@@ -89,13 +85,13 @@ pub const ProcessDeadline = struct {
                 .raw = duration,
                 .clock = .awake,
             }),
-            .pid_file = .{ .handle = pid_fd, .flags = .{ .nonblocking = false } },
+            .exit_watch = try .init(process.id.?),
         };
     }
 
     pub fn deinit(self: *ProcessDeadline) void {
         if (!self.finished) self.process.kill(self.io);
-        self.pid_file.close(self.io);
+        self.exit_watch.deinit(self.io);
         self.* = undefined;
     }
 
@@ -109,16 +105,8 @@ pub const ProcessDeadline = struct {
     }
 
     pub fn waitForExit(self: *ProcessDeadline) !u8 {
-        var poll_fd = [1]std.posix.pollfd{.{
-            .fd = self.pid_file.handle,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
         const timeout_ms = self.remainingMilliseconds() orelse return error.Timeout;
-        if (try std.posix.poll(&poll_fd, timeout_ms) == 0) return error.Timeout;
-        if (poll_fd[0].revents & std.posix.POLL.NVAL != 0) {
-            return error.ChildProcessControlFailed;
-        }
+        if (!try self.exit_watch.wait(timeout_ms)) return error.Timeout;
 
         const termination = try self.process.wait(self.io);
         self.finished = true;
@@ -154,6 +142,97 @@ pub const ProcessDeadline = struct {
         return @intCast(@min(milliseconds, std.math.maxInt(i32)));
     }
 };
+
+const ExitWatch = switch (builtin.os.tag) {
+    .linux => struct {
+        pid_file: std.Io.File,
+
+        fn init(pid: std.posix.pid_t) !ExitWatch {
+            const raw_pid_fd = std.os.linux.pidfd_open(pid, 0);
+            const pid_fd = switch (std.os.linux.errno(raw_pid_fd)) {
+                .SUCCESS => std.math.cast(std.posix.fd_t, raw_pid_fd) orelse
+                    return error.ChildProcessControlFailed,
+                else => return error.ChildProcessControlFailed,
+            };
+            return .{ .pid_file = .{ .handle = pid_fd, .flags = .{ .nonblocking = false } } };
+        }
+
+        fn deinit(self: *ExitWatch, io: std.Io) void {
+            self.pid_file.close(io);
+        }
+
+        fn wait(self: *ExitWatch, timeout_ms: i32) !bool {
+            var poll_fd = [1]std.posix.pollfd{.{
+                .fd = self.pid_file.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            if (try std.posix.poll(&poll_fd, timeout_ms) == 0) return false;
+            if (poll_fd[0].revents & std.posix.POLL.NVAL != 0) {
+                return error.ChildProcessControlFailed;
+            }
+            return true;
+        }
+    },
+    .macos => struct {
+        queue: std.Io.File,
+        exited_before_watch: bool,
+
+        fn init(pid: std.posix.pid_t) !ExitWatch {
+            const queue = std.c.kqueue();
+            if (queue == -1) return error.ChildProcessControlFailed;
+            errdefer _ = std.c.close(queue);
+            const changes = [1]std.c.Kevent{.{
+                .ident = std.math.cast(usize, pid) orelse return error.ChildProcessControlFailed,
+                .filter = std.c.EVFILT.PROC,
+                .flags = std.c.EV.ADD,
+                .fflags = std.c.NOTE.EXIT,
+                .data = 0,
+                .udata = 0,
+            }};
+            var no_events: [0]std.c.Kevent = .{};
+            const result = std.c.kevent(queue, &changes, changes.len, &no_events, 0, null);
+            const exited_before_watch = result == -1 and switch (std.c.errno(result)) {
+                .SRCH => true,
+                else => return error.ChildProcessControlFailed,
+            };
+            return .{
+                .queue = .{ .handle = queue, .flags = .{ .nonblocking = false } },
+                .exited_before_watch = exited_before_watch,
+            };
+        }
+
+        fn deinit(self: *ExitWatch, io: std.Io) void {
+            self.queue.close(io);
+        }
+
+        fn wait(self: *ExitWatch, timeout_ms: i32) !bool {
+            if (self.exited_before_watch) return true;
+            const timeout: std.c.timespec = .{
+                .sec = @divFloor(timeout_ms, std.time.ms_per_s),
+                .nsec = @mod(timeout_ms, std.time.ms_per_s) * std.time.ns_per_ms,
+            };
+            var no_changes: [0]std.c.Kevent = .{};
+            var events: [1]std.c.Kevent = undefined;
+            while (true) {
+                const count = std.c.kevent(self.queue.handle, &no_changes, 0, &events, events.len, &timeout);
+                if (count == 0) return false;
+                if (count > 0) {
+                    if (events[0].flags & std.c.EV.ERROR != 0) return error.ChildProcessControlFailed;
+                    return true;
+                }
+                if (std.c.errno(count) != .INTR) return error.ChildProcessControlFailed;
+            }
+        }
+    },
+    else => @compileError("installed CLI tests run on Linux and macOS only"),
+};
+
+extern "c" fn mkfifoat(dir_fd: std.c.fd_t, path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+pub fn makeFifo(dir: std.Io.Dir, name: [*:0]const u8) !void {
+    try std.testing.expectEqual(@as(c_int, 0), mkfifoat(dir.handle, name, 0o600));
+}
 
 pub fn expectJsonObjectKeys(
     object: std.json.ObjectMap,
@@ -474,7 +553,12 @@ pub const RunOptions = struct {
     stderr: StderrMode = .capture,
     timeout: std.Io.Duration = PROCESS_TIMEOUT,
     output_limit: usize = PROCESS_OUTPUT_LIMIT,
+    environ_map: ?*const std.process.Environ.Map = null,
 };
+
+pub fn cliArgv(allocator: std.mem.Allocator, command_args: []const []const u8) ![]const []const u8 {
+    return std.mem.concat(allocator, []const u8, &.{ CLI_EXEC, &.{ZFASTQ_BIN}, command_args });
+}
 
 pub fn runWith(
     allocator: std.mem.Allocator,
@@ -485,13 +569,12 @@ pub fn runWith(
     defer threaded.deinit();
     const io = threaded.io();
 
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, ZFASTQ_BIN);
-    try argv.appendSlice(allocator, command_args);
+    const argv = try cliArgv(allocator, command_args);
+    defer allocator.free(argv);
 
     var proc = try std.process.spawn(io, .{
-        .argv = argv.items,
+        .argv = argv,
+        .environ_map = options.environ_map,
         .stdin = switch (options.stdin) {
             .closed => .close,
             .stalled, .data => .pipe,

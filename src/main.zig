@@ -1,6 +1,7 @@
 //! CLI entry and subcommand dispatcher for z-fastq.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zfastq = @import("root.zig");
 const fastq = @import("fastq.zig");
 const io_layer = @import("io.zig");
@@ -9,6 +10,7 @@ const sampling = @import("sample.zig");
 const statistics = @import("stats.zig");
 const qc = @import("qc.zig");
 const preprocess = @import("preprocess.zig");
+const simd = @import("simd.zig");
 
 pub const std_options: std.Options = .{ .networking = false };
 
@@ -107,6 +109,30 @@ const USAGE =
 fn argumentError(io: std.Io, message: []const u8, exit_code: u8) noreturn {
     std.Io.File.writeStreamingAll(.stderr(), io, message) catch {};
     std.process.exit(exit_code);
+}
+
+const TIER_VARIABLE = "ZFASTQ_TIER";
+
+fn selectKernelTier(io: std.Io, value: []const u8) void {
+    const tier = std.meta.stringToEnum(simd.Tier, value) orelse
+        argumentError(io, "error: " ++ TIER_VARIABLE ++ " must be baseline, avx2, or avx512\n", 2);
+    simd.selectTier(tier) catch {
+        var buffer: [128]u8 = undefined;
+        var message: std.Io.Writer = .fixed(&buffer);
+        writeUnavailableTier(&message, tier, simd.tierRange()) catch unreachable;
+        argumentError(io, message.buffered(), 2);
+    };
+}
+
+fn writeUnavailableTier(message: *std.Io.Writer, tier: simd.Tier, range: simd.TierRange) std.Io.Writer.Error!void {
+    try message.print("error: {s}={s} is not available; this binary runs ", .{ TIER_VARIABLE, @tagName(tier) });
+    const lowest = @intFromEnum(range.lowest);
+    const count = @intFromEnum(range.highest) - lowest + 1;
+    for (0..count) |index| {
+        if (index > 0) try message.writeAll(if (count == 2) " or " else if (index == count - 1) ", or " else ", ");
+        try message.writeAll(@tagName(@as(simd.Tier, @enumFromInt(lowest + index))));
+    }
+    try message.writeAll(" here\n");
 }
 
 fn printUsageAndExit(io: std.Io) noreturn {
@@ -278,6 +304,8 @@ pub fn main(init: std.process.Init) !void {
         .mask = std.posix.sigemptyset(),
         .flags = 0,
     }, null);
+
+    if (init.environ_map.get(TIER_VARIABLE)) |value| selectKernelTier(io, value);
 
     var args = std.process.Args.Iterator.initAllocator(init.minimal.args, gpa) catch {
         argumentError(io, OUT_OF_MEMORY_LINE, 3);
@@ -1077,12 +1105,26 @@ const InputOptions = struct {
 };
 
 const FileIdentity = struct {
-    device_major: u32,
-    device_minor: u32,
+    device: u64,
     inode: u64,
+};
 
-    fn of(stat: std.os.linux.Statx) FileIdentity {
-        return .{ .device_major = stat.dev_major, .device_minor = stat.dev_minor, .inode = stat.ino };
+const RecordFileStat = struct {
+    identity: FileIdentity,
+    kind: Kind,
+
+    const Kind = enum { regular, directory, fifo, other };
+
+    fn init(device: u64, inode: u64, mode: u32) RecordFileStat {
+        return .{
+            .identity = .{ .device = device, .inode = inode },
+            .kind = switch (mode & std.posix.S.IFMT) {
+                std.posix.S.IFREG => .regular,
+                std.posix.S.IFDIR => .directory,
+                std.posix.S.IFIFO => .fifo,
+                else => .other,
+            },
+        };
     }
 };
 
@@ -1165,7 +1207,7 @@ fn initRecordInput(
 
 fn inputTypeFailure(io: std.Io, file: std.Io.File) ?CommandFailure {
     const stat = statRecordFile(io, file) catch return null;
-    if (stat.mode & std.os.linux.S.IFMT == std.os.linux.S.IFDIR) {
+    if (stat.kind == .directory) {
         return CommandFailure.plain("io_error", "input is a directory", 3);
     }
     return null;
@@ -1245,18 +1287,9 @@ fn openNonblockingRecordFile(label: []const u8) std.posix.OpenError!std.Io.File 
 }
 
 fn prepareRecordFile(io: std.Io, file: *std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!void {
-    const linux = std.os.linux;
     const stat = try statRecordFile(io, file.*);
-    if (stat.mode & linux.S.IFMT == linux.S.IFIFO) {
-        var poll_fd = [1]linux.pollfd{.{ .fd = file.handle, .events = linux.POLL.IN, .revents = 0 }};
-        while (true) switch (linux.errno(linux.poll(&poll_fd, 1, -1))) {
-            .SUCCESS => break,
-            .INTR => try io.checkCancel(),
-            else => return error.Io,
-        };
-        if (poll_fd[0].revents & (linux.POLL.ERR | linux.POLL.NVAL) != 0) return error.Io;
-    }
-    while (true) switch (linux.errno(linux.fcntl(file.handle, linux.F.SETFL, 0))) {
+    if (stat.kind == .fifo) try platform_files.waitForFifoWriter(io, file.handle);
+    while (true) switch (platform_files.clearStatusFlags(file.handle)) {
         .SUCCESS => break,
         .INTR => try io.checkCancel(),
         else => return error.Io,
@@ -1264,22 +1297,110 @@ fn prepareRecordFile(io: std.Io, file: *std.Io.File) (std.Io.Cancelable || error
     file.flags.nonblocking = false;
 }
 
+const platform_files = switch (builtin.os.tag) {
+    .linux => struct {
+        const linux = std.os.linux;
+        const Buffer = linux.Statx;
+        const MASK: linux.STATX = .{ .INO = true, .TYPE = true };
+
+        fn statHandle(handle: std.posix.fd_t, buffer: *Buffer) linux.E {
+            return linux.errno(linux.statx(handle, "", linux.AT.EMPTY_PATH, MASK, buffer));
+        }
+
+        fn statPath(path: [*:0]const u8, buffer: *Buffer) linux.E {
+            return linux.errno(linux.statx(linux.AT.FDCWD, path, 0, MASK, buffer));
+        }
+
+        fn recordFileStat(buffer: *const Buffer) ?RecordFileStat {
+            if (!buffer.mask.INO or !buffer.mask.TYPE) return null;
+            return RecordFileStat.init(@as(u64, buffer.dev_major) << 32 | buffer.dev_minor, buffer.ino, buffer.mode);
+        }
+
+        fn namesDescriptor(path: [*:0]const u8) bool {
+            _ = path;
+            return false;
+        }
+
+        fn waitForFifoWriter(io: std.Io, handle: std.posix.fd_t) (std.Io.Cancelable || error{Io})!void {
+            var poll_fd = [1]linux.pollfd{.{ .fd = handle, .events = linux.POLL.IN, .revents = 0 }};
+            while (true) switch (linux.errno(linux.poll(&poll_fd, 1, -1))) {
+                .SUCCESS => break,
+                .INTR => try io.checkCancel(),
+                else => return error.Io,
+            };
+            if (poll_fd[0].revents & (linux.POLL.ERR | linux.POLL.NVAL) != 0) return error.Io;
+        }
+
+        fn clearStatusFlags(handle: std.posix.fd_t) linux.E {
+            return linux.errno(linux.fcntl(handle, linux.F.SETFL, 0));
+        }
+    },
+    .macos => struct {
+        const Buffer = std.c.Stat;
+
+        fn statHandle(handle: std.posix.fd_t, buffer: *Buffer) std.c.E {
+            return std.c.errno(std.c.fstat(handle, buffer));
+        }
+
+        fn statPath(path: [*:0]const u8, buffer: *Buffer) std.c.E {
+            return std.c.errno(std.c.fstatat(std.c.AT.FDCWD, path, buffer, 0));
+        }
+
+        fn recordFileStat(buffer: *const Buffer) ?RecordFileStat {
+            return RecordFileStat.init(@as(u32, @bitCast(buffer.dev)), buffer.ino, buffer.mode);
+        }
+
+        fn namesDescriptor(path: [*:0]const u8) bool {
+            var resolved: [std.c.PATH_MAX]u8 = undefined;
+            const real_path = std.c.realpath(path, &resolved) orelse return false;
+            return std.mem.startsWith(u8, std.mem.span(real_path), "/dev/fd/");
+        }
+
+        const FD_SETSIZE = 1024;
+        const FdSet = extern struct { bits: [FD_SETSIZE / 32]u32 };
+        extern "c" fn @"select$DARWIN_EXTSN"(
+            count: c_int,
+            readable: ?*FdSet,
+            writable: ?*FdSet,
+            failed: ?*FdSet,
+            timeout: ?*std.c.timeval,
+        ) c_int;
+
+        fn waitForFifoWriter(io: std.Io, handle: std.posix.fd_t) (std.Io.Cancelable || error{Io})!void {
+            const index = std.math.cast(usize, handle) orelse return error.Io;
+            if (index >= FD_SETSIZE) return error.Io;
+            while (true) {
+                var readable: FdSet = .{ .bits = @splat(0) };
+                readable.bits[index / 32] = @as(u32, 1) << @intCast(index % 32);
+                switch (std.c.errno(@"select$DARWIN_EXTSN"(handle + 1, &readable, null, null, null))) {
+                    .SUCCESS => return,
+                    .INTR => try io.checkCancel(),
+                    else => return error.Io,
+                }
+            }
+        }
+
+        fn clearStatusFlags(handle: std.posix.fd_t) std.c.E {
+            return std.c.errno(std.c.fcntl(handle, std.c.F.SETFL, @as(c_int, 0)));
+        }
+    },
+    else => @compileError("z-fastq inspects files on Linux and macOS only"),
+};
+
 fn fileIdentity(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!FileIdentity {
     const stat = try statRecordFile(io, file);
-    return .of(stat);
+    return stat.identity;
 }
 
-fn statRecordFile(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!std.os.linux.Statx {
-    const linux = std.os.linux;
-    var stat: linux.Statx = undefined;
-    while (true) switch (linux.errno(linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .{ .INO = true, .TYPE = true }, &stat))) {
+fn statRecordFile(io: std.Io, file: std.Io.File) (std.Io.Cancelable || error{ Io, BadFileDescriptor })!RecordFileStat {
+    var buffer: platform_files.Buffer = undefined;
+    while (true) switch (platform_files.statHandle(file.handle, &buffer)) {
         .SUCCESS => break,
         .INTR => try io.checkCancel(),
         .BADF => return error.BadFileDescriptor,
         else => return error.Io,
     };
-    if (!stat.mask.INO or !stat.mask.TYPE) return error.Io;
-    return stat;
+    return platform_files.recordFileStat(&buffer) orelse error.Io;
 }
 
 fn stdoutFileIdentity(io: std.Io) (std.Io.Cancelable || error{Io})!?FileIdentity {
@@ -1287,8 +1408,8 @@ fn stdoutFileIdentity(io: std.Io) (std.Io.Cancelable || error{Io})!?FileIdentity
         error.BadFileDescriptor => return null,
         else => |other| return other,
     };
-    if (stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG) return null;
-    return .of(stat);
+    if (stat.kind != .regular) return null;
+    return stat.identity;
 }
 
 fn checkedStdoutIdentity(io: std.Io) error{Reported}!?FileIdentity {
@@ -1298,28 +1419,46 @@ fn checkedStdoutIdentity(io: std.Io) error{Reported}!?FileIdentity {
     };
 }
 
-fn pathIdentity(io: std.Io, path: []const u8) ?FileIdentity {
-    const linux = std.os.linux;
+const PathIdentity = struct {
+    identity: FileIdentity,
+    descriptor_alias: bool,
+};
+
+fn pathIdentity(io: std.Io, path: []const u8) ?PathIdentity {
     const path_z = std.posix.toPosixPath(path) catch return null;
-    var stat: linux.Statx = undefined;
-    while (true) switch (linux.errno(linux.statx(linux.AT.FDCWD, &path_z, 0, .{ .INO = true, .TYPE = true }, &stat))) {
+    if (platform_files.namesDescriptor(&path_z)) {
+        const handle = std.posix.openat(std.Io.Dir.cwd().handle, path, .{
+            .ACCMODE = .RDONLY,
+            .CLOEXEC = true,
+            .NOCTTY = true,
+        }, 0) catch return null;
+        const duplicate: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
+        defer duplicate.close(io);
+        const stat = statRecordFile(io, duplicate) catch return null;
+        return .{ .identity = stat.identity, .descriptor_alias = true };
+    }
+    var buffer: platform_files.Buffer = undefined;
+    while (true) switch (platform_files.statPath(&path_z, &buffer)) {
         .SUCCESS => break,
         .INTR => io.checkCancel() catch return null,
         else => return null,
     };
-    if (!stat.mask.INO or !stat.mask.TYPE) return null;
-    return .of(stat);
+    const stat = platform_files.recordFileStat(&buffer) orelse return null;
+    return .{ .identity = stat.identity, .descriptor_alias = false };
 }
 
 fn inputAliasFailure(io: std.Io, inputs: []const []const u8, output_identity: ?FileIdentity) ?u8 {
     const stdin_stat = statRecordFile(io, .stdin()) catch null;
-    const stdin_identity: ?FileIdentity = if (stdin_stat) |stat| .of(stat) else null;
-    const stdin_is_stream = if (stdin_stat) |stat| stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG else false;
+    const stdin_identity: ?FileIdentity = if (stdin_stat) |stat| stat.identity else null;
+    const stdin_is_stream = if (stdin_stat) |stat| stat.kind != .regular else false;
     var stdin_uses: usize = 0;
     for (inputs) |label| {
-        const identity = if (namesStdin(label)) stdin_identity else pathIdentity(io, label);
-        const reads_stdin = namesStdin(label) or
-            (stdin_is_stream and identity != null and std.meta.eql(identity.?, stdin_identity.?));
+        const path = if (namesStdin(label)) null else pathIdentity(io, label);
+        const identity = if (namesStdin(label)) stdin_identity else if (path) |found| found.identity else null;
+        const same_file_as_stdin = identity != null and stdin_identity != null and
+            std.meta.eql(identity.?, stdin_identity.?);
+        const shares_stdin_offset = stdin_is_stream or (path != null and path.?.descriptor_alias);
+        const reads_stdin = namesStdin(label) or (same_file_as_stdin and shares_stdin_offset);
         if (reads_stdin) {
             stdin_uses += 1;
             if (stdin_uses > 1) {
@@ -1346,8 +1485,8 @@ fn outputFileFailure(io: std.Io, file: std.Io.File, output_identity: ?FileIdenti
 
 fn canReportInputFailure(io: std.Io, known_inputs: ?[]const FileIdentity) bool {
     const stat = statRecordFile(io, .stderr()) catch return false;
-    const inputs = known_inputs orelse return stat.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG;
-    const stderr_identity: FileIdentity = .of(stat);
+    const inputs = known_inputs orelse return stat.kind != .regular;
+    const stderr_identity = stat.identity;
     for (inputs) |input| {
         if (std.meta.eql(input, stderr_identity)) return false;
     }
@@ -1417,6 +1556,24 @@ fn spanIsWritable(span: fastq.RecordSpan) bool {
 fn writeRecordSpan(writer: *zfastq.Writer, span: fastq.RecordSpan) error{WriteFailed}!void {
     if (span.canonical) return fastq.writeCanonicalRecordSpan(writer, span.bytes);
     return fastq.writeRecordUnchecked(writer, span.record());
+}
+
+fn spanPairMismatch(
+    reader: *const zfastq.Reader,
+    mate1: fastq.RecordSpan,
+    mate2: fastq.RecordSpan,
+    offset1: u64,
+    policy: pairing.NamePolicy,
+) PairCommandFailure {
+    const record_index2 = reader.recordIndex() - 1;
+    return headerNameMismatch(
+        mate1.header(),
+        mate2.header(),
+        policy,
+        interleavedPairIndex(record_index2 - 1),
+        .{ record_index2 - 1, record_index2 },
+        .{ offset1, reader.currentRecordOffsets().?.header },
+    );
 }
 
 fn headerNameMismatch(
@@ -1753,7 +1910,7 @@ fn statsInput(
     allocator: std.mem.Allocator,
     label: []const u8,
     options: InputOptions,
-) StatsOutcome {
+) align(4096) StatsOutcome {
     var input: RecordInput = undefined;
     if (initRecordInput(&input, io, label, null)) |failure| return .{ .failure = failure };
     defer input.deinit(io);
@@ -2127,7 +2284,10 @@ fn checkInterleavedSource(
     var validator = fastq.AdaptiveRecordValidator.init(.{ .alphabet = options.alphabet });
 
     while (true) {
-        switch (verifyInterleavedPair(allocator, &reader, &validator, &stored_name, options.pair_name_policy, null)) {
+        var span1: ?fastq.RecordSpan = null;
+        if (checkSpanPairs(allocator, &reader, &validator, options.pair_name_policy, exact_selector, &span1)) |failure| return failure;
+        const first: ?fastq.ValidatedHeader = if (span1) |mate1| .{ .header = mate1.header(), .semantic_error = null } else null;
+        switch (verifyInterleavedPair(allocator, &reader, &validator, &stored_name, options.pair_name_policy, first)) {
             .end => return null,
             .failure => |failure| return failure,
             .pair => {},
@@ -2138,6 +2298,30 @@ fn checkInterleavedSource(
             };
         }
     }
+}
+
+noinline fn checkSpanPairs(
+    allocator: std.mem.Allocator,
+    reader: *zfastq.Reader,
+    validator: *fastq.AdaptiveRecordValidator,
+    policy: pairing.NamePolicy,
+    exact_selector: ?*sampling.ExactSelector,
+    pending1: *?fastq.RecordSpan,
+) ?PairCommandFailure {
+    while (fastq.nextRecordSpan(reader, validator)) |mate1| {
+        const offset1 = reader.currentRecordOffsets().?.header;
+        const mate2 = fastq.nextRecordSpan(reader, validator) orelse {
+            pending1.* = mate1;
+            return null;
+        };
+        if (!pairing.headersMatch(mate1.header(), mate2.header(), policy)) return spanPairMismatch(reader, mate1, mate2, offset1, policy);
+        if (exact_selector) |selector| {
+            selector.considerRecord(allocator, reader.recordIndex() / 2) catch |err| {
+                return exactPairSelectionFailure(err);
+            };
+        }
+    }
+    return null;
 }
 
 inline fn verifyInterleavedPair(
@@ -4049,17 +4233,7 @@ noinline fn splitSpanPairs(
             pending1.* = mate1;
             return null;
         };
-        if (!pairing.headersMatch(mate1.header(), mate2.header(), policy)) {
-            const record_index2 = reader.recordIndex() - 1;
-            return headerNameMismatch(
-                mate1.header(),
-                mate2.header(),
-                policy,
-                interleavedPairIndex(record_index2 - 1),
-                .{ record_index2 - 1, record_index2 },
-                .{ offset1, reader.currentRecordOffsets().?.header },
-            );
-        }
+        if (!pairing.headersMatch(mate1.header(), mate2.header(), policy)) return spanPairMismatch(reader, mate1, mate2, offset1, policy);
         if (!selection.selectPair()) continue;
         if (!spanIsWritable(mate1) or !spanIsWritable(mate2)) {
             return pairCommandFailure(0, unwritableRecordFailure());
@@ -6058,12 +6232,7 @@ test "[failure] - [exact sample]: a FIFO replacement reports input changed on re
         break :snapshot try fileSnapshot(file, io);
     };
     try tmp.dir.deleteFile(io, name);
-    try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.mknodat(
-        tmp.dir.handle,
-        name,
-        std.os.linux.S.IFIFO | 0o600,
-        0,
-    )));
+    try makeFifo(tmp.dir, name);
 
     const keeper: std.Io.File = .{
         .handle = try std.posix.openat(tmp.dir.handle, name, .{
@@ -6085,6 +6254,22 @@ test "[failure] - [exact sample]: a FIFO replacement reports input changed on re
         },
     };
     try expectInputChanged(failure);
+}
+
+fn makeFifo(dir: std.Io.Dir, name: [*:0]const u8) !void {
+    switch (builtin.os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            try std.testing.expectEqual(.SUCCESS, linux.errno(linux.mknodat(dir.handle, name, linux.S.IFIFO | 0o600, 0)));
+        },
+        .macos => {
+            const libc = struct {
+                extern "c" fn mkfifoat(dir_fd: std.c.fd_t, path: [*:0]const u8, mode: std.c.mode_t) c_int;
+            };
+            try std.testing.expectEqual(@as(c_int, 0), libc.mkfifoat(dir.handle, name, 0o600));
+        },
+        else => @compileError("FIFO tests run on Linux and macOS only"),
+    }
 }
 
 test "[failure] - [exact sample]: a failed read in the first pass reports io error before any selection" {
@@ -7026,7 +7211,12 @@ fn exerciseExactAllocations(allocator: std.mem.Allocator) !void {
 
 fn openDescriptorCount() !usize {
     const io = std.testing.io;
-    var directory = try std.Io.Dir.openDirAbsolute(io, "/proc/self/fd", .{ .iterate = true });
+    const open_descriptors = switch (builtin.os.tag) {
+        .linux => "/proc/self/fd",
+        .macos => "/dev/fd",
+        else => @compileError("descriptor counts run on Linux and macOS only"),
+    };
+    var directory = try std.Io.Dir.openDirAbsolute(io, open_descriptors, .{ .iterate = true });
     defer directory.close(io);
     var entries = directory.iterate();
     var count: usize = 0;

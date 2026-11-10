@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use z-fastq, please cite it as below."
+type: software
+title: "z-fastq"
+abstract: "Fast single-threaded FASTQ work in small, predictable memory. One static binary and a Zig package."
+authors:
+  - family-names: "Ergin"
+    given-names: "Enes Kemal"
+version: "0.2.1"
+date-released: "2026-11-01"
+license: MIT
+repository-code: "https://github.com/eneskemalergin/z-fastq"
+url: "https://github.com/eneskemalergin/z-fastq/wiki"
+keywords:
+  - FASTQ
+  - bioinformatics
+  - sequencing
+  - quality control
+  - Zig

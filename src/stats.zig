@@ -70,7 +70,7 @@ pub const Stats = struct {
     q30_bases: u64 = 0,
     last_quality_error: ?QualityError = null,
 
-    pub fn addRecord(self: *Stats, record: fastq.Record) StatsError!void {
+    pub fn addRecord(self: *Stats, record: fastq.Record) align(4096) StatsError!void {
         self.last_quality_error = null;
         var quality_error: ?QualityError = null;
         const delta = recordTotals(record, &quality_error) catch |err| {
@@ -273,22 +273,34 @@ fn payloadTotals(
     quality: []const u8,
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
-    if (sum_type == u64 and simd.useAvx2(quality.len)) return avx2Totals(.both, sequence, quality, quality_error);
+    if (sum_type == u64) {
+        if (simd.spanKernel("payload_totals", &payloadTotalsExport, quality.len)) |kernel| {
+            return objectTotals(kernel, .both, sequence, quality, quality_error);
+        }
+    }
     return payloadTotalsInline(sum_type, .both, sequence, quality, quality_error);
 }
 
 fn chunkTotals(comptime parts: Parts, bytes: []const u8, quality_error: *?QualityError) StatsError!PayloadTotals {
     const sequence = if (parts == .sequence) bytes else "";
     const quality = if (parts == .quality) bytes else "";
-    if (simd.useAvx2(bytes.len)) return avx2Totals(parts, sequence, quality, quality_error);
+    if (simd.spanKernel("payload_totals", &payloadTotalsExport, bytes.len)) |kernel| {
+        return objectTotals(kernel, parts, sequence, quality, quality_error);
+    }
     return payloadTotalsInline(u64, parts, sequence, quality, quality_error);
 }
 
-fn avx2Totals(parts: Parts, sequence: []const u8, quality: []const u8, quality_error: *?QualityError) StatsError!PayloadTotals {
+fn objectTotals(
+    kernel: *const @TypeOf(payloadTotalsExport),
+    parts: Parts,
+    sequence: []const u8,
+    quality: []const u8,
+    quality_error: *?QualityError,
+) StatsError!PayloadTotals {
     var totals: PayloadTotals = undefined;
     var error_index: usize = undefined;
     var error_byte: u8 = undefined;
-    switch (simd.avx2Kernel("payload_totals", &payloadTotalsExport)(@intFromEnum(parts), sequence.ptr, sequence.len, quality.ptr, quality.len, &totals, &error_index, &error_byte)) {
+    switch (kernel(@intFromEnum(parts), sequence.ptr, sequence.len, quality.ptr, quality.len, &totals, &error_index, &error_byte)) {
         0 => return totals,
         1 => {
             quality_error.* = .{ .byte_index = error_index, .byte = error_byte };

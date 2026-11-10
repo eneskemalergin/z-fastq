@@ -4,6 +4,20 @@
 
 All notable changes to z-fastq will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **macOS.** z-fastq builds and runs on macOS 13 or later, on Apple Silicon and on Intel, and each release gains `macos-aarch64` and `macos-x86_64` archives, tested and smoke-tested on GitHub's macOS runners as the Linux archives are. The Intel build picks its AVX2 code at run time, as the Linux x86-64 build does; Apple Silicon runs the portable vector code. macOS binaries link only the system library, `libSystem`; Linux binaries stay static. Outputs, JSON documents, and exit statuses are the same on both systems, except one case of standard input:
+  - On macOS, `/dev/stdin` and `/dev/fd/N` share the read position of the descriptor they name, so naming standard input twice, such as `count - /dev/stdin`, fails with status `2` even when standard input is a regular file. Linux opens the file again and reads it twice, as before.
+- **AVX-512.** x86-64 builds carry a third copy of the SIMD kernels, compiled for AVX-512 (the x86-64-v4 set), and select it at run time on CPUs that have it and an operating system that enables it, in place of AVX2. Output is the same on every tier.
+- **`ZFASTQ_TIER`.** Set to `baseline`, `avx2`, or `avx512`, the variable makes z-fastq run that SIMD kernel tier instead of the fastest one the CPU has, to compare tiers or rule one out; a tier the binary cannot run on that CPU, or any other value, stops the command with status `2`. Unset, nothing changes. Zipir's gzip kernels are not affected.
+
+### Changed
+
+- **x86-64 release binaries need x86-64-v3.** The Linux and macOS x86-64 archives are built for the x86-64-v3 set (AVX2, BMI2, FMA), so short reads use AVX2 code too, not only records of 1 KiB or more: on a Zen 2 CPU, trimming with `process` is about 20% faster, `stats` 14%, `check` 8 to 10%, the other `process` modes about 9%, with the same output and the same memory. On a CPU without the set, the Linux binary stops with status `2` and a message instead of running; z-fastq is then built from source, whose default build still targets any x86-64 CPU.
+- **`-Dcpu` in release builds.** ReleaseSafe and ReleaseFast builds compile for the CPU that `-Dcpu` names, such as `-Dcpu=x86_64_v3`, instead of ignoring it. Without `-Dcpu`, Linux release builds target generic x86-64 or ARMv8-A, as before, and macOS release builds target Zig's macOS defaults, `core2` and `apple_m1`. `-Dstatic=true` confirms a static Linux release build and stops with a message on macOS.
+
 ## [0.2.1]
 
 Faster gzip input, from Zipir 0.3.0's rebuilt DEFLATE decoder: `count`, `stats`, and `check` take 15 to 18% less CPU time on gzip files. `process` can now move a UMI from the start of the reads into their names, as fastp does. Output bytes, JSON documents, and exit statuses are unchanged, apart from the report fields the UMI options add and the fixes below.

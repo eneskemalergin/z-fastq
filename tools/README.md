@@ -85,3 +85,7 @@ tools/install.sh --check zebrac
 The tools support correctness checks and local development comparisons for overlapping FASTQ operations. A comparison must establish compatible output and failure behavior before timing anything.
 
 Local measurements are development evidence. They are not a permanent public ranking, and this document does not define z-fastq's user-facing performance claims.
+
+## Social preview
+
+`tools/social_preview.sh` builds `assets/social-preview.png` (1280x640) from `assets/logo-readme.svg` and `assets/tagline-light.svg` with ImageMagick 7. GitHub's API cannot set a repository's social preview; upload the file under Settings > General > Social preview.

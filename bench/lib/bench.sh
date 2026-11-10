@@ -864,9 +864,6 @@ want_of() { # paths truth
     done
     printf '%s\n' "${out%;}"
 }
-same_answer() { # got want
-    if [[ -n "$AGREE_LANE" ]]; then [[ -z "$(field_diff "$1" "$2")" ]]; else [[ "$1" == "$2" ]]; fi
-}
 CHECKS="$RESULTS/checks.tsv"
 declare -A CHECK_STATUS CHECK_VALUE
 # Appends each case's input identity (every path's fileid, joined by ",") as
@@ -1647,8 +1644,10 @@ quick_check() { # name fam id fmt paths truth bytes params [bin]
     [[ "${FAM_STDIN[$fam]}" == 0 ]] || form=stdin
     truth="$(want_of "$paths" "$6")" || die "no truth for $id: run.sh check first"
     if [[ -n "$bin" ]]; then
-        out="$($(build_cmd "$bin" "$paths" "$fam" "$params") 2>/dev/null | LANE=z-fastq FAMILY="$fam" IN="$paths" TRUTH="$6" PARAMS="$params" fact | paste -sd';' -)" || die "$name failed on $id"
-        same_answer "$out" "$truth" || die "$name printed a wrong answer on $id"
+        # Another build runs the z-fastq lane's full check, exit status and
+        # output files included; its row is read here, not cached.
+        out="$(ZFASTQ="$bin" check_one z-fastq "$form" "$fam" "$id" "$4" "$paths" "$truth" "$7" "$params" "$6")" || die "$name failed on $id"
+        [[ "$(cut -f2 <<<"$out")" == pass ]] || die "$name printed a wrong answer on $id"
         return 0
     fi
     local key
@@ -1742,7 +1741,7 @@ run_ab() {
     a="$(build_rev "$rev_a")"
     if [[ -n "$rev_b" ]]; then b="$(build_rev "$rev_b")"; else b="$ZFASTQ"; fi
     local out="$RESULTS/ab.txt"
-    printf '%-40s %10s %10s %8s %8s %-14s %10s %10s %-8s\n' case "A" "B" change "A/A" verdict "A RSS" "B RSS" "RSS" | tee "$out"
+    printf '%-40s %10s %10s %8s %8s %8s %-14s %10s %10s %-8s\n' case "A" "B" change "A/A" instr verdict "A RSS" "B RSS" "RSS" | tee "$out"
     while IFS=$'\t' read -r fam id fmt paths truth bytes src tier kind params rival mem; do
         quick_check A "$fam" "$id" "$fmt" "$paths" "$truth" "$bytes" "$params" "$a"
         quick_check B "$fam" "$id" "$fmt" "$paths" "$truth" "$bytes" "$params" "$b"
@@ -1755,18 +1754,25 @@ run_ab() {
         timed_spec b z-fastq "$paths" "$fam" "$params" "$b"
         time_lanes "$dir" file "$paths" "$runs" "$warm" "$fam" "$id" "${SPECS[@]}"
         awk -F'\t' -v id="$id" '
-            { w[$3] = $5; r[$3] = $8 }
+            { w[$3] = $5; r[$3] = $8; n[$3] = $15 }
             END {
                 a = (w["a1"] + w["a2"]) / 2; ch = (w["b"] - a) / a * 100; sp = (w["a1"] > w["a2"] ? w["a1"] - w["a2"] : w["a2"] - w["a1"]) / a * 100
                 # One A/A pair underestimates the noise on a busy machine: a change
                 # counts only beyond twice that spread and at least 3%.
                 v = (ch < -2 * sp && ch < -3) ? "faster" : (ch > 2 * sp && ch > 3) ? "slower" : "within noise"
+                # The same work in a different time is usually where the linker put
+                # the code: name it, so it is not read as a code change.
+                ni = "-"
+                if (n["a1"] != "" && n["a2"] != "" && n["b"] != "") {
+                    na = (n["a1"] + n["a2"]) / 2; ich = (n["b"] - na) / na * 100; ni = sprintf("%+.2f%%", ich)
+                    if (v != "within noise" && ich > -1 && ich < 1) v = v ": layout"
+                }
                 ra = (r["a1"] + r["a2"]) / 2; rs = (r["a1"] > r["a2"] ? r["a1"] - r["a2"] : r["a2"] - r["a1"])
                 rv = (r["b"] < ra - rs - 256) ? "smaller" : (r["b"] > ra + rs + 256) ? "larger" : "same"
-                printf "%-40s %8.2fms %8.2fms %+7.1f%% %7.1f%% %-14s %7dKiB %7dKiB %-8s\n", id, a / 1e6, w["b"] / 1e6, ch, sp, v, ra, r["b"], rv
+                printf "%-40s %8.2fms %8.2fms %+7.1f%% %7.1f%% %8s %-14s %7dKiB %7dKiB %-8s\n", id, a / 1e6, w["b"] / 1e6, ch, sp, ni, v, ra, r["b"], rv
             }' "$dir/summary.tsv" | tee -a "$out"
     done < <(pick_rows)
-    note "ab: A=${rev_a} B=${rev_b:-working tree}; a change is real only beyond twice the A/A spread and 3% (time), or one 256 KiB step beyond the A/A spread (RSS)"
+    note "ab: A=${rev_a} B=${rev_b:-working tree}; a change is real only beyond twice the A/A spread and 3% (time), or one 256 KiB step beyond the A/A spread (RSS); instr is B's instruction count against A's, and a time change with under 1% of it is marked layout: where the linker placed the code, not more or less work"
 }
 
 # --- bounded execution -------------------------------------------------------

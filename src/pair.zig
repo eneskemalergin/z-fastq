@@ -26,6 +26,10 @@ pub fn parseName(header: []const u8, policy: NamePolicy) Name {
         };
     }
 
+    return illuminaName(first_token, nextToken(header, first_token.len));
+}
+
+fn illuminaName(first_token: []const u8, second_token: []const u8) Name {
     var normalized_id = first_token;
     var mate_markers: u2 = 0;
     const first_mate_marker = terminalMateMarker(first_token);
@@ -34,7 +38,6 @@ pub fn parseName(header: []const u8, policy: NamePolicy) Name {
         normalized_id = first_token[0 .. first_token.len - 2];
     }
 
-    const second_token = nextToken(header, first_token.len);
     if (leadingMateMarker(second_token)) |mate| {
         mate_markers |= mateMask(mate);
     }
@@ -64,10 +67,14 @@ pub fn headersMatch(header1: []const u8, header2: []const u8, policy: NamePolicy
 pub fn namesMatch(name1: Name, name2: Name) bool {
     if (name1.normalized_id.len == 0 or name2.normalized_id.len == 0) return false;
     if (!std.mem.eql(u8, name1.normalized_id, name2.normalized_id)) return false;
-    if (name1.mate_markers == 0b11 or name2.mate_markers == 0b11) return false;
-    if ((name1.mate_markers == 0) != (name2.mate_markers == 0)) return false;
-    if (name1.mate_markers == 0) return true;
-    return name1.mate_markers == 0b01 and name2.mate_markers == 0b10;
+    return mateMarkersMatch(name1.mate_markers, name2.mate_markers);
+}
+
+fn mateMarkersMatch(markers1: u2, markers2: u2) bool {
+    if (markers1 == 0b11 or markers2 == 0b11) return false;
+    if ((markers1 == 0) != (markers2 == 0)) return false;
+    if (markers1 == 0) return true;
+    return markers1 == 0b01 and markers2 == 0b10;
 }
 
 const TOKEN_LANES = simd.tierWidth(.baseline);
@@ -144,17 +151,21 @@ fn nextToken(header: []const u8, previous_end: usize) []const u8 {
 }
 
 fn illuminaHeadersMatch(header1: []const u8, header2: []const u8) bool {
-    return terminalPairHeadersMatch(header1, header2) or
-        casavaHeadersMatch(header1, header2) or
-        namesMatch(parseName(header1, .illumina), parseName(header2, .illumina));
-}
-
-fn casavaHeadersMatch(header1: []const u8, header2: []const u8) bool {
-    const end = matchingTokenEnd(header1, header2) orelse return false;
-    if (terminalMateMarker(header1[0..end]) != null) return false;
+    if (terminalPairHeadersMatch(header1, header2)) return true;
+    const end = matchingTokenEnd(header1, header2) orelse
+        return namesMatch(parseName(header1, .illumina), parseName(header2, .illumina));
+    const first_token = header1[0..end];
     const token1 = nextToken(header1, end);
     const token2 = nextToken(header2, end);
-    return leadingMateMarker(token1) == 1 and leadingMateMarker(token2) == 2 and
+    if (casavaMarkersMatch(first_token, token1, token2)) return true;
+    const name1 = illuminaName(first_token, token1);
+    const name2 = illuminaName(first_token, token2);
+    return name1.normalized_id.len != 0 and mateMarkersMatch(name1.mate_markers, name2.mate_markers);
+}
+
+fn casavaMarkersMatch(first_token: []const u8, token1: []const u8, token2: []const u8) bool {
+    return terminalMateMarker(first_token) == null and
+        leadingMateMarker(token1) == 1 and leadingMateMarker(token2) == 2 and
         terminalMateMarker(token1) != 2 and terminalMateMarker(token2) != 1;
 }
 
@@ -303,7 +314,7 @@ test "[property] - [paired names]: illumina matching keeps mate markers and opaq
         @memcpy(storage2[length..][0..right.len], right);
         const header1 = storage1[0 .. length + left.len];
         const header2 = storage2[0 .. length + right.len];
-        try std.testing.expectEqual(length != 0, casavaHeadersMatch(header1, header2));
+        try std.testing.expectEqual(length != 0, headersMatch(header1, header2, .illumina));
         for (0..length) |mismatch| {
             storage2[mismatch] = 'y';
             try std.testing.expect(!headersMatch(header1, header2, .illumina));
@@ -403,4 +414,71 @@ test "[property] - [paired names]: combined terminal proof covers vector boundar
 
     try std.testing.expect(!terminalPairHeadersMatch(" 1:N:0/1", " 1:N:0/2"));
     try std.testing.expect(!terminalPairHeadersMatch("cluster 1:N:0/1", "cluster 1:N:0/2"));
+}
+
+test "[property] - [paired names]: illumina matching decides as the terminal, Casava, and parsed checks do in turn" {
+    const Generator = struct {
+        const token_pieces = [_][]const u8{
+            "x", "SRR19571648.1", "A01039:164:HHHJYDSX2:4:1101:1470:1000", "/1", "/2", "/3",       "/",
+            "1", "2",             ":",                                     "1:", "2:", "N:0:ACGT", "length=150",
+        };
+        const delimiters = [_][]const u8{ " ", "\t", "  " };
+
+        fn append(random: std.Random, out: []u8, len: *usize, pieces: []const []const u8, count: usize) void {
+            for (0..count) |_| {
+                const piece = pieces[random.uintLessThan(usize, pieces.len)];
+                if (len.* + piece.len > out.len) return;
+                @memcpy(out[len.*..][0..piece.len], piece);
+                len.* += piece.len;
+            }
+        }
+
+        fn rest(random: std.Random, out: []u8, start: usize) []const u8 {
+            var len = start;
+            for (0..random.uintLessThan(usize, 3)) |_| {
+                append(random, out, &len, &delimiters, 1);
+                append(random, out, &len, &token_pieces, random.uintLessThan(usize, 4));
+            }
+            return out[0..len];
+        }
+
+        fn reference(header1: []const u8, header2: []const u8) bool {
+            if (terminalPairHeadersMatch(header1, header2)) return true;
+            if (matchingTokenEnd(header1, header2)) |end| {
+                if (terminalMateMarker(header1[0..end]) == null) {
+                    const token1 = nextToken(header1, end);
+                    const token2 = nextToken(header2, end);
+                    if (leadingMateMarker(token1) == 1 and leadingMateMarker(token2) == 2 and
+                        terminalMateMarker(token1) != 2 and terminalMateMarker(token2) != 1) return true;
+                }
+            }
+            return namesMatch(parseName(header1, .illumina), parseName(header2, .illumina));
+        }
+    };
+
+    var prng = std.Random.DefaultPrng.init(0x7a1f_e5c0);
+    const random = prng.random();
+    var storage1: [128]u8 = undefined;
+    var storage2: [128]u8 = undefined;
+    var shared_first_token: usize = 0;
+    var matches: usize = 0;
+    for (0..200_000) |_| {
+        var first_len: usize = 0;
+        Generator.append(random, &storage1, &first_len, &Generator.token_pieces, 1 + random.uintLessThan(usize, 4));
+        const header1 = Generator.rest(random, &storage1, first_len);
+        var second_first_len: usize = 0;
+        if (random.uintLessThan(u8, 10) < 6) {
+            @memcpy(storage2[0..first_len], storage1[0..first_len]);
+            second_first_len = first_len;
+        } else {
+            Generator.append(random, &storage2, &second_first_len, &Generator.token_pieces, 1 + random.uintLessThan(usize, 4));
+        }
+        const header2 = Generator.rest(random, &storage2, second_first_len);
+        const expected = Generator.reference(header1, header2);
+        try std.testing.expectEqual(expected, illuminaHeadersMatch(header1, header2));
+        if (matchingTokenEnd(header1, header2) != null) shared_first_token += 1;
+        if (expected) matches += 1;
+    }
+    try std.testing.expect(shared_first_token > 50_000);
+    try std.testing.expect(matches > 10_000);
 }

@@ -717,11 +717,14 @@ test "[cli] - [stats]: output failure preserves an observed limit status" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const long_directory = ("\x01" ** 200 ++ "/") ** 17;
-    try tmp.dir.createDirPath(io, long_directory);
+    const long_name = long_directory ++ "limit.fastq";
+    const long_path_fits = (try cli.tempPath(allocator, &tmp.sub_path, long_name)).len < std.posix.PATH_MAX;
+    if (long_path_fits) try tmp.dir.createDirPath(io, long_directory);
+    const names: []const []const u8 = if (long_path_fits) &.{ "limit.fastq", long_name } else &.{"limit.fastq"};
     try tmp.dir.writeFile(io, .{ .sub_path = "valid.fastq", .data = "@a\nA\n+\n!\n" });
     const valid = try cli.tempPath(allocator, &tmp.sub_path, "valid.fastq");
 
-    for ([_][]const u8{ "limit.fastq", long_directory ++ "limit.fastq" }) |name| {
+    for (names) |name| {
         try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "@abcde\nA\n+\n!\n" });
         const path = try cli.tempPath(allocator, &tmp.sub_path, name);
         const args: []const []const u8 = &.{ "stats", "--json", "--max-line-bytes", "4", path, valid };

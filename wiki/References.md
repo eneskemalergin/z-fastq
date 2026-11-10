@@ -69,6 +69,8 @@ Each run is cut into nested prefixes of whole records, sized by plain bytes with
 
 ## Citations
 
+To cite z-fastq itself, use the repository's citation file: GitHub shows it as "Cite this repository" on the [repository page](https://github.com/eneskemalergin/z-fastq), in APA and BibTeX. The works below are the tools z-fastq follows or is compared with.
+
 1. Chen S, Zhou Y, Chen Y, Gu J. fastp: an ultra-fast all-in-one FASTQ preprocessor. _Bioinformatics_. 2018;34(17):i884–i890. [doi:10.1093/bioinformatics/bty560](https://doi.org/10.1093/bioinformatics/bty560)
 2. Chen S. Ultrafast one-pass FASTQ data preprocessing, quality control, and deduplication using fastp. _iMeta_. 2023;2(2):e107. [doi:10.1002/imt2.107](https://doi.org/10.1002/imt2.107)
 3. Andrews S. FastQC: a quality control tool for high throughput sequence data. 2010. [bioinformatics.babraham.ac.uk/projects/fastqc](https://www.bioinformatics.babraham.ac.uk/projects/fastqc/)

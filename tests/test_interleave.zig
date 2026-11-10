@@ -1,6 +1,7 @@
 //! Installed `z-fastq interleave` behavior: pairing, output, validation, and exit status.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cli = @import("utilities.zig");
 
 const OUTPUT_BUFFER_BYTES = 64 * 1024;
@@ -193,6 +194,11 @@ test "[cli] - [interleave]: a stdout alias of either input rejects before readin
 }
 
 test "[cli] - [interleave]: FIFO inputs complete when a sequential writer feeds them" {
+    const fifo_capacity = switch (builtin.os.tag) {
+        .linux => 4096,
+        .macos => 8192,
+        else => @compileError("FIFO tests run on Linux and macOS only"),
+    };
     const Producer = struct {
         io: std.Io,
         dir: std.Io.Dir,
@@ -209,8 +215,8 @@ test "[cli] - [interleave]: FIFO inputs complete when a sequential writer feeds 
             for ([_][]const u8{ "r1", "r2" }) |name| {
                 const file = try self.dir.openFile(self.io, name, .{ .mode = .write_only });
                 defer file.close(self.io);
-                try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(
-                    std.os.linux.fcntl(file.handle, std.os.linux.F.SETPIPE_SZ, 4096),
+                if (builtin.os.tag == .linux) try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(
+                    std.os.linux.fcntl(file.handle, std.os.linux.F.SETPIPE_SZ, fifo_capacity),
                 ));
                 try file.writeStreamingAll(self.io, self.bytes);
             }
@@ -227,15 +233,9 @@ test "[cli] - [interleave]: FIFO inputs complete when a sequential writer feeds 
         try cli.tempPath(allocator, &tmp.sub_path, "r1"),
         try cli.tempPath(allocator, &tmp.sub_path, "r2"),
     };
-    for ([_][:0]const u8{ "r1", "r2" }) |name| {
-        try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.mknodat(
-            tmp.dir.handle,
-            name,
-            std.os.linux.S.IFIFO | 0o600,
-            0,
-        )));
-    }
-    const payload = "@same\n" ++ "A" ** 3000 ++ "\n+\n" ++ "I" ** 3000 ++ "\n";
+    for ([_][:0]const u8{ "r1", "r2" }) |name| try cli.makeFifo(tmp.dir, name);
+    const field_len = fifo_capacity * 3 / 4;
+    const payload = "@same\n" ++ "A" ** field_len ++ "\n+\n" ++ "I" ** field_len ++ "\n";
     var gzip: std.ArrayList(u8) = .empty;
     try cli.appendGzipMember(allocator, &gzip, payload, .{});
     for ([_][]const u8{ payload, gzip.items, "" }) |bytes| {
