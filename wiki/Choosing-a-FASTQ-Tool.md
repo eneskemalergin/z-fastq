@@ -23,10 +23,11 @@ z-fastq is built for those questions: a small, fast tool whose failures are as w
 
 ## Use another tool when
 
-- **[fastp](https://github.com/OpenGene/fastp)** for the full short-read preprocessing set: deduplication, base correction, pair merging, UMI handling, automatic adapter detection, and its own HTML report. z-fastq follows fastp's rules for the trims and filters it has, but does none of these.
+- **[fastp](https://github.com/OpenGene/fastp)** for the full short-read preprocessing set: deduplication, base correction, pair merging, UMIs taken from the index reads, automatic adapter detection, and its own HTML report. z-fastq follows fastp's rules for the trims and filters it has, and moves a UMI from the start of the reads into their names as fastp does, but does none of these.
 - **[FastQC](https://github.com/s-andrews/FastQC)** for its HTML report and interactive viewer, Kmer Content, and quality encodings other than Phred+33. z-fastq measures FastQC's modules and writes their data, not the report.
 - **[SeqKit](https://github.com/shenwei356/seqkit)** for a broad FASTA and FASTQ toolbox: many subcommands, more compression formats, threads, searching, and conversion.
 - **[seqtk](https://github.com/lh3/seqtk)** for a compact classic with conversion, subsampling, trimming, and subsequences. If a workflow already depends on its flags and output, switching may not be worth it.
+- **[z-fasta](https://github.com/eneskemalergin/z-fasta)** for FASTA: indexing, extraction, validation, and inspection of uncompressed FASTA, built around the same priorities as z-fastq.
 
 [References](References) lists these and the other tools z-fastq is compared with, and how each comparison is made.
 
