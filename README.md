@@ -34,7 +34,7 @@ I built z-fastq for the FASTQ work that comes before alignment: the steps that r
 - [`process`](https://github.com/eneskemalergin/z-fastq/wiki/Processing): Trim and filter paired reads with fastp's rules into plain or gzip files, with [FastQC-compatible QC](https://github.com/eneskemalergin/z-fastq/wiki/Quality-Control) that MultiQC reads, in one pass.
 - [Zig package](https://github.com/eneskemalergin/z-fastq/wiki/Zig-Library): the reader, writer, validation, and statistics give other Zig programs the same rules without the CLI.
 
-z-fastq reads plain and gzip FASTQ and writes plain FASTQ, gzip from `process`, and text or JSON reports. It runs on Linux and macOS, on x86-64 and aarch64.
+z-fastq reads plain and gzip FASTQ and writes plain FASTQ, gzip from `process`, and text or JSON reports. It runs on Linux and macOS, on x86-64 and aarch64. For FASTA, see [z-fasta](https://github.com/eneskemalergin/z-fasta), built around the same priorities.
 
 ## Speed and memory
 
