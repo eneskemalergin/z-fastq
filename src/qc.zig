@@ -208,13 +208,13 @@ pub const MatePopulations = struct {
                 shift = 0;
                 break;
             }
-            for (facts.adapter_starts, &retained.adapter_starts) |start, *starts| {
+            for (facts.adapter_starts, 0..) |start, adapter| {
                 if (start == NO_MATCH) continue;
                 const at = start - shift;
-                if (at + ADAPTER_LENGTH <= kept) starts[at] += 1;
+                if (at + ADAPTER_LENGTH <= kept) retained.adapter_starts.items[at][adapter] += 1;
             }
         }
-        if (self.raw.detailed and kept != 0) retained.addSummary(read, facts);
+        if (self.raw.detailed and kept != 0) try retained.addSummary(allocator, read, facts);
     }
 
     pub fn dropRetained(
@@ -339,7 +339,10 @@ pub const MatePopulations = struct {
             }
             for (&retained.bases.items[cycle], self.raw.bases.items[source], retained.bases.items[source]) |*count, total, removed| count.* = total - removed;
         }
-        if (retained.detailed) retained.quality.shrinkRetainingCapacity(cycles) else retained.cycle_quality.shrinkRetainingCapacity(cycles);
+        if (retained.detailed) {
+            retained.quality.shrinkRetainingCapacity(cycles);
+            retained.adapter_starts.shrinkRetainingCapacity(cycles);
+        } else retained.cycle_quality.shrinkRetainingCapacity(cycles);
         retained.bases.shrinkRetainingCapacity(cycles);
         self.derived = false;
     }
@@ -359,7 +362,7 @@ pub const MateQc = struct {
     gc_model: GcModel = .{},
     terminal_g: u64 = 0,
     terminal_a: u64 = 0,
-    adapter_starts: [ADAPTER_COUNT][MAX_CYCLES]u64 = @splat(@splat(0)),
+    adapter_starts: std.ArrayList([ADAPTER_COUNT]u64) = .empty,
     too_long: bool = false,
     long_stats: statistics.Stats = .{},
 
@@ -368,6 +371,8 @@ pub const MateQc = struct {
         self.cycle_quality.deinit(allocator);
         self.pending_quality.deinit(allocator);
         self.bases.deinit(allocator);
+        self.adapter_starts.deinit(allocator);
+        self.gc_model.deinit(allocator);
     }
 
     pub fn finish(self: *MateQc) void {
@@ -418,6 +423,7 @@ pub const MateQc = struct {
             self.pending_quality.deinit(allocator);
             self.pending_quality = .{};
             self.bases.clearAndFree(allocator);
+            self.adapter_starts.clearAndFree(allocator);
         }
         if (self.too_long) {
             const previous_quality = self.long_stats.quality_sum;
@@ -431,7 +437,7 @@ pub const MateQc = struct {
                 .quality_sum = try std.math.add(u64, self.long_stats.quality_sum - previous_quality, try std.math.mul(u64, PHRED_OFFSET, quality.len)),
                 .gc_count = @as(usize, @intCast(gc_total)) - gcCountScalar(sequence[gc_length..]),
             };
-            if (sequence.len != 0) self.addSummary(sequence, facts);
+            if (sequence.len != 0) try self.addSummary(allocator, sequence, facts);
             return facts;
         }
         const gc_length = if (self.detailed) gcKeptLength(sequence.len) else 0;
@@ -440,19 +446,19 @@ pub const MateQc = struct {
         var facts: ReadFacts = .{ .quality_sum = quality_sum, .gc_count = gc_count };
         if (self.detailed and !self.too_long) {
             facts.adapter_starts = firstAdapterMatches(sequence);
-            for (facts.adapter_starts, &self.adapter_starts) |start, *starts| {
-                if (start != NO_MATCH) starts[start] += 1;
+            for (facts.adapter_starts, 0..) |start, adapter| {
+                if (start != NO_MATCH) self.adapter_starts.items[start][adapter] += 1;
             }
         }
-        if (self.detailed and sequence.len != 0) self.addSummary(sequence, facts);
+        if (self.detailed and sequence.len != 0) try self.addSummary(allocator, sequence, facts);
         return facts;
     }
 
-    fn addSummary(self: *MateQc, sequence: []const u8, facts: ReadFacts) void {
+    fn addSummary(self: *MateQc, allocator: std.mem.Allocator, sequence: []const u8, facts: ReadFacts) error{OutOfMemory}!void {
         std.debug.assert(sequence.len != 0);
         const gc_length = gcKeptLength(sequence.len);
+        const weights = try self.gc_model.weights(allocator, gc_length);
         self.read_quality[facts.quality_sum / sequence.len - PHRED_OFFSET] += 1;
-        const weights = self.gc_model.weights(gc_length);
         const bins = gcBins(gc_length, facts.gc_count);
         for (bins[0]..bins[1] + 1) |bin| self.gc[bin] += weights[bin];
         self.terminal_g += @intFromBool(endsInRun(sequence, 'G'));
@@ -489,6 +495,7 @@ pub const MateQc = struct {
         const capacity = @min(MAX_CYCLES, @max(cycles, self.bases.items.len * 2));
         if (self.detailed) {
             try self.quality.ensureTotalCapacityPrecise(allocator, capacity);
+            try self.adapter_starts.ensureTotalCapacityPrecise(allocator, capacity);
         } else {
             try self.cycle_quality.ensureTotalCapacityPrecise(allocator, capacity);
             try self.pending_quality.ensureCapacity(allocator, capacity);
@@ -496,6 +503,7 @@ pub const MateQc = struct {
         try self.bases.ensureTotalCapacityPrecise(allocator, capacity);
         if (self.detailed) {
             self.quality.appendNTimesAssumeCapacity(@splat(0), cycles - self.quality.items.len);
+            self.adapter_starts.appendNTimesAssumeCapacity(@splat(0), cycles - self.adapter_starts.items.len);
         } else {
             self.cycle_quality.appendNTimesAssumeCapacity(.{}, cycles - self.cycle_quality.items.len);
             self.pending_quality.grow(cycles);
@@ -626,8 +634,8 @@ pub const MateQc = struct {
             const group = groups.next() orelse return null;
             var sums: [ADAPTER_COUNT]f64 = @splat(0);
             while (self.position < group.last) : (self.position += 1) {
-                for (&self.running, &sums, &self.mate.adapter_starts) |*count, *sum, *starts| {
-                    count.* += starts[self.position];
+                for (&self.running, &sums, self.mate.adapter_starts.items[self.position]) |*count, *sum, starts| {
+                    count.* += starts;
                     sum.* += @as(f64, @floatFromInt(count.*)) * 100.0 / self.total;
                 }
             }
@@ -1492,17 +1500,26 @@ const GcWeights = [GC_BINS]f64;
 
 const GcModel = struct {
     filled: std.StaticBitSet(GC_CACHED_LENGTHS) = .initEmpty(),
-    cached: [GC_CACHED_LENGTHS]GcWeights = undefined,
+    cached: ?*[GC_CACHED_LENGTHS]GcWeights = null,
     long_length: usize = 0,
     long: GcWeights = undefined,
 
-    fn weights(self: *GcModel, length: usize) *const GcWeights {
+    fn deinit(self: *GcModel, allocator: std.mem.Allocator) void {
+        if (self.cached) |cached| allocator.destroy(cached);
+    }
+
+    fn weights(self: *GcModel, allocator: std.mem.Allocator, length: usize) error{OutOfMemory}!*const GcWeights {
         if (cacheSlot(length)) |slot| {
+            const cached = self.cached orelse cached: {
+                const cached = try allocator.create([GC_CACHED_LENGTHS]GcWeights);
+                self.cached = cached;
+                break :cached cached;
+            };
             if (!self.filled.isSet(slot)) {
-                fillWeights(&self.cached[slot], length);
+                fillWeights(&cached[slot], length);
                 self.filled.set(slot);
             }
-            return &self.cached[slot];
+            return &cached[slot];
         }
         if (self.long_length != length) {
             fillWeights(&self.long, length);
