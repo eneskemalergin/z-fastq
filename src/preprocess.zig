@@ -1420,6 +1420,33 @@ test "[property] - [preprocess]: the position set answers membership as a full b
     try std.testing.expect(!set.heads[0xffff].dense and set.heads[0xffff].count <= 256);
 }
 
+test "[unit] - [preprocess]: a dense block turns into a bitmap when one high byte holds 255 positions" {
+    const allocator = std.testing.allocator;
+    var set: PositionSet = .{};
+    try set.init(allocator);
+    defer set.deinit(allocator);
+    const block: u32 = 0x0042_0000;
+    var low: u32 = 0;
+    while (low < 0x0300) : (low += 2) {
+        var probe = set.find(block | low);
+        try set.reserve(allocator, &probe);
+        if (!probe.present) set.insert(probe);
+    }
+    try std.testing.expect(set.heads[0x42].dense);
+    for (0..256) |byte| {
+        const position = block | 0x0700 | @as(u32, @intCast(byte));
+        var probe = set.find(position);
+        try std.testing.expect(!probe.present);
+        try set.reserve(allocator, &probe);
+        set.insert(probe);
+        try std.testing.expectEqual(byte == 255, set.heads[0x42].count == PositionSet.BITMAP);
+    }
+    low = 0;
+    while (low < 0x0300) : (low += 2) try std.testing.expect(set.find(block | low).present);
+    for (0..256) |byte| try std.testing.expect(set.find(block | 0x0700 | @as(u32, @intCast(byte))).present);
+    try std.testing.expect(!set.find(block | 0x0801).present);
+}
+
 test "[property] - [preprocess]: the position set keeps its members through list growth and compaction" {
     const allocator = std.testing.allocator;
     var set: PositionSet = .{};
