@@ -175,6 +175,48 @@ fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
     if (header1[header1.len - 1] != '1' or header2[header2.len - 1] != '2') return false;
 
     const prefix_len = header1.len - 1;
+    const separator_plus_one = (if (prefix_len >= NAME_LANES)
+        wideTerminalSeparator(NAME_LANES, header1, header2, prefix_len)
+    else
+        narrowTerminalSeparator(header1, header2, prefix_len)) orelse return false;
+
+    if (separator_plus_one == 0) return true;
+    const separator = separator_plus_one - 1;
+    if (separator == 0) return false;
+
+    const first_token = header1[0..separator];
+    if (terminalMateMarker(first_token) != null) return false;
+
+    return leadingMateMarker(header1[separator_plus_one..]) == null;
+}
+
+const NAME_LANES = simd.INLINE_LANES;
+
+fn wideTerminalSeparator(comptime lanes: comptime_int, header1: []const u8, header2: []const u8, prefix_len: usize) ?usize {
+    const Vector = @Vector(lanes, u8);
+    const Mask = @Int(.unsigned, lanes);
+    const spaces: Vector = @splat(' ');
+    const tabs: Vector = @splat('\t');
+    std.debug.assert(prefix_len >= lanes);
+    var separator_plus_one: usize = 0;
+    var offset: usize = 0;
+    while (offset < prefix_len) {
+        const start = @min(offset, prefix_len - lanes);
+        const bytes1: Vector = header1[start..][0..lanes].*;
+        const bytes2: Vector = header2[start..][0..lanes].*;
+        if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return null;
+        const fresh = ~@as(Mask, 0) << @intCast(offset - start);
+        const space_mask = @as(Mask, @bitCast(bytes1 == spaces)) & fresh;
+        if (space_mask != 0) {
+            if (separator_plus_one != 0 or space_mask & (space_mask - 1) != 0) return null;
+            separator_plus_one = start + @as(usize, @intCast(@ctz(space_mask))) + 1;
+        }
+        offset = start + lanes;
+    }
+    return separator_plus_one;
+}
+
+fn narrowTerminalSeparator(header1: []const u8, header2: []const u8, prefix_len: usize) ?usize {
     var separator_plus_one: usize = 0;
     var offset: usize = 0;
     while (prefix_len - offset >= TOKEN_LANES) : (offset += TOKEN_LANES) {
@@ -182,11 +224,11 @@ fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
         const bytes2: TokenVector = header2[offset..][0..TOKEN_LANES].*;
         const spaces: TokenVector = @splat(' ');
         const tabs: TokenVector = @splat('\t');
-        if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return false;
+        if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return null;
 
         const space_mask: TokenMask = @bitCast(bytes1 == spaces);
         if (space_mask != 0) {
-            if (separator_plus_one != 0 or space_mask & (space_mask - 1) != 0) return false;
+            if (separator_plus_one != 0 or space_mask & (space_mask - 1) != 0) return null;
             separator_plus_one = offset + @as(usize, @intCast(@ctz(space_mask))) + 1;
         }
     }
@@ -199,12 +241,12 @@ fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
             const bytes2: Vector = header2[offset..][0..lanes].*;
             const spaces: Vector = @splat(' ');
             const tabs: Vector = @splat('\t');
-            if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return false;
+            if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return null;
 
             const space_mask: Mask = @bitCast(bytes1 == spaces);
             if (space_mask != 0) {
                 if (separator_plus_one != 0 or space_mask & (space_mask - 1) != 0) {
-                    return false;
+                    return null;
                 }
                 separator_plus_one = offset + @as(usize, @intCast(@ctz(space_mask))) + 1;
             }
@@ -212,21 +254,14 @@ fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
         }
     }
     while (offset < prefix_len) : (offset += 1) {
-        if (header1[offset] != header2[offset] or header1[offset] == '\t') return false;
+        if (header1[offset] != header2[offset] or header1[offset] == '\t') return null;
         if (header1[offset] == ' ') {
-            if (separator_plus_one != 0) return false;
+            if (separator_plus_one != 0) return null;
             separator_plus_one = offset + 1;
         }
     }
 
-    if (separator_plus_one == 0) return true;
-    const separator = separator_plus_one - 1;
-    if (separator == 0) return false;
-
-    const first_token = header1[0..separator];
-    if (terminalMateMarker(first_token) != null) return false;
-
-    return leadingMateMarker(header1[separator_plus_one..]) == null;
+    return separator_plus_one;
 }
 
 fn leadingMateMarker(token: []const u8) ?u2 {
@@ -414,6 +449,28 @@ test "[property] - [paired names]: combined terminal proof covers vector boundar
 
     try std.testing.expect(!terminalPairHeadersMatch(" 1:N:0/1", " 1:N:0/2"));
     try std.testing.expect(!terminalPairHeadersMatch("cluster 1:N:0/1", "cluster 1:N:0/2"));
+}
+
+test "[property] - [paired names]: the wide terminal check finds the separator the narrow check finds at every width" {
+    var prng = std.Random.DefaultPrng.init(0x0e1a_57ed);
+    const random = prng.random();
+    var header1: [120]u8 = undefined;
+    var header2: [120]u8 = undefined;
+    const alphabet = "AC:x12  \t";
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
+        for (0..20_000) |_| {
+            const prefix_len = lanes + random.uintLessThan(usize, header1.len - lanes + 1);
+            for (header1[0..prefix_len]) |*byte| {
+                byte.* = if (random.uintLessThan(u8, 8) == 0) alphabet[random.uintLessThan(usize, alphabet.len)] else 'r';
+            }
+            @memcpy(header2[0..prefix_len], header1[0..prefix_len]);
+            if (random.uintLessThan(u8, 4) == 0) header2[random.uintLessThan(usize, prefix_len)] = 'z';
+            const wide = wideTerminalSeparator(lanes, header1[0..prefix_len], header2[0..prefix_len], prefix_len);
+            const narrow = narrowTerminalSeparator(header1[0..prefix_len], header2[0..prefix_len], prefix_len);
+            errdefer std.debug.print("lanes {d} header {s}\n", .{ lanes, header1[0..prefix_len] });
+            try std.testing.expectEqual(narrow, wide);
+        }
+    }
 }
 
 test "[property] - [paired names]: illumina matching decides as the terminal, Casava, and parsed checks do in turn" {

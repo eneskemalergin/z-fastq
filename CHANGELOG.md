@@ -25,6 +25,7 @@ All notable changes to z-fastq will be documented in this file.
   - `--pair-duplication` computes fastp's pair hash in 32-bit lanes: about 14% faster.
   - `--report` and `--qc-tables` count reads whose qualities are binned to a few values, as NovaSeq and most current Illumina runs write them, with vector compares: about 19% faster on NovaSeq reads and 5% on 10x reads; reads with many quality values take the same time as before.
   - Sampling, `process`, `interleave`, and `deinterleave` check each record inline: 5 to 10% fewer instructions.
+  - Mate names that end in `/1` and `/2` are compared at the full vector width, 32 bytes at a time on AVX2: 2 to 3% fewer instructions in every paired command.
 - **Memory.** `process` allocates its detailed QC tables only for `--report` and `--qc-tables`, so every other `process` run peaks at about 1.3 MiB instead of 2.1 to 2.9 MiB, and the binary is about 550 KB smaller. `--pair-duplication` packs the positions it has seen, with a denser form for crowded blocks: about 4 to 6 bytes per pair instead of about 10 (9.2 MB instead of 15.2 MB at 1.5 million pairs, 180 MB instead of 349 MB at 50 million), for about 2% more CPU time on those runs; the bound stays about 1 GiB.
 
 ## [0.2.1]
