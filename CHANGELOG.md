@@ -17,6 +17,15 @@ All notable changes to z-fastq will be documented in this file.
 
 - **x86-64 release binaries need x86-64-v3.** The Linux and macOS x86-64 archives are built for the x86-64-v3 set (AVX2, BMI2, FMA), so short reads use AVX2 code too, not only records of 1 KiB or more: on a Zen 2 CPU, trimming with `process` is about 20% faster, `stats` 14%, `check` 8 to 10%, the other `process` modes about 9%, with the same output and the same memory. On a CPU without the set, the Linux binary stops with status `2` and a message instead of running; z-fastq is then built from source, whose default build still targets any x86-64 CPU.
 - **`-Dcpu` in release builds.** ReleaseSafe and ReleaseFast builds compile for the CPU that `-Dcpu` names, such as `-Dcpu=x86_64_v3`, instead of ignoring it. Without `-Dcpu`, Linux release builds target generic x86-64 or ARMv8-A, as before, and macOS release builds target Zig's macOS defaults, `core2` and `apple_m1`. `-Dstatic=true` confirms a static Linux release build and stops with a message on macOS.
+- **Speed.** Measured on a Zen 2 CPU on 1 GiB inputs, each change against the build before it, with the same output:
+  - `check` scans the records of each buffer in one loop and ends a bare `+` line without searching for its newline: about 16% faster on 36-base reads and 12% on 150-base reads; `check --interleaved` about 15%.
+  - Quality checks no longer stall on a value written in pieces and read back whole: `check` and `sample` 4 to 9% faster.
+  - Mate names without `/1` and `/2`, such as 10x Genomics and SRA names, are matched in one pass: paired sampling of 10x reads about 9% faster, `deinterleave` about 7%.
+  - `--qc-summary` without `--report` or `--qc-tables` keeps per-cycle sums instead of a full quality histogram: about 13% faster.
+  - `--pair-duplication` computes fastp's pair hash in 32-bit lanes: about 14% faster.
+  - `--report` and `--qc-tables` count reads whose qualities are binned to a few values, as NovaSeq and most current Illumina runs write them, with vector compares: about 19% faster on NovaSeq reads and 5% on 10x reads; reads with many quality values take the same time as before.
+  - Sampling, `process`, `interleave`, and `deinterleave` check each record inline: 5 to 10% fewer instructions.
+- **Memory.** `process` allocates its detailed QC tables only for `--report` and `--qc-tables`, so every other `process` run peaks at about 1.3 MiB instead of 2.1 to 2.9 MiB, and the binary is about 550 KB smaller. `--pair-duplication` packs the positions it has seen, with a denser form for crowded blocks: about 4 to 6 bytes per pair instead of about 10 (9.2 MB instead of 15.2 MB at 1.5 million pairs, 180 MB instead of 349 MB at 50 million), for about 2% more CPU time on those runs; the bound stays about 1 GiB.
 
 ## [0.2.1]
 
