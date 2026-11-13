@@ -87,38 +87,59 @@ fn exactHeadersMatch(header1: []const u8, header2: []const u8) bool {
 
 fn matchingTokenEnd(header1: []const u8, header2: []const u8) ?usize {
     const common_len = @min(header1.len, header2.len);
+    const event = if (common_len >= NAME_LANES)
+        wideTokenEvent(NAME_LANES, header1, header2, common_len)
+    else
+        narrowTokenEvent(header1, header2, common_len);
+    if (event) |at| {
+        return if (at != 0 and isTokenStop(header1[at]) and isTokenStop(header2[at])) at else null;
+    }
+    if (common_len == 0) return null;
+    if (header1.len == header2.len) return common_len;
+    const longer = if (header1.len > header2.len) header1 else header2;
+    return if (isTokenStop(longer[common_len])) common_len else null;
+}
+
+fn isTokenStop(byte: u8) bool {
+    return byte == ' ' or byte == '\t';
+}
+
+/// The first offset below `common_len` where the headers differ or the first
+/// holds a space or a tab (so wherever either holds one), scanned in blocks of
+/// `lanes` with the last block overlapping the one before it.
+fn wideTokenEvent(comptime lanes: comptime_int, header1: []const u8, header2: []const u8, common_len: usize) ?usize {
+    const Vector = @Vector(lanes, u8);
+    const Mask = @Int(.unsigned, lanes);
+    const spaces: Vector = @splat(' ');
+    const tabs: Vector = @splat('\t');
+    std.debug.assert(common_len >= lanes);
+    var offset: usize = 0;
+    while (offset < common_len) {
+        const start = @min(offset, common_len - lanes);
+        const bytes1: Vector = header1[start..][0..lanes].*;
+        const bytes2: Vector = header2[start..][0..lanes].*;
+        const events: Mask = @bitCast((bytes1 == spaces) | (bytes1 == tabs) | (bytes1 != bytes2));
+        const fresh = ~@as(Mask, 0) << @intCast(offset - start);
+        if (events & fresh != 0) return start + @as(usize, @intCast(@ctz(events & fresh)));
+        offset = start + lanes;
+    }
+    return null;
+}
+
+fn narrowTokenEvent(header1: []const u8, header2: []const u8, common_len: usize) ?usize {
     const spaces: TokenVector = @splat(' ');
     const tabs: TokenVector = @splat('\t');
-
     var offset: usize = 0;
     while (common_len - offset >= TOKEN_LANES) : (offset += TOKEN_LANES) {
         const bytes1: TokenVector = header1[offset..][0..TOKEN_LANES].*;
         const bytes2: TokenVector = header2[offset..][0..TOKEN_LANES].*;
-        const stop1: TokenMask = @bitCast((bytes1 == spaces) | (bytes1 == tabs));
-        const stop2: TokenMask = @bitCast((bytes2 == spaces) | (bytes2 == tabs));
-        const mismatch: TokenMask = @bitCast(bytes1 != bytes2);
-        const event = stop1 | stop2 | mismatch;
-        if (event != 0) {
-            const lane = @as(usize, @intCast(@ctz(event)));
-            const bit = @as(TokenMask, 1) << @intCast(lane);
-            const token_end1 = stop1 & bit != 0;
-            const token_end2 = stop2 & bit != 0;
-            return if (offset + lane != 0 and token_end1 and token_end2) offset + lane else null;
-        }
+        const events: TokenMask = @bitCast((bytes1 == spaces) | (bytes1 == tabs) | (bytes1 != bytes2));
+        if (events != 0) return offset + @as(usize, @intCast(@ctz(events)));
     }
     while (offset < common_len) : (offset += 1) {
-        const token_end1 = header1[offset] == ' ' or header1[offset] == '\t';
-        const token_end2 = header2[offset] == ' ' or header2[offset] == '\t';
-        if (token_end1 or token_end2) {
-            return if (offset != 0 and token_end1 and token_end2) offset else null;
-        }
-        if (header1[offset] != header2[offset]) return null;
+        if (isTokenStop(header1[offset]) or header1[offset] != header2[offset]) return offset;
     }
-
-    if (common_len == 0) return null;
-    if (header1.len == header2.len) return common_len;
-    const longer = if (header1.len > header2.len) header1 else header2;
-    return if (longer[common_len] == ' ' or longer[common_len] == '\t') common_len else null;
+    return null;
 }
 
 fn firstTokenEnd(header: []const u8) usize {
@@ -126,6 +147,31 @@ fn firstTokenEnd(header: []const u8) usize {
 }
 
 fn tokenEnd(header: []const u8, start: usize) usize {
+    if (header.len >= NAME_LANES) return wideTokenEnd(NAME_LANES, header, start);
+    return narrowTokenEnd(header, start);
+}
+
+/// The first space or tab at or after `start`, or the header's end, scanned in
+/// blocks of `lanes` with the last block overlapping the one before it.
+fn wideTokenEnd(comptime lanes: comptime_int, header: []const u8, start: usize) usize {
+    const Vector = @Vector(lanes, u8);
+    const Mask = @Int(.unsigned, lanes);
+    const spaces: Vector = @splat(' ');
+    const tabs: Vector = @splat('\t');
+    std.debug.assert(header.len >= lanes and start <= header.len);
+    var offset = start;
+    while (offset < header.len) {
+        const block = @min(offset, header.len - lanes);
+        const bytes: Vector = header[block..][0..lanes].*;
+        const stops: Mask = @bitCast((bytes == spaces) | (bytes == tabs));
+        const fresh = ~@as(Mask, 0) << @intCast(offset - block);
+        if (stops & fresh != 0) return block + @as(usize, @intCast(@ctz(stops & fresh)));
+        offset = block + lanes;
+    }
+    return header.len;
+}
+
+fn narrowTokenEnd(header: []const u8, start: usize) usize {
     const spaces: TokenVector = @splat(' ');
     const tabs: TokenVector = @splat('\t');
 
@@ -135,7 +181,7 @@ fn tokenEnd(header: []const u8, start: usize) usize {
         const mask: TokenMask = @bitCast((bytes == spaces) | (bytes == tabs));
         if (mask != 0) return end + @as(usize, @intCast(@ctz(mask)));
     }
-    while (end < header.len and header[end] != ' ' and header[end] != '\t') {
+    while (end < header.len and !isTokenStop(header[end])) {
         end += 1;
     }
     return end;
@@ -469,6 +515,32 @@ test "[property] - [paired names]: the wide terminal check finds the separator t
             const narrow = narrowTerminalSeparator(header1[0..prefix_len], header2[0..prefix_len], prefix_len);
             errdefer std.debug.print("lanes {d} header {s}\n", .{ lanes, header1[0..prefix_len] });
             try std.testing.expectEqual(narrow, wide);
+        }
+    }
+}
+
+test "[property] - [paired names]: the wide token scans stop where the narrow scans stop at every width" {
+    var prng = std.Random.DefaultPrng.init(0x70c3_e4d5);
+    const random = prng.random();
+    var header1: [120]u8 = undefined;
+    var header2: [120]u8 = undefined;
+    const alphabet = "AC:x12 \t";
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
+        for (0..20_000) |_| {
+            const len1 = lanes + random.uintLessThan(usize, header1.len - lanes + 1);
+            const len2 = lanes + random.uintLessThan(usize, header2.len - lanes + 1);
+            const sparse = random.uintLessThan(u8, 64) + 1;
+            for (header1[0..len1]) |*byte| {
+                byte.* = if (random.uintLessThan(u8, sparse) == 0) alphabet[random.uintLessThan(usize, alphabet.len)] else 'r';
+            }
+            @memcpy(header2[0..@min(len1, len2)], header1[0..@min(len1, len2)]);
+            for (header2[@min(len1, len2)..len2]) |*byte| byte.* = 'r';
+            if (random.uintLessThan(u8, 2) == 0) header2[random.uintLessThan(usize, len2)] = "z \t"[random.uintLessThan(usize, 3)];
+            errdefer std.debug.print("lanes {d} headers {s} | {s}\n", .{ lanes, header1[0..len1], header2[0..len2] });
+            const common_len = @min(len1, len2);
+            try std.testing.expectEqual(narrowTokenEvent(&header1, &header2, common_len), wideTokenEvent(lanes, &header1, &header2, common_len));
+            const start = random.uintLessThan(usize, len1 + 1);
+            try std.testing.expectEqual(narrowTokenEnd(header1[0..len1], start), wideTokenEnd(lanes, header1[0..len1], start));
         }
     }
 }
