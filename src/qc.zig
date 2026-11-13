@@ -1786,7 +1786,7 @@ const SequenceCounts = struct {
     records: std.ArrayList(Record) = .empty,
     keys: std.ArrayList(PackedKey) = .empty,
     base: ?*const SequenceCounts = null,
-    slots: []u64 = &.{},
+    slots: []align(8) u32 = &.{},
     limit: u32 = KEY_LIMIT,
     reads: u64 = 0,
     reads_at_limit: u64 = 0,
@@ -1801,6 +1801,21 @@ const SequenceCounts = struct {
     };
 
     const BASE_KEY: u32 = 1 << 31;
+    const SLOT_INDEX_BITS = 17;
+    const SLOT_INDEX_MASK: u32 = (1 << SLOT_INDEX_BITS) - 1;
+
+    comptime {
+        std.debug.assert(KEY_LIMIT < SLOT_INDEX_MASK);
+    }
+
+    fn slotTag(tag: u32) u32 {
+        return tag >> SLOT_INDEX_BITS;
+    }
+
+    fn storedTag(self: *const SequenceCounts, key: u32) u32 {
+        var buffer: [KEY_LENGTH]u8 = undefined;
+        return SequenceKey.of(decodeKey(self.keyWords(key).*, &buffer)).tag();
+    }
 
     fn deinit(self: *SequenceCounts, allocator: std.mem.Allocator) void {
         self.records.deinit(allocator);
@@ -1840,12 +1855,13 @@ const SequenceCounts = struct {
     }
 
     fn growSlots(self: *SequenceCounts, allocator: std.mem.Allocator) error{OutOfMemory}!void {
-        const slots = try allocator.alloc(u64, @max(SLOT_MIN, self.slots.len * 2));
+        const slots = try allocator.alignedAlloc(u32, .@"8", @max(SLOT_MIN, self.slots.len * 2));
         @memset(slots, 0);
         const mask = slots.len - 1;
         for (self.slots) |slot| {
             if (slot == 0) continue;
-            var index: usize = @as(u32, @truncate(slot >> 32)) & mask;
+            const record = self.records.items[(slot & SLOT_INDEX_MASK) - 1];
+            var index: usize = self.storedTag(record.key) & mask;
             while (slots[index] != 0) index = (index + 1) & mask;
             slots[index] = slot;
         }
@@ -1869,8 +1885,8 @@ const SequenceCounts = struct {
         while (true) : (index = (index + 1) & mask) {
             const slot = self.slots[index];
             if (slot == 0) break;
-            if (@as(u32, @truncate(slot >> 32)) != tag) continue;
-            const record = &self.records.items[@as(u32, @truncate(slot)) - 1];
+            if (slot >> SLOT_INDEX_BITS != slotTag(tag)) continue;
+            const record = &self.records.items[(slot & SLOT_INDEX_MASK) - 1];
             const wanted = packed_key orelse key.pack();
             packed_key = wanted;
             if (!std.mem.eql(u64, self.keyWords(record.key), &wanted)) continue;
@@ -1886,7 +1902,7 @@ const SequenceCounts = struct {
             break :own @as(u32, @intCast(self.keys.items.len - 1));
         };
         self.records.appendAssumeCapacity(.{ .reads = 1, .key = stored });
-        self.slots[index] = @as(u64, tag) << 32 | self.records.items.len;
+        self.slots[index] = slotTag(tag) << SLOT_INDEX_BITS | @as(u32, @intCast(self.records.items.len));
         self.reads_at_limit = reads;
         return stored;
     }
@@ -1895,7 +1911,7 @@ const SequenceCounts = struct {
         if (self.levels != null) return;
         const counts = self.slots[0..self.records.items.len];
         for (self.records.items, counts) |record, *count| count.* = record.reads;
-        std.sort.pdq(u64, counts, {}, std.sort.asc(u64));
+        std.sort.pdq(u32, counts, {}, std.sort.asc(u32));
         var levels: Levels = .{ .bins = @splat(0), .deduplicated = 0, .total = 0 };
         var start: usize = 0;
         while (start < counts.len) {
@@ -1965,7 +1981,7 @@ const SequenceCounts = struct {
         return @as(f64, @floatFromInt(reads)) / @as(f64, @floatFromInt(self.reads)) * 100.0;
     }
 
-    fn moreReads(self: *const SequenceCounts, a: u64, b: u64) bool {
+    fn moreReads(self: *const SequenceCounts, a: u32, b: u32) bool {
         const first = self.records.items[a].reads;
         const second = self.records.items[b].reads;
         return first > second or (first == second and a < b);
@@ -1975,23 +1991,23 @@ const SequenceCounts = struct {
         var row_count: usize = 0;
         for (self.records.items, 0..) |record, index| {
             if (!(self.percentage(record.reads) > OVERREPRESENTED_PERCENT)) continue;
-            self.slots[row_count] = index;
+            self.slots[row_count] = @intCast(index);
             row_count += 1;
         }
         std.debug.assert(row_count <= OVERREPRESENTED_MAX);
-        std.sort.pdq(u64, self.slots[0..row_count], self, moreReads);
+        std.sort.pdq(u32, self.slots[0..row_count], self, moreReads);
         self.overrepresented_count = row_count;
     }
 
-    fn overrepresentedRows(self: *const SequenceCounts) []const u64 {
+    fn overrepresentedRows(self: *const SequenceCounts) []const u32 {
         std.debug.assert(self.levels != null);
         return self.slots[0..self.overrepresented_count];
     }
 
     fn sourceStorage(self: *const SequenceCounts) []?Hit {
-        comptime std.debug.assert(@sizeOf(?Hit) % @sizeOf(u64) == 0 and @alignOf(?Hit) <= @alignOf(u64));
-        const slots_per_hit = @sizeOf(?Hit) / @sizeOf(u64);
-        const remaining = self.slots[self.overrepresented_count..];
+        comptime std.debug.assert(@sizeOf(?Hit) % 8 == 0 and @alignOf(?Hit) <= 8);
+        const slots_per_hit = @sizeOf(?Hit) / @sizeOf(u32);
+        const remaining: []align(8) u32 = @alignCast(self.slots[std.mem.alignForward(usize, self.overrepresented_count, 2)..]);
         return std.mem.bytesAsSlice(?Hit, std.mem.sliceAsBytes(remaining[0 .. remaining.len / slots_per_hit * slots_per_hit]));
     }
 
