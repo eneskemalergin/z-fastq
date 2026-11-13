@@ -1729,6 +1729,21 @@ const SequenceKey = struct {
                 word.* = std.mem.readInt(u64, bytes[index * 8 ..][0..8], .little) & mask;
             }
         }
+        return fromWords(words);
+    }
+
+    fn unpack(packed_words: PackedKey) SequenceKey {
+        var bytes: [KEY_WORDS * 8]u8 = @splat(0);
+        for (bytes[0..KEY_LENGTH], 0..) |*byte, index| {
+            const bit = index * CODE_BITS;
+            var code = packed_words[bit / 64] >> @intCast(bit % 64);
+            if (bit % 64 > 64 - CODE_BITS) code |= packed_words[bit / 64 + 1] << @intCast(64 - bit % 64);
+            byte.* = @intCast(code & CODE_MASK);
+        }
+        return fromWords(@bitCast(bytes));
+    }
+
+    fn fromWords(words: [KEY_WORDS]u64) SequenceKey {
         return .{ .words = words, .hash = mix(
             mix(words[0] ^ KEY_SECRETS[0], words[1] ^ KEY_SECRETS[1]) ^
                 mix(words[2] ^ KEY_SECRETS[2], words[3] ^ KEY_SECRETS[3]) ^
@@ -1813,8 +1828,7 @@ const SequenceCounts = struct {
     }
 
     fn storedTag(self: *const SequenceCounts, key: u32) u32 {
-        var buffer: [KEY_LENGTH]u8 = undefined;
-        return SequenceKey.of(decodeKey(self.keyWords(key).*, &buffer)).tag();
+        return SequenceKey.unpack(self.keyWords(key).*).tag();
     }
 
     fn deinit(self: *SequenceCounts, allocator: std.mem.Allocator) void {
@@ -3280,6 +3294,25 @@ test "[unit] - [qc]: duplication levels count uppercase keys cut to 50 bases" {
     try std.testing.expectEqual(@as(usize, 10), levelBin(51));
     try std.testing.expectEqual(@as(usize, 14), levelBin(10000));
     try std.testing.expectEqual(@as(usize, 15), levelBin(10001));
+}
+
+test "[edge] - [qc]: keys with a code after a zero code are found again after the table grows" {
+    const allocator = std.testing.allocator;
+    var counts: SequenceCounts = .{};
+    defer counts.deinit(allocator);
+    var sequence: [40]u8 = undefined;
+    for (0..2) |_| {
+        for (0..3000) |index| {
+            for (&sequence, 0..) |*base, at| base.* = "ACGT"[(index >> @intCast(2 * (at % 6))) & 3];
+            sequence[20] = '@';
+            const key: SequenceKey = .of(&sequence);
+            try std.testing.expectEqual(key.words, SequenceKey.unpack(key.pack()).words);
+            try counts.reserve(allocator);
+            _ = try counts.add(key, null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3000), counts.records.items.len);
+    for (counts.records.items) |record| try std.testing.expectEqual(@as(u32, 2), record.reads);
 }
 
 test "[edge] - [qc]: past 100,000 keys new reads count only in the total and the levels are corrected" {
