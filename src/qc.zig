@@ -1327,24 +1327,15 @@ inline fn countQualityBlock(
 }
 
 fn addCycleQualities(comptime lanes: comptime_int, pending: PendingRows, quality: []const u8) u64 {
-    const Bytes = @Vector(lanes, u8);
-    const Wide = @Vector(lanes, u16);
-    const ones: Bytes = @splat(1);
-    const zeros: Bytes = @splat(0);
-    var byte_lanes: Wide = @splat(0);
+    var byte_lanes: @Vector(lanes, u16) = @splat(0);
     var cycle: usize = 0;
     while (cycle + lanes <= quality.len) : (cycle += lanes) {
-        const bytes: Bytes = quality[cycle..][0..lanes].*;
-        const scores = bytes -% @as(Bytes, @splat(PHRED_OFFSET));
-        byte_lanes += @as(Wide, bytes);
-        const sums = pending.sums[cycle..][0..lanes];
-        sums.* = @as(Wide, sums.*) + @as(Wide, scores);
-        const reads = pending.reads[cycle..][0..lanes];
-        reads.* = @as(Bytes, reads.*) + ones;
-        inline for (.{ pending.q20, pending.q30, pending.q40 }, .{ statistics.Q20_SCORE, statistics.Q30_SCORE, Q40_SCORE }) |row, threshold| {
-            const counts = row[cycle..][0..lanes];
-            counts.* = @as(Bytes, counts.*) + @select(u8, scores >= @as(Bytes, @splat(threshold)), ones, zeros);
-        }
+        addQualityBlock(lanes, pending, quality, cycle, 0, &byte_lanes);
+    }
+    if (cycle < quality.len and quality.len >= lanes) {
+        const start = quality.len - lanes;
+        addQualityBlock(lanes, pending, quality, start, cycle - start, &byte_lanes);
+        cycle = quality.len;
     }
     var sum: u64 = @reduce(.Add, @as(@Vector(lanes, u32), byte_lanes));
     for (quality[cycle..], cycle..) |byte, at| {
@@ -1357,6 +1348,32 @@ fn addCycleQualities(comptime lanes: comptime_int, pending: PendingRows, quality
         pending.q40[at] += @intFromBool(score >= Q40_SCORE);
     }
     return sum;
+}
+
+inline fn addQualityBlock(
+    comptime lanes: comptime_int,
+    pending: PendingRows,
+    quality: []const u8,
+    start: usize,
+    counted: usize,
+    byte_lanes: *@Vector(lanes, u16),
+) void {
+    const Bytes = @Vector(lanes, u8);
+    const Wide = @Vector(lanes, u16);
+    const ones: Bytes = @splat(1);
+    const zeros: Bytes = @splat(0);
+    const fresh = std.simd.iota(u8, lanes) >= @as(Bytes, @splat(@intCast(counted)));
+    const bytes: Bytes = quality[start..][0..lanes].*;
+    const scores = bytes -% @as(Bytes, @splat(PHRED_OFFSET));
+    byte_lanes.* += @as(Wide, @select(u8, fresh, bytes, zeros));
+    const sums = pending.sums[start..][0..lanes];
+    sums.* = @as(Wide, sums.*) + @as(Wide, @select(u8, fresh, scores, zeros));
+    const reads = pending.reads[start..][0..lanes];
+    reads.* = @as(Bytes, reads.*) + @select(u8, fresh, ones, zeros);
+    inline for (.{ pending.q20, pending.q30, pending.q40 }, .{ statistics.Q20_SCORE, statistics.Q30_SCORE, Q40_SCORE }) |row, threshold| {
+        const counts = row[start..][0..lanes];
+        counts.* = @as(Bytes, counts.*) + @select(u8, (scores >= @as(Bytes, @splat(threshold))) & fresh, ones, zeros);
+    }
 }
 
 fn countCycleBases(comptime lanes: comptime_int, pending: *PendingBases, sequence: []const u8, gc_length: usize) usize {
@@ -2793,6 +2810,36 @@ test "[failure] - [qc]: a failed retained allocation leaves the retained counts 
     try std.testing.expectEqual(@as(u64, 0), populations.retained.lengths[2]);
     try std.testing.expectEqual(@as(usize, 0), populations.retained_cycles);
     try std.testing.expectEqual(@as(u64, 1), populations.raw.lengths[4]);
+}
+
+test "[property] - [qc]: vector quality sums match a scalar count at every tier and lane boundary" {
+    var prng = std.Random.DefaultPrng.init(0x5a17_0b10);
+    const random = prng.random();
+    var quality: [300]u8 = undefined;
+    for (&quality) |*byte| byte.* = PHRED_OFFSET + random.uintLessThan(u8, fastq.PHRED_MAX_SCORE + 1);
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
+        for ([_]usize{ 0, 1, lanes - 1, lanes, lanes + 1, 2 * lanes + 7, 100, 151, 300 }) |length| {
+            errdefer std.debug.print("lanes {d} length {d}\n", .{ lanes, length });
+            var sums: [300]u16 = @splat(0);
+            var counts: [4][300]u8 = @splat(@splat(0));
+            var expected_sums: [300]u16 = @splat(0);
+            var expected_counts: [4][300]u8 = @splat(@splat(0));
+            const rows: PendingRows = .{ .sums = &sums, .reads = &counts[0], .q20 = &counts[1], .q30 = &counts[2], .q40 = &counts[3] };
+            var expected_sum: u64 = 0;
+            for (quality[0..length], 0..) |byte, cycle| {
+                const score = byte - PHRED_OFFSET;
+                expected_sum += byte;
+                expected_sums[cycle] += score;
+                expected_counts[0][cycle] += 1;
+                expected_counts[1][cycle] += @intFromBool(score >= statistics.Q20_SCORE);
+                expected_counts[2][cycle] += @intFromBool(score >= statistics.Q30_SCORE);
+                expected_counts[3][cycle] += @intFromBool(score >= Q40_SCORE);
+            }
+            try std.testing.expectEqual(expected_sum, addCycleQualities(lanes, rows, quality[0..length]));
+            try std.testing.expectEqualSlices(u16, &expected_sums, &sums);
+            for (expected_counts, counts) |expected, actual| try std.testing.expectEqualSlices(u8, &expected, &actual);
+        }
+    }
 }
 
 test "[property] - [qc]: vector cycle counts match a scalar count at every tier and lane boundary" {
