@@ -1363,7 +1363,11 @@ fn countCycleBases(comptime lanes: comptime_int, pending: *PendingBases, sequenc
     var gc_count: usize = 0;
     var cycle: usize = 0;
     while (cycle + lanes <= sequence.len) : (cycle += lanes) {
-        gc_count += countBlock(lanes, pending, sequence, cycle, gc_length);
+        gc_count += countBlock(lanes, pending, sequence, cycle, 0, gc_length);
+    }
+    if (cycle < sequence.len and sequence.len >= lanes) {
+        const start = sequence.len - lanes;
+        return gc_count + countBlock(lanes, pending, sequence, start, cycle - start, gc_length);
     }
     for (sequence[cycle..], cycle..) |base, at| {
         const kind = BASE_KIND[base];
@@ -1379,15 +1383,17 @@ inline fn countBlock(
     pending: *PendingBases,
     sequence: []const u8,
     start: usize,
+    counted: usize,
     gc_length: usize,
 ) usize {
     const Bytes = @Vector(lanes, u8);
     const ones: Bytes = @splat(1);
     const zeros: Bytes = @splat(0);
+    const fresh = std.simd.iota(u8, lanes) >= @as(Bytes, @splat(@intCast(counted)));
     const upper = @as(Bytes, sequence[start..][0..lanes].*) & @as(Bytes, @splat(CASE_FOLD));
     var gc_count: usize = 0;
     inline for (COUNTED_LETTERS, pending) |letter, *row| {
-        const hits = upper == @as(Bytes, @splat(letter));
+        const hits = (upper == @as(Bytes, @splat(letter))) & fresh;
         const counts = row[start..][0..lanes];
         counts.* = @as(Bytes, counts.*) + @select(u8, hits, ones, zeros);
         if (letter == 'G' or letter == 'C') gc_count += keptHits(lanes, hits, start, gc_length);
