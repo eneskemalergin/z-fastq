@@ -169,6 +169,7 @@ pub const MatePopulations = struct {
     retained_enabled: bool = false,
     retained_front: usize = 0,
     last_key: SequenceKey = .{},
+    last_raw_key: ?u32 = null,
     raw_tiles: TileQuality = .{},
     retained_tiles: TileQuality = .{},
 
@@ -202,7 +203,7 @@ pub const MatePopulations = struct {
         }
         self.last = try self.raw.collect(allocator, sequence, quality);
         if (self.raw.detailed) {
-            self.raw_sequences.add(key);
+            self.last_raw_key = try self.raw_sequences.add(key, null);
             try self.raw_tiles.add(allocator, header, quality);
         }
         if (self.retained_enabled and self.raw.detailed) {
@@ -225,19 +226,22 @@ pub const MatePopulations = struct {
         std.debug.assert(self.retained_enabled);
         const read = sequence[front..][0..kept];
         const read_quality = quality[front..][0..kept];
-        const key = if (!self.raw.detailed) SequenceKey{} else if (kept >= @min(sequence.len - front, KEY_LENGTH)) self.last_key else SequenceKey.of(read);
+        const whole_key = kept >= @min(sequence.len - front, KEY_LENGTH);
+        const key = if (!self.raw.detailed) SequenceKey{} else if (whole_key) self.last_key else SequenceKey.of(read);
+        const raw_key = if (front == 0 and whole_key) self.last_raw_key else null;
+        self.retained_sequences.base = &self.raw_sequences;
         if (self.raw.detailed) {
             try self.retained_sequences.reserve(allocator);
             try self.retained_tiles.add(allocator, header, read_quality);
         }
         if (!self.derived) {
             try self.retained.addRead(allocator, read, read_quality);
-            if (self.raw.detailed) self.retained_sequences.add(key);
+            if (self.raw.detailed) _ = try self.retained_sequences.add(key, raw_key);
             return;
         }
         const retained = &self.retained;
         if (sequence.len > retained.bases.items.len) try retained.growCycles(allocator, sequence.len);
-        if (self.raw.detailed) self.retained_sequences.add(key);
+        if (self.raw.detailed) _ = try self.retained_sequences.add(key, raw_key);
         var facts = self.last;
         if (front + kept < sequence.len) {
             const removed_sum = try self.removeCycles(allocator, sequence, quality, front + kept);
@@ -309,6 +313,7 @@ pub const MatePopulations = struct {
     }
 
     pub fn finish(self: *MatePopulations) void {
+        self.retained_sequences.base = &self.raw_sequences;
         if (self.derived) self.materialize();
         self.raw.finish();
         self.retained.finish();
@@ -323,6 +328,7 @@ pub const MatePopulations = struct {
     }
 
     pub fn prepareSources(self: *MatePopulations, contaminants: *const ContaminantList) void {
+        self.retained_sequences.base = &self.raw_sequences;
         self.raw_sequences.prepareSources(contaminants);
         if (self.retained_enabled) self.retained_sequences.prepareSources(contaminants);
     }
@@ -1778,6 +1784,8 @@ const Levels = struct {
 
 const SequenceCounts = struct {
     records: std.ArrayList(Record) = .empty,
+    keys: std.ArrayList(PackedKey) = .empty,
+    base: ?*const SequenceCounts = null,
     slots: []u64 = &.{},
     limit: u32 = KEY_LIMIT,
     reads: u64 = 0,
@@ -1788,13 +1796,21 @@ const SequenceCounts = struct {
     source_count: usize = 0,
 
     const Record = struct {
-        words: PackedKey,
-        reads: u64,
+        reads: u32,
+        key: u32,
     };
+
+    const BASE_KEY: u32 = 1 << 31;
 
     fn deinit(self: *SequenceCounts, allocator: std.mem.Allocator) void {
         self.records.deinit(allocator);
+        self.keys.deinit(allocator);
         allocator.free(self.slots);
+    }
+
+    fn keyWords(self: *const SequenceCounts, key: u32) *const PackedKey {
+        if (key & BASE_KEY != 0) return &self.base.?.keys.items[key & ~BASE_KEY];
+        return &self.keys.items[key];
     }
 
     fn limited(self: *const SequenceCounts) bool {
@@ -1806,7 +1822,8 @@ const SequenceCounts = struct {
         _ = try std.math.add(u64, self.reads, 1);
         if (self.limited()) return;
         const needed = self.records.items.len + 1;
-        if (needed <= self.records.capacity and needed * 100 <= self.slots.len * SLOT_LOAD_PERCENT) return;
+        if (needed <= self.records.capacity and self.keys.items.len < self.keys.capacity and
+            needed * 100 <= self.slots.len * SLOT_LOAD_PERCENT) return;
         return self.grow(allocator);
     }
 
@@ -1814,6 +1831,10 @@ const SequenceCounts = struct {
         const needed = self.records.items.len + 1;
         if (needed > self.records.capacity) {
             try self.records.ensureTotalCapacityPrecise(allocator, @min(self.limit, @max(needed, self.records.capacity * 2, 256)));
+        }
+        const keys_needed = self.keys.items.len + 1;
+        if (keys_needed > self.keys.capacity) {
+            try self.keys.ensureTotalCapacityPrecise(allocator, @min(self.limit, @max(keys_needed, self.keys.capacity * 2, 256)));
         }
         if (needed * 100 > self.slots.len * SLOT_LOAD_PERCENT) try self.growSlots(allocator);
     }
@@ -1837,7 +1858,7 @@ const SequenceCounts = struct {
         @prefetch(&self.slots[key.tag() & (self.slots.len - 1)], .{ .rw = .write });
     }
 
-    fn add(self: *SequenceCounts, key: SequenceKey) void {
+    fn add(self: *SequenceCounts, key: SequenceKey, base_key: ?u32) error{Overflow}!?u32 {
         std.debug.assert(self.levels == null and self.slots.len != 0);
         const reads = self.reads + 1;
         const full = self.limited();
@@ -1852,17 +1873,22 @@ const SequenceCounts = struct {
             const record = &self.records.items[@as(u32, @truncate(slot)) - 1];
             const wanted = packed_key orelse key.pack();
             packed_key = wanted;
-            if (!std.mem.eql(u64, &record.words, &wanted)) continue;
-            record.reads += 1;
+            if (!std.mem.eql(u64, self.keyWords(record.key), &wanted)) continue;
+            record.reads = std.math.add(u32, record.reads, 1) catch return error.Overflow;
             if (!full) self.reads_at_limit = reads;
             self.reads = reads;
-            return;
+            return record.key;
         }
         self.reads = reads;
-        if (full) return;
-        self.records.appendAssumeCapacity(.{ .words = packed_key orelse key.pack(), .reads = 1 });
+        if (full) return null;
+        const stored = if (base_key) |shared| shared | BASE_KEY else own: {
+            self.keys.appendAssumeCapacity(packed_key orelse key.pack());
+            break :own @as(u32, @intCast(self.keys.items.len - 1));
+        };
+        self.records.appendAssumeCapacity(.{ .reads = 1, .key = stored });
         self.slots[index] = @as(u64, tag) << 32 | self.records.items.len;
         self.reads_at_limit = reads;
+        return stored;
     }
 
     fn finish(self: *SequenceCounts) void {
@@ -1975,7 +2001,7 @@ const SequenceCounts = struct {
         self.source_list = contaminants;
         for (self.overrepresentedRows()[0..self.source_count], storage[0..self.source_count]) |index, *hit| {
             var buffer: [KEY_LENGTH]u8 = undefined;
-            hit.* = contaminants.bestHit(decodeKey(self.records.items[index].words, &buffer));
+            hit.* = contaminants.bestHit(decodeKey(self.keyWords(self.records.items[index].key).*, &buffer));
         }
     }
 
@@ -1990,7 +2016,7 @@ const SequenceCounts = struct {
         for (self.overrepresentedRows(), 0..) |index, rank| {
             const record = self.records.items[index];
             var buffer: [KEY_LENGTH]u8 = undefined;
-            const key = decodeKey(record.words, &buffer);
+            const key = decodeKey(self.keyWords(record.key).*, &buffer);
             try json.beginObject();
             try json.objectField("sequence");
             try json.write(key);
@@ -2027,7 +2053,7 @@ const SequenceCounts = struct {
         for (found, 0..) |index, rank| {
             const record = self.records.items[index];
             var buffer: [KEY_LENGTH]u8 = undefined;
-            const key = decodeKey(record.words, &buffer);
+            const key = decodeKey(self.keyWords(record.key).*, &buffer);
             try out.print("{s}\t{d}", .{ key, record.reads });
             try writeCell(out, @round(self.percentage(record.reads) * 100) / 100);
             if (self.sourceHit(rank, key, contaminants)) |hit| {
@@ -2930,6 +2956,55 @@ test "[property] - [qc]: statistics from the tables equal Stats.addRecord, also 
     }
 }
 
+test "[property] - [qc]: retained sequence counts that share raw keys equal their own counts, also at the key cap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5ea_c0de);
+    const random = prng.random();
+    var sequence: [80]u8 = undefined;
+    const quality: [80]u8 = @splat('I');
+    for ([_]u32{ 64, KEY_LIMIT }) |limit| {
+        errdefer std.debug.print("limit {d}\n", .{limit});
+        var populations: MatePopulations = .{};
+        defer populations.deinit(allocator);
+        populations.enableRetained(0);
+        populations.raw_sequences.limit = limit;
+        populations.retained_sequences.limit = limit;
+        var expected: MatePopulations = .{};
+        defer expected.deinit(allocator);
+        expected.raw_sequences.limit = limit;
+        for (0..3000) |_| {
+            const len = 40 + random.uintLessThan(usize, 41);
+            const family = random.uintLessThan(u32, 200);
+            for (sequence[0..len], 0..) |*base, index| {
+                base.* = "ACGT"[@as(usize, @intCast((family *% 2654435761 +% @as(u32, @intCast(index)) *% 40503) >> 7)) & 3];
+            }
+            if (random.uintLessThan(u8, 4) == 0) sequence[random.uintLessThan(usize, len)] = 'N';
+            try populations.addRead(allocator, "r", sequence[0..len], quality[0..len]);
+            if (random.uintLessThan(u8, 10) == 0) {
+                try populations.dropRetained(allocator, sequence[0..len], quality[0..len]);
+                continue;
+            }
+            const kept = if (random.boolean()) len else random.uintLessThan(usize, len + 1);
+            try populations.addRetained(allocator, "r", sequence[0..len], quality[0..len], kept);
+            try expected.addRead(allocator, "r", sequence[0..kept], quality[0..kept]);
+        }
+        populations.finish();
+        expected.finish();
+        const want = try populationReportOf(arena.allocator(), &expected, false);
+        const got = try populationReportOf(arena.allocator(), &populations, true);
+        inline for (.{ "duplication", "overrepresented" }) |module| {
+            const want_text = try std.json.Stringify.valueAlloc(arena.allocator(), want.get(module).?, .{});
+            const got_text = try std.json.Stringify.valueAlloc(arena.allocator(), got.get(module).?, .{});
+            try std.testing.expectEqualStrings(want_text, got_text);
+        }
+        var shared: usize = 0;
+        for (populations.retained_sequences.records.items) |record| shared += @intFromBool(record.key & SequenceCounts.BASE_KEY != 0);
+        try std.testing.expect(shared != 0 and shared < populations.retained_sequences.records.items.len);
+    }
+}
+
 test "[property] - [qc]: a retained population equals one collected from the kept reads, with or without a 5' cut" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3091,7 +3166,7 @@ fn countsOf(allocator: std.mem.Allocator, reads: []const []const u8) !SequenceCo
     errdefer counts.deinit(allocator);
     for (reads) |read| {
         try counts.reserve(allocator);
-        counts.add(.of(read));
+        _ = try counts.add(.of(read), null);
     }
     counts.finish();
     return counts;
@@ -3166,7 +3241,7 @@ test "[unit] - [qc]: duplication levels count uppercase keys cut to 50 bases" {
         try std.testing.expectEqual(SequenceKey.of(long), SequenceKey.of(lower));
     }
     try std.testing.expect(SequenceKey.of(long[0..49]).hash != SequenceKey.of(long).hash);
-    try std.testing.expectEqual(@as(u64, 3), folded.records.items[0].reads);
+    try std.testing.expectEqual(@as(u32, 3), folded.records.items[0].reads);
     for ([_][]const u8{ "acgturyswkmbdhvn" ++ "N" ** 40, "ACGTURYSWKMBDHVN", "", "T", "GATTACA" ** 7 }) |sequence| {
         const length = @min(sequence.len, KEY_LENGTH);
         var buffer: [KEY_LENGTH]u8 = undefined;
@@ -3199,17 +3274,17 @@ test "[edge] - [qc]: past 100,000 keys new reads count only in the total and the
     var buffer: [KEY_LENGTH]u8 = undefined;
     for (0..KEY_LIMIT) |index| {
         try counts.reserve(std.testing.allocator);
-        counts.add(.of(indexedKey(&buffer, index)));
+        _ = try counts.add(.of(indexedKey(&buffer, index)), null);
     }
     try std.testing.expect(counts.limited());
     try std.testing.expectEqual(@as(u64, KEY_LIMIT), counts.reads_at_limit);
     try counts.reserve(std.testing.allocator);
-    counts.add(.of(indexedKey(&buffer, KEY_LIMIT)));
+    _ = try counts.add(.of(indexedKey(&buffer, KEY_LIMIT)), null);
     try std.testing.expectEqual(@as(usize, KEY_LIMIT), counts.records.items.len);
     try std.testing.expectEqual(@as(u64, KEY_LIMIT + 1), counts.reads);
     for (0..KEY_LIMIT / 2) |index| {
         try counts.reserve(std.testing.allocator);
-        counts.add(.of(indexedKey(&buffer, index)));
+        _ = try counts.add(.of(indexedKey(&buffer, index)), null);
     }
     try std.testing.expectEqual(@as(u64, KEY_LIMIT), counts.reads_at_limit);
     try std.testing.expectEqual(@as(usize, KEY_LIMIT), counts.records.capacity);
@@ -3219,11 +3294,11 @@ test "[edge] - [qc]: past 100,000 keys new reads count only in the total and the
     defer probe.deinit(std.testing.allocator);
     for (0..KEY_LIMIT) |index| {
         try probe.reserve(std.testing.allocator);
-        probe.add(.of(indexedKey(&buffer, index)));
+        _ = try probe.add(.of(indexedKey(&buffer, index)), null);
     }
     for (0..KEY_LIMIT / 2) |index| {
         try probe.reserve(std.testing.allocator);
-        probe.add(.of(indexedKey(&buffer, index)));
+        _ = try probe.add(.of(indexedKey(&buffer, index)), null);
     }
     probe.finish();
     const report = try sequenceReportOf(arena.allocator(), &probe, null);
