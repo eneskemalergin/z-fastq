@@ -725,6 +725,16 @@ fn countLowAndN(comptime lanes: comptime_int, sequence: []const u8, quality: []c
         counts.low += @reduce(.Add, @as(Wide, low));
         counts.n += @reduce(.Add, @as(Wide, n_bases));
     }
+    if (whole < sequence.len and sequence.len >= lanes) {
+        const Mask = @Int(.unsigned, lanes);
+        const start = sequence.len - lanes;
+        const fresh = std.simd.iota(u8, lanes) >= @as(Bytes, @splat(@intCast(whole - start)));
+        const bytes: Bytes = quality[start..][0..lanes].*;
+        const bases: Bytes = sequence[start..][0..lanes].*;
+        counts.low += @popCount(@as(Mask, @bitCast((bytes < @as(Bytes, @splat(threshold))) & fresh)));
+        counts.n += @popCount(@as(Mask, @bitCast((bases == @as(Bytes, @splat('N'))) & fresh)));
+        return counts;
+    }
     for (sequence[whole..], quality[whole..]) |base, byte| {
         counts.low += @intFromBool(byte < threshold);
         counts.n += @intFromBool(base == 'N');

@@ -27,6 +27,7 @@ All notable changes to z-fastq will be documented in this file.
   - Sampling, `process`, `interleave`, and `deinterleave` check each record inline: 5 to 10% fewer instructions.
   - QC counts each read's bases to the last one with vectors, finishing on one overlapping block instead of byte by byte: `--qc-summary` about 16% less CPU time, trimming with `--qc-summary` about 11%, `--report` about 16% fewer instructions.
   - `--qc-summary` sums each read's qualities to the last one with vectors, the same way: about 15% less CPU time, trimming with `--qc-summary` about 3%.
+  - The low-quality and N filters count each read to the last base with vectors, the same way: filtering about 10% less CPU time, full trimming about 4%.
   - Mate names that end in `/1` and `/2` are compared at the full vector width, 32 bytes at a time on AVX2: 2 to 3% fewer instructions in every paired command.
 - **Memory.** `process` allocates its detailed QC tables only for `--report` and `--qc-tables`, so every other `process` run peaks at about 1.3 MiB instead of 2.1 to 2.9 MiB, and the binary is about 550 KB smaller. `--pair-duplication` packs the positions it has seen, with a denser form for crowded blocks: about 4 to 6 bytes per pair instead of about 10 (9.2 MB instead of 15.2 MB at 1.5 million pairs, 180 MB instead of 349 MB at 50 million), for about 2% more CPU time on those runs; the bound stays about 1 GiB.
 
