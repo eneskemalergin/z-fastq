@@ -203,7 +203,7 @@ pub const MatePopulations = struct {
         }
         self.last = try self.raw.collect(allocator, sequence, quality);
         if (self.raw.detailed) {
-            self.last_raw_key = try self.raw_sequences.add(key, null);
+            self.last_raw_key = try self.raw_sequences.add(&key, null);
             try self.raw_tiles.add(allocator, header, quality);
         }
         if (self.retained_enabled and self.raw.detailed) {
@@ -236,12 +236,12 @@ pub const MatePopulations = struct {
         }
         if (!self.derived) {
             try self.retained.addRead(allocator, read, read_quality);
-            if (self.raw.detailed) _ = try self.retained_sequences.add(key, raw_key);
+            if (self.raw.detailed) _ = try self.retained_sequences.add(&key, raw_key);
             return;
         }
         const retained = &self.retained;
         if (sequence.len > retained.bases.items.len) try retained.growCycles(allocator, sequence.len);
-        if (self.raw.detailed) _ = try self.retained_sequences.add(key, raw_key);
+        if (self.raw.detailed) _ = try self.retained_sequences.add(&key, raw_key);
         var facts = self.last;
         if (front + kept < sequence.len) {
             const removed_sum = try self.removeCycles(allocator, sequence, quality, front + kept);
@@ -1775,9 +1775,64 @@ const SequenceKey = struct {
         std.debug.assert(packed_words[PACKED_WORDS] == 0);
         return packed_words[0..PACKED_WORDS].*;
     }
+
+    /// The key at two bits per base, A, C, G and T as 0 to 3, with its length
+    /// in the top bits; null when it holds another code, or a code after a zero.
+    fn narrow(self: *const SequenceKey) ?NarrowKey {
+        const Bytes = @Vector(64, u8);
+        var padded: [8]u64 = @splat(0);
+        padded[0..KEY_WORDS].* = self.words;
+        const codes: Bytes = @bitCast(padded);
+        const zero: Bytes = @splat(0);
+        const c = codes == @as(Bytes, @splat('C' & CODE_MASK));
+        const g = codes == @as(Bytes, @splat('G' & CODE_MASK));
+        const t = codes == @as(Bytes, @splat('T' & CODE_MASK));
+        const known = (codes == @as(Bytes, @splat('A' & CODE_MASK))) | c | g | t;
+        const filled: u64 = @bitCast(codes != zero);
+        if (filled & (filled +% 1) != 0) return null;
+        if (@as(u64, @bitCast(known)) != filled) return null;
+        const bases = @select(u8, c, @as(Bytes, @splat(1)), zero) | @select(u8, g, @as(Bytes, @splat(2)), zero) |
+            @select(u8, t, @as(Bytes, @splat(3)), zero);
+        const words: [8]u64 = @bitCast(bases);
+        var result: NarrowKey = .{ 0, 0 };
+        for (words[0..KEY_WORDS], 0..) |word, chunk| {
+            var bits = word;
+            bits = (bits | (bits >> 6)) & 0x000f_000f_000f_000f;
+            bits = (bits | (bits >> 12)) & 0x0000_00ff_0000_00ff;
+            bits = (bits | (bits >> 24)) & 0x0000_0000_0000_ffff;
+            const shift = chunk * 16;
+            result[shift / 64] |= bits << @intCast(shift % 64);
+        }
+        result[1] |= @as(u64, @popCount(filled)) << NARROW_LENGTH_SHIFT;
+        return result;
+    }
 };
 
 const PackedKey = [PACKED_WORDS]u64;
+const NARROW_WORDS = 2;
+const NarrowKey = [NARROW_WORDS]u64;
+const NARROW_LENGTH_SHIFT = 58;
+
+/// A sequence key in the form the duplication table stores it: two bits per
+/// base when it holds only A, C, G and T, five bits per code otherwise.
+const KeyForm = struct {
+    narrow: ?NarrowKey,
+    wide: PackedKey,
+
+    noinline fn fill(self: *KeyForm, key: *const SequenceKey) void {
+        self.narrow = key.narrow();
+        if (self.narrow == null) self.wide = key.pack();
+    }
+};
+
+fn decodeNarrow(key: NarrowKey, buffer: *[KEY_LENGTH]u8) []const u8 {
+    const length: usize = @intCast(key[1] >> NARROW_LENGTH_SHIFT);
+    for (buffer[0..length], 0..) |*byte, index| {
+        const shift = index * 2;
+        byte.* = "ACGT"[@intCast((key[shift / 64] >> @intCast(shift % 64)) & 3)];
+    }
+    return buffer[0..length];
+}
 
 fn decodeKey(words: PackedKey, buffer: *[KEY_LENGTH]u8) []const u8 {
     for (buffer, 0..) |*byte, index| {
@@ -1799,7 +1854,7 @@ const Levels = struct {
 
 const SequenceCounts = struct {
     records: std.ArrayList(Record) = .empty,
-    keys: std.ArrayList(PackedKey) = .empty,
+    key_words: std.ArrayList(u64) = .empty,
     base: ?*const SequenceCounts = null,
     slots: []align(8) u32 = &.{},
     limit: u32 = KEY_LIMIT,
@@ -1815,12 +1870,26 @@ const SequenceCounts = struct {
         key: u32,
     };
 
+    /// A record's key is the word offset of its key in `key_words`, flagged
+    /// `WIDE_KEY` when the key takes `PACKED_WORDS` words instead of two, or
+    /// the base population's key flagged `BASE_KEY`.
     const BASE_KEY: u32 = 1 << 31;
+    const WIDE_KEY: u32 = 1 << 30;
+    const KEY_OFFSET: u32 = WIDE_KEY - 1;
     const SLOT_INDEX_BITS = 17;
     const SLOT_INDEX_MASK: u32 = (1 << SLOT_INDEX_BITS) - 1;
 
     comptime {
         std.debug.assert(KEY_LIMIT < SLOT_INDEX_MASK);
+        std.debug.assert(KEY_LIMIT * PACKED_WORDS <= KEY_OFFSET);
+    }
+
+    fn narrowKey(self: *const SequenceCounts, key: u32) *const NarrowKey {
+        return self.key_words.items[key..][0..NARROW_WORDS];
+    }
+
+    fn wideKey(self: *const SequenceCounts, key: u32) *const PackedKey {
+        return self.key_words.items[key & KEY_OFFSET ..][0..PACKED_WORDS];
     }
 
     fn slotTag(tag: u32) u32 {
@@ -1828,18 +1897,33 @@ const SequenceCounts = struct {
     }
 
     fn storedTag(self: *const SequenceCounts, key: u32) u32 {
-        return SequenceKey.unpack(self.keyWords(key).*).tag();
+        return self.storedKey(key).tag();
+    }
+
+    fn storedKey(self: *const SequenceCounts, key: u32) SequenceKey {
+        if (key & BASE_KEY != 0) return self.base.?.storedKey(key & ~BASE_KEY);
+        if (key & WIDE_KEY != 0) return SequenceKey.unpack(self.wideKey(key).*);
+        var buffer: [KEY_LENGTH]u8 = undefined;
+        return SequenceKey.of(decodeNarrow(self.narrowKey(key).*, &buffer));
     }
 
     fn deinit(self: *SequenceCounts, allocator: std.mem.Allocator) void {
         self.records.deinit(allocator);
-        self.keys.deinit(allocator);
+        self.key_words.deinit(allocator);
         allocator.free(self.slots);
     }
 
-    fn keyWords(self: *const SequenceCounts, key: u32) *const PackedKey {
-        if (key & BASE_KEY != 0) return &self.base.?.keys.items[key & ~BASE_KEY];
-        return &self.keys.items[key];
+    fn keyText(self: *const SequenceCounts, key: u32, buffer: *[KEY_LENGTH]u8) []const u8 {
+        if (key & BASE_KEY != 0) return self.base.?.keyText(key & ~BASE_KEY, buffer);
+        if (key & WIDE_KEY != 0) return decodeKey(self.wideKey(key).*, buffer);
+        return decodeNarrow(self.narrowKey(key).*, buffer);
+    }
+
+    fn keyMatches(self: *const SequenceCounts, key: u32, form: *const KeyForm) bool {
+        if (key & BASE_KEY != 0) return self.base.?.keyMatches(key & ~BASE_KEY, form);
+        if (key & WIDE_KEY != 0) return form.narrow == null and std.mem.eql(u64, self.wideKey(key), &form.wide);
+        const narrow = form.narrow orelse return false;
+        return std.mem.eql(u64, self.narrowKey(key), &narrow);
     }
 
     fn limited(self: *const SequenceCounts) bool {
@@ -1851,7 +1935,7 @@ const SequenceCounts = struct {
         _ = try std.math.add(u64, self.reads, 1);
         if (self.limited()) return;
         const needed = self.records.items.len + 1;
-        if (needed <= self.records.capacity and self.keys.items.len < self.keys.capacity and
+        if (needed <= self.records.capacity and self.key_words.items.len + PACKED_WORDS <= self.key_words.capacity and
             needed * 100 <= self.slots.len * SLOT_LOAD_PERCENT) return;
         return self.grow(allocator);
     }
@@ -1861,9 +1945,10 @@ const SequenceCounts = struct {
         if (needed > self.records.capacity) {
             try self.records.ensureTotalCapacityPrecise(allocator, @min(self.limit, @max(needed, self.records.capacity * 2, 256)));
         }
-        const keys_needed = self.keys.items.len + 1;
-        if (keys_needed > self.keys.capacity) {
-            try self.keys.ensureTotalCapacityPrecise(allocator, @min(self.limit, @max(keys_needed, self.keys.capacity * 2, 256)));
+        const words_needed = self.key_words.items.len + PACKED_WORDS;
+        if (words_needed > self.key_words.capacity) {
+            const words_limit = @as(usize, self.limit) * PACKED_WORDS;
+            try self.key_words.ensureTotalCapacityPrecise(allocator, @min(words_limit, @max(words_needed, self.key_words.capacity * 2, 256 * PACKED_WORDS)));
         }
         if (needed * 100 > self.slots.len * SLOT_LOAD_PERCENT) try self.growSlots(allocator);
     }
@@ -1888,22 +1973,23 @@ const SequenceCounts = struct {
         @prefetch(&self.slots[key.tag() & (self.slots.len - 1)], .{ .rw = .write });
     }
 
-    fn add(self: *SequenceCounts, key: SequenceKey, base_key: ?u32) error{Overflow}!?u32 {
+    fn add(self: *SequenceCounts, key: *const SequenceKey, base_key: ?u32) error{Overflow}!?u32 {
         std.debug.assert(self.levels == null and self.slots.len != 0);
         const reads = self.reads + 1;
         const full = self.limited();
         const mask = self.slots.len - 1;
         const tag = key.tag();
-        var packed_key: ?PackedKey = null;
+        var form: KeyForm = undefined;
+        var formed = false;
         var index: usize = tag & mask;
         while (true) : (index = (index + 1) & mask) {
             const slot = self.slots[index];
             if (slot == 0) break;
             if (slot >> SLOT_INDEX_BITS != slotTag(tag)) continue;
             const record = &self.records.items[(slot & SLOT_INDEX_MASK) - 1];
-            const wanted = packed_key orelse key.pack();
-            packed_key = wanted;
-            if (!std.mem.eql(u64, self.keyWords(record.key), &wanted)) continue;
+            if (!formed) form.fill(key);
+            formed = true;
+            if (!self.keyMatches(record.key, &form)) continue;
             record.reads = std.math.add(u32, record.reads, 1) catch return error.Overflow;
             if (!full) self.reads_at_limit = reads;
             self.reads = reads;
@@ -1912,8 +1998,14 @@ const SequenceCounts = struct {
         self.reads = reads;
         if (full) return null;
         const stored = if (base_key) |shared| shared | BASE_KEY else own: {
-            self.keys.appendAssumeCapacity(packed_key orelse key.pack());
-            break :own @as(u32, @intCast(self.keys.items.len - 1));
+            if (!formed) form.fill(key);
+            const offset: u32 = @intCast(self.key_words.items.len);
+            if (form.narrow) |narrow| {
+                self.key_words.appendSliceAssumeCapacity(&narrow);
+                break :own offset;
+            }
+            self.key_words.appendSliceAssumeCapacity(&form.wide);
+            break :own offset | WIDE_KEY;
         };
         self.records.appendAssumeCapacity(.{ .reads = 1, .key = stored });
         self.slots[index] = slotTag(tag) << SLOT_INDEX_BITS | @as(u32, @intCast(self.records.items.len));
@@ -2031,7 +2123,7 @@ const SequenceCounts = struct {
         self.source_list = contaminants;
         for (self.overrepresentedRows()[0..self.source_count], storage[0..self.source_count]) |index, *hit| {
             var buffer: [KEY_LENGTH]u8 = undefined;
-            hit.* = contaminants.bestHit(decodeKey(self.keyWords(self.records.items[index].key).*, &buffer));
+            hit.* = contaminants.bestHit(self.keyText(self.records.items[index].key, &buffer));
         }
     }
 
@@ -2046,7 +2138,7 @@ const SequenceCounts = struct {
         for (self.overrepresentedRows(), 0..) |index, rank| {
             const record = self.records.items[index];
             var buffer: [KEY_LENGTH]u8 = undefined;
-            const key = decodeKey(self.keyWords(record.key).*, &buffer);
+            const key = self.keyText(record.key, &buffer);
             try json.beginObject();
             try json.objectField("sequence");
             try json.write(key);
@@ -2083,7 +2175,7 @@ const SequenceCounts = struct {
         for (found, 0..) |index, rank| {
             const record = self.records.items[index];
             var buffer: [KEY_LENGTH]u8 = undefined;
-            const key = decodeKey(self.keyWords(record.key).*, &buffer);
+            const key = self.keyText(record.key, &buffer);
             try out.print("{s}\t{d}", .{ key, record.reads });
             try writeCell(out, @round(self.percentage(record.reads) * 100) / 100);
             if (self.sourceHit(rank, key, contaminants)) |hit| {
@@ -3196,7 +3288,7 @@ fn countsOf(allocator: std.mem.Allocator, reads: []const []const u8) !SequenceCo
     errdefer counts.deinit(allocator);
     for (reads) |read| {
         try counts.reserve(allocator);
-        _ = try counts.add(.of(read), null);
+        _ = try counts.add(&.of(read), null);
     }
     counts.finish();
     return counts;
@@ -3308,11 +3400,95 @@ test "[edge] - [qc]: keys with a code after a zero code are found again after th
             const key: SequenceKey = .of(&sequence);
             try std.testing.expectEqual(key.words, SequenceKey.unpack(key.pack()).words);
             try counts.reserve(allocator);
-            _ = try counts.add(key, null);
+            _ = try counts.add(&key, null);
         }
     }
     try std.testing.expectEqual(@as(usize, 3000), counts.records.items.len);
     for (counts.records.items) |record| try std.testing.expectEqual(@as(u32, 2), record.reads);
+}
+
+test "[edge] - [qc]: stored keys match only the whole key, narrow or wide, own or shared" {
+    const allocator = std.testing.allocator;
+    const a50 = "A" ** 50;
+    const sequences = [_][]const u8{
+        "",                a50[0..1],         a50[0..2],          a50[0..32],        a50[0..33],
+        a50[0..32] ++ "C", a50,               a50[0..49] ++ "C",  "N",               "AN",
+        a50[0..32] ++ "N", a50[0..49] ++ "N", a50[0..48] ++ "NA", a50[0..39] ++ "N", a50[0..40] ++ "N",
+    };
+    var raw: SequenceCounts = .{};
+    defer raw.deinit(allocator);
+    var retained: SequenceCounts = .{ .base = &raw };
+    defer retained.deinit(allocator);
+    for (sequences) |sequence| {
+        const key: SequenceKey = .of(sequence);
+        try raw.reserve(allocator);
+        const raw_key = try raw.add(&key, null);
+        try retained.reserve(allocator);
+        _ = try retained.add(&key, raw_key);
+    }
+    try std.testing.expectEqual(sequences.len, raw.records.items.len);
+    try std.testing.expectEqual(sequences.len, retained.records.items.len);
+    for (raw.records.items, retained.records.items, 0..) |raw_record, retained_record, stored| {
+        try std.testing.expect(retained_record.key & SequenceCounts.BASE_KEY != 0);
+        for (sequences, 0..) |sequence, wanted| {
+            errdefer std.debug.print("stored {d}, wanted {d}\n", .{ stored, wanted });
+            var form: KeyForm = undefined;
+            form.fill(&SequenceKey.of(sequence));
+            try std.testing.expectEqual(stored == wanted, raw.keyMatches(raw_record.key, &form));
+            try std.testing.expectEqual(stored == wanted, retained.keyMatches(retained_record.key, &form));
+        }
+    }
+}
+
+test "[property] - [qc]: narrow sequence keys decode and count as the wide keys do" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x2b17_ac67);
+    const random = prng.random();
+    const alphabets = [_][]const u8{ "ACGT", "acgtACGT", "ACGTN", "ACGTRYK", "ACG@T" };
+    var counts: SequenceCounts = .{};
+    defer counts.deinit(allocator);
+    var reference = std.AutoHashMap([KEY_WORDS]u64, u32).init(allocator);
+    defer reference.deinit();
+    var sequence: [70]u8 = undefined;
+    var narrow_distinct: usize = 0;
+    for (0..4000) |step| {
+        const alphabet = alphabets[step % alphabets.len];
+        const len = random.uintLessThan(usize, sequence.len + 1);
+        for (sequence[0..len]) |*base| base.* = alphabet[random.uintLessThan(usize, if (step % 3 == 0) 2 else alphabet.len)];
+        const key: SequenceKey = .of(sequence[0..len]);
+        errdefer std.debug.print("sequence {s}\n", .{sequence[0..len]});
+        var wide_buffer: [KEY_LENGTH]u8 = undefined;
+        const wide_text = decodeKey(key.pack(), &wide_buffer);
+        var codes: usize = 0;
+        for (sequence[0..@min(len, KEY_LENGTH)]) |base| codes += @intFromBool(base & CODE_MASK != 0);
+        const expect_narrow = wide_text.len == codes and std.mem.indexOfNone(u8, wide_text, "ACGT") == null;
+        try std.testing.expectEqual(expect_narrow, key.narrow() != null);
+        if (key.narrow()) |narrow| {
+            var narrow_buffer: [KEY_LENGTH]u8 = undefined;
+            try std.testing.expectEqualStrings(wide_text, decodeNarrow(narrow, &narrow_buffer));
+        }
+        try counts.reserve(allocator);
+        _ = try counts.add(&key, null);
+        const entry = try reference.getOrPut(key.words);
+        if (!entry.found_existing and expect_narrow) narrow_distinct += 1;
+        entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+    }
+    try std.testing.expectEqual(@as(usize, reference.count()), counts.records.items.len);
+    try std.testing.expect(narrow_distinct != 0 and narrow_distinct != reference.count());
+    var wide_count: usize = 0;
+    for (counts.records.items) |record| wide_count += @intFromBool(record.key & SequenceCounts.WIDE_KEY != 0);
+    try std.testing.expectEqual(reference.count() - narrow_distinct, wide_count);
+    try std.testing.expectEqual(narrow_distinct * NARROW_WORDS + wide_count * PACKED_WORDS, counts.key_words.items.len);
+    var expected: std.ArrayList(u32) = .empty;
+    defer expected.deinit(allocator);
+    var values = reference.valueIterator();
+    while (values.next()) |value| try expected.append(allocator, value.*);
+    var actual: std.ArrayList(u32) = .empty;
+    defer actual.deinit(allocator);
+    for (counts.records.items) |record| try actual.append(allocator, record.reads);
+    std.sort.pdq(u32, expected.items, {}, std.sort.asc(u32));
+    std.sort.pdq(u32, actual.items, {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, expected.items, actual.items);
 }
 
 test "[edge] - [qc]: past 100,000 keys new reads count only in the total and the levels are corrected" {
@@ -3323,17 +3499,17 @@ test "[edge] - [qc]: past 100,000 keys new reads count only in the total and the
     var buffer: [KEY_LENGTH]u8 = undefined;
     for (0..KEY_LIMIT) |index| {
         try counts.reserve(std.testing.allocator);
-        _ = try counts.add(.of(indexedKey(&buffer, index)), null);
+        _ = try counts.add(&.of(indexedKey(&buffer, index)), null);
     }
     try std.testing.expect(counts.limited());
     try std.testing.expectEqual(@as(u64, KEY_LIMIT), counts.reads_at_limit);
     try counts.reserve(std.testing.allocator);
-    _ = try counts.add(.of(indexedKey(&buffer, KEY_LIMIT)), null);
+    _ = try counts.add(&.of(indexedKey(&buffer, KEY_LIMIT)), null);
     try std.testing.expectEqual(@as(usize, KEY_LIMIT), counts.records.items.len);
     try std.testing.expectEqual(@as(u64, KEY_LIMIT + 1), counts.reads);
     for (0..KEY_LIMIT / 2) |index| {
         try counts.reserve(std.testing.allocator);
-        _ = try counts.add(.of(indexedKey(&buffer, index)), null);
+        _ = try counts.add(&.of(indexedKey(&buffer, index)), null);
     }
     try std.testing.expectEqual(@as(u64, KEY_LIMIT), counts.reads_at_limit);
     try std.testing.expectEqual(@as(usize, KEY_LIMIT), counts.records.capacity);
@@ -3343,11 +3519,11 @@ test "[edge] - [qc]: past 100,000 keys new reads count only in the total and the
     defer probe.deinit(std.testing.allocator);
     for (0..KEY_LIMIT) |index| {
         try probe.reserve(std.testing.allocator);
-        _ = try probe.add(.of(indexedKey(&buffer, index)), null);
+        _ = try probe.add(&.of(indexedKey(&buffer, index)), null);
     }
     for (0..KEY_LIMIT / 2) |index| {
         try probe.reserve(std.testing.allocator);
-        _ = try probe.add(.of(indexedKey(&buffer, index)), null);
+        _ = try probe.add(&.of(indexedKey(&buffer, index)), null);
     }
     probe.finish();
     const report = try sequenceReportOf(arena.allocator(), &probe, null);
