@@ -486,7 +486,7 @@ then fail 'checker continued after a failed command'; fi
     zig() {
         [[ "$PWD" == "$REPO" ]] || return 9
         printf '%s\n' "$*" >>"$work/build.log"
-        [[ "$*" == 'build -Dstatic=true -Doptimize=ReleaseFast' ]] || return 8
+        [[ "$*" == 'build -Dstatic=true -Doptimize=ReleaseFast -Dcpu=x86_64_v3' ]] || return 8
         ((compiler_exit == 0)) || return "$compiler_exit"
         printf 'ReleaseFast\n' >"$ZFASTQ"
     }

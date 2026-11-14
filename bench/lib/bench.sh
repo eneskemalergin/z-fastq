@@ -663,8 +663,8 @@ build_subject() {
     [[ "$ZFASTQ" == "$ZFASTQ_DEFAULT" ]] || return 0
     # A newer binary may be Debug or ReleaseSafe. Let Zig check the requested
     # build options and reuse its own cache instead of inferring them from mtime.
-    log build RUN "z-fastq (static ReleaseFast)"
-    (cd "$REPO" && zig build -Dstatic=true -Doptimize=ReleaseFast)
+    log build RUN "z-fastq (static ReleaseFast, x86-64-v3)"
+    (cd "$REPO" && zig build -Dstatic=true -Doptimize=ReleaseFast -Dcpu=x86_64_v3)
 }
 
 # --- checks -----------------------------------------------------------------
@@ -1728,7 +1728,7 @@ build_rev() { # rev -> binary path
     if [[ ! -x "$bin" ]]; then
         if [[ ! -d "$wt" ]]; then git -C "$REPO" worktree add --detach "$wt" "$sha" >&2; else git -C "$wt" checkout -q --detach "$sha"; fi
         log build RUN "z-fastq at ${sha:0:9}"
-        (cd "$wt" && bench_scope 400% 4G zig build -Dstatic=true -Doptimize=ReleaseFast -j4) >&2
+        (cd "$wt" && bench_scope 400% 4G zig build -Dstatic=true -Doptimize=ReleaseFast -Dcpu=x86_64_v3 -j4) >&2
         mkdir -p -- "$(dirname -- "$bin")"
         install -m 755 "$wt/zig-out/bin/z-fastq" "$bin"
     fi

@@ -87,7 +87,7 @@ fastp and FastQC-Rust can use many threads, and with enough of them they match z
 
 ## A few honest tradeoffs
 
-z-fastq is built and tested on Linux and macOS, each on x86-64 and aarch64; a native Windows build is not there yet, so on Windows, WSL is the way to try it. The benchmarks run on Linux x86-64, with z-fastq built for generic x86-64 and its AVX2 code picked at run time; on aarch64, z-fastq runs its 16-lane vector code as NEON, and its speed there and on macOS is not in the published benchmarks yet.
+z-fastq is built and tested on Linux and macOS, each on x86-64 and aarch64; a native Windows build is not there yet, so on Windows, WSL is the way to try it. The benchmarks run on Linux x86-64, with z-fastq built as its release binary is, for x86-64-v3; on aarch64, z-fastq runs its 16-lane vector code as NEON, and its speed there and on macOS is not in the published benchmarks yet.
 
 One core is a choice, not a limit I am waiting to lift. It keeps every run's cost known before it starts, so a pipeline can run one sample per core side by side. The price is one large file on an otherwise idle machine: a tool that spreads it over many cores can finish sooner, and z-fastq does not split a file across cores yet.
 
