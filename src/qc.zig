@@ -9,9 +9,9 @@ const fastq = @import("fastq.zig");
 const simd = @import("simd.zig");
 const statistics = @import("stats.zig");
 
-pub const MAX_CYCLES = 1024;
-pub const TERMINAL_RUN_MIN = 10;
-pub const TOO_LONG = "a read is longer than 1024 bases";
+const MAX_CYCLES = 1024;
+const TERMINAL_RUN_MIN = 10;
+const TOO_LONG = "a read is longer than 1024 bases";
 
 const PHRED_OFFSET = fastq.PHRED_OFFSET;
 const QUALITY_BINS = fastq.PHRED_MAX_SCORE + 1;
@@ -487,7 +487,7 @@ pub const MateQc = struct {
         var quality_sum: u64 = 0;
         const gc_count = try self.addCycles(allocator, sequence, quality, gc_length, &quality_sum);
         var facts: ReadFacts = .{ .quality_sum = quality_sum, .gc_count = gc_count };
-        if (self.detailed and !self.too_long) {
+        if (self.detailed) {
             facts.adapter_starts = firstAdapterMatches(sequence);
             for (facts.adapter_starts, 0..) |start, adapter| {
                 if (start != NO_MATCH) self.adapter_starts.items[start][adapter] += 1;
@@ -2282,7 +2282,7 @@ pub const ContaminantList = struct {
     arena: std.heap.ArenaAllocator,
     items: []const Contaminant,
 
-    pub const ParseError = error{ OutOfMemory, InvalidBase };
+    const ParseError = error{ OutOfMemory, InvalidBase };
 
     pub fn parse(allocator: std.mem.Allocator, text: []const u8, failed_line: *usize) ParseError!ContaminantList {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -2344,7 +2344,7 @@ pub const ContaminantList = struct {
         self.arena.deinit();
     }
 
-    pub fn bestHit(self: *const ContaminantList, key: []const u8) ?Hit {
+    fn bestHit(self: *const ContaminantList, key: []const u8) ?Hit {
         var best: ?Hit = null;
         for (self.items) |contaminant| {
             const hit = contaminant.match(key) orelse continue;

@@ -809,22 +809,30 @@ pub const Mt19937_64 = struct {
     }
 };
 
-fn expectFirstAllocationFails(comptime exercise: anytype) !void {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, exercise(failing.allocator()));
+fn expectEachAllocationFails(comptime exercise: anytype) !void {
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        exercise(failing.allocator()) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        try std.testing.expect(fail_index > 0);
+        return;
+    }
 }
 
 test "[failure] - [exact selector]: record numbers above 32 bits are returned exactly" {
     try exerciseWideExactIndexes(std.testing.allocator);
-    try expectFirstAllocationFails(exerciseWideExactIndexes);
+    try expectEachAllocationFails(exerciseWideExactIndexes);
 }
 
 test "[failure] - [exact selector]: indexes sort by their high bits" {
     try exerciseUpperBitIndexSort(std.testing.allocator);
-    try expectFirstAllocationFails(exerciseUpperBitIndexSort);
+    try expectEachAllocationFails(exerciseUpperBitIndexSort);
 }
 
 test "[failure] - [exact selector]: batched records match direct records across the upper-bit boundary" {
     try exerciseBatchedUpperBoundary(std.testing.allocator);
-    try expectFirstAllocationFails(exerciseBatchedUpperBoundary);
+    try expectEachAllocationFails(exerciseBatchedUpperBoundary);
 }

@@ -44,19 +44,19 @@ const COMPLEMENT: [256]u8 = table: {
     break :table table;
 };
 
-pub const Tail = struct {
+const Tail = struct {
     window: u16,
     quality: u8,
 };
 
-pub const LowQuality = struct {
+const LowQuality = struct {
     quality: u8,
     percent: u8,
 };
 
 pub const UmiMates = enum { @"1", @"2", both };
 
-pub const Umi = struct {
+const Umi = struct {
     length: u8,
     skip: u8 = 0,
     mates: UmiMates,
@@ -83,11 +83,11 @@ pub const Options = struct {
     max_n: ?u8 = null,
     low_quality: ?LowQuality = null,
 
-    pub fn trims(self: Options) bool {
+    fn trims(self: Options) bool {
         return self.adapters != null or self.poly_g != null or self.tail != null;
     }
 
-    pub fn filters(self: Options) bool {
+    fn filters(self: Options) bool {
         return self.min_length != null or self.max_n != null or self.low_quality != null;
     }
 
@@ -647,7 +647,7 @@ pub const Reason = enum { too_many_n, too_short, low_quality, adapter_dimer };
 
 pub const REASON_COUNT = @typeInfo(Reason).@"enum".fields.len;
 
-pub const Decision = struct {
+const Decision = struct {
     reads: [2]?Reason,
     pair: ?Reason,
 };
@@ -748,14 +748,14 @@ fn readReason(options: Options, sequence: []const u8, quality: []const u8) ?Reas
 
 pub const Step = enum { quality_tail, poly_g, overlap, adapter };
 
-pub const STEP_COUNT = @typeInfo(Step).@"enum".fields.len;
+const STEP_COUNT = @typeInfo(Step).@"enum".fields.len;
 
-pub const Overlap = struct {
+const Overlap = struct {
     offset: isize,
     length: usize,
 };
 
-pub const Result = struct {
+const Result = struct {
     kept: [2]usize,
     removed: [2][STEP_COUNT]usize = @splat(@splat(0)),
     overlap: ?Overlap = null,
@@ -770,7 +770,7 @@ pub const Result = struct {
     }
 };
 
-pub const StepCounts = struct {
+const StepCounts = struct {
     reads: u64 = 0,
     bases: u64 = 0,
 };

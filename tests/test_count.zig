@@ -9,10 +9,8 @@ const runCli = cli.run;
 const runCliWithStdin = cli.runWithStdin;
 const runCliWithClosedStdout = cli.runWithClosedStdout;
 const runCliWithClosedStdin = cli.runWithClosedStdin;
-const GzipOptions = cli.GzipOptions;
 const appendGzipMember = cli.appendGzipMember;
 const fixturePath = cli.fixturePath;
-const FIXTURE_DIR = cli.FIXTURE_DIR;
 const OUTPUT_FAILURE = "error: standard output: I/O error\n";
 const GZIP_OPTIONAL_FIELD_LIMIT = 64 * 1024;
 const EXPECTED_USAGE =
@@ -1129,7 +1127,7 @@ test "[cli] - [diagnostics]: untrusted command, option, and path bytes use escap
     );
 }
 
-test "[edge] - [count]: a line one byte past the read buffer is accepted at the limit" {
+test "[edge] - [count]: a line one byte past the read buffer is accepted, and refused by a limit one byte shorter" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

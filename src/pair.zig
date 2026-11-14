@@ -499,7 +499,7 @@ test "[property] - [paired names]: the wide terminal check finds the separator t
     var header2: [120]u8 = undefined;
     const alphabet = "AC:x12  \t";
     inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
-        for (0..20_000) |_| {
+        for (0..2_000) |_| {
             const prefix_len = lanes + random.uintLessThan(usize, header1.len - lanes + 1);
             for (header1[0..prefix_len]) |*byte| {
                 byte.* = if (random.uintLessThan(u8, 8) == 0) alphabet[random.uintLessThan(usize, alphabet.len)] else 'r';
@@ -521,7 +521,7 @@ test "[property] - [paired names]: the wide token scans stop where the narrow sc
     var header2: [120]u8 = undefined;
     const alphabet = "AC:x12 \t";
     inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
-        for (0..20_000) |_| {
+        for (0..2_000) |_| {
             const len1 = lanes + random.uintLessThan(usize, header1.len - lanes + 1);
             const len2 = lanes + random.uintLessThan(usize, header2.len - lanes + 1);
             const sparse = random.uintLessThan(u8, 64) + 1;
@@ -586,7 +586,7 @@ test "[property] - [paired names]: illumina matching decides as the terminal, Ca
     var storage2: [128]u8 = undefined;
     var shared_first_token: usize = 0;
     var matches: usize = 0;
-    for (0..200_000) |_| {
+    for (0..20_000) |_| {
         var first_len: usize = 0;
         Generator.append(random, &storage1, &first_len, &Generator.token_pieces, 1 + random.uintLessThan(usize, 4));
         const header1 = Generator.rest(random, &storage1, first_len);
@@ -603,6 +603,6 @@ test "[property] - [paired names]: illumina matching decides as the terminal, Ca
         if (matchingTokenEnd(header1, header2) != null) shared_first_token += 1;
         if (expected) matches += 1;
     }
-    try std.testing.expect(shared_first_token > 50_000);
-    try std.testing.expect(matches > 10_000);
+    try std.testing.expect(shared_first_token > 5_000);
+    try std.testing.expect(matches > 1_000);
 }

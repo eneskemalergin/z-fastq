@@ -392,10 +392,6 @@ pub fn collectNewlines(comptime lanes: usize, bytes: []const u8, base: usize, en
     return n;
 }
 
-pub fn findNewlinesFor(comptime lanes: usize, bytes: []const u8, ends: *[4]usize) bool {
-    return collectNewlines(lanes, bytes, 0, ends, 0) == ends.len;
-}
-
 pub fn containsNewlineFor(comptime lanes: usize, first: [*]const u8, second: ?[*]const u8, len: usize) bool {
     var pos: usize = 0;
     while (len - pos >= BLOCK_BYTES) : (pos += BLOCK_BYTES) {
@@ -429,7 +425,7 @@ fn expectNewlineSearch(bytes: []const u8, second: []const u8) !void {
     var ends: [4]usize = undefined;
     inline for (.{ BASELINE_LANES, tierWidth(.avx2), tierWidth(.avx512) }) |lanes| {
         try std.testing.expectEqual(want_first, findNewlineFor(lanes, bytes));
-        try std.testing.expectEqual(want_count == 4, findNewlinesFor(lanes, bytes, &ends));
+        try std.testing.expectEqual(want_count == 4, collectNewlines(lanes, bytes, 0, &ends, 0) == ends.len);
         if (want_count == 4) try std.testing.expectEqualSlices(usize, &want_ends, &ends);
         try std.testing.expectEqual(want_first != null, containsNewlineFor(lanes, bytes.ptr, null, bytes.len));
         try std.testing.expectEqual(want_any, containsNewlineFor(lanes, bytes.ptr, second.ptr, bytes.len));

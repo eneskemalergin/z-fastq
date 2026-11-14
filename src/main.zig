@@ -1546,7 +1546,7 @@ fn writeCheckedRecord(
 }
 
 fn writeTaggedRecord(writer: *zfastq.Writer, record: zfastq.Record, tag: []const u8) error{WriteFailed}!void {
-    try fastq.writeRecordWithNameTag(writer, record, pairing.idEnd(record.header), tag);
+    try fastq.writeRecordWithNameTagUnchecked(writer, record, pairing.idEnd(record.header), tag);
 }
 
 fn spanIsWritable(span: fastq.RecordSpan) bool {
@@ -1554,8 +1554,7 @@ fn spanIsWritable(span: fastq.RecordSpan) bool {
 }
 
 fn writeRecordSpan(writer: *zfastq.Writer, span: fastq.RecordSpan) error{WriteFailed}!void {
-    if (span.canonical) return fastq.writeCanonicalRecordSpan(writer, span.bytes);
-    return fastq.writeRecordUnchecked(writer, span.record());
+    return writeCheckedRecord(writer, span.record(), if (span.canonical) span.bytes else null);
 }
 
 fn spanPairMismatch(
@@ -3922,7 +3921,11 @@ const RecordOutput = struct {
         const file = self.file.?;
         self.sink = io_layer.FileSink.init(io, file, &self.write_buffer);
         if (self.gzip) |gzip| {
-            gzip.init(&self.sink.writer, self.gzip_preset) catch return IO_FAILURE;
+            gzip.init(&self.sink.writer, self.gzip_preset) catch {
+                self.close(io);
+                std.Io.Dir.cwd().deleteFile(io, self.path) catch {};
+                return IO_FAILURE;
+            };
             self.writer = zfastq.Writer.init(gzip.byteSink());
         } else {
             self.writer = zfastq.Writer.init(self.sink.byteSink());

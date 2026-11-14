@@ -8,9 +8,9 @@ pub const JSON_OUTPUT_BUFFER_BYTES = 16 * 1024;
 pub const FIXTURE_DIR = "tests/data/synthetic";
 
 pub const EXPECTED_VERSION = @import("test_options").package_version;
-pub const ZFASTQ_BIN = "zig-out/bin/z-fastq";
-pub const CLI_EXEC: []const []const u8 = @import("test_options").cli_exec;
-pub const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
+const ZFASTQ_BIN = "zig-out/bin/z-fastq";
+const CLI_EXEC: []const []const u8 = @import("test_options").cli_exec;
+const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
 pub const PROCESS_TIMEOUT = std.Io.Duration.fromSeconds(30);
 
 pub const CommandResult = struct {
@@ -41,7 +41,7 @@ pub fn expectFailedPrefix(
     try std.testing.expectEqualStrings(stderr, result.stderr);
 }
 
-pub fn expectPrefix(valid: []const u8, actual: []const u8) !void {
+fn expectPrefix(valid: []const u8, actual: []const u8) !void {
     try std.testing.expect(actual.len <= valid.len);
     try std.testing.expectEqualSlices(u8, valid[0..actual.len], actual);
 }
@@ -104,7 +104,7 @@ pub const ProcessDeadline = struct {
             self.deadline.raw.nanoseconds;
     }
 
-    pub fn waitForExit(self: *ProcessDeadline) !u8 {
+    fn waitForExit(self: *ProcessDeadline) !u8 {
         const timeout_ms = self.remainingMilliseconds() orelse return error.Timeout;
         if (!try self.exit_watch.wait(timeout_ms)) return error.Timeout;
 
@@ -246,7 +246,7 @@ pub fn expectJsonObjectKeys(
     }
 }
 
-pub fn expectJsonDocument(
+fn expectJsonDocument(
     value: *const std.json.Value,
     schema: []const u8,
 ) ![]const std.json.Value {
@@ -324,7 +324,7 @@ fn expectJsonError(
     return error_object;
 }
 
-pub fn expectJsonErrorLocation(
+fn expectJsonErrorLocation(
     object: std.json.ObjectMap,
     record_index: u64,
     byte_offset: u64,

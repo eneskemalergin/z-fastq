@@ -118,7 +118,8 @@ pub const Scanner = struct {
                 self.machine.expected == .header and
                 self.line.raw_len == 0)
             {
-                const progress = try self.feedFast(data[pos..]);
+                var progress: FastProgress = .{};
+                const fast_result = self.feedFast(data[pos..], &progress);
                 if (progress.bytes > 0) {
                     const next_offset = try fastq.progressAfter(self.byte_offset, progress.bytes);
                     const next_record_index = try fastq.progressAfter(
@@ -129,12 +130,13 @@ pub const Scanner = struct {
                     self.line_start_offset = next_offset;
                     self.record_index = next_record_index;
                     pos += progress.bytes;
-                    continue;
                 }
+                try fast_result;
+                if (progress.bytes > 0) continue;
             }
 
             const advanced = try self.feedSlow(data[pos..]);
-            if (advanced == 0) break;
+            std.debug.assert(advanced != 0);
             pos += advanced;
         }
         return pos;
@@ -152,9 +154,10 @@ pub const Scanner = struct {
         return error.S004TruncatedRecord;
     }
 
-    fn feedFast(self: *Scanner, data: []const u8) fastq.ReaderError!FastProgress {
+    fn feedFast(self: *Scanner, data: []const u8, progress: *FastProgress) fastq.ReaderError!void {
         var cursor: usize = 0;
         var records: usize = 0;
+        defer progress.* = .{ .bytes = cursor, .records = records };
 
         while (cursor < data.len) {
             var remaining = data[cursor..];
@@ -173,11 +176,10 @@ pub const Scanner = struct {
             }
 
             const consumed = try self.tryFastRecord(remaining);
-            if (consumed == 0) return .{ .bytes = cursor, .records = records };
+            if (consumed == 0) return;
             records = std.math.add(usize, records, 1) catch return error.ArithmeticLimit;
             cursor += consumed;
         }
-        return .{ .bytes = cursor, .records = records };
     }
 
     fn tryStrideBlock(self: *Scanner, data: []const u8, layout: DenseLayout) StrideRun {
@@ -566,7 +568,8 @@ test "[property] - [derived record]: normalized records enable fast parsing with
         _ = try scanner.feed(data);
         try std.testing.expect(scanner.fast_path_enabled);
         try std.testing.expect(scanner.layout == null);
-        const progress = try scanner.feedFast(data);
+        var progress: FastProgress = .{};
+        try scanner.feedFast(data, &progress);
         try std.testing.expectEqual(data.len, progress.bytes);
         try std.testing.expectEqual(@as(usize, 1), progress.records);
         try std.testing.expect(scanner.layout == null);
@@ -646,7 +649,8 @@ test "[property] - [dense exit]: short tails preserve prediction and changed rec
         _ = try scanner.feed(record ** 2);
         const old_layout = scanner.layout.?;
 
-        const progress = try scanner.feedFast(data[record.len * 2 .. record.len * 3 + tail_len]);
+        var progress: FastProgress = .{};
+        try scanner.feedFast(data[record.len * 2 .. record.len * 3 + tail_len], &progress);
         const complete_tail = tail_len == longer.len;
         try std.testing.expectEqual(record.len + (if (complete_tail) longer.len else @as(usize, 0)), progress.bytes);
         try std.testing.expectEqual(@as(usize, if (complete_tail) 2 else 1), progress.records);
@@ -687,8 +691,8 @@ test "[failure] - [count scanner]: arithmetic and line-limit errors keep the las
     var limited = Scanner.init(.{ .max_line_bytes = 4 });
     _ = try limited.feed(record ** 2);
     try std.testing.expectError(error.LineTooLong, limited.feed(record ++ changed));
-    try std.testing.expectEqual(@as(u64, 2), limited.record_index);
-    try std.testing.expectEqual(@as(u64, record.len * 2), limited.byte_offset);
+    try std.testing.expectEqual(@as(u64, 3), limited.record_index);
+    try std.testing.expectEqual(@as(u64, record.len * 3), limited.byte_offset);
 }
 
 test "[edge] - [count scanner]: byte-offset and record-count limits reject the record on both paths" {

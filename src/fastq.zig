@@ -2480,7 +2480,7 @@ pub fn writeRecordUnchecked(writer: *Writer, record: Record) WriteError!void {
     try writer.sink.writeVec(&fields);
 }
 
-pub fn writeRecordWithNameTag(writer: *Writer, record: Record, at: usize, tag: []const u8) WriteError!void {
+pub fn writeRecordWithNameTagUnchecked(writer: *Writer, record: Record, at: usize, tag: []const u8) WriteError!void {
     const head = record.header[0..at];
     const rest = record.header[at..];
     if (record.plus.len == 0) {
@@ -4939,9 +4939,7 @@ test "[integration] - [record delivery]: retained fallback storage survives a re
             const validated2 = buffered2 orelse (try nextFallbackValidatedRecord(&reader, &validator)).?;
             const record2 = validated2.record;
             try std.testing.expect(validated2.semantic_error == null);
-            if (mate2_len == 2) {
-                try std.testing.expectEqual(allocations_before_refill + 4, tracking.allocations);
-            }
+            try std.testing.expectEqual(allocations_before_refill + 4, tracking.allocations);
             try std.testing.expectEqualStrings("pair/1", record1.header);
             try std.testing.expect(std.mem.allEqual(u8, record1.sequence, 'A'));
             try std.testing.expect(std.mem.allEqual(u8, record1.quality, '!'));
