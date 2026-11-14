@@ -1,6 +1,7 @@
-//! Build graph for z-fastq. Every step compiles with LLVM, Debug included: with Zig 0.16's
-//! self-hosted x86-64 backend, a Debug build whose target has PCLMUL compiles Zipir's PCLMUL
-//! CRC32 kernel inline, and the result corrupts later state in tests.
+//! Build graph for z-fastq: the CLI, the library module, the kernel objects, and the test suites.
+//!
+//! Every step compiles with LLVM, Debug included: Zig 0.16's own x86-64 code generator fails the
+//! Debug tests when Zipir's PCLMUL CRC-32 kernel is part of the build.
 
 const std = @import("std");
 
@@ -73,6 +74,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "avx2_object", link_avx2_object);
     build_options.addOption(bool, "avx512_object", link_avx512_object);
     build_options.addOption(bool, "simd_object", false);
+    build_options.addOption(bool, "entry_object", false);
+    build_options.addOption(bool, "require_x86_64_v4", false);
     const kernel_objects = [_]?*std.Build.Step.Compile{
         if (link_avx2_object) kernelObject(b, target, optimize, strip, "simd_avx2", .baseline, &.{.avx2}, &.{}) else null,
         if (link_avx512_object) kernelObject(b, target, optimize, strip, "simd_avx512", .{ .explicit = &std.Target.x86.cpu.x86_64_v4 }, &.{}, &.{.prefer_256_bit}) else null,
@@ -203,9 +206,10 @@ fn x86_64Entry(
     entry_options.addOption(bool, "simd_object", false);
     entry_options.addOption(bool, "avx2_object", false);
     entry_options.addOption(bool, "avx512_object", false);
+    entry_options.addOption(bool, "entry_object", true);
     entry_options.addOption(bool, "require_x86_64_v4", require_x86_64_v4);
     const module = b.createModule(.{
-        .root_source_file = b.path("src/x86_64_entry.zig"),
+        .root_source_file = b.path("src/simd.zig"),
         .target = b.resolveTargetQuery(query),
         .optimize = optimize,
         .single_threaded = true,
@@ -235,6 +239,8 @@ fn kernelObject(
     object_options.addOption(bool, "simd_object", true);
     object_options.addOption(bool, "avx2_object", false);
     object_options.addOption(bool, "avx512_object", false);
+    object_options.addOption(bool, "entry_object", false);
+    object_options.addOption(bool, "require_x86_64_v4", false);
     const module = b.createModule(.{
         .root_source_file = b.path("src/simd.zig"),
         .target = b.resolveTargetQuery(query),

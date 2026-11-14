@@ -1,4 +1,4 @@
-//! Installed `z-fastq check` validation, diagnostics, input forms, and exit status.
+//! Installed z-fastq check: validation, diagnostics, input forms, and exit status.
 
 const std = @import("std");
 const cli = @import("utilities.zig");

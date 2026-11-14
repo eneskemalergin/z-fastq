@@ -1,6 +1,6 @@
 //! Single-pass plain FASTQ record counting.
 //!
-//! Zero heap allocations with incremental byte-slice input.
+//! Takes its input as byte slices in increments and allocates nothing.
 
 const std = @import("std");
 const fastq = @import("fastq.zig");

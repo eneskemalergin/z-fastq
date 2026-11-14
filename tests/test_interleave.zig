@@ -1,4 +1,4 @@
-//! Installed `z-fastq interleave` behavior: pairing, output, validation, and exit status.
+//! Installed z-fastq interleave: pairing, output, validation, and exit status.
 
 const std = @import("std");
 const builtin = @import("builtin");

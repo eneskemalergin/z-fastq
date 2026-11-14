@@ -1,4 +1,4 @@
-//! CLI-private paired-read name parsing and matching.
+//! Paired-read name parsing and matching for the CLI.
 
 const std = @import("std");
 const simd = @import("simd.zig");
@@ -104,9 +104,6 @@ fn isTokenStop(byte: u8) bool {
     return byte == ' ' or byte == '\t';
 }
 
-/// The first offset below `common_len` where the headers differ or the first
-/// holds a space or a tab (so wherever either holds one), scanned in blocks of
-/// `lanes` with the last block overlapping the one before it.
 fn wideTokenEvent(comptime lanes: comptime_int, header1: []const u8, header2: []const u8, common_len: usize) ?usize {
     const Vector = @Vector(lanes, u8);
     const Mask = @Int(.unsigned, lanes);
@@ -151,8 +148,6 @@ fn tokenEnd(header: []const u8, start: usize) usize {
     return narrowTokenEnd(header, start);
 }
 
-/// The first space or tab at or after `start`, or the header's end, scanned in
-/// blocks of `lanes` with the last block overlapping the one before it.
 fn wideTokenEnd(comptime lanes: comptime_int, header: []const u8, start: usize) usize {
     const Vector = @Vector(lanes, u8);
     const Mask = @Int(.unsigned, lanes);

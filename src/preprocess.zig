@@ -1,24 +1,7 @@
-//! Paired read trimming and pair retention with fastp 1.1.0's rules. First, as fastp's per-read
-//! UMI location does, a fixed-length UMI and spacer are cut from the 5' end of the selected mates,
-//! and the UMI bases, joined with an underscore, name the pair. Then come the 3' quality window,
-//! poly-G tails, adapters found by mate overlap or by adapter sequence, and the empty-read,
-//! adapter-dimer, quality, N, and length checks. Every trim keeps a prefix of the read, so a
-//! result is one kept length per mate; sequence and quality are cut together by the caller.
-//! The overlap and adapter searches score a block of consecutive offsets per pass over the
-//! pattern, reading the read through a fixed stack window padded with zero bytes, which no read
-//! or adapter base equals. The block kernel, the reverse complement, and the low-quality and N
-//! count use the inline vector width only, with no AVX2 object for builds whose target lacks
-//! AVX2: each costs a small share of a trimmed or filtered run at every read length. Insert sizes
-//! follow fastp's overlap rule. Adapter cuts also count as fastp counts them: an overlap trim
-//! counts both mates and the bases each lost, a sequence match counts its mate and the bases
-//! removed, or the matched adapter length when the match starts before the read. The pair
-//! duplication estimate is fastp's: the bases of mate 1, then
-//! mate 2, hash to one position in each of two 2^32-bit arrays, and a pair whose two positions are
-//! both set already counts as a duplicate, hash collisions included. Only the set positions are
-//! kept, per 65,536-bit block as a sorted list of offsets, from 256 of them as a dense form (a
-//! count per high byte and the low bytes in order), and from 7,936, or 255 under one high byte,
-//! as a bitmap, so memory follows the pairs read instead of fastp's fixed 1 GiB. The pair sum has
-//! an AVX2 kernel.
+//! Paired read trimming, filtering, insert sizes, and pair duplication, by fastp 1.1.0's rules.
+//!
+//! After any UMI cut, every trim keeps a prefix of the read, so a result is one kept length per
+//! mate; the caller cuts sequence and quality together.
 
 const std = @import("std");
 const builtin = @import("builtin");

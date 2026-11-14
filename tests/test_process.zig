@@ -1,4 +1,4 @@
-//! Installed `z-fastq process` behavior: paired validation, two outputs, the report, and exit status.
+//! Installed z-fastq process: paired validation, two outputs, the report, and exit status.
 
 const std = @import("std");
 const cli = @import("utilities.zig");

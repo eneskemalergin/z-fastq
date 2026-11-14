@@ -1,24 +1,8 @@
-//! Per-mate FASTQ quality distributions for `process`, computed as FastQC 0.13.0 computes its core
-//! modules: per-cycle quality and base content, per-read quality and GC, read lengths, terminal
-//! homopolymer runs, and Adapter Content for FastQC's bundled adapter list, where a read exactly
-//! one adapter long counts as FastQC-Rust counts it. The retained population of a trimmed or
-//! filtered run counts only the removed 3' ends and dropped reads per cycle and takes its
-//! per-cycle tables as raw minus removed, until raw drops its tables for a read past the cycle
-//! limit; from then on it counts its reads in full. When every retained read of a mate starts a
-//! fixed number of bases into its raw read, after a UMI cut, retained cycle i is raw cycle i plus
-//! that offset. Adapter matches are searched once per raw read and count for the retained read
-//! when they lie inside its kept bases; a first match that starts inside the cut is searched
-//! again. Sequence Duplication Levels and Overrepresented sequences share FastQC's sequence table, one per population: the
-//! uppercase read cut to 50 bases is the key, at most 100,000 keys are stored, and later reads
-//! count only toward stored keys and the total. A key is kept as 50 five-bit codes, the low five
-//! bits of each IUPAC letter, which are distinct and nonzero. Overrepresented ties keep
-//! first-appearance order, and Possible Source comes from a FastQC contaminant list matched by
-//! FastQC's rules. A population also writes as a FastQC 0.13.0 fastqc_data.txt: the same tables
-//! in FastQC's text layout and Java number format, each module graded pass, warn, or fail by
-//! FastQC's rules at its default limits, without Kmer Content. Basic Statistics names the
-//! Sanger / Illumina 1.9 encoding, the only one z-fastq reads. As a read section of fastp 1.1.0's
-//! JSON it writes fastp's totals and per-cycle mean quality and base content curves; a population
-//! that feeds only that summary collects only those totals and curves, and no FastQC module.
+//! Per-mate QC for process: FastQC 0.13.0's core modules and fastp 1.1.0's read summaries, for the
+//! reads as read and as written.
+//!
+//! Each read is added raw first, then as retained or dropped, because the retained tables are
+//! derived from the raw ones.
 
 const std = @import("std");
 const fastq = @import("fastq.zig");
@@ -1776,8 +1760,6 @@ const SequenceKey = struct {
         return packed_words[0..PACKED_WORDS].*;
     }
 
-    /// The key at two bits per base, A, C, G and T as 0 to 3, with its length
-    /// in the top bits; null when it holds another code, or a code after a zero.
     fn narrow(self: *const SequenceKey) ?NarrowKey {
         const Bytes = @Vector(64, u8);
         var padded: [8]u64 = @splat(0);
@@ -1813,8 +1795,6 @@ const NARROW_WORDS = 2;
 const NarrowKey = [NARROW_WORDS]u64;
 const NARROW_LENGTH_SHIFT = 58;
 
-/// A sequence key in the form the duplication table stores it: two bits per
-/// base when it holds only A, C, G and T, five bits per code otherwise.
 const KeyForm = struct {
     narrow: ?NarrowKey,
     wide: PackedKey,
@@ -1870,9 +1850,6 @@ const SequenceCounts = struct {
         key: u32,
     };
 
-    /// A record's key is the word offset of its key in `key_words`, flagged
-    /// `WIDE_KEY` when the key takes `PACKED_WORDS` words instead of two, or
-    /// the base population's key flagged `BASE_KEY`.
     const BASE_KEY: u32 = 1 << 31;
     const WIDE_KEY: u32 = 1 << 30;
     const KEY_OFFSET: u32 = WIDE_KEY - 1;

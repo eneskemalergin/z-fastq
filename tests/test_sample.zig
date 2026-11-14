@@ -1,4 +1,4 @@
-//! Private `sample` RNG vectors and installed `z-fastq sample` behavior.
+//! The sample RNG vectors and installed z-fastq sample behavior.
 
 const std = @import("std");
 const sampling = @import("sample_internal");

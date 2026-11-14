@@ -1,4 +1,4 @@
-//! Installed `z-fastq deinterleave` behavior: pairing, two outputs, validation, and exit status.
+//! Installed z-fastq deinterleave: pairing, two outputs, validation, and exit status.
 
 const std = @import("std");
 const cli = @import("utilities.zig");

@@ -1,4 +1,4 @@
-//! CLI entry and subcommand dispatcher for z-fastq.
+//! CLI entry and subcommand dispatch for z-fastq.
 
 const std = @import("std");
 const builtin = @import("builtin");

@@ -1,4 +1,4 @@
-//! Installed `z-fastq count` results, stream output, options, and exit precedence.
+//! Installed z-fastq count: results, stream output, options, and exit precedence.
 
 const std = @import("std");
 const builtin = @import("builtin");

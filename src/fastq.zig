@@ -1,4 +1,4 @@
-//! Four-line FASTQ records, streaming reader and writer, and record validation.
+//! Four-line FASTQ records, the streaming reader and writer, and record validation.
 
 const std = @import("std");
 const io_layer = @import("io.zig");

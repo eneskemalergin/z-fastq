@@ -1,4 +1,4 @@
-//! Library exports, byte sources, Reader and count scanner behavior, and record validation.
+//! Library exports, byte sources, the reader and count scanner, and record validation.
 
 const std = @import("std");
 const zfastq = @import("z-fastq");

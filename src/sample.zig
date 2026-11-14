@@ -1,4 +1,4 @@
-//! Deterministic numeric parsing and record selection for the private sample command.
+//! Deterministic numeric parsing and record selection for the sample command.
 
 const std = @import("std");
 

@@ -1,14 +1,9 @@
-//! Byte-kernel tiers, their run-time selection, and the newline search kernels.
+//! Byte-kernel tiers, their run-time selection, the newline search kernels, and the process
+//! entry of x86-64-v3 builds.
 //!
-//! Every byte kernel has a scalar reference and one generic vector body over a
-//! comptime lane count. Inline code uses the widest tier the compile target
-//! guarantees. When an x86-64 target lacks AVX2 or AVX-512, the same bodies are
-//! also compiled into separate AVX2 and AVX-512 objects, and long spans call the
-//! best one the CPU runs. On aarch64 the baseline tier's 16 lanes are one NEON
-//! register. Kernels whose work per call outweighs the call at any length, such
-//! as fastp's pair sum in preprocess.zig, use an object whenever one applies.
-//! `selectTier` lowers the run-time choice to any tier from the compiled one to
-//! the CPU's best; the CLI sets it once from `ZFASTQ_TIER` before any kernel runs.
+//! The CLI may lower the run-time tier once, from ZFASTQ_TIER, before any kernel runs. The
+//! process entry is compiled into its own object for any x86-64 CPU and stops with status 2 on a
+//! CPU without the set the build needs.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -103,6 +98,7 @@ comptime {
     exportKernel("find_newline", &findNewlineExport);
     exportKernel("collect_newlines", &collectNewlinesExport);
     exportKernel("contains_newline", &containsNewlineExport);
+    if (build_options.entry_object) @export(&x86_64Entry, .{ .name = "zfq_x86_64_entry" });
 }
 
 pub inline fn findNewline(bytes: []const u8) ?usize {
@@ -177,12 +173,27 @@ fn detectAvx2() bool {
     return cpuid(7).ebx & (1 << 5) != 0;
 }
 
-pub fn cpuHasX86V3() bool {
-    return detectX86V3();
+const CPU_MESSAGE = "error: this z-fastq build needs an x86-64 CPU with " ++
+    (if (build_options.require_x86_64_v4) "the x86-64-v4 set (AVX-512)" else "the x86-64-v3 set (AVX2, BMI2, FMA)") ++
+    "; build z-fastq from source for this CPU\n";
+
+fn x86_64Entry() callconv(.naked) noreturn {
+    asm volatile (
+        \\ movq %%rsp, %%r12
+        \\ andq $-16, %%rsp
+        \\ callq %[checkCpu:P]
+        \\ movq %%r12, %%rsp
+        \\ jmp _start
+        :
+        : [checkCpu] "X" (&checkEntryCpu),
+    );
 }
 
-pub fn cpuHasX86V4() bool {
-    return detectAvx512();
+fn checkEntryCpu() callconv(.c) void {
+    const supported = if (build_options.require_x86_64_v4) detectAvx512() else detectX86V3();
+    if (supported) return;
+    _ = std.os.linux.write(2, CPU_MESSAGE, CPU_MESSAGE.len);
+    std.os.linux.exit_group(2);
 }
 
 fn detectX86V3() bool {

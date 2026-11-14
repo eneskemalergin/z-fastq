@@ -1,4 +1,4 @@
-//! Public aggregate statistics and installed `z-fastq stats` results.
+//! Public aggregate statistics and installed z-fastq stats results.
 
 const std = @import("std");
 const zfastq = @import("z-fastq");
