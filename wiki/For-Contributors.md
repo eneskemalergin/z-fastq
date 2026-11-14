@@ -51,8 +51,8 @@ zig build test -Dstatic=true -Doptimize=ReleaseFast --summary all
 GitHub Actions checks every pull request and every push to `main`, and any branch when started by hand, on Linux and macOS runners, each on x86-64 and ARM. A change that touches only documentation, benchmark reports, or tool recipes skips the builds. The first failure stops the run. The runs above stay the local check before a commit; CI repeats only what a separate machine adds.
 
 - **Source checks:** formatting, the syntax of every shell script, shellcheck on the CI scripts, the benchmark Python, and `.github/scripts/docs_check.sh`, which fails on a link, image, or heading anchor that does not exist in the README, the reports, or the wiki.
-- **Tests:** one Debug run per system; on x86-64 it targets generic x86-64 (`core2` on macOS), so the AVX2 kernels run through run-time dispatch as in the release binary.
-- **AVX-512:** on an emulated AVX-512 CPU (Intel SDE, pinned by version and checksum), so the AVX-512 kernels run whatever CPU the runner has: the source tests in Debug, then every command of a ReleaseFast build on generated reads, whose output must match the baseline tier byte for byte.
+- **Tests:** one Debug run per system; on x86-64 it targets generic x86-64 (`core2` on macOS), so the AVX2 kernels run through run-time dispatch, as in a build from source without `-Dcpu`.
+- **AVX-512:** on an emulated AVX-512 CPU (Intel SDE, pinned by version and checksum), so the AVX-512 kernels run whatever CPU the runner has: the source tests in Debug, then `count`, `stats`, `check`, `sample`, `interleave`, and `process` of a ReleaseFast build on generated reads, whose output must match the baseline tier byte for byte.
 - **Release binaries:** each system's ReleaseFast binary, static on Linux and linked only to `libSystem` on macOS, packaged and smoke-tested on every command from the unpacked archive, with Zig off `PATH`.
 - **Source package:** the files under `.paths` in `build.zig.zon`, fetched into a fresh Zig package and tested through the public module.
 - **Workflows:** actionlint and zizmor, when `.github/` changes.

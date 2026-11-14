@@ -15,8 +15,10 @@
 //! duplication estimate is fastp's: the bases of mate 1, then
 //! mate 2, hash to one position in each of two 2^32-bit arrays, and a pair whose two positions are
 //! both set already counts as a duplicate, hash collisions included. Only the set positions are
-//! kept, per 65,536-bit block as a sorted list of offsets or, past 4,096 of them, as a bitmap, so
-//! memory follows the pairs read instead of fastp's fixed 1 GiB. The pair sum has an AVX2 kernel.
+//! kept, per 65,536-bit block as a sorted list of offsets, from 256 of them as a dense form (a
+//! count per high byte and the low bytes in order), and from 7,936, or 255 under one high byte,
+//! as a bitmap, so memory follows the pairs read instead of fastp's fixed 1 GiB. The pair sum has
+//! an AVX2 kernel.
 
 const std = @import("std");
 const builtin = @import("builtin");
