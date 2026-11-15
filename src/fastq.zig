@@ -362,6 +362,9 @@ fn validateRecordVector(
     comptime alphabet: Alphabet,
     record: Record,
 ) ?SemanticError {
+    if (vector_len > simd.BASELINE_LANES and record.sequence.len < vector_len) {
+        return validateRecordVector(vector_len / 2, alphabet, record);
+    }
     if (record.sequence.len < vector_len) {
         if (firstInvalidSequenceScalar(record.sequence, alphabet, 0)) |byte_index| {
             return semanticSequenceError(byte_index);
@@ -514,6 +517,9 @@ fn firstInvalidSequenceVector(
     const Bytes = @Vector(vector_len, u8);
     const Mask = @Vector(vector_len, bool);
 
+    if (vector_len > simd.BASELINE_LANES and sequence.len < vector_len) {
+        return firstInvalidSequenceVector(vector_len / 2, alphabet, sequence);
+    }
     if (sequence.len < vector_len) {
         return firstInvalidSequenceScalar(sequence, alphabet, 0);
     }
@@ -596,6 +602,7 @@ fn hasInvalidQualityVector(
     const Bytes = @Vector(vector_len, u8);
     const Mask = @Vector(vector_len, bool);
 
+    if (vector_len > simd.BASELINE_LANES and quality.len < vector_len) return hasInvalidQualityVector(vector_len / 2, quality);
     if (quality.len < vector_len) return firstInvalidQualityScalar(quality, 0) != null;
 
     var invalid: Mask = @splat(false);

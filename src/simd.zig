@@ -28,7 +28,7 @@ else if (targetHas(&.{.avx2}))
 else
     .baseline;
 pub const INLINE_LANES = tierWidth(INLINE_TIER);
-const BASELINE_LANES = tierWidth(.baseline);
+pub const BASELINE_LANES = tierWidth(.baseline);
 
 pub const BLOCK_BYTES = 64;
 

@@ -348,7 +348,7 @@ fn payloadTotalsInline(
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
     const len = if (parts == .sequence) sequence.len else quality.len;
-    if (sum_type == u64 and len >= simd.INLINE_LANES) {
+    if (sum_type == u64 and len >= simd.BASELINE_LANES) {
         return payloadTotalsVector(simd.INLINE_LANES, parts, sequence, quality, quality_error);
     }
     return payloadTotalsScalar(sum_type, parts, sequence, quality, quality_error);
@@ -406,6 +406,10 @@ fn payloadTotalsVector(
 ) StatsError!PayloadTotals {
     comptime std.debug.assert(vector_len >= 2 and vector_len % 2 == 0 and
         vector_len <= std.math.maxInt(u16) / std.math.maxInt(u8));
+    const len = if (parts == .sequence) sequence.len else quality.len;
+    if (vector_len > simd.BASELINE_LANES and len < vector_len) {
+        return payloadTotalsVector(vector_len / 2, parts, sequence, quality, quality_error);
+    }
     const half_len = vector_len / 2;
     const vectors_per_quality_block: usize = std.math.maxInt(u8) - 1;
     const vectors_per_base_block: usize = std.math.maxInt(u8) - 1;
@@ -426,7 +430,7 @@ fn payloadTotalsVector(
     const ones: Bytes = @splat(1);
     const zeros: Bytes = @splat(0);
     const lane_indices = std.simd.iota(u8, vector_len);
-    const tail_len = (if (parts == .sequence) sequence.len else quality.len) % vector_len;
+    const tail_len = len % vector_len;
 
     var quality_sum: u64 = 0;
     var q20_bases: usize = 0;
@@ -660,7 +664,7 @@ test "[property] - [statistics]: vector payload totals match the scalar path at 
                 try payloadTotalsScalar(u64, .both, sequence_part, quality_part, &quality_error),
                 try payloadTotals(u64, sequence_part, quality_part, &quality_error),
             );
-            if (length < vector_len) continue;
+            if (length < simd.BASELINE_LANES) continue;
             inline for (.{ Parts.both, Parts.sequence, Parts.quality }) |parts| {
                 try std.testing.expectEqualDeep(
                     try payloadTotalsScalar(u64, parts, sequence_part, quality_part, &quality_error),
