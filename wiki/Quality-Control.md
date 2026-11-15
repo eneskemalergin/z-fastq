@@ -47,7 +47,7 @@ Each read is keyed by its first 50 bases, in uppercase. The first 100,000 distin
 
 ### Per-tile quality
 
-The tile is read from the header split at `:`: the fifth field when the first counted read has 7 or more fields, as Illumina's `instrument:run:flowcell:lane:tile:x:y` does, or the third when it has 5 or 6. Each tile's mean quality per group of cycles is compared with the average over all tiles, so a dark or bubbled tile stands out. The first 10,000 reads with a quality string count, then every tenth. The module is unavailable, and says why, when a header has no valid tile number, with more than 2,500 tiles, or when a counted read is longer than 1024 bases.
+The tile is read from the header split at `:`: the fifth field when the first counted read has 7 or more fields, as Illumina's `instrument:run:flowcell:lane:tile:x:y` does, or the third when it has 5 or 6. Each tile's mean quality per group of cycles is compared with the average over all tiles, so a dark or bubbled tile stands out. The first 10,000 reads with a quality string count, then every tenth. The module is unavailable, and says why, when a header has no valid tile number, with more than 2,501 tiles, or when a counted read is longer than 1024 bases.
 
 ### Insert sizes
 
