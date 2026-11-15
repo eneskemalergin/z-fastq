@@ -10,7 +10,7 @@ builds here (oldest first, so a slowdown can be pinned to the commit that brough
 cache directory, since a local cache shared across worktrees can hand one worktree's binary to another with the
 same build script, and lists each binary's hash. It generates fixed inputs of 60 to 330 MB (a block of reads repeated, so each run takes
 tenths of a second to seconds), checks that every build and every kernel tier the binary
-runs here (ZFASTQ_TIER) writes the same bytes, then times each one five times, interleaved, and prints median
+runs here (ZFASTQ_TIER) writes the same bytes, apart from the z-fastq version in JSON documents, then times each one five times, interleaved, and prints median
 wall times as a Markdown table (also appended to $GITHUB_STEP_SUMMARY). Exits 1 when outputs differ.
 Shared CI runners make the numbers rough: only large differences mean anything, and no number is compared
 across runs.
@@ -21,6 +21,7 @@ import gzip
 import os
 import platform
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -30,10 +31,22 @@ TIERS = ("baseline", "avx2", "avx512")
 ROUNDS = 5
 ADAPTER1 = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"
 ADAPTER2 = "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"
+# The z-fastq version inside a JSON document's tool object: builds of different
+# versions write the same bytes everywhere else.
+TOOL_VERSION = re.compile(rb'("name"\s*:\s*"z-fastq"\s*,\s*"version"\s*:\s*")[^"]*(")')
 
 
 def run(argv, cwd=None):
     subprocess.run(argv, cwd=cwd, check=True)
+
+
+def commit(revision):
+    """The commit a revision names, trying origin/REVISION when no local ref has the name."""
+    for name in (revision, "origin/" + revision):
+        found = subprocess.run(["git", "rev-parse", "--verify", "--quiet", name + "^{commit}"], capture_output=True, text=True)
+        if found.returncode == 0:
+            return found.stdout.strip()
+    sys.exit(f"no commit named {revision}")
 
 
 def build(source, prefix, *flags):
@@ -142,12 +155,12 @@ def output_digest(binary, tier, argv, outputs):
         if os.path.exists(path):
             os.remove(path)
     result = subprocess.run([binary, *argv], env=tier_environment(tier), capture_output=True)
-    digest = hashlib.sha256(result.stdout)
+    digest = hashlib.sha256(TOOL_VERSION.sub(rb"\1\2", result.stdout))
     for path in outputs:
         if not os.path.exists(path):
             return result.returncode, "missing " + path
         with open(path, "rb") as produced:
-            digest.update(produced.read())
+            digest.update(TOOL_VERSION.sub(rb"\1\2", produced.read()))
     return result.returncode, digest.hexdigest()
 
 
@@ -170,7 +183,7 @@ def main():
     native = build(".", os.path.join(work, "native"), "-Dcpu=native")
     if native:
         variants["-Dcpu=native"] = (native, None)
-    for revision in revisions:
+    for revision in map(commit, revisions):
         source = os.path.join(work, f"source-{revision}")
         run(["git", "worktree", "add", "--detach", source, revision])
         built = build(source, os.path.join(work, f"build-{revision}"))
