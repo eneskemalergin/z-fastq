@@ -111,12 +111,12 @@ Peak memory of the same runs. Threads buy the other tools wall time, never memor
 
 ## Feature reports
 
-- [count](count/README.md): Counting records; timed 2026-10-28, z-fastq 0.2.0, source at 246bbb1.
-- [stats](stats/README.md): Aggregate statistics; timed 2026-10-28, z-fastq 0.2.0, source at 246bbb1.
-- [check](check/README.md): Validating FASTQ files; timed 2026-10-28, z-fastq 0.2.0, source at 246bbb1.
-- [sample](sample/README.md): Sampling records; timed 2026-10-28, z-fastq 0.2.0, source at 246bbb1.
-- [layout](layout/README.md): Converting paired layouts; timed 2026-10-28, z-fastq 0.2.0, source at 246bbb1.
-- [process](process/README.md): Processing paired reads; timed 2026-10-29, z-fastq 0.2.0, source at 246bbb1.
+- [count](count/README.md): Counting records; z-fastq 0.2.0.
+- [stats](stats/README.md): Aggregate statistics; z-fastq 0.2.0.
+- [check](check/README.md): Validating FASTQ files; z-fastq 0.2.0.
+- [sample](sample/README.md): Sampling records; z-fastq 0.2.0.
+- [layout](layout/README.md): Converting paired layouts; z-fastq 0.2.0.
+- [process](process/README.md): Processing paired reads; z-fastq 0.2.0.
 
 ## Limits
 

@@ -438,7 +438,7 @@ trim_fact() {
             printf 'wrong: summary %s\n' "$d"
         fi
     else
-        # Sorted only now: the same records in another order are not wrong records.
+        # Sorted only in this branch: the same records in another order are not wrong records.
         local -a g=($g1 $g2)
         if [[ "${g[1]} ${g[2]} ${g[4]} ${g[5]}" == "${w[1]} ${w[2]} ${w[5]} ${w[6]}" &&
             "$(read_sums "$O1" sorted | cut -d' ' -f4) $(read_sums "$O2" sorted | cut -d' ' -f4)" == "${w[3]} ${w[7]}" ]]; then

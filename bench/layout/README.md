@@ -3,7 +3,7 @@
 # Converting paired layouts
 > <sub>`z-fastq interleave` and `deinterleave` against 5 other converters, on 4 real sequencing runs and 1 synthetic shape, plain and gzip. A tool is timed only where its output was byte-exact; time and memory come from the same run, on one CPU.</sub>
 
-- `z-fastq`: *0.2.0, source at 246bbb1*
+- `z-fastq`: *0.2.0*
 - `machine`: *Ryzen 9 3950X, Linux; one CPU per run*
 - `runner`: *zebrac 0.6.2 with zexec*
 - `data`:
@@ -12,7 +12,6 @@
     - `Short, variable length`: *10x mates, 28 and 150 bp*
   - **Synthetic**: *1 shape generated from real reads, each changing one thing; one group in the bars at 1 GiB, and the scaling lines from 1 MiB to 1 GiB*
     - `paired`: *100 bp mate pairs*
-- `date`: *2026-10-30*
 
 ## Findings
 
@@ -222,13 +221,13 @@ z-fastq peaks at 1.06 MiB at every size of the paired shape. No other tool grows
 
 <details><summary>How it was measured</summary>
 
-Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, 8G for deinterleave, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that `wait4` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Timed by `bench/layout/run.sh release`, last on 2026-10-28; this page written on 2026-10-30.
+Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, 8G for deinterleave, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that `wait4` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Timed by `bench/layout/run.sh release`.
 
 </details>
 
 <details><summary>Identity</summary>
 
-- `z-fastq`: *0.2.0, source at 246bbb1*
+- `z-fastq`: *0.2.0*
 - `zebrac`: *0.6.2*
 - `zexec`: *15000 bytes, static, no libc*
 - `cpu`: *AMD Ryzen 9 3950X 16-Core Processor*

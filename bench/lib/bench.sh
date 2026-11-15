@@ -24,7 +24,7 @@ BENCH_CPU="${BENCH_CPU:-3}"
 BENCH_MEM="${BENCH_MEM:-4G}"
 BENCH_JOBS="${BENCH_JOBS:-4}"
 # The most cores one batch may hold. A family whose cases need more is not
-# timed until the lead raises this for that run (BENCH_MAX_CORES=16).
+# timed unless BENCH_MAX_CORES is raised for that run.
 BENCH_MAX_CORES="${BENCH_MAX_CORES:-16}"
 REAL="$BENCH/data/real"
 SHAPES="$BENCH/data/synthetic"
@@ -1693,7 +1693,7 @@ run_peer() {
             time_lanes "$BATCH" "$form" "$paths" "$PEER_RUNS" "$PEER_WARM" "$fam" "$id" "${SPECS[@]}"
         fi
         local ref="$BATCH/summary.tsv"
-        # z-fastq now: headline settings, kept while its binary is unchanged.
+        # z-fastq at the headline settings, kept while its binary is unchanged.
         read -r runs warm <<<"$(batch_settings "$tier" "$kind")"
         batch_meta "$form" "$inid" "$runs" "$warm" z-fastq
         [[ "$params" == - ]] || META+="params $params"$'\n'
@@ -1933,8 +1933,8 @@ validate() {
     printf 'run.sh: %s\n' "${errs[@]}" >&2
     exit 2
 }
-# One timing job at a time on this machine: every feature times on the same
-# CPU, so two runs at once would slow each other. The lock is released when
+# One timing job at a time: every feature times on the same CPU, so two runs
+# at once would slow each other. The lock is released when
 # the process exits.
 take_lock() {
     # Process verification uses the whole CPU allowance, even before timing.

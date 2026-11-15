@@ -3,7 +3,7 @@
 # Aggregate statistics
 > <sub>`z-fastq stats` against 5 other tools, on 7 real sequencing runs and 5 synthetic shapes, plain and gzip. A tool is timed only where its values were right; time and memory come from the same run, on one CPU.</sub>
 
-- `z-fastq`: *0.2.0, source at 246bbb1*
+- `z-fastq`: *0.2.0*
 - `machine`: *Ryzen 9 3950X, Linux; one CPU per run*
 - `runner`: *zebrac 0.6.2 with zexec*
 - `data`:
@@ -17,7 +17,6 @@
     - `variable`: *50 to 150 bp, annotated plus line*
     - `longread`: *nanopore headers, rare 300 kb reads*
     - `long`: *300 kb sequence lines*
-- `date`: *2026-10-30*
 
 ## Findings
 
@@ -147,13 +146,13 @@ Summarizing all 11 xsmall corpus files (110 MiB) in one call, z-fastq takes 33.5
 
 <details><summary>How it was measured</summary>
 
-Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that `wait4` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Timed by `bench/stats/run.sh release`, last on 2026-10-28; this page written on 2026-10-30.
+Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that `wait4` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Timed by `bench/stats/run.sh release`.
 
 </details>
 
 <details><summary>Identity</summary>
 
-- `z-fastq`: *0.2.0, source at 246bbb1*
+- `z-fastq`: *0.2.0*
 - `zebrac`: *0.6.2*
 - `zexec`: *15000 bytes, static, no libc*
 - `cpu`: *AMD Ryzen 9 3950X 16-Core Processor*

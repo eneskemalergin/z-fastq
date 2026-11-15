@@ -530,6 +530,9 @@ data_list() {
     printf -- '  - **Real**: *%d public sequencing runs, %s each, pooled in the bars by the kind of reads they hold*\n%s' "$reals" "${TIER_SIZE[$HEADLINE]}" "$lines"
     printf -- '  - **Synthetic**: *%d %s generated from real reads, each changing one thing; one group in the bars at %s, and the scaling lines from %s*\n%s' "$shapes" "$( ((shapes == 1)) && echo shape || echo shapes)" "${TIER_SIZE[$HEADLINE]}" "$(scaling_range)" "$synth"
 }
+# A timed command as a reader sees it: repository paths relative, and a file
+# inside a pinned tool's install directory under that tool's name.
+shown_cmd() { sed "s#$REPO/##g; s#tools/\.local/\([A-Za-z0-9_-]*\)-current/\(runtime/\)\{0,1\}#{\1}/#g"; }
 # The source revisions of the z-fastq binaries the current batches timed, as
 # recorded when each was built, with batch counts when there are several.
 zfastq_revision() {
@@ -543,8 +546,8 @@ zfastq_revision() {
             for (i = 1; i <= k; i++) printf "%s%s (%d batches)", (i > 1 ? "; " : "at "), list[i], n[list[i]]; print "" }'
 }
 # z-fastq as the current batches timed it: the version in build.zig.zon when
-# every batch timed the current source, then the source revision. The binary
-# on disk is not asked, since it may be a later build.
+# every batch timed the current source, otherwise the source revision. The
+# binary on disk is not asked, since it may be a later build.
 zfastq_label() {
     local rev ids dir version=""
     rev="$(zfastq_revision)"
@@ -552,14 +555,13 @@ zfastq_label() {
         sed -n 's/^lane z-fastq \([^#]*\)#.*/\1/p' "$dir/meta.tsv"
     done | sort -u)"
     [[ "$ids" != "$(zfastq_id)" ]] || version="$(sed -n 's/^ *\.version = "\([^"]*\)",*$/\1/p' "$REPO/build.zig.zon")"
-    printf '%s%s\n' "${version:+$version, }" "${rev:+source $rev}"
+    if [[ -n "$version" ]]; then printf '%s\n' "$version"; else printf '%s\n' "${rev:+source $rev}"; fi
 }
 # The README's sections, each printing its Markdown; readme() puts them in
 # the default order, and a feature with its own feature_readme orders them.
 readme_head() {
     local first="${FAMILIES[0]}" name
-    local date rev
-    date="$(date -u +%Y-%m-%d)"
+    local rev
     rev="$(zfastq_label)"
     local counters reals shapes
     counters=0
@@ -587,7 +589,6 @@ readme_head() {
 - \`machine\`: *$cpu, Linux; $per*
 - \`runner\`: *$(zebrac --version) with zexec*
 $(data_list)
-- \`date\`: *$date*
 
 EOF
 }
@@ -697,16 +698,13 @@ batch_memory() {
     m="$(awk -F'\t' '{ print $3 }' "$RESULTS/current.tsv" | sort -u | while IFS= read -r d; do sed -n 's/^execution .* memory=\([^ ]*\).*/\1/p' "$d/meta.tsv"; done | sort -u | paste -sd/ -)"
     printf '%s\n' "${m:-$BENCH_MEM}"
 }
-# The day the last release run that ended well finished.
-last_release() { awk -F'\t' '$3 == "release" && $9 == "ok" { d = substr($2, 1, 10) } END { print (d == "" ? "an unrecorded day" : d) }' "$RESULTS/runs.tsv"; }
 readme_repro() {
-    local name fam date rev
-    date="$(date -u +%Y-%m-%d)"
+    local name fam rev
     rev="$(zfastq_label)"
     printf '## Reproducibility\n\n'
     details "How it was measured"
     cat <<EOF
-Every tool runs through \`zexec -r\` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a $(batch_memory) memory cap$(mem_caps)$( ((${#LANE_CORES[@]} == 0)) || printf '; a batch with threaded variants holds as many physical cores as its largest lane, one logical CPU each, with each lane pinned to its own cores and z-fastq to one'), after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that \`wait4\` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny ${RUNS[tiny]}, xsmall ${RUNS[xsmall]}, small ${RUNS[small]}, medium ${RUNS[medium]}; sizes 1 MiB to 1 GiB. Timed by \`bench/$FEATURE/run.sh release\`, last on $(last_release); this page written on $date.
+Every tool runs through \`zexec -r\` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a $(batch_memory) memory cap$(mem_caps)$( ((${#LANE_CORES[@]} == 0)) || printf '; a batch with threaded variants holds as many physical cores as its largest lane, one logical CPU each, with each lane pinned to its own cores and z-fastq to one'), after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that \`wait4\` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny ${RUNS[tiny]}, xsmall ${RUNS[xsmall]}, small ${RUNS[small]}, medium ${RUNS[medium]}; sizes 1 MiB to 1 GiB. Timed by \`bench/$FEATURE/run.sh release\`.
 
 </details>
 
@@ -724,12 +722,12 @@ EOF
     if [[ -z "$any" ]]; then
         for name in "${LANES[@]}"; do
             [[ ! -v "LANE_OF[$name]" ]] || continue
-            printf -- '- `%s`: *%s*%s\n' "${REG_LABEL[$name]}" "$(lane_cmd "$name" IN | sed "s#$REPO/##g")" "$(thread_options "$name")"
+            printf -- '- `%s`: *%s*%s\n' "${REG_LABEL[$name]}" "$(lane_cmd "$name" IN | shown_cmd)" "$(thread_options "$name")"
         done
         for fam in "${FAMILIES[@]}"; do
             for name in ${FAM_LANES[$fam]}; do
                 [[ -v "FAM_TMPL[$fam|$name]" && ! -v "LANE_OF[$name]" ]] || continue
-                printf -- '- `%s`, %s: *%s*%s\n' "${REG_LABEL[$name]}" "$(family_name "$fam")" "$(lane_cmd "$name" IN "$fam" | sed "s#$REPO/##g")" "$(thread_options "$name" "$fam")"
+                printf -- '- `%s`, %s: *%s*%s\n' "${REG_LABEL[$name]}" "$(family_name "$fam")" "$(lane_cmd "$name" IN "$fam" | shown_cmd)" "$(thread_options "$name" "$fam")"
             done
         done
     else
@@ -740,7 +738,7 @@ EOF
             params="$(cases | awk -F'\t' -v f="$fam" '$1 == f && !p { p = $10 } END { print p }')"
             for name in "${LANES[@]}"; do
                 [[ " ${FAM_LANES[$fam]} " == *" $name "* && ! -v "LANE_OF[$name]" ]] || continue
-                printf -- '- `%s`, %s: *%s*%s\n' "${REG_LABEL[$name]}" "$(family_name "$fam")" "$(lane_cmd "$name" IN "$fam" "$params" | sed "s#$REPO/##g")" "$(thread_options "$name" "$fam")"
+                printf -- '- `%s`, %s: *%s*%s\n' "${REG_LABEL[$name]}" "$(family_name "$fam")" "$(lane_cmd "$name" IN "$fam" "$params" | shown_cmd)" "$(thread_options "$name" "$fam")"
             done
         done
     fi
@@ -983,8 +981,8 @@ summary_readme() {
     printf '\n## Feature reports\n\n'
     for feat in count stats check sample layout process; do
         [[ -f "$BENCH/$feat/README.md" ]] || continue
-        printf -- '- [%s](%s/README.md): %s; timed %s, z-fastq %s.\n' "$feat" "$feat" "$(sed -n '3s/^# //p' "$BENCH/$feat/README.md")" \
-            "$(RESULTS="$BENCH/$feat/results" last_release)" "$(RESULTS="$BENCH/$feat/results" zfastq_label)"
+        printf -- '- [%s](%s/README.md): %s; z-fastq %s.\n' "$feat" "$feat" "$(sed -n '3s/^# //p' "$BENCH/$feat/README.md")" \
+            "$(RESULTS="$BENCH/$feat/results" zfastq_label)"
     done
     printf '\n## Limits\n\n'
     printf -- '- One CPU per tool in every comparison except the threads figure; a tool built for many cores may do better with them.\n'
