@@ -5,14 +5,14 @@ Each [release](https://github.com/eneskemalergin/z-fastq/releases) has a ready-m
 ## Download a release
 
 ```bash
-curl -fLO https://github.com/eneskemalergin/z-fastq/releases/download/v0.2.1/z-fastq-0.2.1-linux-x86_64.tar.gz
-curl -fLO https://github.com/eneskemalergin/z-fastq/releases/download/v0.2.1/SHA256SUMS
+curl -fLO https://github.com/eneskemalergin/z-fastq/releases/download/v0.3.0/z-fastq-0.3.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/eneskemalergin/z-fastq/releases/download/v0.3.0/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf z-fastq-0.2.1-linux-x86_64.tar.gz
-./z-fastq-0.2.1-linux-x86_64/z-fastq --version
+tar -xzf z-fastq-0.3.0-linux-x86_64.tar.gz
+./z-fastq-0.3.0-linux-x86_64/z-fastq --version
 ```
 
-On an ARM machine, use `linux-aarch64` in place of `linux-x86_64`; on a Mac, use `macos-aarch64` (Apple Silicon) or `macos-x86_64` (Intel), and check the archive with `grep macos-aarch64 SHA256SUMS | shasum -a 256 --check`. The archive holds the binary and its license. The Linux binary is static and the macOS binary needs only the system library every Mac has, so copy it into a directory on your `PATH`. With the [GitHub CLI](https://cli.github.com/), `gh attestation verify z-fastq-0.2.1-linux-x86_64.tar.gz --repo eneskemalergin/z-fastq` also confirms the archive was built by this repository's release workflow.
+On an ARM machine, use `linux-aarch64` in place of `linux-x86_64`; on a Mac, use `macos-aarch64` (Apple Silicon) or `macos-x86_64` (Intel), and check the archive with `grep macos-aarch64 SHA256SUMS | shasum -a 256 --check`. The archive holds the binary and its license. The Linux binary is static and the macOS binary needs only the system library every Mac has, so copy it into a directory on your `PATH`. With the [GitHub CLI](https://cli.github.com/), `gh attestation verify z-fastq-0.3.0-linux-x86_64.tar.gz --repo eneskemalergin/z-fastq` also confirms the archive was built by this repository's release workflow.
 
 On Apple Silicon, use `macos-aarch64`: the `macos-x86_64` binary needs AVX2, and Rosetta did not run AVX2 code on the macOS 15 machines z-fastq is tested on.
 
@@ -35,7 +35,7 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/z-fastq --version
 ```
 
-The second line prints `z-fastq 0.2.1`.
+The second line prints `z-fastq 0.3.0`.
 
 - `-Doptimize=ReleaseSafe` keeps Zig's safety checks in the release build.
 - `-Dstatic=true` confirms a static Linux release build; it stops with a message on macOS, where no build is static.

@@ -61,7 +61,7 @@ Check the `schema` field before reading a document; `tool.name` and `tool.versio
 Each is one JSON object on one line. After `schema`, `tool`, and `byte_strings` ([Report reference](Report-Reference#shared-conventions)), `results` holds one entry per input:
 
 ```json
-{"schema":"z-fastq/check-v1","tool":{"name":"z-fastq","version":"0.2.1"},"byte_strings":"escaped-bytes-v1","results":[{"input":"ok.fq","status":"ok"},{"input":"bad.fq","status":"error","error":{"code":"S002","message":"sequence byte is outside the selected alphabet","record_index":0,"byte_offset":5,"line_in_record":2}}]}
+{"schema":"z-fastq/check-v1","tool":{"name":"z-fastq","version":"0.3.0"},"byte_strings":"escaped-bytes-v1","results":[{"input":"ok.fq","status":"ok"},{"input":"bad.fq","status":"error","error":{"code":"S002","message":"sequence byte is outside the selected alphabet","record_index":0,"byte_offset":5,"line_in_record":2}}]}
 ```
 
 - **`input`**: the path as given, or **`inputs`**, the two paths, for `check --paired`.

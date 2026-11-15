@@ -4,7 +4,9 @@
 
 All notable changes to z-fastq will be documented in this file.
 
-## [Unreleased]
+## [0.3.0]
+
+z-fastq runs on macOS, on Apple Silicon and on Intel, and x86-64 builds pick AVX-512 kernels at run time on CPUs that have them. The x86-64 release binaries are built for x86-64-v3, which makes most commands faster on 1 GiB inputs, and `process` needs less memory for its QC reports and pair duplication. Output bytes, JSON documents, and exit statuses are unchanged, apart from the fixes below.
 
 ### Added
 
