@@ -508,6 +508,26 @@ pub const MateQc = struct {
         self.terminal_a += @intFromBool(endsInRun(sequence, 'A'));
     }
 
+    inline fn addCyclesAt(
+        self: *MateQc,
+        comptime lanes: comptime_int,
+        sequence: []const u8,
+        quality: []const u8,
+        gc_length: usize,
+        quality_sum: *u64,
+    ) usize {
+        if (self.detailed) {
+            quality_sum.* = addQualityCounts(lanes, &self.quality_bins, self.quality.items, quality);
+        } else {
+            quality_sum.* = addCycleQualities(lanes, self.pending_quality.rows(), quality);
+        }
+        return countCycleBases(lanes, &self.pending_bases, sequence, gc_length);
+    }
+
+    noinline fn addShortCycles(self: *MateQc, sequence: []const u8, quality: []const u8, gc_length: usize, quality_sum: *u64) usize {
+        return self.addCyclesAt(simd.BASELINE_LANES, sequence, quality, gc_length, quality_sum);
+    }
+
     fn addCycles(
         self: *MateQc,
         allocator: std.mem.Allocator,
@@ -518,12 +538,10 @@ pub const MateQc = struct {
     ) error{OutOfMemory}!usize {
         if (sequence.len > self.bases.items.len) try self.growCycles(allocator, sequence.len);
         self.lengths[sequence.len] += 1;
-        if (self.detailed) {
-            quality_sum.* = addQualityCounts(simd.INLINE_LANES, &self.quality_bins, self.quality.items, quality);
-        } else {
-            quality_sum.* = addCycleQualities(simd.INLINE_LANES, self.pending_quality.rows(), quality);
-        }
-        const gc_count = countCycleBases(simd.INLINE_LANES, &self.pending_bases, sequence, gc_length);
+        const gc_count = if (simd.shortRecord(sequence.len))
+            self.addShortCycles(sequence, quality, gc_length, quality_sum)
+        else
+            self.addCyclesAt(simd.INLINE_LANES, sequence, quality, gc_length, quality_sum);
         self.pending_reads += 1;
         if (self.pending_reads == PENDING_READS_MAX) self.finish();
         return gc_count;

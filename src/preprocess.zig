@@ -732,7 +732,10 @@ fn readReason(options: Options, sequence: []const u8, quality: []const u8) ?Reas
     if (sequence.len == 0) return .too_short;
     if (options.low_quality != null or options.max_n != null) {
         const threshold: u8 = if (options.low_quality) |low_quality| PHRED_OFFSET + low_quality.quality else 0;
-        const counts = countLowAndN(LANES, sequence, quality, threshold);
+        const counts = if (simd.shortRecord(sequence.len))
+            countLowAndN(simd.BASELINE_LANES, sequence, quality, threshold)
+        else
+            countLowAndN(LANES, sequence, quality, threshold);
         if (options.low_quality) |low_quality| {
             if (counts.low * 100 > @as(usize, low_quality.percent) * sequence.len) return .low_quality;
         }

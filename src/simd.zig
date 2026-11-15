@@ -30,6 +30,10 @@ else
 pub const INLINE_LANES = tierWidth(INLINE_TIER);
 pub const BASELINE_LANES = tierWidth(.baseline);
 
+pub fn shortRecord(len: usize) bool {
+    return INLINE_LANES > BASELINE_LANES and len < INLINE_LANES;
+}
+
 pub const BLOCK_BYTES = 64;
 
 const OBJECT_MIN_BYTES = 1024;
