@@ -101,6 +101,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addOptions("build_options", build_options);
+    if (release_build and os == .linux) {
+        exe.use_lld = true;
+        exe.link_function_sections = true;
+        exe.setLinkerScript(b.path("src/layout.ld"));
+    }
     if (arch == .x86_64 and os == .linux and
         std.Target.x86.featureSetHasAll(target_features, .{ .avx2, .bmi, .bmi2, .fma, .f16c, .lzcnt, .movbe }))
     {

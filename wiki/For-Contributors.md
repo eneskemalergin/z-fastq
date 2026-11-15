@@ -17,6 +17,7 @@ This page maps the code, the tests, and the wiki onto each other, so a change to
 | `src/qc.zig`         | the QC modules and the QC table writer                       |
 | `src/simd.zig`       | vector kernels and their run-time selection                  |
 | `src/io.zig`         | byte sources and sinks, limits, and gzip                     |
+| `src/layout.ld`      | order of the code in Linux release binaries                  |
 | `tests/`             | command-line and library tests, one file per command or part |
 
 ## Before changing documented behavior
