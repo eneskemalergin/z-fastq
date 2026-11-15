@@ -295,9 +295,13 @@ fn validateRecordCommandInputs(
     return inputAliasFailure(io, inputs, output_identity);
 }
 
-pub fn main(init: std.process.Init) !void {
-    const io = init.io;
-    const gpa = init.gpa;
+pub fn main(init: std.process.Init.Minimal) !void {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = debug_allocator.deinit();
+    const gpa = debug_allocator.allocator();
+    var threaded: std.Io.Threaded = .init(gpa, .{ .argv0 = .init(init.args), .environ = init.environ });
+    defer threaded.deinit();
+    const io = threaded.io();
 
     std.posix.sigaction(.PIPE, &.{
         .handler = .{ .handler = std.posix.SIG.IGN },
@@ -305,9 +309,9 @@ pub fn main(init: std.process.Init) !void {
         .flags = 0,
     }, null);
 
-    if (init.environ_map.get(TIER_VARIABLE)) |value| selectKernelTier(io, value);
+    if (init.environ.getPosix(TIER_VARIABLE)) |value| selectKernelTier(io, value);
 
-    var args = std.process.Args.Iterator.initAllocator(init.minimal.args, gpa) catch {
+    var args = std.process.Args.Iterator.initAllocator(init.args, gpa) catch {
         argumentError(io, OUT_OF_MEMORY_LINE, 3);
     };
     defer args.deinit();
@@ -651,7 +655,7 @@ pub fn main(init: std.process.Init) !void {
             .report = report_path,
             .qc_tables = qc_tables,
             .qc_summary = qc_summary,
-            .argv = if (qc_summary != null) processArguments(io, gpa, init.minimal.args) else &.{},
+            .argv = if (qc_summary != null) processArguments(io, gpa, init.args) else &.{},
             .contaminants = contaminants_path,
             .pair_duplication = pair_duplication,
             .gzip = gzip_output,
