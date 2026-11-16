@@ -3,7 +3,7 @@
 # Validating FASTQ files
 > <sub>`z-fastq check` against 3 other validators, on 7 real sequencing runs and 5 synthetic shapes, plain and gzip. A tool is timed only where it accepted the valid input; time and memory come from the same run, on one CPU.</sub>
 
-- `z-fastq`: *0.2.0, source at 246bbb1*
+- `z-fastq`: *0.3.0*
 - `machine`: *Ryzen 9 3950X, Linux; one CPU per run*
 - `runner`: *zebrac 0.6.2 with zexec*
 - `data`:
@@ -17,19 +17,18 @@
     - `variable`: *50 to 150 bp, annotated plus line*
     - `longread`: *nanopore headers, rare 300 kb reads*
     - `long`: *300 kb sequence lines*
-- `date`: *2026-10-30*
 
 ## Findings
 
 - **Right answers:** z-fastq returned the right verdict on all 228 checked inputs and rejected every malformed edge case. 2 of the 3 other tools print a wrong verdict or crash on at least one.
-- **Speed:** fq, the fastest other full-check tool, takes 4.08x z-fastq's time on plain input and 2.29x on gzip.
-- **Memory:** every other tool peaks at 4.1x to 9x z-fastq's 0.79 MiB.
+- **Speed:** fq, the fastest other full-check tool, takes 4.83x z-fastq's time on plain input and 2.87x on gzip.
+- **Memory:** every other tool peaks at 6.3x to 13x z-fastq's 0.52 MiB.
 - **Where z-fastq is not fastest:** on no kind of input; it is the fastest tool on every kind of input (geometric mean over the group), plain and gzip.
 
 ## Compared tools
 > <sub>*complete* tools check as much as z-fastq; *partial* tools check less, so they do less work. The bold count is how many of four malformed inputs the tool rejects: a sequence and quality length mismatch, a truncated last record, `-` instead of `+`, and a quality byte below 33.</sub>
 
-- `z-fastq 0.1.0` **(subject)**; *checks every record's structure*; **4 of 4 rejected**
+- `z-fastq 0.3.0` **(subject)**; *checks every record's structure*; **4 of 4 rejected**
 - `fq 0.12.0` **(complete)**; *checks every record's structure; IUPAC codes and empty reads are invalid under its rules*; **4 of 4 rejected**
 - `fqtools 2.3` **(partial)**; *rejects CRLF; accepts a blank line*; **4 of 4 rejected**
 - `fastQValidator 0.1.1a` **(partial)**; *minimum length and duplicate-name checks off; reads the whole file before exiting*; **4 of 4 rejected**
@@ -157,15 +156,15 @@ There were a total of 1 errors.
   <img src="results/figures/single-overview-light.png" alt="Time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
-z-fastq itself takes 216.1 ms and 0.79 MiB per plain input, 1433.9 ms and 0.79 MiB per gzip input (geometric means over 12 inputs each); the table gives every other tool as a multiple of that.
-Geometric-mean process CPU time is 213.9 ms for plain input and 1424.7 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
+z-fastq itself takes 180.9 ms and 0.52 MiB per plain input, 1146.2 ms and 0.52 MiB per gzip input (geometric means over 12 inputs each); the table gives every other tool as a multiple of that.
+Geometric-mean process CPU time is 179.3 ms for plain input and 1139.7 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
 
 | Tool           | Plain time | Plain memory | Gzip time | Gzip memory |
 | -------------- | ---------: | -----------: | --------: | ----------: |
-| z-fastq        |     216 ms |     0.79 MiB |    1.43 s |    0.79 MiB |
-| fq             |      4.08x |        5.29x |     2.29x |       5.38x |
-| fqtools        |     16.14x |        4.11x |     3.17x |       4.78x |
-| fastQValidator |     30.12x |        8.26x |     5.38x |       8.54x |
+| z-fastq        |     181 ms |     0.52 MiB |    1.15 s |    0.52 MiB |
+| fq             |      4.83x |        8.61x |     2.87x |       8.70x |
+| fqtools        |     18.95x |        6.28x |     4.03x |       7.33x |
+| fastQValidator |     35.09x |       12.77x |     6.75x |      13.25x |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/single-speed-dark.png">
@@ -205,8 +204,8 @@ Geometric-mean process CPU time is 213.9 ms for plain input and 1424.7 ms for gz
   <img src="results/figures/single-scaling-memory-light.png" alt="Peak memory by input size" width="100%">
 </picture>
 
-At 1 GiB, z-fastq validates 3.4 to 8.2 GiB/s on plain input and 0.4 to 0.9 GiB/s on gzip input; no other tool is faster there.
-z-fastq peaks at 0.79 MiB at every size of the dense, endings, long, longread and variable shapes. Memory that grows with the input: fqtools by 1.3x on gzip longread; fastQValidator by 4.4x on plain longread.
+At 1 GiB, z-fastq validates 4.2 to 8.6 GiB/s on plain input and 0.5 to 1.1 GiB/s on gzip input; no other tool is faster there.
+z-fastq peaks at 0.52 MiB at every size of the dense, endings, long, longread and variable shapes. Memory that grows with the input: fqtools by 1.4x on plain longread; fastQValidator by 4.5x on plain longread.
 
 ## Other layouts
 > <sub>Mates in two files, with names checked across them, and mates interleaved in one file.</sub>
@@ -215,41 +214,41 @@ z-fastq peaks at 0.79 MiB at every size of the dense, endings, long, longread an
 
 Mates in two files, names checked across them.
 
-z-fastq itself takes 435.4 ms and 1.06 MiB per plain input, 1623.2 ms and 1.06 MiB per gzip input (geometric means over 5 inputs each); the table gives every other tool as a multiple of that.
-Geometric-mean process CPU time is 376.0 ms for plain input and 1483.5 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
+z-fastq itself takes 305.1 ms and 1.02 MiB per plain input, 1160.2 ms and 1.02 MiB per gzip input (geometric means over 5 inputs each); the table gives every other tool as a multiple of that.
+Geometric-mean process CPU time is 302.9 ms for plain input and 1153.4 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
 
 | Tool    | Plain time | Plain memory | Gzip time | Gzip memory |
 | ------- | ---------: | -----------: | --------: | ----------: |
-| z-fastq |     435 ms |     1.06 MiB |    1.62 s |    1.06 MiB |
-| fq      |      6.74x |       25.45x |     3.86x |      25.41x |
+| z-fastq |     305 ms |     1.02 MiB |    1.16 s |    1.02 MiB |
+| fq      |      7.69x |       26.78x |     4.87x |      26.87x |
 
 ### Interleaved
 
 Mates alternating in one file.
 
-z-fastq itself takes 430.0 ms and 0.53 MiB per plain input, 1535.0 ms and 0.81 MiB per gzip input (geometric means over 5 inputs each); the table gives every other tool as a multiple of that.
-Geometric-mean process CPU time is 426.7 ms for plain input and 1524.8 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
+z-fastq itself takes 285.4 ms and 0.77 MiB per plain input, 1122.9 ms and 0.77 MiB per gzip input (geometric means over 5 inputs each); the table gives every other tool as a multiple of that.
+Geometric-mean process CPU time is 283.2 ms for plain input and 1116.5 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
 
 | Tool    | Plain time | Plain memory | Gzip time | Gzip memory |
 | ------- | ---------: | -----------: | --------: | ----------: |
-| z-fastq |     430 ms |     0.53 MiB |    1.53 s |    0.81 MiB |
-| fqtools |      8.02x |        6.03x |     2.95x |       4.58x |
+| z-fastq |     285 ms |     0.77 MiB |    1.12 s |    0.77 MiB |
+| fqtools |     11.95x |        4.09x |     3.96x |       4.82x |
 
 ## Reproducibility
 
 <details><summary>How it was measured</summary>
 
-Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that `wait4` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Timed by `bench/check/run.sh release`, last on 2026-10-28; this page written on 2026-10-30.
+Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that `wait4` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Timed by `bench/check/run.sh release`.
 
 </details>
 
 <details><summary>Identity</summary>
 
-- `z-fastq`: *0.2.0, source at 246bbb1*
+- `z-fastq`: *0.3.0*
 - `zebrac`: *0.6.2*
 - `zexec`: *15000 bytes, static, no libc*
 - `cpu`: *AMD Ryzen 9 3950X 16-Core Processor*
-- `load at batch start`: *1.34 to 5.65*
+- `load at batch start`: *1.03 to 2.16*
 
 </details>
 
@@ -269,14 +268,14 @@ Every tool runs through `zexec -r` inside one zebrac batch per case, held to one
 
 Picked from these results: per group and format, the case where z-fastq leads its fastest full-check rival by the least. `run.sh peer` times z-fastq against a cached reference of the rival on each; `run.sh ab REV` times two z-fastq builds on each.
 
-- `Long reads, plain`: *PromethION, 30 to 153 kb*; rival fq at 4.95x z-fastq's time
-- `Short, fixed length, plain`: *miRNA, 36 bp*; rival fq at 2.71x z-fastq's time
-- `Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival fq at 3.65x z-fastq's time
-- `Synthetic, plain`: *endings: 100 bp, CRLF and LF lines*; rival fq at 3.95x z-fastq's time
-- `Long reads, gzip`: *PromethION, 30 to 153 kb*; rival fq at 1.99x z-fastq's time
-- `Short, fixed length, gzip`: *BGISEQ, 100 bp*; rival fq at 2.13x z-fastq's time
-- `Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival fq at 2.53x z-fastq's time
-- `Synthetic, gzip`: *longread: nanopore headers, rare 300 kb reads*; rival fq at 1.80x z-fastq's time
+- `Long reads, plain`: *PromethION, 30 to 153 kb*; rival fq at 5.10x z-fastq's time
+- `Short, fixed length, plain`: *miRNA, 36 bp*; rival fq at 3.88x z-fastq's time
+- `Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival fq at 4.89x z-fastq's time
+- `Synthetic, plain`: *long: 300 kb sequence lines*; rival fq at 4.30x z-fastq's time
+- `Long reads, gzip`: *PromethION, 30 to 153 kb*; rival fq at 2.35x z-fastq's time
+- `Short, fixed length, gzip`: *BGISEQ, 100 bp*; rival fq at 2.59x z-fastq's time
+- `Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival fq at 3.32x z-fastq's time
+- `Synthetic, gzip`: *longread: nanopore headers, rare 300 kb reads*; rival fq at 2.12x z-fastq's time
 
 </details>
 
@@ -284,9 +283,9 @@ Picked from these results: per group and format, the case where z-fastq leads it
 
 | Tool           | Instructions per byte | Instructions per cycle | Cache misses per MiB | Branch misses per MiB |
 | -------------- | --------------------: | ---------------------: | -------------------: | --------------------: |
-| z-fastq        |                  1.47 |                   3.71 |                  980 |                    86 |
-| fq             |                  9.51 |                   3.82 |                  422 |                  4673 |
-| fqtools        |                 36.81 |                   3.36 |                 1179 |                  1697 |
-| fastQValidator |                 54.04 |                   2.53 |                 3221 |                  4482 |
+| z-fastq        |                  0.96 |                   3.39 |                  933 |                    74 |
+| fq             |                  9.51 |                   3.86 |                  362 |                  4622 |
+| fqtools        |                 36.81 |                   3.44 |                  877 |                  1607 |
+| fastQValidator |                 54.05 |                   2.59 |                 1843 |                  4179 |
 
 </details>

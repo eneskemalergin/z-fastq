@@ -29,7 +29,7 @@ word past "processed"
 word payer "a processor"
 word same "processing"
 word many "Processing"
-word truth "Copies must equal the corpus pairs byte for byte. Trimmed pairs must hold the records fastp 1.4.0 keeps with the same settings, and every field of z-fastq's QC summary must equal fastp's (its own schema and tool names aside); fastp itself is that reference. QC tables must equal FastQC-Rust's \`fastqc_data.txt\` without its version and file name lines, tied overrepresented rows in sorted order."
+word truth "Copies must equal the corpus pairs byte for byte. Trimmed pairs must hold the records fastp 1.4.0 keeps with the same settings, and every field of z-fastq's QC summary must equal fastp's (its own schema and tool names aside); fastp itself is that reference. Tools with their own trimming rules (chelae, Trim Galore, fastq-trim) must write every pair as a cut of its input pair, mates in step and in input order. QC tables must equal FastQC-Rust's \`fastqc_data.txt\` without its version and file name lines, tied overrepresented rows in sorted order."
 word cells "A cell is the tool's verdict: \`accept\` (exit 0, outputs right), \`reject P001\` (with the rule it named), \`reject\`, \`wrong: accept\` (exit 0 on a broken pair or record), \`wrong: records differ\` or \`wrong: table R1\` (exit 0, other output), \`no table\` (no table written for a mate), \`refused\` (rejected a valid input), \`crash\`, or \`-\` (the tool has no such job)."
 
 # Adapters: TruSeq for rnaFusion's settings, Nextera for FRAMEFusion's.
@@ -56,6 +56,19 @@ CONTAMINANTS="$REPO/tools/.local/fastqc-current/runtime/Configuration/contaminan
 ZQ_QC="{zfastq} process --qc-tables {stem}.qc --contaminants $CONTAMINANTS $ZQ_OUT"
 FR_QC="{bin} --threads 1 -o {stem}.qc {in}"
 FJ_QC="{bin} --threads 1 --quiet --outdir {stem}.qc {in}"
+# The trimming peers with their own rules, at their one-thread settings, with
+# the families' adapters, filters, and lengths in their own terms. fasterp
+# takes fastp's commands. Trim Galore names its outputs after its inputs, so
+# it writes o_val_1.fq and o_val_2.fq into a directory of its own, plain on
+# gzip input too, as every other lane does.
+CH_TRUSEQ="{bin} trim -i {in1} {in2} -o {stem}_1.fq {stem}_2.fq -a $RF1 $RF2 --trim-polyg 0 --filter-low-qual 15:0.4 --filter-max-ns 5 -l 15 -t 1"
+CH_NEXTERA="{bin} trim -i {in1} {in2} -o {stem}_1.fq {stem}_2.fq -a $FF $FF --trim-polyg 10 --quality-trim-3p 4:20 --filter-low-qual 15:0.4 --filter-max-ns 5 -l 30 -t 1"
+TG_TRUSEQ="{bin} --paired -a $RF1 -a2 $RF2 --no_poly_g -q 0 --max_n 5 --length 15 --dont_gzip --no_report_file --cores 1 --basename o -o {stem}.tg {in1} {in2}"
+TG_NEXTERA="{bin} --paired --nextera --poly_g -q 20 --max_n 5 --length 30 --dont_gzip --no_report_file --cores 1 --basename o -o {stem}.tg {in1} {in2}"
+FT_TRUSEQ="{bin} --3p-adapter1 $RF1 --3p-adapter2 $RF2 --min-length 15 --min-qual 1 {in1} {stem}_1.fq {in2} {stem}_2.fq"
+# Thread variants run on this pair alone: how a tool scales with threads
+# does not depend on which pair it reads.
+SWEEP_SOURCE=illumina-drr1001190
 
 # Every lane writes new files under its stem, removed after each run: reads,
 # fastp's JSON and HTML, and QC files inside the {stem}.qc directory.
@@ -64,36 +77,59 @@ lane z-fastq subject "$ZQ_COPY" "$OUTPUTS" outdir=.qc
 lane fastp partial "$FP_COPY" "$OUTPUTS" note="writes its JSON and HTML report and measures duplication on every run; compression level 4"
 lane fastqc-rust partial "$FR_QC" outdir=.qc note="QC tables only, no reads written and no pair checks; the QC tables' reference"
 lane fastqc partial "$FJ_QC" outdir=.qc note="QC tables only, no reads written and no pair checks; a Java program whose JVM starts its own threads"
+lane fasterp partial "$FP_TRUSEQ" "$OUTPUTS" note="fastp's interface and records in Rust; writes its JSON and HTML report and measures duplication on every run; reader, writer, and compression threads beside its -w workers"
+lane chelae partial "$CH_TRUSEQ" "$OUTPUTS" note="its own trimming rules (paired-end overlap, adapter matching, fastp-style filters); checks pair names; a reader per input and a writer per output beside its -t workers"
+lane trim-galore partial "$TG_TRUSEQ" outdir=.tg note="Cutadapt's trimming rules, as nf-core runs it: a single 3' base matching the adapter is trimmed (stringency 1); no low-quality-fraction filter; --cores 1 is one thread"
+lane fastq-trim partial "$FT_TRUSEQ" "$OUTPUTS" only=illumina-drr1001190,illumina-err4686103,illumina-srr19571648 note="its own trimming rules, with Q20 trimming of both ends always on; no poly-G, overlap, or N handling; one thread; TruSeq job only, on the runs whose read names hold a space (it stops on mates named /1 and /2)"
 # Each peer again at 2, 4, 8, and 16 threads, on as many physical cores, in
-# the same batches as z-fastq on one: at the 1 GiB inputs only.
+# the same batches as z-fastq on one: at the 1 GiB tier, on the sweep pair.
 THREADS="2 4 8 16"
+SWEEP="cores=%s headline-only only=$SWEEP_SOURCE"
 for n in $THREADS; do
-    lane "fastp-w$n" partial "${FP_COPY/-w 1/-w $n}" "$OUTPUTS" cores="$n" of=fastp headline-only
-    lane "fastqc-rust-t$n" partial "${FR_QC/--threads 1/--threads $n}" outdir=.qc cores="$n" of=fastqc-rust headline-only
-    lane "fastqc-t$n" partial "${FJ_QC/--threads 1/--threads $n}" outdir=.qc cores="$n" of=fastqc headline-only
+    # shellcheck disable=SC2046
+    {
+        lane "fastp-w$n" partial "${FP_COPY/-w 1/-w $n}" "$OUTPUTS" $(printf "$SWEEP" "$n") of=fastp
+        lane "fastqc-rust-t$n" partial "${FR_QC/--threads 1/--threads $n}" outdir=.qc $(printf "$SWEEP" "$n") of=fastqc-rust
+        lane "fastqc-t$n" partial "${FJ_QC/--threads 1/--threads $n}" outdir=.qc $(printf "$SWEEP" "$n") of=fastqc
+        lane "fasterp-w$n" partial "${FP_TRUSEQ/-w 1/-w $n}" "$OUTPUTS" $(printf "$SWEEP" "$n") of=fasterp
+        lane "chelae-t$n" partial "${CH_TRUSEQ/-t 1/-t $n}" "$OUTPUTS" $(printf "$SWEEP" "$n") of=chelae
+        lane "trim-galore-c$n" partial "${TG_TRUSEQ/--cores 1/--cores $n}" outdir=.tg $(printf "$SWEEP" "$n") of=trim-galore
+    }
 done
-FASTP_LANES="z-fastq,fastp$(printf ',fastp-w%s' $THREADS)"
-QC_LANES="z-fastq,fastqc-rust$(printf ',fastqc-rust-t%s' $THREADS),fastqc$(printf ',fastqc-t%s' $THREADS)"
-# fastp's command in the current family, at one worker and at each count.
-fastp_command() {
+# A tool and its thread variants, as a lane list.
+with_threads() { printf '%s' "$1"; printf ",$1-$2%s" $THREADS; }
+TRIM_LANES="z-fastq,$(with_threads fastp w),$(with_threads fasterp w),$(with_threads chelae t),$(with_threads trim-galore c)"
+QC_LANES="z-fastq,$(with_threads fastqc-rust t),$(with_threads fastqc t)"
+# A tool's command in the current family, at one thread and at each count:
+# threaded_command LANE SUFFIX ONE-THREAD-FLAG TEMPLATE.
+threaded_command() {
     local n
-    command fastp "$1"
-    for n in $THREADS; do command "fastp-w$n" "${1/-w 1/-w $n}"; done
+    command "$1" "$4"
+    for n in $THREADS; do command "$1-$2$n" "${4/$3/${3% *} $n}"; done
+}
+fastp_command() {
+    threaded_command fastp w "-w 1" "$1"
+    threaded_command fasterp w "-w 1" "$1"
 }
 
 family trim-truseq "TruSeq adapters, quality and N filters, minimum length 15 (rnaFusion's settings)"
-lanes "$FASTP_LANES"
+lanes "$TRIM_LANES,fastq-trim"
 look full
 command z-fastq "$ZQ_TRUSEQ"
 fastp_command "$FP_TRUSEQ"
+threaded_command chelae t "-t 1" "$CH_TRUSEQ"
+threaded_command trim-galore c "--cores 1" "$TG_TRUSEQ"
+command fastq-trim "$FT_TRUSEQ"
 input pair "$PAIRED_SOURCES" medium
 input pair paired tiny,xsmall,small,medium
 
 family trim-nextera "Nextera adapters, poly-G and quality-tail trimming, filters, minimum length 30 (FRAMEFusion's settings)"
-lanes "$FASTP_LANES"
+lanes "$TRIM_LANES"
 look full
 command z-fastq "$ZQ_NEXTERA"
 fastp_command "$FP_NEXTERA"
+threaded_command chelae t "-t 1" "$CH_NEXTERA"
+threaded_command trim-galore c "--cores 1" "$TG_NEXTERA"
 input pair "$PAIRED_SOURCES" medium
 input pair paired tiny,xsmall,small,medium
 
@@ -136,17 +172,20 @@ fastqc_stem() {
     for s in .gz .bz2 .txt .fastq .fq .csfastq .sam .bam .ubam; do n="${n%"$s"}"; done
     printf '%s\n' "$n"
 }
-# What each lane writes into its {stem}.qc directory: z-fastq one folder per
-# mate holding fastqc_data.txt, the FastQC tools an HTML page and a zip.
+# What each lane writes into its output directory: z-fastq one folder per
+# mate holding fastqc_data.txt, the FastQC tools an HTML page and a zip,
+# Trim Galore its two trimmed mates.
 outdir_entries() { # lane family paths
     local p s
     for p in $3; do
         s="$(fastqc_stem "$p")"
         case "$1" in
             z-fastq) printf '%s_fastqc/fastqc_data.txt\n' "$s" ;;
+            trim-galore*) ;;
             *) printf '%s_fastqc.html\n%s_fastqc.zip\n' "$s" "$s" ;;
         esac
     done
+    [[ "$1" != trim-galore* ]] || printf 'o_val_1.fq\no_val_2.fq\n'
     [[ "$1" != z-fastq ]] || for p in $3; do printf '%s_fastqc/\n' "$(fastqc_stem "$p")"; done
     return 0
 }
@@ -325,8 +364,9 @@ reference_jobs() {
         done | sort -u
 }
 # One reference line: family, the two plain inputs, then for trimming the
-# fastp outputs' read_sums per mate, mate 2 reads holding S, W, or D, and
-# the kept JSON; for QC the two kept tables.
+# fastp outputs' read_sums per mate, mate 2 reads holding S, W, or D, the
+# kept JSON, and each mate's read fingerprints (reads.py hashes); for QC the
+# two kept tables.
 reference_one() {
     local fam paths stem dir
     IFS=$'\t' read -r fam paths <<<"$1"
@@ -347,11 +387,14 @@ reference_one() {
         printf '%s\t%s\t%s%s\n' "$fam" "${p[0]}" "${p[1]}" "$out"
     else
         $(STEM="$stem" lane_cmd fastp "$paths" "$fam") >/dev/null 2>"$dir/err" || { log reference FAIL "fastp on ${p[0]}: $(head -c 300 "$dir/err")"; rm -f -- "$dir/err" "$stem"_1.fq "$stem"_2.fq "$stem.json" "$stem.html"; rmdir -- "$dir"; return 1; }
-        local s1 s2 swd json="$REF_DIR/$fam-$(ref_name "${p[0]}").json"
+        local s1 s2 swd json="$REF_DIR/$fam-$(ref_name "${p[0]}").json" h1 h2
         s1="$(read_sums "${stem}_1.fq" sorted)" s2="$(read_sums "${stem}_2.fq" sorted)"
         swd="$(awk 'NR % 4 == 2 && /[SWDswd]/ { n++ } END { print n + 0 }' "${p[1]}")"
         cp -- "$stem.json" "$json"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$fam" "${p[0]}" "${p[1]}" "$s1" "$s2" "$swd" "$json"
+        h1="${json%.json}.r1" h2="${json%.json}.r2"
+        python3 -I "$BENCH/lib/reads.py" hashes "${stem}_1.fq" "$h1"
+        python3 -I "$BENCH/lib/reads.py" hashes "${stem}_2.fq" "$h2"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$fam" "${p[0]}" "${p[1]}" "$s1" "$s2" "$swd" "$json" "$h1" "$h2"
     fi
     rm -f -- "$dir/err" "$stem"_1.fq "$stem"_2.fq "$stem.json" "$stem.html"
     rmdir -- "$dir"
@@ -362,7 +405,7 @@ feature_prepare() {
     available="$(df -PB1 /var/tmp | awk 'NR == 2 { print $4 }')"
     ((available >= needed)) || die "process verification needs at least $needed free bytes under /var/tmp; $available available"
     key="$(lane_id fastp trim-truseq; lane_id fastp trim-nextera; lane_id fastqc-rust qc-tables; reference_jobs | cut -f2 | tr ' ' '\n' | sort -u | TZ=UTC xargs stat -L -c "%n $FILE_ID_FORMAT"
-        declare -f reference_one read_sums table_of table_norm fastqc_stem | cksum)"
+        declare -f reference_one read_sums table_of table_norm fastqc_stem | cat - "$BENCH/lib/reads.py" | cksum)"
     # New inputs or commands write separate sidecars. A failed refresh must
     # leave the JSON and tables named by the saved reference.tsv unchanged.
     REF_DIR="$RESULTS/reference/$(printf '%s' "$key" | sha256sum | cut -d' ' -f1)"
@@ -404,10 +447,17 @@ copy_fact() {
     else printf 'wrong: bytes differ\n'; fi
     out_bytes "$O1" "$O2"
 }
-# Trimmed reads against fastp's records, then the lane's JSON against fastp's.
+# The trimming rules a lane follows: fastp's (z-fastq, fastp, fasterp, and
+# their thread variants), or the tool's own.
+own_rules() { case "${LANE_OF[$LANE]:-$LANE}" in chelae | trim-galore | fastq-trim) return 0 ;; *) return 1 ;; esac; }
+# A lane with fastp's rules must write fastp's records; z-fastq's summary must
+# also equal fastp's JSON, while fastp's and fasterp's own reports only state
+# where they differ. A lane with its own rules must write a valid trimmed
+# pair (reads.py valid). Every lane on a corpus input then states how many of
+# fastp's reads it wrote exactly and how many pairs it kept.
 trim_fact() {
-    local fam="${FAMILY%-threads}" ref w1 w2 swd json g1 g2 dir="" json_got
-    read_outputs
+    local fam="${FAMILY%-threads}" ref w1 w2 swd json h1="" h2="" g1 g2 dir="" json_got
+    if [[ "${LANE_OF[$LANE]:-$LANE}" == trim-galore ]]; then O1="$OUTDIR/o_val_1.fq" O2="$OUTDIR/o_val_2.fq"; else read_outputs; fi
     json_got="${OUT1%_1.fq}.json"
     if [[ -n "${EDGE:-}" ]]; then
         # Small edge inputs: fastp runs here, with the family's command.
@@ -417,35 +467,50 @@ trim_fact() {
         w1="$(read_sums "$dir/o_1.fq" sorted)" w2="$(read_sums "$dir/o_2.fq" sorted)" swd=0 json="$dir/o.json"
     else
         ref="$(reference_of "$fam" "$IN")" || { printf 'wrong: no reference\n'; return; }
-        IFS=$'\t' read -r _ _ _ w1 w2 swd json <<<"$ref"
+        IFS=$'\t' read -r _ _ _ w1 w2 swd json h1 h2 <<<"$ref"
     fi
-    g1="$(read_sums "$O1")" g2="$(read_sums "$O2")"
-    local -a w=($w1 $w2)
-    if ((swd > 0)); then
-        printf 'wrong: no reference (S, W, D in R2)\n'
-    elif [[ "$g1 $g2" == "${w[0]} ${w[1]} ${w[2]} ${w[4]} ${w[5]} ${w[6]}" ]]; then
-        local d="file missing"
-        [[ ! -f "$json_got" ]] || d="$(json_diff "$json_got" "$json")"
-        if [[ -z "$d" ]]; then
-            printf 'accept\n'
-        elif [[ "$LANE" == fastp* && "$d" != "file missing" ]]; then
-            # fastp is the reference at one worker. With more, its records
-            # stay the same but its own report does not (adapter sequence
-            # counts, the insert size histogram), so that is a fact, not a
-            # wrong output.
-            printf 'accept\nsummary_differs %s\n' "$d"
-        else
-            printf 'wrong: summary %s\n' "$d"
-        fi
+    if own_rules; then
+        local -a in
+        read -r -a in <<<"$IN"
+        python3 -I "$BENCH/lib/reads.py" valid "${in[0]}" "${in[1]}" "$O1" "$O2"
     else
-        # Sorted only now: the same records in another order are not wrong records.
-        local -a g=($g1 $g2)
-        if [[ "${g[1]} ${g[2]} ${g[4]} ${g[5]}" == "${w[1]} ${w[2]} ${w[5]} ${w[6]}" &&
-            "$(read_sums "$O1" sorted | cut -d' ' -f4) $(read_sums "$O2" sorted | cut -d' ' -f4)" == "${w[3]} ${w[7]}" ]]; then
-            printf 'wrong: same records, other order\n'
+        g1="$(read_sums "$O1")" g2="$(read_sums "$O2")"
+        local -a w=($w1 $w2)
+        if ((swd > 0)); then
+            printf 'wrong: no reference (S, W, D in R2)\n'
+        elif [[ "$g1 $g2" == "${w[0]} ${w[1]} ${w[2]} ${w[4]} ${w[5]} ${w[6]}" ]]; then
+            local d="file missing"
+            [[ ! -f "$json_got" ]] || d="$(json_diff "$json_got" "$json")"
+            if [[ -z "$d" ]]; then
+                printf 'accept\n'
+            elif [[ "$LANE" != z-fastq && "$d" != "file missing" ]]; then
+                # fastp is the reference at one worker. With more, its records
+                # stay the same but its own report does not (adapter sequence
+                # counts, the insert size histogram), and fasterp's report is
+                # its own: a fact, not a wrong output.
+                printf 'accept\nsummary_differs %s\n' "$d"
+            else
+                printf 'wrong: summary %s\n' "$d"
+            fi
         else
-            printf 'wrong: records differ\n'
+            # Sorted only in this branch: the same records in another order are not wrong records.
+            local -a g=($g1 $g2)
+            if [[ "${g[1]} ${g[2]} ${g[4]} ${g[5]}" == "${w[1]} ${w[2]} ${w[5]} ${w[6]}" &&
+                "$(read_sums "$O1" sorted | cut -d' ' -f4) $(read_sums "$O2" sorted | cut -d' ' -f4)" == "${w[3]} ${w[7]}" ]]; then
+                printf 'wrong: same records, other order\n'
+            else
+                printf 'wrong: records differ\n'
+            fi
         fi
+    fi
+    if [[ -n "$h1" && -n "$h2" ]] && ((swd == 0)); then
+        local a1 a2
+        read -r -a a1 < <(python3 -I "$BENCH/lib/reads.py" agree "$h1" "$O1")
+        read -r -a a2 < <(python3 -I "$BENCH/lib/reads.py" agree "$h2" "$O2")
+        # agree: fastp's reads written exactly, both mates, in percent of fastp's;
+        # when fastp keeps no pair, 100 for an empty output and 0 for any other.
+        awk -v f="$((a1[0] + a2[0]))" -v r="$((a1[1] + a2[1]))" -v o="$((a1[2] + a2[2]))" 'BEGIN { printf "agree %.3f\n", r ? f * 100 / r : (o ? 0 : 100) }'
+        printf 'kept %s\nref_kept %s\n' "${a1[2]}" "${a1[1]}"
     fi
     out_bytes "$O1" "$O2"
     if [[ -n "$dir" ]]; then rm -f -- "$dir"/*; rmdir -- "$dir"; fi
@@ -494,20 +559,31 @@ declare -A FAMILY_TITLE=([copy-plain]="Copying into plain files" [copy-gzip]="Co
 tools_table() {
     local name fam line
     {
-        printf 'Tool\tClass\tCopy to plain\tCopy to gzip\tTruSeq trim\tNextera trim\tQC tables\tThreads\tMalformed rejected\n'
-        printf 'l\tl\tl\tl\tl\tl\tl\tl\tr\n'
+        printf 'Tool\tClass\tTrimming rules\tCopy to plain\tCopy to gzip\tTruSeq trim\tNextera trim\tQC tables\tThreads\tMalformed rejected\n'
+        printf 'l\tl\tl\tl\tl\tl\tl\tl\tl\tr\n'
         for name in "${LANES[@]}"; do
             [[ ! -v "LANE_OF[$name]" ]] || continue
             line="${REG_LABEL[$name]}"$'\t'"${LANE_CLASS[$name]}"
+            case "$name" in
+                z-fastq | fasterp) line+=$'\t'"fastp's" ;;
+                fastp) line+=$'\t'"fastp's (reference)" ;;
+                chelae | trim-galore | fastq-trim) line+=$'\t'"its own" ;;
+                *) line+=$'\t-' ;;
+            esac
             for fam in copy-plain copy-gzip trim-truseq trim-nextera qc-tables; do
                 if [[ " ${FAM_LANES[$fam]} " == *" $name "* ]]; then line+=$'\t'"$(mode_cell "$name" "$fam")"; else line+=$'\t-'; fi
             done
-            case "$name" in z-fastq) line+=$'\t1' ;; fastp) line+=$'\t1 to 16 (-w)' ;; *) line+=$'\t1 to 16 (-t)' ;; esac
+            case "$name" in
+                z-fastq | fastq-trim) line+=$'\t1' ;;
+                fastp | fasterp) line+=$'\t1 to 16 (-w)' ;;
+                trim-galore) line+=$'\t1 to 16 (--cores)' ;;
+                *) line+=$'\t1 to 16 (-t)' ;;
+            esac
             printf '%s\t%s\n' "$line" "$(rejects_all "$name")"
         done
     } | mdtable
 }
-# One bullet per job: each other tool at one thread, its time and memory over
+# One bullet per job, one sub-bullet per other tool: at one thread, its time and memory over
 # z-fastq's on plain and gzip input; then its fastest thread count on plain
 # input, with its time and CPU time there over z-fastq's on one core, and the
 # fewest threads at which it is faster, if any. Geometric means over the
@@ -531,15 +607,15 @@ job_bullet() { # family label
                 p1 = t SUBSEP "plain" SUBSEP 1; g1 = t SUBSEP "gzip" SUBSEP 1
                 if (p1 in k) s = s sprintf(" takes %.1fx z-fastq%ss time on plain input", exp(sw[p1] / k[p1]), "\047")
                 if (g1 in k) s = s sprintf(" and %.1fx on gzip", exp(sw[g1] / k[g1]))
-                if (p1 in k) s = s sprintf(", with %.0fx its memory", exp(sr[p1] / k[p1]))
+                if (p1 in k) { mr = exp(sr[p1] / k[p1]); s = s sprintf(", with " (mr < 1 ? "%.2f" : mr < 10 ? "%.1f" : "%.0f") "x its memory", mr) }
                 best = 0; from = 0
                 for (m = 2; m <= 1024; m *= 2) { q = t SUBSEP "plain" SUBSEP m; if (!(q in k)) continue
                     v = exp(sw[q] / k[q]); if (!best || v < bv) { best = m; bv = v; bc = exp(sc[q] / k[q]) }
                     if (!from && v < 1) from = m }
                 if (best) s = s sprintf("; at its fastest, %d threads, %.2fx z-fastq%ss time for %.1fx its CPU time", best, bv, "\047", bc)
                 if (from) s = s sprintf(" (faster than z-fastq from %d threads)", from)
-                out = out (out == "" ? "" : "; ") s }
-            if (out != "") printf "- **%s:** %s.\n", lbl, out
+                out = out "\n  - " s "." }
+            if (out != "") printf "- **%s:**%s\n", lbl, out
         }' "$REPORT_DIR/cases.tsv" "$REPORT_DIR/style.tsv" "$REPORT_DIR/summary.tsv"
 }
 process_findings() {
@@ -553,6 +629,7 @@ process_findings() {
               if (k) line = line sprintf(" %d of the %d other tools write output from a broken pair or record with exit 0.", k, others)
               print line }' "$REPORT_DIR/checks.tsv" "$REPORT_DIR/edges.tsv"
     valid_wrong_bullet
+    agreement_text bullet
     steps_text bullet
     gzip_size_bullet
     for fam in trim-truseq trim-nextera qc-tables; do job_bullet "$fam" "${FAMILY_TITLE[$fam]}"; done
@@ -566,6 +643,49 @@ gzip_size_bullet() {
               printf "- **Gzip output size:** on that pair, z-fastq'"'"'s default `fast` preset writes %.1f MB, %.0f%% %s than fastp'"'"'s %.1f MB at its default level 4; `--gzip-preset even` or `dense` writes less, more slowly.\n", z / 1e6, (z > p ? z / p - 1 : 1 - z / p) * 100, (z > p ? "more" : "less"), p / 1e6 } }' \
         "$REPORT_DIR/cases.tsv" "$FAMILY_CHECKS"
 }
+# How many of fastp's trimmed reads each tool writes exactly, per trimming
+# job, from the agree, kept, and ref_kept facts of the headline inputs:
+# MODE bullet (Findings) or table (its section).
+agreement_text() { # mode
+    awk -F'\t' -v mode="$1" -v tier="$HEADLINE" '
+        FILENAME ~ /cases.tsv$/ { if (FNR > 1 && ($1 == "trim-truseq" || $1 == "trim-nextera") && $5 == tier && $6 != "many") want[$1, $2] = 1; next }
+        FILENAME ~ /style.tsv$/ { if (FNR > 1) { label[$1] = $2; ord[$1] = $7 + 0; base[$1] = ($10 == "" || $10 == $1) } next }
+        (($1, $5) in want) && $3 == "pass" && base[$2] {
+            a = k = r = -1; n = split($4, f, ";")
+            for (i = 1; i <= n; i++) { split(f[i], q, " "); if (q[1] == "agree") a = q[2]; else if (q[1] == "kept") k = q[2]; else if (q[1] == "ref_kept") r = q[2] }
+            if (a < 0) next
+            key = $1 SUBSEP $2; sa[key] += a; c[key]++; sk[key] += k; sr[key] += r; full[key] += (a == 100); lanes[$2] = 1 }
+        END {
+            n = 0; for (l in lanes) list[++n] = l
+            for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (ord[list[j]] < ord[list[i]]) { t = list[i]; list[i] = list[j]; list[j] = t }
+            split("trim-truseq trim-nextera", fams, " "); split("TruSeq Nextera", jobs, " ")
+            if (mode == "table") {
+                print "Job\tTool\tTrimming rules\tSame reads as fastp\tPairs kept, of fastp\x27s\tInputs identical"
+                print "l\tl\tl\tr\tr\tr"
+                for (x = 1; x <= 2; x++) for (i = 1; i <= n; i++) { key = fams[x] SUBSEP list[i]; if (!c[key]) continue
+                    rules = (list[i] == "chelae" || list[i] == "trim-galore" || list[i] == "fastq-trim") ? "its own" : "fastp\x27s"
+                    name = label[list[i]]; gsub("_", " ", name)
+                    printf "%s\t%s\t%s\t%.2f%%\t%.2f%%\t%d of %d\n", jobs[x], name, rules, sa[key] / c[key], sr[key] ? sk[key] * 100 / sr[key] : 0, full[key], c[key] }
+                exit }
+            same = ""; own = ""
+            for (i = 1; i <= n; i++) { l = list[i]; if (l == "fastp") continue; name = label[l]; gsub("_", " ", name)
+                all = 1; tot = 0; cnt = 0; lo = 101; hi = -1
+                for (x = 1; x <= 2; x++) { key = fams[x] SUBSEP l; if (!c[key]) continue; cnt += c[key]; tot += full[key]; if (full[key] < c[key]) all = 0
+                    v = sa[key] / c[key]; if (v < lo) lo = v; if (v > hi) hi = v }
+                if (!cnt) continue
+                if (all) same = same (same == "" ? "" : " and ") name
+                else own = own (own == "" ? "" : ", ") (lo == hi || hi - lo < 0.005 ? sprintf("%s %.2f%%", name, lo) : sprintf("%s %.2f to %.2f%%", name, lo, hi)) }
+            if (same == "" && own == "") exit
+            printf "- **Same reads as fastp:** %s%s%s.\n", (same == "" ? "" : same " write exactly the reads fastp 1.4.0 writes, on every input of both trimming jobs"),
+                (same != "" && own != "" ? "; with their own trimming rules, " : own != "" ? "with their own trimming rules, " : ""),
+                (own == "" ? "" : own " of fastp\x27s reads come out the same")
+        }' "$REPORT_DIR/cases.tsv" "$REPORT_DIR/style.tsv" "$FAMILY_CHECKS"
+}
+agreement_part() {
+    printf '## Same reads as fastp\n> <sub>Of the reads fastp 1.4.0 writes with the same settings, the share each tool writes exactly (name, bases, and qualities), both mates, mean over the %s inputs; pairs kept as a share of fastp\x27s; and on how many inputs every read is the same (an input on which fastp keeps no pair counts when the tool keeps none either). Tools with fastp\x27s rules must match it to be right. Tools with their own rules are right when every pair they write is a cut of its input pair in input order; this column then shows how far their rules lead from fastp\x27s, not an error.</sub>\n\n' "${TIER_SIZE[$HEADLINE]}"
+    agreement_text table | mdtable
+    printf '\n'
+}
 # One report section: the jobs SLUG draws together.
 readme_section() { # slug title family:job...
     local slug="$1" title="$2" spec fam jobs=""
@@ -573,14 +693,14 @@ readme_section() { # slug title family:job...
     for spec; do fam="${spec%%:*}"; jobs+="${spec#*:}: ${FAM_DESC[$fam]}. "; done
     printf '## %s\n> <sub>%sThe real runs and the synthetic pair at %s, plain and gzip input, in the page cache, every tool on one CPU. The other tools at 2 to 16 threads are in the threads part below.</sub>\n\n' "$title" "$jobs" "${TIER_SIZE[$HEADLINE]}"
     picture "$slug-overview" "$title: time and peak RSS relative to z-fastq" && printf '\n'
-    printf 'Geometric means over the %s inputs: z-fastq'"'"'s own time and memory, and every other tool'"'"'s as a multiple of them.\n\n' "${TIER_SIZE[$HEADLINE]}"
-    MODE_HEADER=Job summary_table "$@"
+    printf 'Geometric means over the %s inputs: z-fastq'"'"'s own wall time, CPU time, and memory, and every other tool'"'"'s as a multiple of them. CPU time counts every thread a tool starts at its one-thread setting.\n\n' "${TIER_SIZE[$HEADLINE]}"
+    CPU=1 MODE_HEADER=Job summary_table "$@"
     printf '\n'
     picture "$slug-speed" "$title: wall time by kind of input" && printf '\n'
     picture "$slug-memory" "$title: peak memory by kind of input" && printf '\n'
     for spec; do output_sentence "${spec%%:*}" "${spec#*:}"; done
     threads_part "$slug" "$title" "$@"
-    details "Scaling"
+    printf '### %s: scaling\n> <sub>The synthetic pair from 1 MiB to %s, every tool on one CPU: throughput and peak memory by input size.</sub>\n\n' "$title" "${TIER_SIZE[$HEADLINE]}"
     picture "$slug-scaling" "$title: throughput and peak memory by input size" && printf '\n'
     # Jobs whose scaling sentences match say them once, under all their names.
     local names="" text first="" same=1
@@ -591,7 +711,7 @@ readme_section() { # slug title family:job...
     done
     if ((same)); then printf '**%s.** %s\n' "$names" "$first"
     else for spec; do printf '**%s.** %s\n' "${spec#*:}" "$(scaling_sentences "${spec%%:*}")"; done; fi
-    printf '</details>\n\n'
+    printf '\n'
 }
 # The cost of each step on the one pair copying runs on: the copies, then the
 # trims on the same input, z-fastq beside fastp at one thread.
@@ -651,20 +771,26 @@ steps_text() { # mode
 threads_part() { # slug title family:job...
     local slug="$1" title="$2"
     shift 2
-    printf '### %s: threads\n> <sub>Each other tool at 1, 2, 4, 8, and 16 threads on as many physical cores, z-fastq on one, in the same batches, at the %s inputs. Geometric means over those inputs. Cores used is CPU time over wall time.</sub>\n\n' "$title" "${TIER_SIZE[$HEADLINE]}"
+    printf '### %s: threads\n> <sub>Each other tool at 1, 2, 4, 8, and 16 threads on as many physical cores (one hardware thread each), z-fastq on one, in the same batches, on one pair at %s (%s), plain and gzip input. Cores used is CPU time over wall time.</sub>\n\n' "$title" "${TIER_SIZE[$HEADLINE]}" "$(label_of "$SWEEP_SOURCE")"
     picture "$slug-threads" "$title: wall time, CPU time, and peak memory by thread count" && printf '\n'
     threads_table "$@"
     printf '\n'
     threads_sentences "$@"
 }
+# The cases that ran thread variants: the thread figures and tables compare
+# every tool on these alone.
+sweep_cases() {
+    awk -F'\t' 'FILENAME ~ /style.tsv$/ { if (FNR > 1 && $10 != "" && $10 != $1) variant[$1] = 1; next }
+        FNR > 1 && variant[$3] { print $2 }' "$REPORT_DIR/style.tsv" "$REPORT_DIR/summary.tsv" | sort -u | paste -sd' ' -
+}
 threads_table() { # family:job...
     local fams
     fams="$(printf '%s|' "$@")"
-    awk -F'\t' -v fams="${fams%|}" -v tier="$HEADLINE" '
+    awk -F'\t' -v fams="${fams%|}" -v tier="$HEADLINE" -v sweep=" $(sweep_cases) " '
         BEGIN { nf = split(fams, fl, "|"); for (i = 1; i <= nf; i++) { split(fl[i], q, ":"); fam[i] = q[1]; job[q[1]] = q[2]; at[q[1]] = 1 } }
         FILENAME ~ /cases.tsv$/ { if (FNR > 1 && ($1 in at) && $5 == tier && $6 != "many") { fmt[$1, $2] = $3; if ($3 == "gzip") hasgz = 1 } next }
         FILENAME ~ /style.tsv$/ { if (FNR > 1) { label[$1] = $2; ord[$1] = $7 + 0; cores[$1] = ($9 > 0 ? $9 : 1); of[$1] = ($10 == "" ? $1 : $10) } next }
-        FNR == 1 || !(($1, $2) in fmt) || $11 <= 0 { next }
+        FNR == 1 || !(($1, $2) in fmt) || $11 <= 0 || (sweep != "  " && !index(sweep, " " $2 " ")) { next }
         { k = $1 SUBSEP $3 SUBSEP fmt[$1, $2]; n[k]++; w[k] += log($5 / 1e9); c[k] += log($11 / 1e6); m[k] += log($8 / 1024); lanes[$1, $3] = 1 }
         END {
             print "Job\tTool\tThreads" "\tPlain wall s\tPlain CPU s\tPlain cores used\tPlain peak MiB" (hasgz ? "\tGzip wall s\tGzip CPU s\tGzip cores used\tGzip peak MiB" : "")
@@ -690,10 +816,10 @@ threads_table() { # family:job...
 threads_sentences() { # family:job...
     local spec
     for spec; do
-        awk -F'\t' -v fam="${spec%%:*}" -v job="${spec#*:}" -v tier="$HEADLINE" '
+        awk -F'\t' -v fam="${spec%%:*}" -v job="${spec#*:}" -v tier="$HEADLINE" -v sweep=" $(sweep_cases) " '
             FILENAME ~ /cases.tsv$/ { if (FNR > 1 && $1 == fam && $5 == tier && $6 != "many") fmt[$2] = $3; next }
             FILENAME ~ /style.tsv$/ { if (FNR > 1) { label[$1] = $2; ord[$1] = $7 + 0; cores[$1] = ($9 > 0 ? $9 : 1); of[$1] = ($10 == "" ? $1 : $10) } next }
-            FNR == 1 || $1 != fam || !($2 in fmt) { next }
+            FNR == 1 || $1 != fam || !($2 in fmt) || (sweep != "  " && !index(sweep, " " $2 " ")) { next }
             { w[$2, $3] = $5; c[$2, $3] = $11; lanes[$3] = 1 }
             END {
                 for (l in lanes) if (l != "z-fastq") for (x in fmt) if ((x, l) in w && (x, "z-fastq") in w && c[x, l] > 0 && c[x, "z-fastq"] > 0) {
@@ -724,13 +850,14 @@ feature_readme() {
     readme_head
     printf '## Findings\n\n'
     process_findings
-    printf '\n## Compared tools\n> <sub>*partial* tools do less than z-fastq: fastp checks records less strictly, and the FastQC tools write no reads and check no pairs. A job is `yes` when the tool was right on every input of it, `partly` on some, `-` when the tool has no such job. Threads: z-fastq runs on one; in the trimming and QC jobs every other tool runs at 1 thread and again at 2, 4, 8, and 16 on as many physical cores, at the %s inputs, in the same batches as z-fastq; copying runs every tool on one. Malformed rejected: of the broken pairs and records in the edge cases, how many the tool rejects.</sub>\n\n' "${TIER_SIZE[$HEADLINE]}"
+    printf '\n## Compared tools\n> <sub>*partial* tools do less than z-fastq: fastp checks records less strictly, and the FastQC tools write no reads and check no pairs. A job is `yes` when the tool was right on every input of it, `partly` on some, `-` when the tool has no such job. Trimming rules: fastp\x27s, or the tool\x27s own (see Same reads as fastp). Threads: z-fastq runs on one; every other tool runs at its one-thread setting on every input, and at 2, 4, 8, and 16 threads on as many physical cores on one pair at the %s tier, in the same batches as z-fastq; copying runs every tool on one. Malformed rejected: of the broken pairs and records in the edge cases, how many the tool rejects.</sub>\n\n' "${TIER_SIZE[$HEADLINE]}"
     tools_table
     printf '\n'
     local name
     for name in "${LANES[@]}"; do [[ -z "${LANE_NOTE[$name]}" ]] || printf -- '- `%s %s`: *%s*\n' "${REG_LABEL[$name]}" "$(lane_version "$name")" "${LANE_NOTE[$name]}"; done
-    printf '\n> [!IMPORTANT]\n> fastp computes its QC report and pair duplication on every run, so z-fastq'"'"'s trimming lanes write the QC summary and measure pair duplication too. In the QC job z-fastq also writes both mates, which it cannot skip, while the FastQC tools write tables only.\n'
+    printf '\n> [!IMPORTANT]\n> fastp and fasterp compute a QC report and pair duplication on every run, so z-fastq'"'"'s trimming lanes write the QC summary and measure pair duplication too. chelae, Trim Galore, and fastq-trim compute neither, and z-fastq still does in the same batches. In the QC job z-fastq also writes both mates, which it cannot skip, while the FastQC tools write tables only.\n'
     readme_right
+    agreement_part
     steps_part
     readme_section trimming Trimming "trim-truseq:TruSeq" "trim-nextera:Nextera"
     readme_section qc "QC tables" "qc-tables:FastQC tables"

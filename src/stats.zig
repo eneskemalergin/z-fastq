@@ -70,7 +70,7 @@ pub const Stats = struct {
     q30_bases: u64 = 0,
     last_quality_error: ?QualityError = null,
 
-    pub fn addRecord(self: *Stats, record: fastq.Record) StatsError!void {
+    pub fn addRecord(self: *Stats, record: fastq.Record) align(4096) StatsError!void {
         self.last_quality_error = null;
         var quality_error: ?QualityError = null;
         const delta = recordTotals(record, &quality_error) catch |err| {
@@ -273,22 +273,34 @@ fn payloadTotals(
     quality: []const u8,
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
-    if (sum_type == u64 and simd.useAvx2(quality.len)) return avx2Totals(.both, sequence, quality, quality_error);
+    if (sum_type == u64) {
+        if (simd.spanKernel("payload_totals", &payloadTotalsExport, quality.len)) |kernel| {
+            return objectTotals(kernel, .both, sequence, quality, quality_error);
+        }
+    }
     return payloadTotalsInline(sum_type, .both, sequence, quality, quality_error);
 }
 
 fn chunkTotals(comptime parts: Parts, bytes: []const u8, quality_error: *?QualityError) StatsError!PayloadTotals {
     const sequence = if (parts == .sequence) bytes else "";
     const quality = if (parts == .quality) bytes else "";
-    if (simd.useAvx2(bytes.len)) return avx2Totals(parts, sequence, quality, quality_error);
+    if (simd.spanKernel("payload_totals", &payloadTotalsExport, bytes.len)) |kernel| {
+        return objectTotals(kernel, parts, sequence, quality, quality_error);
+    }
     return payloadTotalsInline(u64, parts, sequence, quality, quality_error);
 }
 
-fn avx2Totals(parts: Parts, sequence: []const u8, quality: []const u8, quality_error: *?QualityError) StatsError!PayloadTotals {
+fn objectTotals(
+    kernel: *const @TypeOf(payloadTotalsExport),
+    parts: Parts,
+    sequence: []const u8,
+    quality: []const u8,
+    quality_error: *?QualityError,
+) StatsError!PayloadTotals {
     var totals: PayloadTotals = undefined;
     var error_index: usize = undefined;
     var error_byte: u8 = undefined;
-    switch (simd.avx2Kernel("payload_totals", &payloadTotalsExport)(@intFromEnum(parts), sequence.ptr, sequence.len, quality.ptr, quality.len, &totals, &error_index, &error_byte)) {
+    switch (kernel(@intFromEnum(parts), sequence.ptr, sequence.len, quality.ptr, quality.len, &totals, &error_index, &error_byte)) {
         0 => return totals,
         1 => {
             quality_error.* = .{ .byte_index = error_index, .byte = error_byte };
@@ -336,7 +348,7 @@ fn payloadTotalsInline(
     quality_error: *?QualityError,
 ) StatsError!PayloadTotals {
     const len = if (parts == .sequence) sequence.len else quality.len;
-    if (sum_type == u64 and len >= simd.INLINE_LANES) {
+    if (sum_type == u64 and len >= simd.BASELINE_LANES) {
         return payloadTotalsVector(simd.INLINE_LANES, parts, sequence, quality, quality_error);
     }
     return payloadTotalsScalar(sum_type, parts, sequence, quality, quality_error);
@@ -394,6 +406,10 @@ fn payloadTotalsVector(
 ) StatsError!PayloadTotals {
     comptime std.debug.assert(vector_len >= 2 and vector_len % 2 == 0 and
         vector_len <= std.math.maxInt(u16) / std.math.maxInt(u8));
+    const len = if (parts == .sequence) sequence.len else quality.len;
+    if (vector_len > simd.BASELINE_LANES and len < vector_len) {
+        return payloadTotalsVector(vector_len / 2, parts, sequence, quality, quality_error);
+    }
     const half_len = vector_len / 2;
     const vectors_per_quality_block: usize = std.math.maxInt(u8) - 1;
     const vectors_per_base_block: usize = std.math.maxInt(u8) - 1;
@@ -414,7 +430,7 @@ fn payloadTotalsVector(
     const ones: Bytes = @splat(1);
     const zeros: Bytes = @splat(0);
     const lane_indices = std.simd.iota(u8, vector_len);
-    const tail_len = (if (parts == .sequence) sequence.len else quality.len) % vector_len;
+    const tail_len = len % vector_len;
 
     var quality_sum: u64 = 0;
     var q20_bases: usize = 0;
@@ -648,7 +664,7 @@ test "[property] - [statistics]: vector payload totals match the scalar path at 
                 try payloadTotalsScalar(u64, .both, sequence_part, quality_part, &quality_error),
                 try payloadTotals(u64, sequence_part, quality_part, &quality_error),
             );
-            if (length < vector_len) continue;
+            if (length < simd.BASELINE_LANES) continue;
             inline for (.{ Parts.both, Parts.sequence, Parts.quality }) |parts| {
                 try std.testing.expectEqualDeep(
                     try payloadTotalsScalar(u64, parts, sequence_part, quality_part, &quality_error),

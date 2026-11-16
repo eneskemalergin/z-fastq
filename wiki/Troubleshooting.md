@@ -6,6 +6,10 @@ Find the symptom, then the fix.
 
 The binary stays in the build tree: run `./zig-out/bin/z-fastq`, or link it into a directory on your `PATH` ([Installation](Installation)).
 
+## The binary stops at once with status 2
+
+The x86-64 release binaries need a CPU with the x86-64-v3 set (AVX2, BMI2, FMA). On an older CPU the Linux binary stops before reading anything, with `this z-fastq build needs an x86-64 CPU with the x86-64-v3 set`. Build z-fastq from source instead; a build without `-Dcpu` runs on any x86-64 CPU ([Installation](Installation#build-from-source)). A `ZFASTQ_TIER` value the CPU cannot run also stops a command with status `2`, and the message names the tiers it can run.
+
 ## The build cannot download zipir
 
 The first build fetches the zipir release named in `build.zig.zon` and checks its hash. Build once with network access; later builds reuse the download.
@@ -46,7 +50,7 @@ Streaming commands write records as they go, and a later failure, such as a brok
 
 ## The command exits with status 4
 
-A limit was reached: the line limit, a sampling limit, or an arithmetic limit. The message names which.
+A limit was reached: the line limit, a sampling or arithmetic limit, the 1 MiB limit on a contaminant list, or an option value above its supported range, such as `--seed` or `--max-pairs`. The message names which.
 
 ## Related pages
 

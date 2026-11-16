@@ -1,24 +1,10 @@
-//! Paired read trimming and pair retention with fastp 1.1.0's rules. First, as fastp's per-read
-//! UMI location does, a fixed-length UMI and spacer are cut from the 5' end of the selected mates,
-//! and the UMI bases, joined with an underscore, name the pair. Then come the 3' quality window,
-//! poly-G tails, adapters found by mate overlap or by adapter sequence, and the empty-read,
-//! adapter-dimer, quality, N, and length checks. Every trim keeps a prefix of the read, so a
-//! result is one kept length per mate; sequence and quality are cut together by the caller.
-//! The overlap and adapter searches score a block of consecutive offsets per pass over the
-//! pattern, reading the read through a fixed stack window padded with zero bytes, which no read
-//! or adapter base equals. The block kernel, the reverse complement, and the low-quality and N
-//! count use the inline vector width only, with no AVX2 object for builds whose target lacks
-//! AVX2: each costs a small share of a trimmed or filtered run at every read length. Insert sizes
-//! follow fastp's overlap rule. Adapter cuts also count as fastp counts them: an overlap trim
-//! counts both mates and the bases each lost, a sequence match counts its mate and the bases
-//! removed, or the matched adapter length when the match starts before the read. The pair
-//! duplication estimate is fastp's: the bases of mate 1, then
-//! mate 2, hash to one position in each of two 2^32-bit arrays, and a pair whose two positions are
-//! both set already counts as a duplicate, hash collisions included. Only the set positions are
-//! kept, per 65,536-bit block as a sorted list of offsets or, past 4,096 of them, as a bitmap, so
-//! memory follows the pairs read instead of fastp's fixed 1 GiB. The pair sum has an AVX2 kernel.
+//! Paired read trimming, filtering, insert sizes, and pair duplication, by fastp 1.1.0's rules.
+//!
+//! After any UMI cut, every trim keeps a prefix of the read, so a result is one kept length per
+//! mate; the caller cuts sequence and quality together.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const fastq = @import("fastq.zig");
 const simd = @import("simd.zig");
@@ -58,19 +44,19 @@ const COMPLEMENT: [256]u8 = table: {
     break :table table;
 };
 
-pub const Tail = struct {
+const Tail = struct {
     window: u16,
     quality: u8,
 };
 
-pub const LowQuality = struct {
+const LowQuality = struct {
     quality: u8,
     percent: u8,
 };
 
 pub const UmiMates = enum { @"1", @"2", both };
 
-pub const Umi = struct {
+const Umi = struct {
     length: u8,
     skip: u8 = 0,
     mates: UmiMates,
@@ -97,11 +83,11 @@ pub const Options = struct {
     max_n: ?u8 = null,
     low_quality: ?LowQuality = null,
 
-    pub fn trims(self: Options) bool {
+    fn trims(self: Options) bool {
         return self.adapters != null or self.poly_g != null or self.tail != null;
     }
 
-    pub fn filters(self: Options) bool {
+    fn filters(self: Options) bool {
         return self.min_length != null or self.max_n != null or self.low_quality != null;
     }
 
@@ -282,9 +268,9 @@ pub const PairDuplication = struct {
         if (read1.len + read2.len >= VECTOR_LENGTH_LIMIT) {
             sumsScalar(&self.primes, read1, 0, &sums);
             sumsScalar(&self.primes, read2, read1.len, &sums);
-        } else if (simd.INLINE_TIER == .baseline and simd.avx2Selected()) {
-            simd.avx2Kernel("pair_sums", &pairSumsExport)(&self.primes, read1.ptr, read1.len, read2.ptr, read2.len, &sums);
-        } else if (simd.INLINE_TIER == .avx2) {
+        } else if (simd.callKernel("pair_sums", &pairSumsExport)) |kernel| {
+            kernel(&self.primes, read1.ptr, read1.len, read2.ptr, read2.len, &sums);
+        } else if (simd.INLINE_TIER != .baseline or builtin.cpu.arch == .aarch64) {
             pairSumsVector(&self.primes, read1, read2, &sums);
         } else {
             sumsScalar(&self.primes, read1, 0, &sums);
@@ -315,28 +301,27 @@ pub const PairDuplication = struct {
     }
 
     fn sumsVector(primes: *const Primes, read: []const u8, start: usize, sums: *Sums) void {
+        const Lanes8 = @Vector(SUM_LANES, u8);
         const Lanes32 = @Vector(SUM_LANES, u32);
-        const Lanes64 = @Vector(SUM_LANES, u64);
-        var totals: [ARRAY_COUNT]Lanes64 = @splat(@splat(0));
+        var totals: [ARRAY_COUNT]Lanes32 = @splat(@splat(0));
         const steps: Lanes32 = std.simd.iota(u32, SUM_LANES);
         var index: usize = 0;
         while (index + SUM_LANES <= read.len) : (index += SUM_LANES) {
-            const bytes: @Vector(SUM_LANES, u8) = read[index..][0..SUM_LANES].*;
-            var values: Lanes32 = @splat(OTHER_VALUE);
+            const bytes: Lanes8 = read[index..][0..SUM_LANES].*;
+            var values: Lanes8 = @splat(OTHER_VALUE);
             inline for (.{ 'A', 'C', 'G', 'T' }) |base| {
-                const matches = bytes == @as(@Vector(SUM_LANES, u8), @splat(base));
-                values = @select(u32, matches, @as(Lanes32, @splat(@intCast(BASE_VALUE[base]))), values);
+                values = @select(u8, bytes == @as(Lanes8, @splat(base)), @as(Lanes8, @splat(BASE_VALUE[base])), values);
             }
             const position = start + index;
-            const terms: Lanes64 = values + @as(Lanes32, @splat(@intCast(position))) + steps;
+            const terms = @as(Lanes32, values) + @as(Lanes32, @splat(@intCast(position))) + steps;
             const row = position % PRIME_ROW;
             for (&totals, primes) |*total, *factors| {
-                const wide: Lanes64 = @as(Lanes32, factors[row..][0..SUM_LANES].*);
-                total.* +%= wide * terms;
+                const row_factors: Lanes32 = factors[row..][0..SUM_LANES].*;
+                total.* +%= row_factors *% terms;
             }
         }
         for (&totals, sums) |total, *sum| {
-            for (@as([SUM_LANES]u64, total)) |lane| sum.* +%= lane;
+            for (@as([SUM_LANES]u32, total)) |lane| sum.* +%= lane;
         }
         sumsScalar(primes, read[index..], start + index, sums);
     }
@@ -359,10 +344,10 @@ pub const PairDuplication = struct {
         for (&probes, &self.sets, bits) |*probe, *set, bit| probe.* = set.find(bit);
         for (&probes, &self.sets) |*probe, *set| try set.reserve(allocator, probe);
         var seen = true;
-        for (probes) |probe| {
+        for (probes, &self.sets) |probe, *set| {
             if (probe.present) continue;
             seen = false;
-            PositionSet.insert(probe);
+            set.insert(probe);
         }
         self.pairs = pairs;
         if (seen) self.duplicates += 1;
@@ -390,120 +375,271 @@ comptime {
 }
 
 const PositionSet = struct {
-    blocks: []Block = &.{},
+    heads: []Head = &.{},
+    store: std.ArrayList(u16) = .empty,
+    order: std.ArrayList(u16) = .empty,
+    garbage: usize = 0,
+    bitmaps: std.ArrayList(*[BITMAP_WORDS]u64) = .empty,
 
     const BLOCK_COUNT = 1 << 16;
-    const LIST_MAX = 4096;
     const BITMAP_WORDS = BLOCK_COUNT / 64;
-    const BITMAP = std.math.maxInt(u32);
+    const BITMAP = std.math.maxInt(u16);
+    const COMPACT_MIN = 1 << 16;
+    const DENSE_MIN = 256;
+    const DENSE_INDEX_UNITS = 128;
+    const DENSE_MAX = BITMAP_WORDS * 8 - DENSE_INDEX_UNITS * 2;
+    const BUCKET_MAX = std.math.maxInt(u8);
 
-    const Block = struct {
-        data: ?*anyopaque = null,
-        count: u32 = 0,
-        capacity: u32 = 0,
+    const Head = packed struct(u64) {
+        offset: u32 = 0,
+        count: u16 = 0,
+        capacity: u15 = 0,
+        dense: bool = false,
 
-        fn list(self: Block) []u16 {
-            const items: [*]u16 = @ptrCast(@alignCast(self.data.?));
-            return items[0..self.count];
-        }
-
-        fn bitmap(self: Block) *[BITMAP_WORDS]u64 {
-            return @ptrCast(@alignCast(self.data.?));
+        fn usedUnits(self: Head) usize {
+            return if (self.dense) DENSE_INDEX_UNITS + (@as(usize, self.count) + 1) / 2 else self.count;
         }
     };
 
     const Probe = struct {
-        block: *Block,
+        head: *Head,
         low: u16,
         index: u32,
         present: bool,
     };
 
     fn init(self: *PositionSet, allocator: std.mem.Allocator) error{OutOfMemory}!void {
-        self.blocks = try allocator.alloc(Block, BLOCK_COUNT);
-        @memset(self.blocks, .{});
+        self.heads = try allocator.alloc(Head, BLOCK_COUNT);
+        @memset(self.heads, .{});
     }
 
     fn deinit(self: *PositionSet, allocator: std.mem.Allocator) void {
-        for (self.blocks) |block| {
-            const data = block.data orelse continue;
-            if (block.count == BITMAP) {
-                allocator.destroy(block.bitmap());
-            } else {
-                const items: [*]u16 = @ptrCast(@alignCast(data));
-                allocator.free(items[0..block.capacity]);
-            }
-        }
-        allocator.free(self.blocks);
-        self.blocks = &.{};
+        for (self.bitmaps.items) |words| allocator.destroy(words);
+        self.bitmaps.deinit(allocator);
+        self.store.deinit(allocator);
+        self.order.deinit(allocator);
+        allocator.free(self.heads);
+        self.* = .{};
+    }
+
+    fn units(self: *const PositionSet, head: Head) []u16 {
+        return self.store.items[head.offset..][0..head.capacity];
+    }
+
+    fn list(self: *const PositionSet, head: Head) []u16 {
+        return self.store.items[head.offset..][0..head.count];
+    }
+
+    fn bucketCounts(self: *const PositionSet, head: Head) *[256]u8 {
+        return @ptrCast(self.units(head)[0..DENSE_INDEX_UNITS]);
+    }
+
+    fn denseBytes(self: *const PositionSet, head: Head) []u8 {
+        const area: []u8 = @ptrCast(self.units(head)[DENSE_INDEX_UNITS..]);
+        return area[0..head.count];
     }
 
     fn prefetch(self: *const PositionSet, position: u32) void {
-        @prefetch(&self.blocks[position >> 16], .{ .rw = .write });
+        @prefetch(&self.heads[position >> 16], .{ .rw = .write });
     }
 
-    fn prefetchBlock(self: *const PositionSet, position: u32) void {
-        const block = self.blocks[position >> 16];
-        if (block.data == null) return;
+    inline fn prefetchBlock(self: *const PositionSet, position: u32) void {
+        const head = self.heads[position >> 16];
         const low: u16 = @truncate(position);
-        if (block.count == BITMAP) {
-            @prefetch(&block.bitmap()[low >> 6], .{ .rw = .write });
-        } else {
-            const items = block.list();
+        if (head.count == BITMAP) {
+            @prefetch(&self.bitmaps.items[head.offset][low >> 6], .{ .rw = .write });
+        } else if (head.dense) {
+            const area = self.units(head);
+            @prefetch(area.ptr, .{});
+            @prefetch(&area[DENSE_INDEX_UNITS + head.count / 4], .{ .rw = .write });
+        } else if (head.count != 0) {
+            const items = self.list(head);
             @prefetch(items.ptr, .{ .rw = .write });
             if (items.len > 32) @prefetch(&items[items.len / 2], .{});
         }
     }
 
-    fn find(self: *PositionSet, position: u32) Probe {
-        const block = &self.blocks[position >> 16];
+    inline fn find(self: *PositionSet, position: u32) Probe {
+        const head = &self.heads[position >> 16];
         const low: u16 = @truncate(position);
-        if (block.count == BITMAP) {
-            const present = block.bitmap()[low >> 6] & (@as(u64, 1) << @intCast(low & 63)) != 0;
-            return .{ .block = block, .low = low, .index = 0, .present = present };
+        if (head.count == BITMAP) {
+            const present = self.bitmaps.items[head.offset][low >> 6] & (@as(u64, 1) << @intCast(low & 63)) != 0;
+            return .{ .head = head, .low = low, .index = 0, .present = present };
         }
-        const index = if (block.data == null) 0 else std.sort.lowerBound(u16, block.list(), low, orderU16);
-        const present = index < block.count and block.list()[index] == low;
-        return .{ .block = block, .low = low, .index = @intCast(index), .present = present };
+        if (head.dense) return self.findDense(head, low);
+        const items = self.list(head.*);
+        const index = std.sort.lowerBound(u16, items, low, orderU16);
+        const present = index < items.len and items[index] == low;
+        return .{ .head = head, .low = low, .index = @intCast(index), .present = present };
+    }
+
+    noinline fn findDense(self: *PositionSet, head: *Head, low: u16) Probe {
+        const counts = self.bucketCounts(head.*);
+        const bucket: u8 = @intCast(low >> 8);
+        const start = bucketStart(counts, bucket);
+        const bytes = self.denseBytes(head.*)[start..][0..counts[bucket]];
+        const index = std.sort.lowerBound(u8, bytes, @as(u8, @truncate(low)), orderU8);
+        const present = index < bytes.len and bytes[index] == @as(u8, @truncate(low));
+        return .{ .head = head, .low = low, .index = @intCast(start + index), .present = present };
+    }
+
+    fn bucketStart(counts: *const [256]u8, bucket: u8) usize {
+        const Chunk = @Vector(32, u8);
+        const lanes: Chunk = std.simd.iota(u8, 32);
+        var total: usize = 0;
+        inline for (0..8) |chunk| {
+            const first = chunk * 32;
+            if (bucket > first) {
+                const values: Chunk = counts[first..][0..32].*;
+                const keep = lanes < @as(Chunk, @splat(@intCast(@min(32, bucket - first))));
+                total += @reduce(.Add, @as(@Vector(32, u16), @select(u8, keep, values, @as(Chunk, @splat(0)))));
+            }
+        }
+        return total;
     }
 
     fn orderU16(wanted: u16, item: u16) std.math.Order {
         return std.math.order(wanted, item);
     }
 
-    fn reserve(self: *PositionSet, allocator: std.mem.Allocator, probe: *Probe) error{OutOfMemory}!void {
-        _ = self;
-        const block = probe.block;
-        if (probe.present or block.count == BITMAP or block.count < block.capacity) return;
-        if (block.count == LIST_MAX) {
-            const words = try allocator.create([BITMAP_WORDS]u64);
-            @memset(words, 0);
-            const items = block.list();
-            for (items) |item| words[item >> 6] |= @as(u64, 1) << @intCast(item & 63);
-            allocator.free(@as([*]u16, @ptrCast(@alignCast(block.data.?)))[0..block.capacity]);
-            block.* = .{ .data = words, .count = BITMAP, .capacity = 0 };
-            return;
-        }
-        const capacity: u32 = @min(LIST_MAX, @max(4, block.capacity * 2));
-        const old: []u16 = if (block.data) |data| @as([*]u16, @ptrCast(@alignCast(data)))[0..block.capacity] else &.{};
-        const items = try allocator.realloc(old, capacity);
-        block.data = items.ptr;
-        block.capacity = capacity;
+    fn orderU8(wanted: u8, item: u8) std.math.Order {
+        return std.math.order(wanted, item);
     }
 
-    fn insert(probe: Probe) void {
-        std.debug.assert(!probe.present);
-        const block = probe.block;
-        if (block.count == BITMAP) {
-            block.bitmap()[probe.low >> 6] |= @as(u64, 1) << @intCast(probe.low & 63);
+    fn reserve(self: *PositionSet, allocator: std.mem.Allocator, probe: *Probe) error{OutOfMemory}!void {
+        const head = probe.head;
+        if (probe.present or head.count == BITMAP) return;
+        const position = (@as(u32, @intCast(head - self.heads.ptr)) << 16) | probe.low;
+        if (head.dense) {
+            if (head.count == DENSE_MAX or self.bucketCounts(head.*)[probe.low >> 8] == BUCKET_MAX) {
+                try self.toBitmap(allocator, head);
+                probe.* = self.find(position);
+                return;
+            }
+            const needed = DENSE_INDEX_UNITS + (@as(usize, head.count) + 2) / 2;
+            if (needed <= head.capacity) return;
+            try self.grow(allocator, head, needed, DENSE_INDEX_UNITS + DENSE_MAX / 2);
             return;
         }
-        std.debug.assert(block.count < block.capacity);
-        const items: [*]u16 = @ptrCast(@alignCast(block.data.?));
-        var index = block.count;
+        if (head.count < head.capacity) return;
+        if (head.count == DENSE_MIN) {
+            try self.toDense(allocator, head);
+            probe.* = self.find(position);
+            return;
+        }
+        try self.grow(allocator, head, head.count + 1, DENSE_MIN);
+    }
+
+    fn grow(self: *PositionSet, allocator: std.mem.Allocator, head: *Head, needed: usize, limit: usize) error{OutOfMemory}!void {
+        std.debug.assert(needed <= limit);
+        const step = std.mem.alignForward(usize, @max(8, head.capacity / 3), 4);
+        const capacity: u15 = @intCast(@min(limit, @max(needed, head.capacity + step)));
+        if (self.garbage >= COMPACT_MIN and self.garbage * 6 > self.store.items.len) self.compact();
+        const extra = capacity - head.capacity;
+        if (head.capacity != 0 and head.offset + head.capacity == self.store.items.len) {
+            try self.store.ensureUnusedCapacity(allocator, extra);
+            self.store.items.len += extra;
+        } else {
+            try self.store.ensureUnusedCapacity(allocator, capacity);
+            try self.order.ensureUnusedCapacity(allocator, 1);
+            const offset = self.store.items.len;
+            self.store.items.len += capacity;
+            const used = head.usedUnits();
+            @memcpy(self.store.items[offset..][0..used], self.store.items[head.offset..][0..used]);
+            self.garbage += head.capacity;
+            head.offset = @intCast(offset);
+            self.order.appendAssumeCapacity(@intCast(head - self.heads.ptr));
+        }
+        head.capacity = capacity;
+    }
+
+    fn toDense(self: *PositionSet, allocator: std.mem.Allocator, head: *Head) error{OutOfMemory}!void {
+        std.debug.assert(head.count == DENSE_MIN and !head.dense);
+        var values: [DENSE_MIN]u16 = undefined;
+        @memcpy(&values, self.list(head.*));
+        try self.grow(allocator, head, DENSE_INDEX_UNITS + DENSE_MIN / 2 + DENSE_MIN / 8, DENSE_INDEX_UNITS + DENSE_MAX / 2);
+        head.dense = true;
+        const counts = self.bucketCounts(head.*);
+        @memset(counts, 0);
+        for (values, self.denseBytes(head.*)) |value, *byte| {
+            counts[value >> 8] += 1;
+            byte.* = @truncate(value);
+        }
+    }
+
+    fn toBitmap(self: *PositionSet, allocator: std.mem.Allocator, head: *Head) error{OutOfMemory}!void {
+        try self.bitmaps.ensureUnusedCapacity(allocator, 1);
+        const words = try allocator.create([BITMAP_WORDS]u64);
+        @memset(words, 0);
+        if (head.dense) {
+            const counts = self.bucketCounts(head.*);
+            const bytes = self.denseBytes(head.*);
+            var at: usize = 0;
+            for (counts, 0..) |count, bucket| {
+                for (bytes[at..][0..count]) |byte| {
+                    const value = (bucket << 8) | byte;
+                    words[value >> 6] |= @as(u64, 1) << @intCast(value & 63);
+                }
+                at += count;
+            }
+        } else {
+            for (self.list(head.*)) |item| words[item >> 6] |= @as(u64, 1) << @intCast(item & 63);
+        }
+        self.garbage += head.capacity;
+        head.* = .{ .offset = @intCast(self.bitmaps.items.len), .count = BITMAP, .capacity = 0 };
+        self.bitmaps.appendAssumeCapacity(words);
+    }
+
+    fn compact(self: *PositionSet) void {
+        const order = self.order.items;
+        var seen: [BITMAP_WORDS]u64 = @splat(0);
+        var first = order.len;
+        var index = order.len;
+        while (index > 0) {
+            index -= 1;
+            const block = order[index];
+            const bit = @as(u64, 1) << @intCast(block & 63);
+            if (seen[block >> 6] & bit != 0 or self.heads[block].count == BITMAP) continue;
+            seen[block >> 6] |= bit;
+            first -= 1;
+            order[first] = block;
+        }
+        var end: usize = 0;
+        for (order[first..], 0..) |block, kept| {
+            const head = &self.heads[block];
+            const used = head.usedUnits();
+            std.mem.copyForwards(u16, self.store.items[end..][0..used], self.store.items[head.offset..][0..used]);
+            head.offset = @intCast(end);
+            end += head.capacity;
+            order[kept] = block;
+        }
+        self.order.items.len = order.len - first;
+        self.store.items.len = end;
+        self.garbage = 0;
+    }
+
+    fn insert(self: *PositionSet, probe: Probe) void {
+        std.debug.assert(!probe.present);
+        const head = probe.head;
+        if (head.count == BITMAP) {
+            self.bitmaps.items[head.offset][probe.low >> 6] |= @as(u64, 1) << @intCast(probe.low & 63);
+            return;
+        }
+        if (head.dense) {
+            head.count += 1;
+            const bytes = self.denseBytes(head.*);
+            var index = bytes.len - 1;
+            while (index > probe.index) : (index -= 1) bytes[index] = bytes[index - 1];
+            bytes[probe.index] = @truncate(probe.low);
+            self.bucketCounts(head.*)[probe.low >> 8] += 1;
+            return;
+        }
+        std.debug.assert(head.count < head.capacity);
+        const items = self.store.items[head.offset..][0 .. head.count + 1];
+        var index = head.count;
         while (index > probe.index) : (index -= 1) items[index] = items[index - 1];
         items[probe.index] = probe.low;
-        block.count += 1;
+        head.count += 1;
     }
 };
 
@@ -511,7 +647,7 @@ pub const Reason = enum { too_many_n, too_short, low_quality, adapter_dimer };
 
 pub const REASON_COUNT = @typeInfo(Reason).@"enum".fields.len;
 
-pub const Decision = struct {
+const Decision = struct {
     reads: [2]?Reason,
     pair: ?Reason,
 };
@@ -574,6 +710,16 @@ fn countLowAndN(comptime lanes: comptime_int, sequence: []const u8, quality: []c
         counts.low += @reduce(.Add, @as(Wide, low));
         counts.n += @reduce(.Add, @as(Wide, n_bases));
     }
+    if (whole < sequence.len and sequence.len >= lanes) {
+        const Mask = @Int(.unsigned, lanes);
+        const start = sequence.len - lanes;
+        const fresh = std.simd.iota(u8, lanes) >= @as(Bytes, @splat(@intCast(whole - start)));
+        const bytes: Bytes = quality[start..][0..lanes].*;
+        const bases: Bytes = sequence[start..][0..lanes].*;
+        counts.low += @popCount(@as(Mask, @bitCast((bytes < @as(Bytes, @splat(threshold))) & fresh)));
+        counts.n += @popCount(@as(Mask, @bitCast((bases == @as(Bytes, @splat('N'))) & fresh)));
+        return counts;
+    }
     for (sequence[whole..], quality[whole..]) |base, byte| {
         counts.low += @intFromBool(byte < threshold);
         counts.n += @intFromBool(base == 'N');
@@ -586,7 +732,10 @@ fn readReason(options: Options, sequence: []const u8, quality: []const u8) ?Reas
     if (sequence.len == 0) return .too_short;
     if (options.low_quality != null or options.max_n != null) {
         const threshold: u8 = if (options.low_quality) |low_quality| PHRED_OFFSET + low_quality.quality else 0;
-        const counts = countLowAndN(LANES, sequence, quality, threshold);
+        const counts = if (simd.shortRecord(sequence.len))
+            countLowAndN(simd.BASELINE_LANES, sequence, quality, threshold)
+        else
+            countLowAndN(LANES, sequence, quality, threshold);
         if (options.low_quality) |low_quality| {
             if (counts.low * 100 > @as(usize, low_quality.percent) * sequence.len) return .low_quality;
         }
@@ -602,14 +751,14 @@ fn readReason(options: Options, sequence: []const u8, quality: []const u8) ?Reas
 
 pub const Step = enum { quality_tail, poly_g, overlap, adapter };
 
-pub const STEP_COUNT = @typeInfo(Step).@"enum".fields.len;
+const STEP_COUNT = @typeInfo(Step).@"enum".fields.len;
 
-pub const Overlap = struct {
+const Overlap = struct {
     offset: isize,
     length: usize,
 };
 
-pub const Result = struct {
+const Result = struct {
     kept: [2]usize,
     removed: [2][STEP_COUNT]usize = @splat(@splat(0)),
     overlap: ?Overlap = null,
@@ -624,7 +773,7 @@ pub const Result = struct {
     }
 };
 
-pub const StepCounts = struct {
+const StepCounts = struct {
     reads: u64 = 0,
     bases: u64 = 0,
 };
@@ -1249,22 +1398,86 @@ test "[property] - [preprocess]: the position set answers membership as a full b
     var reference = std.AutoHashMap(u32, void).init(std.testing.allocator);
     defer reference.deinit();
     var state: u64 = 5;
-    for (0..30_000) |step| {
+    for (0..40_000) |step| {
         state = state *% 6364136223846793005 +% 1442695040888963407;
         const random: u32 = @truncate(state >> 32);
-        const position = switch (step % 3) {
+        const position = switch (step % 4) {
             0 => random,
-            1 => 0x0007_0000 | (random & 0x3fff),
+            1 => 0x0007_0000 | (random & 0xffff),
+            2 => 0x0009_0000 | (random & 0x0fff),
             else => 0xffff_0000 | (random & 0x00ff),
         };
         var probe = set.find(position);
         try std.testing.expectEqual(reference.contains(position), probe.present);
         try set.reserve(std.testing.allocator, &probe);
-        if (!probe.present) PositionSet.insert(probe);
+        if (!probe.present) set.insert(probe);
         try reference.put(position, {});
     }
-    try std.testing.expectEqual(PositionSet.BITMAP, set.blocks[7].count);
-    try std.testing.expect(set.blocks[0xffff].count <= 256);
+    try std.testing.expectEqual(PositionSet.BITMAP, set.heads[7].count);
+    try std.testing.expect(set.heads[9].dense);
+    try std.testing.expect(!set.heads[0xffff].dense and set.heads[0xffff].count <= 256);
+}
+
+test "[unit] - [preprocess]: a dense block turns into a bitmap when one high byte holds 255 positions" {
+    const allocator = std.testing.allocator;
+    var set: PositionSet = .{};
+    try set.init(allocator);
+    defer set.deinit(allocator);
+    const block: u32 = 0x0042_0000;
+    var low: u32 = 0;
+    while (low < 0x0300) : (low += 2) {
+        var probe = set.find(block | low);
+        try set.reserve(allocator, &probe);
+        if (!probe.present) set.insert(probe);
+    }
+    try std.testing.expect(set.heads[0x42].dense);
+    for (0..256) |byte| {
+        const position = block | 0x0700 | @as(u32, @intCast(byte));
+        var probe = set.find(position);
+        try std.testing.expect(!probe.present);
+        try set.reserve(allocator, &probe);
+        set.insert(probe);
+        try std.testing.expectEqual(byte == 255, set.heads[0x42].count == PositionSet.BITMAP);
+    }
+    low = 0;
+    while (low < 0x0300) : (low += 2) try std.testing.expect(set.find(block | low).present);
+    for (0..256) |byte| try std.testing.expect(set.find(block | 0x0700 | @as(u32, @intCast(byte))).present);
+    try std.testing.expect(!set.find(block | 0x0801).present);
+}
+
+test "[property] - [preprocess]: the position set keeps its members through list growth and compaction" {
+    const allocator = std.testing.allocator;
+    var set: PositionSet = .{};
+    try set.init(allocator);
+    defer set.deinit(allocator);
+    var reference = std.AutoHashMap(u32, void).init(allocator);
+    defer reference.deinit();
+    var members: std.ArrayList(u32) = .empty;
+    defer members.deinit(allocator);
+    var state: u64 = 11;
+    for (0..600_000) |_| {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        const random: u32 = @truncate(state >> 32);
+        const fresh = if (random % 2 == 0) random else random & 0x00ff_ffff;
+        const position = if (members.items.len != 0 and random % 8 == 1) members.items[random % members.items.len] else fresh;
+        var probe = set.find(position);
+        try std.testing.expectEqual(reference.contains(position), probe.present);
+        try set.reserve(allocator, &probe);
+        if (probe.present) continue;
+        set.insert(probe);
+        try reference.put(position, {});
+        try members.append(allocator, position);
+    }
+    for (members.items) |position| try std.testing.expect(set.find(position).present);
+    var capacities: usize = 0;
+    for (set.heads) |head| {
+        if (head.count != PositionSet.BITMAP) capacities += head.capacity;
+    }
+    try std.testing.expectEqual(set.store.items.len, capacities + set.garbage);
+    var dense: usize = 0;
+    for (set.heads[0..256]) |head| dense += @intFromBool(head.dense);
+    try std.testing.expectEqual(@as(usize, 256), dense);
+    try std.testing.expect(set.garbage * 3 <= set.store.items.len);
 }
 
 test "[failure] - [preprocess]: a failed position allocation leaves the pair counts unchanged" {
@@ -1282,7 +1495,7 @@ test "[failure] - [preprocess]: a failed position allocation leaves the pair cou
     try std.testing.expectEqual(@as(u64, 1), pairs.duplicates);
 }
 
-test "[property] - [preprocess]: the vector pair sums equal fastp's per-base sums" {
+test "[property] - [preprocess]: the vector pair hash equals fastp's per-base sums" {
     var pairs: PairDuplication = undefined;
     try pairs.init(std.testing.allocator);
     defer pairs.deinit(std.testing.allocator);
@@ -1301,7 +1514,7 @@ test "[property] - [preprocess]: the vector pair sums equal fastp's per-base sum
             PairDuplication.sumsScalar(&pairs.primes, read2, length1, &scalar);
             var vector: PairDuplication.Sums = @splat(0);
             PairDuplication.pairSumsVector(&pairs.primes, read[0..length1], read2, &vector);
-            try std.testing.expectEqual(scalar, vector);
+            for (scalar, vector) |scalar_sum, vector_sum| try std.testing.expectEqual(@as(u32, @truncate(scalar_sum)), @as(u32, @truncate(vector_sum)));
         }
     }
 }

@@ -38,7 +38,7 @@ No. `deinterleave` and `process` create new files and fail on an existing path.
 
 ## Does it support wrapped FASTQ or FASTA?
 
-Not today. See [Limits](Limits-and-Supported-Formats).
+Not today. See [Limits](Limits-and-Supported-Formats). For FASTA, [z-fasta](https://github.com/eneskemalergin/z-fasta) indexes, extracts, validates, and inspects uncompressed FASTA, wrapped lines included.
 
 ## How fast is it, and how much memory does it use?
 

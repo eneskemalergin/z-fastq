@@ -14,11 +14,11 @@ Standard input is read only when you write `-`; leaving out the path is an error
 gzip -dc reads.fastq.gz | z-fastq stats -
 ```
 
-A command reads standard input at most once. A pipe can be read only once, so other names for it, such as `/dev/stdin`, count as the same input. Exact-count sampling needs a regular file, because it reads twice.
+A command reads standard input at most once. A pipe can be read only once, so other names for it, such as `/dev/stdin`, count as the same input. On macOS, `/dev/stdin` and `/dev/fd/N` share the read position of the descriptor they name, so they count as the same input even when standard input is a regular file; on Linux, they open a regular file again, from its start. Exact-count sampling needs a regular file, because it reads twice.
 
 ## Writing
 
-Results, JSON, and FASTQ go to standard output; messages go to standard error. FASTQ is always written as four lines per record with LF endings. A field that ends in a carriage return of its own, beyond the CR of a CRLF ending, cannot be written that way and read back the same, so a command fails with status `1` when it would write such a record; `check`, which writes no FASTQ, accepts it, and `sample` fails only when it selects one.
+Results, JSON, and FASTQ go to standard output; messages go to standard error. FASTQ is always written as four lines per record with LF endings. A field that ends in a carriage return of its own, beyond the CR of a CRLF ending, cannot be written and read back the same. A command fails with status `1` when it would write such a record. `check`, which writes no FASTQ, accepts it, and `sample` fails only when it selects one.
 
 | Command                                       | Reads              | Writes                       |
 | --------------------------------------------- | ------------------ | ---------------------------- |

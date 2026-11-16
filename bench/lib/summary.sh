@@ -66,10 +66,11 @@ lane_version() {
 # Thread variants are left out: a feature with them shows them in its own
 # threads part. z-fastq's row gives its own time and memory; every other row
 # gives the tool's as a multiple of z-fastq's, within each batch.
+# CPU=1 adds each format's CPU time beside its wall time.
 summary_table() { # family | family:mode...
     local fams
     fams="$(printf '%s|' "$@")"
-    awk -F'\t' -v fams="${fams%|}" -v tier="$HEADLINE" -v through="${THROUGH:-0}" -v modehead="${MODE_HEADER:-Mode}" '
+    awk -F'\t' -v fams="${fams%|}" -v tier="$HEADLINE" -v through="${THROUGH:-0}" -v modehead="${MODE_HEADER:-Mode}" -v cpu="${CPU:-0}" '
         function secs(ns) { return ns >= 1e9 ? sprintf("%.2f s", ns / 1e9) : ns >= 1e7 ? sprintf("%.0f ms", ns / 1e6) : sprintf("%.1f ms", ns / 1e6) }
         function mib(kib) { return kib >= 10240 ? sprintf("%.1f MiB", kib / 1024) : sprintf("%.2f MiB", kib / 1024) }
         BEGIN { nf = split(fams, fl, "|"); for (i = 1; i <= nf; i++) { split(fl[i], q, ":"); fam[i] = q[1]; mode[i] = q[2]; at[q[1]] = i } }
@@ -77,11 +78,11 @@ summary_table() { # family | family:mode...
         FILENAME ~ /cases.tsv$/ { if (FNR > 1 && ($1 in at) && $5 == tier && $6 != "many") { fmt[$1, $2] = $3; if ($3 == "gzip") hasgz = 1 } next }
         FILENAME ~ /style.tsv$/ { if (FNR > 1) { label[$1] = $2; ord[$1] = $7; variant[$1] = ($10 != "" && $10 != $1) } next }
         FNR == 1 || !(($1, $2) in fmt) || variant[$3] { next }
-        { w[$1, $2, $3] = $5; m[$1, $2, $3] = $8; lanes[$1, $3] = 1; cs[$1, $2] = 1 }
+        { w[$1, $2, $3] = $5; m[$1, $2, $3] = $8; u[$1, $2, $3] = $11 * 1000; lanes[$1, $3] = 1; cs[$1, $2] = 1 }
         END {
             moded = mode[1] != ""; nfmt = hasgz ? 2 : 1
-            print (moded ? modehead "\t" : "") "Tool\tPlain time\tPlain memory" (hasgz ? "\tGzip time\tGzip memory" : "") (through ? "\tPasses malformed" : "")
-            print (moded ? "l\t" : "") "l\tr\tr" (hasgz ? "\tr\tr" : "") (through ? "\tl" : "")
+            print (moded ? modehead "\t" : "") "Tool\tPlain time" (cpu ? "\tPlain CPU" : "") "\tPlain memory" (hasgz ? "\tGzip time" (cpu ? "\tGzip CPU" : "") "\tGzip memory" : "") (through ? "\tPasses malformed" : "")
+            print (moded ? "l\t" : "") "l\tr" (cpu ? "\tr" : "") "\tr" (hasgz ? "\tr" (cpu ? "\tr" : "") "\tr" : "") (through ? "\tl" : "")
             for (x = 1; x <= nf; x++) {
                 F = fam[x]; n = 0; delete list
                 for (k in lanes) { split(k, q, SUBSEP); if (q[1] == F) list[++n] = q[2] }
@@ -90,15 +91,15 @@ summary_table() { # family | family:mode...
                     l = list[i]; line = (moded ? mode[x] "\t" : "") label[l]; gsub("_", " ", line)
                     split("plain gzip", fs, " ")
                     for (f = 1; f <= nfmt; f++) {
-                        k = sw = sm = 0
+                        k = sw = sm = su = 0
                         for (cc in cs) { split(cc, q, SUBSEP); if (q[1] != F) continue; c2 = q[2]
-                            if (fmt[F, c2] == fs[f] && (F, c2, l) in w && (F, c2, "z-fastq") in w) {
+                            if (fmt[F, c2] == fs[f] && (F, c2, l) in w && (F, c2, "z-fastq") in w && (!cpu || (u[F, c2, l] > 0 && u[F, c2, "z-fastq"] > 0))) {
                                 k++
-                                if (l == "z-fastq") { sw += log(w[F, c2, l]); sm += log(m[F, c2, l]) }
-                                else { sw += log(w[F, c2, l] / w[F, c2, "z-fastq"]); sm += log(m[F, c2, l] / m[F, c2, "z-fastq"]) } } }
-                        if (!k) line = line "\t-\t-"
-                        else if (l == "z-fastq") line = line "\t" secs(exp(sw / k)) "\t" mib(exp(sm / k))
-                        else line = line "\t" sprintf("%.2fx", exp(sw / k)) "\t" sprintf("%.2fx", exp(sm / k))
+                                if (l == "z-fastq") { sw += log(w[F, c2, l]); sm += log(m[F, c2, l]); if (cpu) su += log(u[F, c2, l]) }
+                                else { sw += log(w[F, c2, l] / w[F, c2, "z-fastq"]); sm += log(m[F, c2, l] / m[F, c2, "z-fastq"]); if (cpu) su += log(u[F, c2, l] / u[F, c2, "z-fastq"]) } } }
+                        if (!k) line = line "\t-" (cpu ? "\t-" : "") "\t-"
+                        else if (l == "z-fastq") line = line "\t" secs(exp(sw / k)) (cpu ? "\t" secs(exp(su / k)) : "") "\t" mib(exp(sm / k))
+                        else line = line "\t" sprintf("%.2fx", exp(sw / k)) (cpu ? "\t" sprintf("%.2fx", exp(su / k)) : "") "\t" sprintf("%.2fx", exp(sm / k))
                     }
                     print line (through ? "\t" (((F, l) in lets) ? lets[F, l] : (("", l) in lets) ? lets["", l] : "-") : "")
                 }
@@ -282,11 +283,12 @@ scaling_sentences() { # family
             print (grow == "" ? " No other tool grows by more than a quarter either." : " Memory that grows with the input: " grow ".")
         }' "$REPORT_DIR/cases.tsv" "$REPORT_DIR/style.tsv" "$REPORT_DIR/summary.tsv"
 }
-# A CAUTION callout naming the tools that print a wrong answer with exit 0 or
-# crash on malformed edge cases; nothing when none does.
+# A CAUTION callout naming the tools that print a wrong answer with exit 0 on
+# malformed edge cases, or crash on any, with the kind of input they crash on;
+# nothing when none does.
 caution() {
     awk -F'\t' -v wrong="${WORD[wrong]}" -v unseen="${WORD[unseen]}" 'FILENAME ~ /style.tsv$/ { if (FNR > 1) ord[$2] = $7 + 0; next }
-        FNR > 1 && $6 == "wrong" { w[$4] = 1 } FNR > 1 && $6 == "crash" { c[$4] = 1 }
+        FNR > 1 && $6 == "wrong" { w[$4] = 1 } FNR > 1 && $6 == "crash" { c[$4] = 1; if ($3 ~ /^reject/) cbad = 1; else cgood = 1 }
         END {
             for (t in w) k1++
             for (t in c) k2++
@@ -294,7 +296,7 @@ caution() {
             if (wl == "" && cl == "") exit
             printf "> [!CAUTION]\n> On the edge cases below,"
             if (wl != "") printf " %s %s %s and %s 0 on some malformed inputs, so a script cannot tell %s.", wl, (k1 > 1 ? "print" : "prints"), wrong, (k1 > 1 ? "exit" : "exits"), unseen
-            if (cl != "") printf " %s %s on some malformed gzip input.", cl, (k2 > 1 ? "crash" : "crashes")
+            if (cl != "") printf " %s %s on some %s.", cl, (k2 > 1 ? "crash" : "crashes"), (cbad && cgood ? "inputs" : cbad ? "malformed inputs" : "valid inputs")
             printf "\n\n"
         }
         # The tools in a set, in registry order, joined with commas and "and".
@@ -386,9 +388,10 @@ valid_wrong_bullet() {
             if (out != "") { gsub(/`/, "", out); print "- **Wrong on valid input, exit 0:** " out "." } }' \
         <(edge_list) "$REPORT_DIR/style.tsv" "$RESULTS/edges.tsv"
 }
-# Per lane, "N of M": the malformed edge inputs it rejects, over every one it ran.
+# Per lane, "N of M": the malformed edge inputs it rejects, over every one it
+# ran; "-" when it ran none.
 rejects_all() { # lane
-    awk -F'\t' -v l="$1" 'FNR == NR { if ($2 ~ /^reject/) want[$1] = 1; next } $1 == l && ($2 in want) && $3 != "-" { n++; if ($3 ~ /^reject/) r++ } END { printf "%d of %d", r, n }' <(edge_list) "$RESULTS/edges.tsv"
+    awk -F'\t' -v l="$1" 'FNR == NR { if ($2 ~ /^reject/) want[$1] = 1; next } $1 == l && ($2 in want) && $3 != "-" { n++; if ($3 ~ /^reject/) r++ } END { if (n) printf "%d of %d", r, n; else printf "-" }' <(edge_list) "$RESULTS/edges.tsv"
 }
 # yes when every check of LANE in FAMILY passed, partly when some did, no when none.
 mode_cell() { # lane family
@@ -530,6 +533,9 @@ data_list() {
     printf -- '  - **Real**: *%d public sequencing runs, %s each, pooled in the bars by the kind of reads they hold*\n%s' "$reals" "${TIER_SIZE[$HEADLINE]}" "$lines"
     printf -- '  - **Synthetic**: *%d %s generated from real reads, each changing one thing; one group in the bars at %s, and the scaling lines from %s*\n%s' "$shapes" "$( ((shapes == 1)) && echo shape || echo shapes)" "${TIER_SIZE[$HEADLINE]}" "$(scaling_range)" "$synth"
 }
+# A timed command as a reader sees it: repository paths relative, and a file
+# inside a pinned tool's install directory under that tool's name.
+shown_cmd() { sed "s#$REPO/##g; s#tools/\.local/\([A-Za-z0-9_-]*\)-current/\(runtime/\)\{0,1\}#{\1}/#g"; }
 # The source revisions of the z-fastq binaries the current batches timed, as
 # recorded when each was built, with batch counts when there are several.
 zfastq_revision() {
@@ -543,8 +549,8 @@ zfastq_revision() {
             for (i = 1; i <= k; i++) printf "%s%s (%d batches)", (i > 1 ? "; " : "at "), list[i], n[list[i]]; print "" }'
 }
 # z-fastq as the current batches timed it: the version in build.zig.zon when
-# every batch timed the current source, then the source revision. The binary
-# on disk is not asked, since it may be a later build.
+# every batch timed the current source, otherwise the source revision. The
+# binary on disk is not asked, since it may be a later build.
 zfastq_label() {
     local rev ids dir version=""
     rev="$(zfastq_revision)"
@@ -552,14 +558,13 @@ zfastq_label() {
         sed -n 's/^lane z-fastq \([^#]*\)#.*/\1/p' "$dir/meta.tsv"
     done | sort -u)"
     [[ "$ids" != "$(zfastq_id)" ]] || version="$(sed -n 's/^ *\.version = "\([^"]*\)",*$/\1/p' "$REPO/build.zig.zon")"
-    printf '%s%s\n' "${version:+$version, }" "${rev:+source $rev}"
+    if [[ -n "$version" ]]; then printf '%s\n' "$version"; else printf '%s\n' "${rev:+source $rev}"; fi
 }
 # The README's sections, each printing its Markdown; readme() puts them in
 # the default order, and a feature with its own feature_readme orders them.
 readme_head() {
     local first="${FAMILIES[0]}" name
-    local date rev
-    date="$(date -u +%Y-%m-%d)"
+    local rev
     rev="$(zfastq_label)"
     local counters reals shapes
     counters=0
@@ -587,7 +592,6 @@ readme_head() {
 - \`machine\`: *$cpu, Linux; $per*
 - \`runner\`: *$(zebrac --version) with zexec*
 $(data_list)
-- \`date\`: *$date*
 
 EOF
 }
@@ -697,16 +701,13 @@ batch_memory() {
     m="$(awk -F'\t' '{ print $3 }' "$RESULTS/current.tsv" | sort -u | while IFS= read -r d; do sed -n 's/^execution .* memory=\([^ ]*\).*/\1/p' "$d/meta.tsv"; done | sort -u | paste -sd/ -)"
     printf '%s\n' "${m:-$BENCH_MEM}"
 }
-# The day the last release run that ended well finished.
-last_release() { awk -F'\t' '$3 == "release" && $9 == "ok" { d = substr($2, 1, 10) } END { print (d == "" ? "an unrecorded day" : d) }' "$RESULTS/runs.tsv"; }
 readme_repro() {
-    local name fam date rev
-    date="$(date -u +%Y-%m-%d)"
+    local name fam rev
     rev="$(zfastq_label)"
     printf '## Reproducibility\n\n'
     details "How it was measured"
     cat <<EOF
-Every tool runs through \`zexec -r\` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a $(batch_memory) memory cap$(mem_caps)$( ((${#LANE_CORES[@]} == 0)) || printf '; a batch with threaded variants holds as many physical cores as its largest lane, one logical CPU each, with each lane pinned to its own cores and z-fastq to one'), after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that \`wait4\` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny ${RUNS[tiny]}, xsmall ${RUNS[xsmall]}, small ${RUNS[small]}, medium ${RUNS[medium]}; sizes 1 MiB to 1 GiB. Timed by \`bench/$FEATURE/run.sh release\`, last on $(last_release); this page written on $date.
+Every tool runs through \`zexec -r\` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a $(batch_memory) memory cap$(mem_caps)$( ((${#LANE_CORES[@]} == 0)) || printf '; a batch with threaded variants holds as many physical cores as its largest lane, one logical CPU each, with each lane pinned to its own cores and z-fastq to one'), after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that \`wait4\` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny ${RUNS[tiny]}, xsmall ${RUNS[xsmall]}, small ${RUNS[small]}, medium ${RUNS[medium]}; sizes 1 MiB to 1 GiB. Timed by \`bench/$FEATURE/run.sh release\`.
 
 </details>
 
@@ -724,12 +725,12 @@ EOF
     if [[ -z "$any" ]]; then
         for name in "${LANES[@]}"; do
             [[ ! -v "LANE_OF[$name]" ]] || continue
-            printf -- '- `%s`: *%s*%s\n' "${REG_LABEL[$name]}" "$(lane_cmd "$name" IN | sed "s#$REPO/##g")" "$(thread_options "$name")"
+            printf -- '- `%s`: *%s*%s\n' "${REG_LABEL[$name]}" "$(lane_cmd "$name" IN | shown_cmd)" "$(thread_options "$name")"
         done
         for fam in "${FAMILIES[@]}"; do
             for name in ${FAM_LANES[$fam]}; do
                 [[ -v "FAM_TMPL[$fam|$name]" && ! -v "LANE_OF[$name]" ]] || continue
-                printf -- '- `%s`, %s: *%s*%s\n' "${REG_LABEL[$name]}" "$(family_name "$fam")" "$(lane_cmd "$name" IN "$fam" | sed "s#$REPO/##g")" "$(thread_options "$name" "$fam")"
+                printf -- '- `%s`, %s: *%s*%s\n' "${REG_LABEL[$name]}" "$(family_name "$fam")" "$(lane_cmd "$name" IN "$fam" | shown_cmd)" "$(thread_options "$name" "$fam")"
             done
         done
     else
@@ -740,7 +741,7 @@ EOF
             params="$(cases | awk -F'\t' -v f="$fam" '$1 == f && !p { p = $10 } END { print p }')"
             for name in "${LANES[@]}"; do
                 [[ " ${FAM_LANES[$fam]} " == *" $name "* && ! -v "LANE_OF[$name]" ]] || continue
-                printf -- '- `%s`, %s: *%s*%s\n' "${REG_LABEL[$name]}" "$(family_name "$fam")" "$(lane_cmd "$name" IN "$fam" "$params" | sed "s#$REPO/##g")" "$(thread_options "$name" "$fam")"
+                printf -- '- `%s`, %s: *%s*%s\n' "${REG_LABEL[$name]}" "$(family_name "$fam")" "$(lane_cmd "$name" IN "$fam" "$params" | shown_cmd)" "$(thread_options "$name" "$fam")"
             done
         done
     fi
@@ -983,8 +984,8 @@ summary_readme() {
     printf '\n## Feature reports\n\n'
     for feat in count stats check sample layout process; do
         [[ -f "$BENCH/$feat/README.md" ]] || continue
-        printf -- '- [%s](%s/README.md): %s; timed %s, z-fastq %s.\n' "$feat" "$feat" "$(sed -n '3s/^# //p' "$BENCH/$feat/README.md")" \
-            "$(RESULTS="$BENCH/$feat/results" last_release)" "$(RESULTS="$BENCH/$feat/results" zfastq_label)"
+        printf -- '- [%s](%s/README.md): %s; z-fastq %s.\n' "$feat" "$feat" "$(sed -n '3s/^# //p' "$BENCH/$feat/README.md")" \
+            "$(RESULTS="$BENCH/$feat/results" zfastq_label)"
     done
     printf '\n## Limits\n\n'
     printf -- '- One CPU per tool in every comparison except the threads figure; a tool built for many cores may do better with them.\n'

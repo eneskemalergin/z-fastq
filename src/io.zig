@@ -341,11 +341,51 @@ fn writeVecToWriter(writer: *std.Io.Writer, data: []const []const u8) std.Io.Wri
     }
 
     if (total <= writer.unusedCapacityLen()) {
-        _ = try writer.writeVec(data);
+        var dest = writer.buffer[writer.end..][0..total];
+        for (data) |bytes| {
+            copyPiece(dest[0..bytes.len], bytes);
+            dest = dest[bytes.len..];
+        }
+        writer.end += total;
         return;
     }
 
     for (data) |bytes| try writer.writeAll(bytes);
+}
+
+fn copyPiece(dest: []u8, src: []const u8) void {
+    const len = src.len;
+    if (len > 16) return @memcpy(dest, src);
+    if (len >= 8) {
+        dest[0..8].* = src[0..8].*;
+        dest[len - 8 ..][0..8].* = src[len - 8 ..][0..8].*;
+    } else if (len >= 4) {
+        dest[0..4].* = src[0..4].*;
+        dest[len - 4 ..][0..4].* = src[len - 4 ..][0..4].*;
+    } else if (len >= 2) {
+        dest[0..2].* = src[0..2].*;
+        dest[len - 2 ..][0..2].* = src[len - 2 ..][0..2].*;
+    } else if (len == 1) {
+        dest[0] = src[0];
+    }
+}
+
+test "[unit] - [writer sink]: vectored writes copy pieces of every length exactly" {
+    var source: [40]u8 = undefined;
+    for (&source, 0..) |*byte, index| byte.* = @intCast('A' + index);
+    var pieces: [source.len + 1][]const u8 = undefined;
+    var expected: [source.len * (source.len + 1) / 2]u8 = undefined;
+    var expected_len: usize = 0;
+    for (&pieces, 0..) |*piece, len| {
+        piece.* = source[0..len];
+        @memcpy(expected[expected_len..][0..len], source[0..len]);
+        expected_len += len;
+    }
+    var output: [expected.len + 1]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&output);
+    var writer_sink: WriterSink = .init(&writer);
+    try writer_sink.byteSink().writeVec(&pieces);
+    try std.testing.expectEqualSlices(u8, expected[0..expected_len], writer.buffered());
 }
 
 fn writerFlush(ctx: *anyopaque) WriteError!void {

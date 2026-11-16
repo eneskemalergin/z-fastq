@@ -7,7 +7,7 @@ The command line is the main product, but the reader, writer, validation, and st
 Each release has a source package for Zig to fetch; it holds the source, the build files, the license, the README, and the changelog:
 
 ```bash
-zig fetch --save=z_fastq https://github.com/eneskemalergin/z-fastq/releases/download/v0.2.1/z-fastq-0.2.1-source.tar.gz
+zig fetch --save=z_fastq https://github.com/eneskemalergin/z-fastq/releases/download/v0.3.0/z-fastq-0.3.0-source.tar.gz
 ```
 
 In `build.zig`, the module is named `z-fastq`:
@@ -23,7 +23,7 @@ and in the code:
 const zfastq = @import("z-fastq");
 ```
 
-It is registered from `src/root.zig` and targets Zig 0.16.0 on Linux, x86-64 or aarch64.
+Its root file is `src/root.zig`; it targets Zig 0.16.0 on Linux or macOS, x86-64 or aarch64.
 
 ## What it exports
 

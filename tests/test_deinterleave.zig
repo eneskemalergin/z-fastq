@@ -1,4 +1,4 @@
-//! Installed `z-fastq deinterleave` behavior: pairing, two outputs, validation, and exit status.
+//! Installed z-fastq deinterleave: pairing, two outputs, validation, and exit status.
 
 const std = @import("std");
 const cli = @import("utilities.zig");
@@ -228,7 +228,7 @@ test "[cli] - [deinterleave]: the earliest failure decides the diagnostic and wh
             .first_line = false,
         },
         .{
-            .name = "iupac-quality",
+            .name = "bad-plus-line",
             .input = "@bad/1\nR\n+\n \n@bad/2\nA\nx\n!\n",
             .message = "S001: plus line must start with '+' (record 1, line 3, offset 22)\n",
             .first_line = false,
@@ -702,15 +702,7 @@ test "[cli] - [deinterleave]: failure does not delete replaced or created output
     defer threaded.deinit();
     const child_io = threaded.io();
     var process = try std.process.spawn(child_io, .{
-        .argv = &.{
-            cli.ZFASTQ_BIN,
-            "deinterleave",
-            "--out1",
-            out1_path,
-            "--out2",
-            out2_path,
-            "-",
-        },
+        .argv = try cli.cliArgv(allocator, &.{ "deinterleave", "--out1", out1_path, "--out2", out2_path, "-" }),
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -754,33 +746,40 @@ test "[cli] - [deinterleave]: invalid arguments fail before output creation" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const one = try cli.tempPath(allocator, &tmp.sub_path, "one");
+    const two = try cli.tempPath(allocator, &tmp.sub_path, "two");
+    const input = try cli.tempPath(allocator, &tmp.sub_path, "input");
     const cases = [_]struct {
         args: []const []const u8,
         error_message: []const u8,
     }{
         .{
-            .args = &.{ "deinterleave", "--out1", "one", "input" },
+            .args = &.{ "deinterleave", "--out1", one, input },
             .error_message = "error: deinterleave requires --out2\n",
         },
         .{
-            .args = &.{ "deinterleave", "--out1", "one", "--out2" },
+            .args = &.{ "deinterleave", "--out1", one, "--out2" },
             .error_message = "error: --out2 requires a value\n",
         },
         .{
-            .args = &.{ "deinterleave", "--out1", "-", "--out2", "two", "input" },
+            .args = &.{ "deinterleave", "--out1", "-", "--out2", two, input },
             .error_message = "error: deinterleave output paths cannot be standard output\n",
         },
         .{
-            .args = &.{ "deinterleave", "--out1", "one", "--out2", "-", "input" },
+            .args = &.{ "deinterleave", "--out1", one, "--out2", "-", input },
             .error_message = "error: deinterleave output paths cannot be standard output\n",
         },
         .{
-            .args = &.{ "deinterleave", "--out1", "one", "--out2", "two" },
+            .args = &.{ "deinterleave", "--out1", one, "--out2", two },
             .error_message = "error: deinterleave requires exactly one input\n",
         },
     };
     for (cases) |case| {
         try cli.expectResult(try cli.run(allocator, case.args), 2, "", case.error_message);
+        try std.testing.expect(!try pathExists(std.testing.io, one));
+        try std.testing.expect(!try pathExists(std.testing.io, two));
     }
 }
 

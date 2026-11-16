@@ -1,33 +1,17 @@
-//! Per-mate FASTQ quality distributions for `process`, computed as FastQC 0.13.0 computes its core
-//! modules: per-cycle quality and base content, per-read quality and GC, read lengths, terminal
-//! homopolymer runs, and Adapter Content for FastQC's bundled adapter list, where a read exactly
-//! one adapter long counts as FastQC-Rust counts it. The retained population of a trimmed or
-//! filtered run counts only the removed 3' ends and dropped reads per cycle and takes its
-//! per-cycle tables as raw minus removed, until raw drops its tables for a read past the cycle
-//! limit; from then on it counts its reads in full. When every retained read of a mate starts a
-//! fixed number of bases into its raw read, after a UMI cut, retained cycle i is raw cycle i plus
-//! that offset. Adapter matches are searched once per raw read and count for the retained read
-//! when they lie inside its kept bases; a first match that starts inside the cut is searched
-//! again. Sequence Duplication Levels and Overrepresented sequences share FastQC's sequence table, one per population: the
-//! uppercase read cut to 50 bases is the key, at most 100,000 keys are stored, and later reads
-//! count only toward stored keys and the total. A key is kept as 50 five-bit codes, the low five
-//! bits of each IUPAC letter, which are distinct and nonzero. Overrepresented ties keep
-//! first-appearance order, and Possible Source comes from a FastQC contaminant list matched by
-//! FastQC's rules. A population also writes as a FastQC 0.13.0 fastqc_data.txt: the same tables
-//! in FastQC's text layout and Java number format, each module graded pass, warn, or fail by
-//! FastQC's rules at its default limits, without Kmer Content. Basic Statistics names the
-//! Sanger / Illumina 1.9 encoding, the only one z-fastq reads. As a read section of fastp 1.1.0's
-//! JSON it writes fastp's totals and per-cycle mean quality and base content curves; a population
-//! that feeds only that summary collects only those totals and curves, and no FastQC module.
+//! Per-mate QC for process: FastQC 0.13.0's core modules and fastp 1.1.0's read summaries, for the
+//! reads as read and as written.
+//!
+//! Each read is added raw first, then as retained or dropped, because the retained tables are
+//! derived from the raw ones.
 
 const std = @import("std");
 const fastq = @import("fastq.zig");
 const simd = @import("simd.zig");
 const statistics = @import("stats.zig");
 
-pub const MAX_CYCLES = 1024;
-pub const TERMINAL_RUN_MIN = 10;
-pub const TOO_LONG = "a read is longer than 1024 bases";
+const MAX_CYCLES = 1024;
+const TERMINAL_RUN_MIN = 10;
+const TOO_LONG = "a read is longer than 1024 bases";
 
 const PHRED_OFFSET = fastq.PHRED_OFFSET;
 const QUALITY_BINS = fastq.PHRED_MAX_SCORE + 1;
@@ -42,7 +26,83 @@ const BaseKind = enum(u3) { a, c, g, t, n, other };
 const COUNTED_LETTERS = [_]u8{ 'A', 'C', 'G', 'T', 'N' };
 const COUNTED_KINDS = COUNTED_LETTERS.len;
 const QualityCounts = [QUALITY_BINS]u64;
+const CycleQuality = struct { reads: u64 = 0, sum: u64 = 0, q20: u64 = 0, q30: u64 = 0, q40: u64 = 0 };
+const PendingQuality = struct {
+    sums: std.ArrayList(u16) = .empty,
+    reads: std.ArrayList(u8) = .empty,
+    q20: std.ArrayList(u8) = .empty,
+    q30: std.ArrayList(u8) = .empty,
+    q40: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *PendingQuality, allocator: std.mem.Allocator) void {
+        self.sums.deinit(allocator);
+        inline for (.{ &self.reads, &self.q20, &self.q30, &self.q40 }) |row| row.deinit(allocator);
+    }
+
+    fn ensureCapacity(self: *PendingQuality, allocator: std.mem.Allocator, capacity: usize) error{OutOfMemory}!void {
+        try self.sums.ensureTotalCapacityPrecise(allocator, capacity);
+        inline for (.{ &self.reads, &self.q20, &self.q30, &self.q40 }) |row| try row.ensureTotalCapacityPrecise(allocator, capacity);
+    }
+
+    fn grow(self: *PendingQuality, cycles: usize) void {
+        self.sums.appendNTimesAssumeCapacity(0, cycles - self.sums.items.len);
+        inline for (.{ &self.reads, &self.q20, &self.q30, &self.q40 }) |row| row.appendNTimesAssumeCapacity(0, cycles - row.items.len);
+    }
+
+    fn rows(self: *const PendingQuality) PendingRows {
+        return .{ .sums = self.sums.items, .reads = self.reads.items, .q20 = self.q20.items, .q30 = self.q30.items, .q40 = self.q40.items };
+    }
+};
+
+const PendingRows = struct { sums: []u16, reads: []u8, q20: []u8, q30: []u8, q40: []u8 };
 const BaseCounts = [COUNTED_KINDS]u64;
+const QUALITY_BIN_LIMIT = 8;
+
+const QualityBins = struct {
+    values: [QUALITY_BIN_LIMIT]u8 = @splat(0),
+    count: usize = 0,
+    rows: [QUALITY_BIN_LIMIT]std.ArrayList(u8) = @splat(.empty),
+    vector_bytes: u64 = 0,
+    unmatched_bytes: u64 = 0,
+    enabled: bool = true,
+
+    fn deinit(self: *QualityBins, allocator: std.mem.Allocator) void {
+        for (&self.rows) |*row| row.deinit(allocator);
+    }
+
+    fn ensureCapacity(self: *QualityBins, allocator: std.mem.Allocator, capacity: usize) error{OutOfMemory}!void {
+        for (&self.rows) |*row| try row.ensureTotalCapacityPrecise(allocator, capacity);
+    }
+
+    fn grow(self: *QualityBins, cycles: usize) void {
+        for (&self.rows) |*row| row.appendNTimesAssumeCapacity(0, cycles - row.items.len);
+    }
+
+    fn shrink(self: *QualityBins, cycles: usize) void {
+        for (&self.rows) |*row| row.shrinkRetainingCapacity(cycles);
+    }
+
+    fn learn(self: *QualityBins, byte: u8) void {
+        if (self.count == QUALITY_BIN_LIMIT) return;
+        for (self.values[0..self.count]) |value| if (value == byte) return;
+        self.values[self.count] = byte;
+        self.count += 1;
+    }
+
+    fn flush(self: *QualityBins, counts: []QualityCounts) void {
+        for (self.values[0..self.count], self.rows[0..self.count]) |value, *row| {
+            for (row.items[0..counts.len], counts) |*pending, *cycle_counts| {
+                cycle_counts[value - PHRED_OFFSET] += pending.*;
+                pending.* = 0;
+            }
+        }
+        if (self.unmatched_bytes * 8 > self.vector_bytes) {
+            self.enabled = false;
+            self.count = 0;
+        }
+    }
+};
+
 const PendingBases = [COUNTED_KINDS][MAX_CYCLES]u8;
 const PENDING_READS_MAX = std.math.maxInt(u8);
 const CASE_FOLD = 0xdf;
@@ -93,6 +153,7 @@ pub const MatePopulations = struct {
     retained_enabled: bool = false,
     retained_front: usize = 0,
     last_key: SequenceKey = .{},
+    last_raw_key: ?u32 = null,
     raw_tiles: TileQuality = .{},
     retained_tiles: TileQuality = .{},
 
@@ -126,7 +187,7 @@ pub const MatePopulations = struct {
         }
         self.last = try self.raw.collect(allocator, sequence, quality);
         if (self.raw.detailed) {
-            self.raw_sequences.add(key);
+            self.last_raw_key = try self.raw_sequences.add(&key, null);
             try self.raw_tiles.add(allocator, header, quality);
         }
         if (self.retained_enabled and self.raw.detailed) {
@@ -149,19 +210,22 @@ pub const MatePopulations = struct {
         std.debug.assert(self.retained_enabled);
         const read = sequence[front..][0..kept];
         const read_quality = quality[front..][0..kept];
-        const key = if (!self.raw.detailed) SequenceKey{} else if (kept >= @min(sequence.len - front, KEY_LENGTH)) self.last_key else SequenceKey.of(read);
+        const whole_key = kept >= @min(sequence.len - front, KEY_LENGTH);
+        const key = if (!self.raw.detailed) SequenceKey{} else if (whole_key) self.last_key else SequenceKey.of(read);
+        const raw_key = if (front == 0 and whole_key) self.last_raw_key else null;
+        self.retained_sequences.base = &self.raw_sequences;
         if (self.raw.detailed) {
             try self.retained_sequences.reserve(allocator);
             try self.retained_tiles.add(allocator, header, read_quality);
         }
         if (!self.derived) {
             try self.retained.addRead(allocator, read, read_quality);
-            if (self.raw.detailed) self.retained_sequences.add(key);
+            if (self.raw.detailed) _ = try self.retained_sequences.add(&key, raw_key);
             return;
         }
         const retained = &self.retained;
-        if (sequence.len > retained.quality.items.len) try retained.growCycles(allocator, sequence.len);
-        if (self.raw.detailed) self.retained_sequences.add(key);
+        if (sequence.len > retained.bases.items.len) try retained.growCycles(allocator, sequence.len);
+        if (self.raw.detailed) _ = try self.retained_sequences.add(&key, raw_key);
         var facts = self.last;
         if (front + kept < sequence.len) {
             const removed_sum = try self.removeCycles(allocator, sequence, quality, front + kept);
@@ -179,13 +243,13 @@ pub const MatePopulations = struct {
                 shift = 0;
                 break;
             }
-            for (facts.adapter_starts, &retained.adapter_starts) |start, *starts| {
+            for (facts.adapter_starts, 0..) |start, adapter| {
                 if (start == NO_MATCH) continue;
                 const at = start - shift;
-                if (at + ADAPTER_LENGTH <= kept) starts[at] += 1;
+                if (at + ADAPTER_LENGTH <= kept) retained.adapter_starts.items[at][adapter] += 1;
             }
         }
-        if (self.raw.detailed and kept != 0) retained.addSummary(read, facts);
+        if (self.raw.detailed and kept != 0) try retained.addSummary(allocator, read, facts);
     }
 
     pub fn dropRetained(
@@ -206,15 +270,25 @@ pub const MatePopulations = struct {
         from: usize,
     ) error{OutOfMemory}!u64 {
         const retained = &self.retained;
-        if (sequence.len > retained.quality.items.len) try retained.growCycles(allocator, sequence.len);
+        if (sequence.len > retained.bases.items.len) try retained.growCycles(allocator, sequence.len);
         var removed_sum: u64 = 0;
         for (
             sequence[from..],
             quality[from..],
-            retained.quality.items[from..sequence.len],
             retained.bases.items[from..sequence.len],
-        ) |base, byte, *qualities, *bases| {
-            qualities[byte - PHRED_OFFSET] += 1;
+            from..,
+        ) |base, byte, *bases, cycle| {
+            const score = byte - PHRED_OFFSET;
+            if (retained.detailed) {
+                retained.quality.items[cycle][score] += 1;
+            } else {
+                const totals = &retained.cycle_quality.items[cycle];
+                totals.reads += 1;
+                totals.sum += score;
+                totals.q20 += @intFromBool(score >= statistics.Q20_SCORE);
+                totals.q30 += @intFromBool(score >= statistics.Q30_SCORE);
+                totals.q40 += @intFromBool(score >= Q40_SCORE);
+            }
             removed_sum += byte;
             const kind = BASE_KIND[base];
             if (kind != .other) bases[@intFromEnum(kind)] += 1;
@@ -223,6 +297,7 @@ pub const MatePopulations = struct {
     }
 
     pub fn finish(self: *MatePopulations) void {
+        self.retained_sequences.base = &self.raw_sequences;
         if (self.derived) self.materialize();
         self.raw.finish();
         self.retained.finish();
@@ -237,6 +312,7 @@ pub const MatePopulations = struct {
     }
 
     pub fn prepareSources(self: *MatePopulations, contaminants: *const ContaminantList) void {
+        self.retained_sequences.base = &self.raw_sequences;
         self.raw_sequences.prepareSources(contaminants);
         if (self.retained_enabled) self.retained_sequences.prepareSources(contaminants);
     }
@@ -282,13 +358,29 @@ pub const MatePopulations = struct {
         const retained = &self.retained;
         const cycles = self.retained_cycles;
         const front = self.retained_front;
-        std.debug.assert(cycles == 0 or front + cycles <= retained.quality.items.len);
+        std.debug.assert(cycles == 0 or front + cycles <= retained.bases.items.len);
         for (0..cycles) |cycle| {
             const source = front + cycle;
-            for (&retained.quality.items[cycle], self.raw.quality.items[source], retained.quality.items[source]) |*count, total, removed| count.* = total - removed;
+            if (retained.detailed) {
+                for (&retained.quality.items[cycle], self.raw.quality.items[source], retained.quality.items[source]) |*count, total, removed| count.* = total - removed;
+            } else {
+                const total = self.raw.cycle_quality.items[source];
+                const removed = retained.cycle_quality.items[source];
+                retained.cycle_quality.items[cycle] = .{
+                    .reads = total.reads - removed.reads,
+                    .sum = total.sum - removed.sum,
+                    .q20 = total.q20 - removed.q20,
+                    .q30 = total.q30 - removed.q30,
+                    .q40 = total.q40 - removed.q40,
+                };
+            }
             for (&retained.bases.items[cycle], self.raw.bases.items[source], retained.bases.items[source]) |*count, total, removed| count.* = total - removed;
         }
-        retained.quality.shrinkRetainingCapacity(cycles);
+        if (retained.detailed) {
+            retained.quality.shrinkRetainingCapacity(cycles);
+            retained.quality_bins.shrink(cycles);
+            retained.adapter_starts.shrinkRetainingCapacity(cycles);
+        } else retained.cycle_quality.shrinkRetainingCapacity(cycles);
         retained.bases.shrinkRetainingCapacity(cycles);
         self.derived = false;
     }
@@ -297,8 +389,10 @@ pub const MatePopulations = struct {
 pub const MateQc = struct {
     detailed: bool = true,
     quality: std.ArrayList(QualityCounts) = .empty,
+    cycle_quality: std.ArrayList(CycleQuality) = .empty,
     bases: std.ArrayList(BaseCounts) = .empty,
     pending_bases: PendingBases = @splat(@splat(0)),
+    pending_quality: PendingQuality = .{},
     pending_reads: u8 = 0,
     lengths: [MAX_CYCLES + 1]u64 = @splat(0),
     read_quality: QualityCounts = @splat(0),
@@ -306,13 +400,19 @@ pub const MateQc = struct {
     gc_model: GcModel = .{},
     terminal_g: u64 = 0,
     terminal_a: u64 = 0,
-    adapter_starts: [ADAPTER_COUNT][MAX_CYCLES]u64 = @splat(@splat(0)),
+    adapter_starts: std.ArrayList([ADAPTER_COUNT]u64) = .empty,
     too_long: bool = false,
     long_stats: statistics.Stats = .{},
+    quality_bins: QualityBins = .{},
 
     pub fn deinit(self: *MateQc, allocator: std.mem.Allocator) void {
         self.quality.deinit(allocator);
+        self.quality_bins.deinit(allocator);
+        self.cycle_quality.deinit(allocator);
+        self.pending_quality.deinit(allocator);
         self.bases.deinit(allocator);
+        self.adapter_starts.deinit(allocator);
+        self.gc_model.deinit(allocator);
     }
 
     pub fn finish(self: *MateQc) void {
@@ -321,6 +421,20 @@ pub const MateQc = struct {
                 total.* += pending[cycle];
                 pending[cycle] = 0;
             }
+        }
+        self.quality_bins.flush(self.quality.items);
+        const pending = &self.pending_quality;
+        for (self.cycle_quality.items, 0..) |*totals, cycle| {
+            totals.reads += pending.reads.items[cycle];
+            totals.sum += pending.sums.items[cycle];
+            totals.q20 += pending.q20.items[cycle];
+            totals.q30 += pending.q30.items[cycle];
+            totals.q40 += pending.q40.items[cycle];
+            pending.reads.items[cycle] = 0;
+            pending.sums.items[cycle] = 0;
+            pending.q20.items[cycle] = 0;
+            pending.q30.items[cycle] = 0;
+            pending.q40.items[cycle] = 0;
         }
         self.pending_reads = 0;
     }
@@ -346,7 +460,13 @@ pub const MateQc = struct {
             self.long_stats = try self.tableStats();
             self.too_long = true;
             self.quality.clearAndFree(allocator);
+            self.quality_bins.deinit(allocator);
+            self.quality_bins = .{};
+            self.cycle_quality.clearAndFree(allocator);
+            self.pending_quality.deinit(allocator);
+            self.pending_quality = .{};
             self.bases.clearAndFree(allocator);
+            self.adapter_starts.clearAndFree(allocator);
         }
         if (self.too_long) {
             const previous_quality = self.long_stats.quality_sum;
@@ -360,32 +480,52 @@ pub const MateQc = struct {
                 .quality_sum = try std.math.add(u64, self.long_stats.quality_sum - previous_quality, try std.math.mul(u64, PHRED_OFFSET, quality.len)),
                 .gc_count = @as(usize, @intCast(gc_total)) - gcCountScalar(sequence[gc_length..]),
             };
-            if (sequence.len != 0) self.addSummary(sequence, facts);
+            if (sequence.len != 0) try self.addSummary(allocator, sequence, facts);
             return facts;
         }
         const gc_length = if (self.detailed) gcKeptLength(sequence.len) else 0;
         var quality_sum: u64 = 0;
         const gc_count = try self.addCycles(allocator, sequence, quality, gc_length, &quality_sum);
         var facts: ReadFacts = .{ .quality_sum = quality_sum, .gc_count = gc_count };
-        if (self.detailed and !self.too_long) {
+        if (self.detailed) {
             facts.adapter_starts = firstAdapterMatches(sequence);
-            for (facts.adapter_starts, &self.adapter_starts) |start, *starts| {
-                if (start != NO_MATCH) starts[start] += 1;
+            for (facts.adapter_starts, 0..) |start, adapter| {
+                if (start != NO_MATCH) self.adapter_starts.items[start][adapter] += 1;
             }
         }
-        if (self.detailed and sequence.len != 0) self.addSummary(sequence, facts);
+        if (self.detailed and sequence.len != 0) try self.addSummary(allocator, sequence, facts);
         return facts;
     }
 
-    fn addSummary(self: *MateQc, sequence: []const u8, facts: ReadFacts) void {
+    fn addSummary(self: *MateQc, allocator: std.mem.Allocator, sequence: []const u8, facts: ReadFacts) error{OutOfMemory}!void {
         std.debug.assert(sequence.len != 0);
         const gc_length = gcKeptLength(sequence.len);
+        const weights = try self.gc_model.weights(allocator, gc_length);
         self.read_quality[facts.quality_sum / sequence.len - PHRED_OFFSET] += 1;
-        const weights = self.gc_model.weights(gc_length);
         const bins = gcBins(gc_length, facts.gc_count);
         for (bins[0]..bins[1] + 1) |bin| self.gc[bin] += weights[bin];
         self.terminal_g += @intFromBool(endsInRun(sequence, 'G'));
         self.terminal_a += @intFromBool(endsInRun(sequence, 'A'));
+    }
+
+    inline fn addCyclesAt(
+        self: *MateQc,
+        comptime lanes: comptime_int,
+        sequence: []const u8,
+        quality: []const u8,
+        gc_length: usize,
+        quality_sum: *u64,
+    ) usize {
+        if (self.detailed) {
+            quality_sum.* = addQualityCounts(lanes, &self.quality_bins, self.quality.items, quality);
+        } else {
+            quality_sum.* = addCycleQualities(lanes, self.pending_quality.rows(), quality);
+        }
+        return countCycleBases(lanes, &self.pending_bases, sequence, gc_length);
+    }
+
+    noinline fn addShortCycles(self: *MateQc, sequence: []const u8, quality: []const u8, gc_length: usize, quality_sum: *u64) usize {
+        return self.addCyclesAt(simd.BASELINE_LANES, sequence, quality, gc_length, quality_sum);
     }
 
     fn addCycles(
@@ -396,25 +536,36 @@ pub const MateQc = struct {
         gc_length: usize,
         quality_sum: *u64,
     ) error{OutOfMemory}!usize {
-        if (sequence.len > self.quality.items.len) try self.growCycles(allocator, sequence.len);
+        if (sequence.len > self.bases.items.len) try self.growCycles(allocator, sequence.len);
         self.lengths[sequence.len] += 1;
-        var sum: u64 = 0;
-        for (quality, self.quality.items[0..sequence.len]) |byte, *qualities| {
-            qualities[byte - PHRED_OFFSET] += 1;
-            sum += byte;
-        }
-        quality_sum.* = sum;
-        const gc_count = countCycleBases(simd.INLINE_LANES, &self.pending_bases, sequence, gc_length);
+        const gc_count = if (simd.shortRecord(sequence.len))
+            self.addShortCycles(sequence, quality, gc_length, quality_sum)
+        else
+            self.addCyclesAt(simd.INLINE_LANES, sequence, quality, gc_length, quality_sum);
         self.pending_reads += 1;
         if (self.pending_reads == PENDING_READS_MAX) self.finish();
         return gc_count;
     }
 
     fn growCycles(self: *MateQc, allocator: std.mem.Allocator, cycles: usize) error{OutOfMemory}!void {
-        const capacity = @min(MAX_CYCLES, @max(cycles, self.quality.items.len * 2));
-        try self.quality.ensureTotalCapacityPrecise(allocator, capacity);
+        const capacity = @min(MAX_CYCLES, @max(cycles, self.bases.items.len * 2));
+        if (self.detailed) {
+            try self.quality.ensureTotalCapacityPrecise(allocator, capacity);
+            try self.quality_bins.ensureCapacity(allocator, capacity);
+            try self.adapter_starts.ensureTotalCapacityPrecise(allocator, capacity);
+        } else {
+            try self.cycle_quality.ensureTotalCapacityPrecise(allocator, capacity);
+            try self.pending_quality.ensureCapacity(allocator, capacity);
+        }
         try self.bases.ensureTotalCapacityPrecise(allocator, capacity);
-        self.quality.appendNTimesAssumeCapacity(@splat(0), cycles - self.quality.items.len);
+        if (self.detailed) {
+            self.quality.appendNTimesAssumeCapacity(@splat(0), cycles - self.quality.items.len);
+            self.quality_bins.grow(cycles);
+            self.adapter_starts.appendNTimesAssumeCapacity(@splat(0), cycles - self.adapter_starts.items.len);
+        } else {
+            self.cycle_quality.appendNTimesAssumeCapacity(.{}, cycles - self.cycle_quality.items.len);
+            self.pending_quality.grow(cycles);
+        }
         self.bases.appendNTimesAssumeCapacity(@splat(0), cycles - self.bases.items.len);
     }
 
@@ -448,6 +599,11 @@ pub const MateQc = struct {
                 if (score >= statistics.Q20_SCORE) result.q20_bases = try add(u64, result.q20_bases, count);
                 if (score >= statistics.Q30_SCORE) result.q30_bases = try add(u64, result.q30_bases, count);
             }
+        }
+        for (self.cycle_quality.items) |totals| {
+            result.quality_sum = try add(u64, result.quality_sum, totals.sum);
+            result.q20_bases = try add(u64, result.q20_bases, totals.q20);
+            result.q30_bases = try add(u64, result.q30_bases, totals.q30);
         }
         return result;
     }
@@ -536,8 +692,8 @@ pub const MateQc = struct {
             const group = groups.next() orelse return null;
             var sums: [ADAPTER_COUNT]f64 = @splat(0);
             while (self.position < group.last) : (self.position += 1) {
-                for (&self.running, &sums, &self.mate.adapter_starts) |*count, *sum, *starts| {
-                    count.* += starts[self.position];
+                for (&self.running, &sums, self.mate.adapter_starts.items[self.position]) |*count, *sum, starts| {
+                    count.* += starts;
                     sum.* += @as(f64, @floatFromInt(count.*)) * 100.0 / self.total;
                 }
             }
@@ -750,27 +906,20 @@ pub const MateQc = struct {
             try json.write(value);
         }
         if (!self.too_long) {
-            const cycles = self.quality.items[0..self.longestRead()];
+            const cycles = self.longestRead();
             var q40_bases: u64 = 0;
-            for (cycles) |counts| {
-                for (counts[Q40_SCORE..]) |count| q40_bases += count;
-            }
+            for (0..cycles) |cycle| q40_bases += self.cycleTotals(cycle).q40;
             try json.objectField("q40_bases");
             try json.write(q40_bases);
             try json.objectField("total_cycles");
-            try json.write(cycles.len);
+            try json.write(cycles);
             try json.objectField("quality_curves");
             try json.beginObject();
             try json.objectField("mean");
             try json.beginArray();
-            for (cycles) |counts| {
-                var reads: u64 = 0;
-                var scores: u64 = 0;
-                for (counts, 0..) |count, score| {
-                    reads += count;
-                    scores += count * score;
-                }
-                try json.write(@as(f64, @floatFromInt(scores)) / @as(f64, @floatFromInt(reads)));
+            for (0..cycles) |cycle| {
+                const cycle_totals = self.cycleTotals(cycle);
+                try json.write(@as(f64, @floatFromInt(cycle_totals.sum)) / @as(f64, @floatFromInt(cycle_totals.reads)));
             }
             try json.endArray();
             try json.endObject();
@@ -779,9 +928,8 @@ pub const MateQc = struct {
             for ([_][]const u8{ "A", "T", "C", "G", "N", "GC" }, [_][]const BaseKind{ &.{.a}, &.{.t}, &.{.c}, &.{.g}, &.{.n}, &.{ .g, .c } }) |name, kinds| {
                 try json.objectField(name);
                 try json.beginArray();
-                for (cycles, self.bases.items[0..cycles.len]) |qualities, bases| {
-                    var reads: u64 = 0;
-                    for (qualities) |count| reads += count;
+                for (self.bases.items[0..cycles], 0..) |bases, cycle| {
+                    const reads = self.cycleTotals(cycle).reads;
                     var matched: u64 = 0;
                     for (kinds) |kind| matched += bases[@intFromEnum(kind)];
                     try json.write(@as(f64, @floatFromInt(matched)) / @as(f64, @floatFromInt(reads)));
@@ -791,6 +939,19 @@ pub const MateQc = struct {
             try json.endObject();
         }
         try json.endObject();
+    }
+
+    fn cycleTotals(self: *const MateQc, cycle: usize) CycleQuality {
+        if (!self.detailed) return self.cycle_quality.items[cycle];
+        var totals: CycleQuality = .{};
+        for (self.quality.items[cycle], 0..) |count, score| {
+            totals.reads += count;
+            totals.sum += count * score;
+            if (score >= statistics.Q20_SCORE) totals.q20 += count;
+            if (score >= statistics.Q30_SCORE) totals.q30 += count;
+            if (score >= Q40_SCORE) totals.q40 += count;
+        }
+        return totals;
     }
 
     fn writeQcTable(self: *const MateQc, out: *std.Io.Writer, filename: []const u8, version: []const u8, sequences: PopulationView) !void {
@@ -1115,11 +1276,123 @@ fn gcDeviation(gc: *const [GC_BINS]f64) f64 {
     return difference / total * 100;
 }
 
+inline fn addQualityCounts(comptime lanes: comptime_int, bins: *QualityBins, counts: []QualityCounts, quality: []const u8) u64 {
+    if (bins.enabled and quality.len >= lanes) return addBinnedQualities(lanes, bins, counts, quality);
+    var sum: u64 = 0;
+    for (quality, counts[0..quality.len]) |byte, *cycle_counts| {
+        cycle_counts[byte - PHRED_OFFSET] += 1;
+        sum += byte;
+    }
+    return sum;
+}
+
+noinline fn addBinnedQualities(comptime lanes: comptime_int, bins: *QualityBins, counts: []QualityCounts, quality: []const u8) u64 {
+    std.debug.assert(quality.len >= lanes);
+    var byte_lanes: @Vector(lanes, u16) = @splat(0);
+    var cycle: usize = 0;
+    while (cycle + lanes <= quality.len) : (cycle += lanes) {
+        byte_lanes += countQualityBlock(lanes, bins, counts, quality, cycle, 0);
+    }
+    if (cycle < quality.len) {
+        const start = quality.len - lanes;
+        byte_lanes += countQualityBlock(lanes, bins, counts, quality, start, cycle - start);
+    }
+    bins.vector_bytes += quality.len;
+    return @reduce(.Add, @as(@Vector(lanes, u32), byte_lanes));
+}
+
+inline fn countQualityBlock(
+    comptime lanes: comptime_int,
+    bins: *QualityBins,
+    counts: []QualityCounts,
+    quality: []const u8,
+    start: usize,
+    counted: usize,
+) @Vector(lanes, u16) {
+    const Bytes = @Vector(lanes, u8);
+    const ones: Bytes = @splat(1);
+    const zeros: Bytes = @splat(0);
+    const lane_index: Bytes = std.simd.iota(u8, lanes);
+    const fresh = lane_index >= @as(Bytes, @splat(@intCast(counted)));
+    const bytes: Bytes = quality[start..][0..lanes].*;
+    var matched = @select(u8, fresh, zeros, ones);
+    for (bins.values[0..bins.count], bins.rows[0..bins.count]) |value, *row| {
+        const hits = @select(u8, bytes == @as(Bytes, @splat(value)), ones, zeros) & @select(u8, fresh, ones, zeros);
+        const pending = row.items[start..][0..lanes];
+        pending.* = @as(Bytes, pending.*) + hits;
+        matched |= hits;
+    }
+    if (!@reduce(.And, matched == ones)) {
+        const flags: [lanes]u8 = matched;
+        for (flags, quality[start..][0..lanes], counts[start..][0..lanes]) |flag, byte, *cycle_counts| {
+            if (flag != 0) continue;
+            cycle_counts[byte - PHRED_OFFSET] += 1;
+            bins.unmatched_bytes += 1;
+            bins.learn(byte);
+        }
+    }
+    return @as(@Vector(lanes, u16), @select(u8, fresh, bytes, zeros));
+}
+
+fn addCycleQualities(comptime lanes: comptime_int, pending: PendingRows, quality: []const u8) u64 {
+    var byte_lanes: @Vector(lanes, u16) = @splat(0);
+    var cycle: usize = 0;
+    while (cycle + lanes <= quality.len) : (cycle += lanes) {
+        addQualityBlock(lanes, pending, quality, cycle, 0, &byte_lanes);
+    }
+    if (cycle < quality.len and quality.len >= lanes) {
+        const start = quality.len - lanes;
+        addQualityBlock(lanes, pending, quality, start, cycle - start, &byte_lanes);
+        cycle = quality.len;
+    }
+    var sum: u64 = @reduce(.Add, @as(@Vector(lanes, u32), byte_lanes));
+    for (quality[cycle..], cycle..) |byte, at| {
+        const score = byte - PHRED_OFFSET;
+        sum += byte;
+        pending.sums[at] += score;
+        pending.reads[at] += 1;
+        pending.q20[at] += @intFromBool(score >= statistics.Q20_SCORE);
+        pending.q30[at] += @intFromBool(score >= statistics.Q30_SCORE);
+        pending.q40[at] += @intFromBool(score >= Q40_SCORE);
+    }
+    return sum;
+}
+
+inline fn addQualityBlock(
+    comptime lanes: comptime_int,
+    pending: PendingRows,
+    quality: []const u8,
+    start: usize,
+    counted: usize,
+    byte_lanes: *@Vector(lanes, u16),
+) void {
+    const Bytes = @Vector(lanes, u8);
+    const Wide = @Vector(lanes, u16);
+    const ones: Bytes = @splat(1);
+    const zeros: Bytes = @splat(0);
+    const fresh = std.simd.iota(u8, lanes) >= @as(Bytes, @splat(@intCast(counted)));
+    const bytes: Bytes = quality[start..][0..lanes].*;
+    const scores = bytes -% @as(Bytes, @splat(PHRED_OFFSET));
+    byte_lanes.* += @as(Wide, @select(u8, fresh, bytes, zeros));
+    const sums = pending.sums[start..][0..lanes];
+    sums.* = @as(Wide, sums.*) + @as(Wide, @select(u8, fresh, scores, zeros));
+    const reads = pending.reads[start..][0..lanes];
+    reads.* = @as(Bytes, reads.*) + @select(u8, fresh, ones, zeros);
+    inline for (.{ pending.q20, pending.q30, pending.q40 }, .{ statistics.Q20_SCORE, statistics.Q30_SCORE, Q40_SCORE }) |row, threshold| {
+        const counts = row[start..][0..lanes];
+        counts.* = @as(Bytes, counts.*) + @select(u8, (scores >= @as(Bytes, @splat(threshold))) & fresh, ones, zeros);
+    }
+}
+
 fn countCycleBases(comptime lanes: comptime_int, pending: *PendingBases, sequence: []const u8, gc_length: usize) usize {
     var gc_count: usize = 0;
     var cycle: usize = 0;
     while (cycle + lanes <= sequence.len) : (cycle += lanes) {
-        gc_count += countBlock(lanes, pending, sequence, cycle, gc_length);
+        gc_count += countBlock(lanes, pending, sequence, cycle, 0, gc_length);
+    }
+    if (cycle < sequence.len and sequence.len >= lanes) {
+        const start = sequence.len - lanes;
+        return gc_count + countBlock(lanes, pending, sequence, start, cycle - start, gc_length);
     }
     for (sequence[cycle..], cycle..) |base, at| {
         const kind = BASE_KIND[base];
@@ -1135,15 +1408,17 @@ inline fn countBlock(
     pending: *PendingBases,
     sequence: []const u8,
     start: usize,
+    counted: usize,
     gc_length: usize,
 ) usize {
     const Bytes = @Vector(lanes, u8);
     const ones: Bytes = @splat(1);
     const zeros: Bytes = @splat(0);
+    const fresh = std.simd.iota(u8, lanes) >= @as(Bytes, @splat(@intCast(counted)));
     const upper = @as(Bytes, sequence[start..][0..lanes].*) & @as(Bytes, @splat(CASE_FOLD));
     var gc_count: usize = 0;
     inline for (COUNTED_LETTERS, pending) |letter, *row| {
-        const hits = upper == @as(Bytes, @splat(letter));
+        const hits = (upper == @as(Bytes, @splat(letter))) & fresh;
         const counts = row[start..][0..lanes];
         counts.* = @as(Bytes, counts.*) + @select(u8, hits, ones, zeros);
         if (letter == 'G' or letter == 'C') gc_count += keptHits(lanes, hits, start, gc_length);
@@ -1364,17 +1639,26 @@ const GcWeights = [GC_BINS]f64;
 
 const GcModel = struct {
     filled: std.StaticBitSet(GC_CACHED_LENGTHS) = .initEmpty(),
-    cached: [GC_CACHED_LENGTHS]GcWeights = undefined,
+    cached: ?*[GC_CACHED_LENGTHS]GcWeights = null,
     long_length: usize = 0,
     long: GcWeights = undefined,
 
-    fn weights(self: *GcModel, length: usize) *const GcWeights {
+    fn deinit(self: *GcModel, allocator: std.mem.Allocator) void {
+        if (self.cached) |cached| allocator.destroy(cached);
+    }
+
+    fn weights(self: *GcModel, allocator: std.mem.Allocator, length: usize) error{OutOfMemory}!*const GcWeights {
         if (cacheSlot(length)) |slot| {
+            const cached = self.cached orelse cached: {
+                const cached = try allocator.create([GC_CACHED_LENGTHS]GcWeights);
+                self.cached = cached;
+                break :cached cached;
+            };
             if (!self.filled.isSet(slot)) {
-                fillWeights(&self.cached[slot], length);
+                fillWeights(&cached[slot], length);
                 self.filled.set(slot);
             }
-            return &self.cached[slot];
+            return &cached[slot];
         }
         if (self.long_length != length) {
             fillWeights(&self.long, length);
@@ -1447,6 +1731,21 @@ const SequenceKey = struct {
                 word.* = std.mem.readInt(u64, bytes[index * 8 ..][0..8], .little) & mask;
             }
         }
+        return fromWords(words);
+    }
+
+    fn unpack(packed_words: PackedKey) SequenceKey {
+        var bytes: [KEY_WORDS * 8]u8 = @splat(0);
+        for (bytes[0..KEY_LENGTH], 0..) |*byte, index| {
+            const bit = index * CODE_BITS;
+            var code = packed_words[bit / 64] >> @intCast(bit % 64);
+            if (bit % 64 > 64 - CODE_BITS) code |= packed_words[bit / 64 + 1] << @intCast(64 - bit % 64);
+            byte.* = @intCast(code & CODE_MASK);
+        }
+        return fromWords(@bitCast(bytes));
+    }
+
+    fn fromWords(words: [KEY_WORDS]u64) SequenceKey {
         return .{ .words = words, .hash = mix(
             mix(words[0] ^ KEY_SECRETS[0], words[1] ^ KEY_SECRETS[1]) ^
                 mix(words[2] ^ KEY_SECRETS[2], words[3] ^ KEY_SECRETS[3]) ^
@@ -1478,9 +1777,60 @@ const SequenceKey = struct {
         std.debug.assert(packed_words[PACKED_WORDS] == 0);
         return packed_words[0..PACKED_WORDS].*;
     }
+
+    fn narrow(self: *const SequenceKey) ?NarrowKey {
+        const Bytes = @Vector(64, u8);
+        var padded: [8]u64 = @splat(0);
+        padded[0..KEY_WORDS].* = self.words;
+        const codes: Bytes = @bitCast(padded);
+        const zero: Bytes = @splat(0);
+        const c = codes == @as(Bytes, @splat('C' & CODE_MASK));
+        const g = codes == @as(Bytes, @splat('G' & CODE_MASK));
+        const t = codes == @as(Bytes, @splat('T' & CODE_MASK));
+        const known = (codes == @as(Bytes, @splat('A' & CODE_MASK))) | c | g | t;
+        const filled: u64 = @bitCast(codes != zero);
+        if (filled & (filled +% 1) != 0) return null;
+        if (@as(u64, @bitCast(known)) != filled) return null;
+        const bases = @select(u8, c, @as(Bytes, @splat(1)), zero) | @select(u8, g, @as(Bytes, @splat(2)), zero) |
+            @select(u8, t, @as(Bytes, @splat(3)), zero);
+        const words: [8]u64 = @bitCast(bases);
+        var result: NarrowKey = .{ 0, 0 };
+        for (words[0..KEY_WORDS], 0..) |word, chunk| {
+            var bits = word;
+            bits = (bits | (bits >> 6)) & 0x000f_000f_000f_000f;
+            bits = (bits | (bits >> 12)) & 0x0000_00ff_0000_00ff;
+            bits = (bits | (bits >> 24)) & 0x0000_0000_0000_ffff;
+            const shift = chunk * 16;
+            result[shift / 64] |= bits << @intCast(shift % 64);
+        }
+        result[1] |= @as(u64, @popCount(filled)) << NARROW_LENGTH_SHIFT;
+        return result;
+    }
 };
 
 const PackedKey = [PACKED_WORDS]u64;
+const NARROW_WORDS = 2;
+const NarrowKey = [NARROW_WORDS]u64;
+const NARROW_LENGTH_SHIFT = 58;
+
+const KeyForm = struct {
+    narrow: ?NarrowKey,
+    wide: PackedKey,
+
+    noinline fn fill(self: *KeyForm, key: *const SequenceKey) void {
+        self.narrow = key.narrow();
+        if (self.narrow == null) self.wide = key.pack();
+    }
+};
+
+fn decodeNarrow(key: NarrowKey, buffer: *[KEY_LENGTH]u8) []const u8 {
+    const length: usize = @intCast(key[1] >> NARROW_LENGTH_SHIFT);
+    for (buffer[0..length], 0..) |*byte, index| {
+        const shift = index * 2;
+        byte.* = "ACGT"[@intCast((key[shift / 64] >> @intCast(shift % 64)) & 3)];
+    }
+    return buffer[0..length];
+}
 
 fn decodeKey(words: PackedKey, buffer: *[KEY_LENGTH]u8) []const u8 {
     for (buffer, 0..) |*byte, index| {
@@ -1502,7 +1852,9 @@ const Levels = struct {
 
 const SequenceCounts = struct {
     records: std.ArrayList(Record) = .empty,
-    slots: []u64 = &.{},
+    key_words: std.ArrayList(u64) = .empty,
+    base: ?*const SequenceCounts = null,
+    slots: []align(8) u32 = &.{},
     limit: u32 = KEY_LIMIT,
     reads: u64 = 0,
     reads_at_limit: u64 = 0,
@@ -1512,13 +1864,61 @@ const SequenceCounts = struct {
     source_count: usize = 0,
 
     const Record = struct {
-        words: PackedKey,
-        reads: u64,
+        reads: u32,
+        key: u32,
     };
+
+    const BASE_KEY: u32 = 1 << 31;
+    const WIDE_KEY: u32 = 1 << 30;
+    const KEY_OFFSET: u32 = WIDE_KEY - 1;
+    const SLOT_INDEX_BITS = 17;
+    const SLOT_INDEX_MASK: u32 = (1 << SLOT_INDEX_BITS) - 1;
+
+    comptime {
+        std.debug.assert(KEY_LIMIT < SLOT_INDEX_MASK);
+        std.debug.assert(KEY_LIMIT * PACKED_WORDS <= KEY_OFFSET);
+    }
+
+    fn narrowKey(self: *const SequenceCounts, key: u32) *const NarrowKey {
+        return self.key_words.items[key..][0..NARROW_WORDS];
+    }
+
+    fn wideKey(self: *const SequenceCounts, key: u32) *const PackedKey {
+        return self.key_words.items[key & KEY_OFFSET ..][0..PACKED_WORDS];
+    }
+
+    fn slotTag(tag: u32) u32 {
+        return tag >> SLOT_INDEX_BITS;
+    }
+
+    fn storedTag(self: *const SequenceCounts, key: u32) u32 {
+        return self.storedKey(key).tag();
+    }
+
+    fn storedKey(self: *const SequenceCounts, key: u32) SequenceKey {
+        if (key & BASE_KEY != 0) return self.base.?.storedKey(key & ~BASE_KEY);
+        if (key & WIDE_KEY != 0) return SequenceKey.unpack(self.wideKey(key).*);
+        var buffer: [KEY_LENGTH]u8 = undefined;
+        return SequenceKey.of(decodeNarrow(self.narrowKey(key).*, &buffer));
+    }
 
     fn deinit(self: *SequenceCounts, allocator: std.mem.Allocator) void {
         self.records.deinit(allocator);
+        self.key_words.deinit(allocator);
         allocator.free(self.slots);
+    }
+
+    fn keyText(self: *const SequenceCounts, key: u32, buffer: *[KEY_LENGTH]u8) []const u8 {
+        if (key & BASE_KEY != 0) return self.base.?.keyText(key & ~BASE_KEY, buffer);
+        if (key & WIDE_KEY != 0) return decodeKey(self.wideKey(key).*, buffer);
+        return decodeNarrow(self.narrowKey(key).*, buffer);
+    }
+
+    fn keyMatches(self: *const SequenceCounts, key: u32, form: *const KeyForm) bool {
+        if (key & BASE_KEY != 0) return self.base.?.keyMatches(key & ~BASE_KEY, form);
+        if (key & WIDE_KEY != 0) return form.narrow == null and std.mem.eql(u64, self.wideKey(key), &form.wide);
+        const narrow = form.narrow orelse return false;
+        return std.mem.eql(u64, self.narrowKey(key), &narrow);
     }
 
     fn limited(self: *const SequenceCounts) bool {
@@ -1530,7 +1930,8 @@ const SequenceCounts = struct {
         _ = try std.math.add(u64, self.reads, 1);
         if (self.limited()) return;
         const needed = self.records.items.len + 1;
-        if (needed <= self.records.capacity and needed * 100 <= self.slots.len * SLOT_LOAD_PERCENT) return;
+        if (needed <= self.records.capacity and self.key_words.items.len + PACKED_WORDS <= self.key_words.capacity and
+            needed * 100 <= self.slots.len * SLOT_LOAD_PERCENT) return;
         return self.grow(allocator);
     }
 
@@ -1539,16 +1940,22 @@ const SequenceCounts = struct {
         if (needed > self.records.capacity) {
             try self.records.ensureTotalCapacityPrecise(allocator, @min(self.limit, @max(needed, self.records.capacity * 2, 256)));
         }
+        const words_needed = self.key_words.items.len + PACKED_WORDS;
+        if (words_needed > self.key_words.capacity) {
+            const words_limit = @as(usize, self.limit) * PACKED_WORDS;
+            try self.key_words.ensureTotalCapacityPrecise(allocator, @min(words_limit, @max(words_needed, self.key_words.capacity * 2, 256 * PACKED_WORDS)));
+        }
         if (needed * 100 > self.slots.len * SLOT_LOAD_PERCENT) try self.growSlots(allocator);
     }
 
     fn growSlots(self: *SequenceCounts, allocator: std.mem.Allocator) error{OutOfMemory}!void {
-        const slots = try allocator.alloc(u64, @max(SLOT_MIN, self.slots.len * 2));
+        const slots = try allocator.alignedAlloc(u32, .@"8", @max(SLOT_MIN, self.slots.len * 2));
         @memset(slots, 0);
         const mask = slots.len - 1;
         for (self.slots) |slot| {
             if (slot == 0) continue;
-            var index: usize = @as(u32, @truncate(slot >> 32)) & mask;
+            const record = self.records.items[(slot & SLOT_INDEX_MASK) - 1];
+            var index: usize = self.storedTag(record.key) & mask;
             while (slots[index] != 0) index = (index + 1) & mask;
             slots[index] = slot;
         }
@@ -1561,39 +1968,51 @@ const SequenceCounts = struct {
         @prefetch(&self.slots[key.tag() & (self.slots.len - 1)], .{ .rw = .write });
     }
 
-    fn add(self: *SequenceCounts, key: SequenceKey) void {
+    fn add(self: *SequenceCounts, key: *const SequenceKey, base_key: ?u32) error{Overflow}!?u32 {
         std.debug.assert(self.levels == null and self.slots.len != 0);
         const reads = self.reads + 1;
         const full = self.limited();
         const mask = self.slots.len - 1;
         const tag = key.tag();
-        var packed_key: ?PackedKey = null;
+        var form: KeyForm = undefined;
+        var formed = false;
         var index: usize = tag & mask;
         while (true) : (index = (index + 1) & mask) {
             const slot = self.slots[index];
             if (slot == 0) break;
-            if (@as(u32, @truncate(slot >> 32)) != tag) continue;
-            const record = &self.records.items[@as(u32, @truncate(slot)) - 1];
-            const wanted = packed_key orelse key.pack();
-            packed_key = wanted;
-            if (!std.mem.eql(u64, &record.words, &wanted)) continue;
-            record.reads += 1;
+            if (slot >> SLOT_INDEX_BITS != slotTag(tag)) continue;
+            const record = &self.records.items[(slot & SLOT_INDEX_MASK) - 1];
+            if (!formed) form.fill(key);
+            formed = true;
+            if (!self.keyMatches(record.key, &form)) continue;
+            record.reads = std.math.add(u32, record.reads, 1) catch return error.Overflow;
             if (!full) self.reads_at_limit = reads;
             self.reads = reads;
-            return;
+            return record.key;
         }
         self.reads = reads;
-        if (full) return;
-        self.records.appendAssumeCapacity(.{ .words = packed_key orelse key.pack(), .reads = 1 });
-        self.slots[index] = @as(u64, tag) << 32 | self.records.items.len;
+        if (full) return null;
+        const stored = if (base_key) |shared| shared | BASE_KEY else own: {
+            if (!formed) form.fill(key);
+            const offset: u32 = @intCast(self.key_words.items.len);
+            if (form.narrow) |narrow| {
+                self.key_words.appendSliceAssumeCapacity(&narrow);
+                break :own offset;
+            }
+            self.key_words.appendSliceAssumeCapacity(&form.wide);
+            break :own offset | WIDE_KEY;
+        };
+        self.records.appendAssumeCapacity(.{ .reads = 1, .key = stored });
+        self.slots[index] = slotTag(tag) << SLOT_INDEX_BITS | @as(u32, @intCast(self.records.items.len));
         self.reads_at_limit = reads;
+        return stored;
     }
 
     fn finish(self: *SequenceCounts) void {
         if (self.levels != null) return;
         const counts = self.slots[0..self.records.items.len];
         for (self.records.items, counts) |record, *count| count.* = record.reads;
-        std.sort.pdq(u64, counts, {}, std.sort.asc(u64));
+        std.sort.pdq(u32, counts, {}, std.sort.asc(u32));
         var levels: Levels = .{ .bins = @splat(0), .deduplicated = 0, .total = 0 };
         var start: usize = 0;
         while (start < counts.len) {
@@ -1663,7 +2082,7 @@ const SequenceCounts = struct {
         return @as(f64, @floatFromInt(reads)) / @as(f64, @floatFromInt(self.reads)) * 100.0;
     }
 
-    fn moreReads(self: *const SequenceCounts, a: u64, b: u64) bool {
+    fn moreReads(self: *const SequenceCounts, a: u32, b: u32) bool {
         const first = self.records.items[a].reads;
         const second = self.records.items[b].reads;
         return first > second or (first == second and a < b);
@@ -1673,23 +2092,23 @@ const SequenceCounts = struct {
         var row_count: usize = 0;
         for (self.records.items, 0..) |record, index| {
             if (!(self.percentage(record.reads) > OVERREPRESENTED_PERCENT)) continue;
-            self.slots[row_count] = index;
+            self.slots[row_count] = @intCast(index);
             row_count += 1;
         }
         std.debug.assert(row_count <= OVERREPRESENTED_MAX);
-        std.sort.pdq(u64, self.slots[0..row_count], self, moreReads);
+        std.sort.pdq(u32, self.slots[0..row_count], self, moreReads);
         self.overrepresented_count = row_count;
     }
 
-    fn overrepresentedRows(self: *const SequenceCounts) []const u64 {
+    fn overrepresentedRows(self: *const SequenceCounts) []const u32 {
         std.debug.assert(self.levels != null);
         return self.slots[0..self.overrepresented_count];
     }
 
     fn sourceStorage(self: *const SequenceCounts) []?Hit {
-        comptime std.debug.assert(@sizeOf(?Hit) % @sizeOf(u64) == 0 and @alignOf(?Hit) <= @alignOf(u64));
-        const slots_per_hit = @sizeOf(?Hit) / @sizeOf(u64);
-        const remaining = self.slots[self.overrepresented_count..];
+        comptime std.debug.assert(@sizeOf(?Hit) % 8 == 0 and @alignOf(?Hit) <= 8);
+        const slots_per_hit = @sizeOf(?Hit) / @sizeOf(u32);
+        const remaining: []align(8) u32 = @alignCast(self.slots[std.mem.alignForward(usize, self.overrepresented_count, 2)..]);
         return std.mem.bytesAsSlice(?Hit, std.mem.sliceAsBytes(remaining[0 .. remaining.len / slots_per_hit * slots_per_hit]));
     }
 
@@ -1699,7 +2118,7 @@ const SequenceCounts = struct {
         self.source_list = contaminants;
         for (self.overrepresentedRows()[0..self.source_count], storage[0..self.source_count]) |index, *hit| {
             var buffer: [KEY_LENGTH]u8 = undefined;
-            hit.* = contaminants.bestHit(decodeKey(self.records.items[index].words, &buffer));
+            hit.* = contaminants.bestHit(self.keyText(self.records.items[index].key, &buffer));
         }
     }
 
@@ -1714,7 +2133,7 @@ const SequenceCounts = struct {
         for (self.overrepresentedRows(), 0..) |index, rank| {
             const record = self.records.items[index];
             var buffer: [KEY_LENGTH]u8 = undefined;
-            const key = decodeKey(record.words, &buffer);
+            const key = self.keyText(record.key, &buffer);
             try json.beginObject();
             try json.objectField("sequence");
             try json.write(key);
@@ -1751,7 +2170,7 @@ const SequenceCounts = struct {
         for (found, 0..) |index, rank| {
             const record = self.records.items[index];
             var buffer: [KEY_LENGTH]u8 = undefined;
-            const key = decodeKey(record.words, &buffer);
+            const key = self.keyText(record.key, &buffer);
             try out.print("{s}\t{d}", .{ key, record.reads });
             try writeCell(out, @round(self.percentage(record.reads) * 100) / 100);
             if (self.sourceHit(rank, key, contaminants)) |hit| {
@@ -1881,7 +2300,7 @@ pub const ContaminantList = struct {
     arena: std.heap.ArenaAllocator,
     items: []const Contaminant,
 
-    pub const ParseError = error{ OutOfMemory, InvalidBase };
+    const ParseError = error{ OutOfMemory, InvalidBase };
 
     pub fn parse(allocator: std.mem.Allocator, text: []const u8, failed_line: *usize) ParseError!ContaminantList {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -1943,7 +2362,7 @@ pub const ContaminantList = struct {
         self.arena.deinit();
     }
 
-    pub fn bestHit(self: *const ContaminantList, key: []const u8) ?Hit {
+    fn bestHit(self: *const ContaminantList, key: []const u8) ?Hit {
         var best: ?Hit = null;
         for (self.items) |contaminant| {
             const hit = contaminant.match(key) orelse continue;
@@ -2536,6 +2955,36 @@ test "[failure] - [qc]: a failed retained allocation leaves the retained counts 
     try std.testing.expectEqual(@as(u64, 1), populations.raw.lengths[4]);
 }
 
+test "[property] - [qc]: vector quality sums match a scalar count at every tier and lane boundary" {
+    var prng = std.Random.DefaultPrng.init(0x5a17_0b10);
+    const random = prng.random();
+    var quality: [300]u8 = undefined;
+    for (&quality) |*byte| byte.* = PHRED_OFFSET + random.uintLessThan(u8, fastq.PHRED_MAX_SCORE + 1);
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
+        for ([_]usize{ 0, 1, lanes - 1, lanes, lanes + 1, 2 * lanes + 7, 100, 151, 300 }) |length| {
+            errdefer std.debug.print("lanes {d} length {d}\n", .{ lanes, length });
+            var sums: [300]u16 = @splat(0);
+            var counts: [4][300]u8 = @splat(@splat(0));
+            var expected_sums: [300]u16 = @splat(0);
+            var expected_counts: [4][300]u8 = @splat(@splat(0));
+            const rows: PendingRows = .{ .sums = &sums, .reads = &counts[0], .q20 = &counts[1], .q30 = &counts[2], .q40 = &counts[3] };
+            var expected_sum: u64 = 0;
+            for (quality[0..length], 0..) |byte, cycle| {
+                const score = byte - PHRED_OFFSET;
+                expected_sum += byte;
+                expected_sums[cycle] += score;
+                expected_counts[0][cycle] += 1;
+                expected_counts[1][cycle] += @intFromBool(score >= statistics.Q20_SCORE);
+                expected_counts[2][cycle] += @intFromBool(score >= statistics.Q30_SCORE);
+                expected_counts[3][cycle] += @intFromBool(score >= Q40_SCORE);
+            }
+            try std.testing.expectEqual(expected_sum, addCycleQualities(lanes, rows, quality[0..length]));
+            try std.testing.expectEqualSlices(u16, &expected_sums, &sums);
+            for (expected_counts, counts) |expected, actual| try std.testing.expectEqualSlices(u8, &expected, &actual);
+        }
+    }
+}
+
 test "[property] - [qc]: vector cycle counts match a scalar count at every tier and lane boundary" {
     const pattern = "ACGTNacgtnRYgc";
     var sequence: [151]u8 = undefined;
@@ -2559,6 +3008,53 @@ test "[property] - [qc]: vector cycle counts match a scalar count at every tier 
     }
 }
 
+test "[property] - [qc]: binned quality counts equal a per-byte count at every tier, alphabet, and length" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xb1_7ed5);
+    const random = prng.random();
+    const Alphabet = struct { values: []const u8, rare: ?u8 = null, vector: bool };
+    const alphabets = [_]Alphabet{
+        .{ .values = "#,:F", .vector = true },
+        .{ .values = "!+5?FIJK", .vector = true },
+        .{ .values = "AF", .rare = '5', .vector = true },
+        .{ .values = "!#%')+-/13", .vector = false },
+    };
+    var quality: [MAX_CYCLES]u8 = undefined;
+    const counts = try allocator.alloc(QualityCounts, MAX_CYCLES);
+    defer allocator.free(counts);
+    const reference = try allocator.alloc(QualityCounts, MAX_CYCLES);
+    defer allocator.free(reference);
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
+        for (alphabets) |alphabet| {
+            errdefer std.debug.print("lanes {d} alphabet {s}\n", .{ lanes, alphabet.values });
+            var bins: QualityBins = .{};
+            defer bins.deinit(allocator);
+            try bins.ensureCapacity(allocator, MAX_CYCLES);
+            bins.grow(MAX_CYCLES);
+            @memset(counts, @splat(0));
+            @memset(reference, @splat(0));
+            for (0..1200) |read| {
+                const lengths = [_]usize{ 0, 1, lanes - 1, lanes, lanes + 1, 2 * lanes + 7, MAX_CYCLES };
+                const len = if (read < lengths.len) lengths[read] else random.uintLessThan(usize, 300);
+                for (quality[0..len]) |*byte| {
+                    const rare = alphabet.rare != null and random.uintLessThan(u8, 64) == 0;
+                    byte.* = if (rare) alphabet.rare.? else alphabet.values[random.uintLessThan(usize, alphabet.values.len)];
+                }
+                var expected_sum: u64 = 0;
+                for (quality[0..len], reference[0..len]) |byte, *cycle_counts| {
+                    cycle_counts[byte - PHRED_OFFSET] += 1;
+                    expected_sum += byte;
+                }
+                try std.testing.expectEqual(expected_sum, addQualityCounts(lanes, &bins, counts, quality[0..len]));
+                if (read % 255 == 254) bins.flush(counts);
+            }
+            bins.flush(counts);
+            try std.testing.expectEqual(alphabet.vector, bins.enabled);
+            for (reference, counts) |*expected, *actual| try std.testing.expectEqualSlices(u64, expected, actual);
+        }
+    }
+}
+
 test "[property] - [qc]: statistics from the tables equal Stats.addRecord, also past the cycle limit" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2574,6 +3070,55 @@ test "[property] - [qc]: statistics from the tables equal Stats.addRecord, also 
         defer mate.deinit(std.testing.allocator);
         mate.finish();
         try std.testing.expectEqualDeep(expected.result(), (try mate.stats()).result());
+    }
+}
+
+test "[property] - [qc]: retained sequence counts that share raw keys equal their own counts, also at the key cap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5ea_c0de);
+    const random = prng.random();
+    var sequence: [80]u8 = undefined;
+    const quality: [80]u8 = @splat('I');
+    for ([_]u32{ 64, KEY_LIMIT }) |limit| {
+        errdefer std.debug.print("limit {d}\n", .{limit});
+        var populations: MatePopulations = .{};
+        defer populations.deinit(allocator);
+        populations.enableRetained(0);
+        populations.raw_sequences.limit = limit;
+        populations.retained_sequences.limit = limit;
+        var expected: MatePopulations = .{};
+        defer expected.deinit(allocator);
+        expected.raw_sequences.limit = limit;
+        for (0..3000) |_| {
+            const len = 40 + random.uintLessThan(usize, 41);
+            const family = random.uintLessThan(u32, 200);
+            for (sequence[0..len], 0..) |*base, index| {
+                base.* = "ACGT"[@as(usize, @intCast((family *% 2654435761 +% @as(u32, @intCast(index)) *% 40503) >> 7)) & 3];
+            }
+            if (random.uintLessThan(u8, 4) == 0) sequence[random.uintLessThan(usize, len)] = 'N';
+            try populations.addRead(allocator, "r", sequence[0..len], quality[0..len]);
+            if (random.uintLessThan(u8, 10) == 0) {
+                try populations.dropRetained(allocator, sequence[0..len], quality[0..len]);
+                continue;
+            }
+            const kept = if (random.boolean()) len else random.uintLessThan(usize, len + 1);
+            try populations.addRetained(allocator, "r", sequence[0..len], quality[0..len], kept);
+            try expected.addRead(allocator, "r", sequence[0..kept], quality[0..kept]);
+        }
+        populations.finish();
+        expected.finish();
+        const want = try populationReportOf(arena.allocator(), &expected, false);
+        const got = try populationReportOf(arena.allocator(), &populations, true);
+        inline for (.{ "duplication", "overrepresented" }) |module| {
+            const want_text = try std.json.Stringify.valueAlloc(arena.allocator(), want.get(module).?, .{});
+            const got_text = try std.json.Stringify.valueAlloc(arena.allocator(), got.get(module).?, .{});
+            try std.testing.expectEqualStrings(want_text, got_text);
+        }
+        var shared: usize = 0;
+        for (populations.retained_sequences.records.items) |record| shared += @intFromBool(record.key & SequenceCounts.BASE_KEY != 0);
+        try std.testing.expect(shared != 0 and shared < populations.retained_sequences.records.items.len);
     }
 }
 
@@ -2738,7 +3283,7 @@ fn countsOf(allocator: std.mem.Allocator, reads: []const []const u8) !SequenceCo
     errdefer counts.deinit(allocator);
     for (reads) |read| {
         try counts.reserve(allocator);
-        counts.add(.of(read));
+        _ = try counts.add(&.of(read), null);
     }
     counts.finish();
     return counts;
@@ -2813,7 +3358,7 @@ test "[unit] - [qc]: duplication levels count uppercase keys cut to 50 bases" {
         try std.testing.expectEqual(SequenceKey.of(long), SequenceKey.of(lower));
     }
     try std.testing.expect(SequenceKey.of(long[0..49]).hash != SequenceKey.of(long).hash);
-    try std.testing.expectEqual(@as(u64, 3), folded.records.items[0].reads);
+    try std.testing.expectEqual(@as(u32, 3), folded.records.items[0].reads);
     for ([_][]const u8{ "acgturyswkmbdhvn" ++ "N" ** 40, "ACGTURYSWKMBDHVN", "", "T", "GATTACA" ** 7 }) |sequence| {
         const length = @min(sequence.len, KEY_LENGTH);
         var buffer: [KEY_LENGTH]u8 = undefined;
@@ -2838,6 +3383,109 @@ test "[unit] - [qc]: duplication levels count uppercase keys cut to 50 bases" {
     try std.testing.expectEqual(@as(usize, 15), levelBin(10001));
 }
 
+test "[edge] - [qc]: keys with a code after a zero code are found again after the table grows" {
+    const allocator = std.testing.allocator;
+    var counts: SequenceCounts = .{};
+    defer counts.deinit(allocator);
+    var sequence: [40]u8 = undefined;
+    for (0..2) |_| {
+        for (0..3000) |index| {
+            for (&sequence, 0..) |*base, at| base.* = "ACGT"[(index >> @intCast(2 * (at % 6))) & 3];
+            sequence[20] = '@';
+            const key: SequenceKey = .of(&sequence);
+            try std.testing.expectEqual(key.words, SequenceKey.unpack(key.pack()).words);
+            try counts.reserve(allocator);
+            _ = try counts.add(&key, null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3000), counts.records.items.len);
+    for (counts.records.items) |record| try std.testing.expectEqual(@as(u32, 2), record.reads);
+}
+
+test "[edge] - [qc]: stored keys match only the whole key, narrow or wide, own or shared" {
+    const allocator = std.testing.allocator;
+    const a50 = "A" ** 50;
+    const sequences = [_][]const u8{
+        "",                a50[0..1],         a50[0..2],          a50[0..32],        a50[0..33],
+        a50[0..32] ++ "C", a50,               a50[0..49] ++ "C",  "N",               "AN",
+        a50[0..32] ++ "N", a50[0..49] ++ "N", a50[0..48] ++ "NA", a50[0..39] ++ "N", a50[0..40] ++ "N",
+    };
+    var raw: SequenceCounts = .{};
+    defer raw.deinit(allocator);
+    var retained: SequenceCounts = .{ .base = &raw };
+    defer retained.deinit(allocator);
+    for (sequences) |sequence| {
+        const key: SequenceKey = .of(sequence);
+        try raw.reserve(allocator);
+        const raw_key = try raw.add(&key, null);
+        try retained.reserve(allocator);
+        _ = try retained.add(&key, raw_key);
+    }
+    try std.testing.expectEqual(sequences.len, raw.records.items.len);
+    try std.testing.expectEqual(sequences.len, retained.records.items.len);
+    for (raw.records.items, retained.records.items, 0..) |raw_record, retained_record, stored| {
+        try std.testing.expect(retained_record.key & SequenceCounts.BASE_KEY != 0);
+        for (sequences, 0..) |sequence, wanted| {
+            errdefer std.debug.print("stored {d}, wanted {d}\n", .{ stored, wanted });
+            var form: KeyForm = undefined;
+            form.fill(&SequenceKey.of(sequence));
+            try std.testing.expectEqual(stored == wanted, raw.keyMatches(raw_record.key, &form));
+            try std.testing.expectEqual(stored == wanted, retained.keyMatches(retained_record.key, &form));
+        }
+    }
+}
+
+test "[property] - [qc]: narrow sequence keys decode and count as the wide keys do" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x2b17_ac67);
+    const random = prng.random();
+    const alphabets = [_][]const u8{ "ACGT", "acgtACGT", "ACGTN", "ACGTRYK", "ACG@T" };
+    var counts: SequenceCounts = .{};
+    defer counts.deinit(allocator);
+    var reference = std.AutoHashMap([KEY_WORDS]u64, u32).init(allocator);
+    defer reference.deinit();
+    var sequence: [70]u8 = undefined;
+    var narrow_distinct: usize = 0;
+    for (0..4000) |step| {
+        const alphabet = alphabets[step % alphabets.len];
+        const len = random.uintLessThan(usize, sequence.len + 1);
+        for (sequence[0..len]) |*base| base.* = alphabet[random.uintLessThan(usize, if (step % 3 == 0) 2 else alphabet.len)];
+        const key: SequenceKey = .of(sequence[0..len]);
+        errdefer std.debug.print("sequence {s}\n", .{sequence[0..len]});
+        var wide_buffer: [KEY_LENGTH]u8 = undefined;
+        const wide_text = decodeKey(key.pack(), &wide_buffer);
+        var codes: usize = 0;
+        for (sequence[0..@min(len, KEY_LENGTH)]) |base| codes += @intFromBool(base & CODE_MASK != 0);
+        const expect_narrow = wide_text.len == codes and std.mem.indexOfNone(u8, wide_text, "ACGT") == null;
+        try std.testing.expectEqual(expect_narrow, key.narrow() != null);
+        if (key.narrow()) |narrow| {
+            var narrow_buffer: [KEY_LENGTH]u8 = undefined;
+            try std.testing.expectEqualStrings(wide_text, decodeNarrow(narrow, &narrow_buffer));
+        }
+        try counts.reserve(allocator);
+        _ = try counts.add(&key, null);
+        const entry = try reference.getOrPut(key.words);
+        if (!entry.found_existing and expect_narrow) narrow_distinct += 1;
+        entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+    }
+    try std.testing.expectEqual(@as(usize, reference.count()), counts.records.items.len);
+    try std.testing.expect(narrow_distinct != 0 and narrow_distinct != reference.count());
+    var wide_count: usize = 0;
+    for (counts.records.items) |record| wide_count += @intFromBool(record.key & SequenceCounts.WIDE_KEY != 0);
+    try std.testing.expectEqual(reference.count() - narrow_distinct, wide_count);
+    try std.testing.expectEqual(narrow_distinct * NARROW_WORDS + wide_count * PACKED_WORDS, counts.key_words.items.len);
+    var expected: std.ArrayList(u32) = .empty;
+    defer expected.deinit(allocator);
+    var values = reference.valueIterator();
+    while (values.next()) |value| try expected.append(allocator, value.*);
+    var actual: std.ArrayList(u32) = .empty;
+    defer actual.deinit(allocator);
+    for (counts.records.items) |record| try actual.append(allocator, record.reads);
+    std.sort.pdq(u32, expected.items, {}, std.sort.asc(u32));
+    std.sort.pdq(u32, actual.items, {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, expected.items, actual.items);
+}
+
 test "[edge] - [qc]: past 100,000 keys new reads count only in the total and the levels are corrected" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2846,17 +3494,17 @@ test "[edge] - [qc]: past 100,000 keys new reads count only in the total and the
     var buffer: [KEY_LENGTH]u8 = undefined;
     for (0..KEY_LIMIT) |index| {
         try counts.reserve(std.testing.allocator);
-        counts.add(.of(indexedKey(&buffer, index)));
+        _ = try counts.add(&.of(indexedKey(&buffer, index)), null);
     }
     try std.testing.expect(counts.limited());
     try std.testing.expectEqual(@as(u64, KEY_LIMIT), counts.reads_at_limit);
     try counts.reserve(std.testing.allocator);
-    counts.add(.of(indexedKey(&buffer, KEY_LIMIT)));
+    _ = try counts.add(&.of(indexedKey(&buffer, KEY_LIMIT)), null);
     try std.testing.expectEqual(@as(usize, KEY_LIMIT), counts.records.items.len);
     try std.testing.expectEqual(@as(u64, KEY_LIMIT + 1), counts.reads);
     for (0..KEY_LIMIT / 2) |index| {
         try counts.reserve(std.testing.allocator);
-        counts.add(.of(indexedKey(&buffer, index)));
+        _ = try counts.add(&.of(indexedKey(&buffer, index)), null);
     }
     try std.testing.expectEqual(@as(u64, KEY_LIMIT), counts.reads_at_limit);
     try std.testing.expectEqual(@as(usize, KEY_LIMIT), counts.records.capacity);
@@ -2866,11 +3514,11 @@ test "[edge] - [qc]: past 100,000 keys new reads count only in the total and the
     defer probe.deinit(std.testing.allocator);
     for (0..KEY_LIMIT) |index| {
         try probe.reserve(std.testing.allocator);
-        probe.add(.of(indexedKey(&buffer, index)));
+        _ = try probe.add(&.of(indexedKey(&buffer, index)), null);
     }
     for (0..KEY_LIMIT / 2) |index| {
         try probe.reserve(std.testing.allocator);
-        probe.add(.of(indexedKey(&buffer, index)));
+        _ = try probe.add(&.of(indexedKey(&buffer, index)), null);
     }
     probe.finish();
     const report = try sequenceReportOf(arena.allocator(), &probe, null);
@@ -3037,4 +3685,64 @@ test "[edge] - [qc]: per-tile counters flushed into wide carries give the same v
     try std.testing.expectEqualStrings("", TileQuality.headerField("A:B:C:D:", 4).?);
     try std.testing.expectEqual(@as(?[]const u8, null), TileQuality.headerField("A:B:C", 4));
     try std.testing.expectEqualStrings("12", TileQuality.headerField("LONG-INSTRUMENT-NAME-0123:run:flowcell:lane:12", 4).?);
+}
+
+test "[property] - [qc]: summary-only collection writes the summary the full histogram writes" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x51c0_5a77);
+    const random = prng.random();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var sequence: [MAX_CYCLES + 76]u8 = undefined;
+    var quality: [MAX_CYCLES + 76]u8 = undefined;
+    for (0..6) |round| {
+        var full: MatePopulations = .{};
+        defer full.deinit(allocator);
+        var summary: MatePopulations = .{};
+        defer summary.deinit(allocator);
+        summary.raw.detailed = false;
+        summary.retained.detailed = false;
+        const front = round % 3;
+        const trims = round >= 2;
+        if (trims) {
+            full.enableRetained(front);
+            summary.enableRetained(front);
+        }
+        for (0..700) |read| {
+            const long_read = round == 5 and read == 400;
+            const len = if (long_read) MAX_CYCLES + 76 else front + random.uintLessThan(usize, 300);
+            for (sequence[0..len], quality[0..len]) |*base, *score| {
+                base.* = "ACGTNacgtn"[random.uintLessThan(usize, 10)];
+                score.* = PHRED_OFFSET + random.uintLessThan(u8, fastq.PHRED_MAX_SCORE + 1);
+            }
+            for ([_]*MatePopulations{ &full, &summary }) |populations| {
+                try populations.addRead(allocator, "r", sequence[0..len], quality[0..len]);
+            }
+            if (!trims) continue;
+            const drop = random.uintLessThan(u8, 8) == 0;
+            const kept = random.uintLessThan(usize, len - front + 1);
+            for ([_]*MatePopulations{ &full, &summary }) |populations| {
+                if (drop) {
+                    try populations.dropRetained(allocator, sequence[0..len], quality[0..len]);
+                } else {
+                    try populations.addRetained(allocator, "r", sequence[0..len], quality[0..len], kept);
+                }
+            }
+        }
+        full.finish();
+        summary.finish();
+        for ([_]bool{ false, true }) |retained| {
+            if (retained and !trims) continue;
+            var texts: [2][]const u8 = undefined;
+            for ([_]*MatePopulations{ &full, &summary }, &texts) |populations, *text| {
+                var output: std.Io.Writer.Allocating = .init(arena);
+                var json: std.json.Stringify = .{ .writer = &output.writer };
+                try populations.writeSummaryRead(&json, retained);
+                text.* = output.written();
+            }
+            try std.testing.expectEqualStrings(texts[0], texts[1]);
+            try std.testing.expectEqualDeep(try full.population(retained).stats(), try summary.population(retained).stats());
+        }
+    }
 }

@@ -46,7 +46,8 @@ THEMES = {
     "light": dict(bg="#ffffff", ink="#1f2328", ink2="#59636e", muted="#818b98", grid="#d1d9e0", region="#fff4e0"),
     "dark": dict(bg="#0d1117", ink="#f0f6fc", ink2="#9198a1", muted="#656c76", grid="#3d444d", region="#2a1f0c"),
 }
-MARKERS = {"circle": "o", "square": "s", "diamond": "D", "triangle": "^", "triangle-down": "v", "plus": "P", "star": "*", "cross": "X"}
+MARKERS = {"circle": "o", "square": "s", "diamond": "D", "triangle": "^", "triangle-down": "v", "plus": "P", "star": "*", "cross": "X",
+           "pentagon": "p", "hexagon": "h"}
 SUBJECT = "z-fastq"
 # Reserved status colors (dataviz reference palette); every cell also carries its text.
 # Strength: how much of the color a cell shows, per theme; stronger for worse verdicts.
@@ -700,18 +701,23 @@ class Figures:
                    ("Peak memory", "peak RSS (MiB)", lambda r: float(r["rss_kib"]) / 1024)]
         tools = [n for n in self.order if n != SUBJECT and not self.variant(n)
                  and any(self.style[v]["of"] == n and self.variant(v) for v in self.style)]
-        # Rows: (name, fmt, [(family, case), ...]); a pooled section has one row per format.
+        # Rows: (name, fmt, [(family, case), ...]); a pooled section has one row per format. Only the
+        # cases that ran thread variants count, so every line and z-fastq's level share their inputs.
+        def swept(family, fmt):
+            return [(family, i["case"]) for i in self.tier_cases(family, fmt)
+                    if any(self.variant(v) for v in self.rows.get((family, i["case"]), {}))]
+
         rows = []
         if slug in self.pooled:
             name = " and ".join(n for _, n in cols)
             for fmt in self.section_formats(cols):
-                cases = [(f, i["case"]) for f, _ in cols for i in self.tier_cases(f, fmt)]
+                cases = [c for f, _ in cols for c in swept(f, fmt)]
                 if cases:
                     rows.append((name, fmt, cases))
         else:
             for family, name in cols:
                 for fmt in self.formats(family):
-                    cases = [(family, i["case"]) for i in self.tier_cases(family, fmt)]
+                    cases = swept(family, fmt)
                     if cases:
                         rows.append((name, fmt, cases))
         if not tools or not rows:
@@ -761,7 +767,7 @@ class Figures:
             ax.xaxis.set_major_formatter(FixedFormatter([str(x) for x in ticks]))
             ax.xaxis.set_minor_locator(NullLocator())
         self.finish(fig, f"{slug}-threads", theme, f"{title}: the other tools by thread count",
-                    f"Lower is better. Geometric means over the {self.headline}-tier inputs, about {self.words['size']} each"
+                    f"Lower is better. Geometric means over the {self.headline}-tier inputs that ran every thread count, about {self.words['size']} each"
                     + (f", {' and '.join(n for _, n in cols)} pooled" if slug in self.pooled else "") + "; each "
                     "tool at 1 to 16 threads on as many physical cores, z-fastq on one core (dashed line), all in the same batches. "
                     "Where a line crosses z-fastq's in the first column, that tool matches z-fastq's wall time.",

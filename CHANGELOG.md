@@ -4,6 +4,46 @@
 
 All notable changes to z-fastq will be documented in this file.
 
+## [0.3.0]
+
+z-fastq now runs on macOS, on Apple Silicon and on Intel, and x86-64 builds switch to AVX-512 kernels on CPUs that have them. The x86-64 release binaries target x86-64-v3, which makes most commands faster, and most commands need less memory. Output bytes, JSON documents, and exit statuses are unchanged, apart from the fix below.
+
+### Added
+
+- **macOS.** z-fastq builds and runs on macOS 13 or later (tested on macOS 15), and each release adds `macos-aarch64` and `macos-x86_64` archives, tested on GitHub's macOS runners like the Linux archives. The Intel build targets x86-64-v3, as on Linux; Apple Silicon runs the vector code as NEON, as Linux aarch64 does. macOS binaries link only `libSystem`; Linux binaries stay static. Output is the same on both systems, with one exception:
+  - On macOS, `/dev/stdin` and `/dev/fd/N` share the read position of the descriptor they name, so naming standard input twice, as in `count - /dev/stdin`, fails with status `2`. Linux reopens the file and reads it twice.
+- **AVX-512.** x86-64 builds carry a second copy of the SIMD kernels compiled for AVX-512 (the x86-64-v4 set) and use it in place of AVX2 when the CPU and the operating system support it. Output is the same on every tier.
+- **`ZFASTQ_TIER`.** Set to `baseline`, `avx2`, or `avx512`, it makes z-fastq run that kernel tier instead of the fastest the CPU has, to compare tiers or rule one out. A tier the CPU cannot run, or any other value, stops the command with status `2`. Zipir's gzip kernels are not affected.
+
+### Changed
+
+- **x86-64 release binaries need x86-64-v3.** The Linux and macOS x86-64 archives are built for the x86-64-v3 set (AVX2, BMI2, FMA), so 150-base reads use AVX2 code too, not only records of 1 KiB or more. On a Zen 2 CPU, trimming with `process` is about 20% faster, `stats` 14%, `check` 8 to 10%, and the copying commands 4 to 5%, with the same output and memory. On a CPU without x86-64-v3 the Linux binary stops with status `2` and says why; a build from source still runs on any x86-64 CPU.
+- **`-Dcpu` in release builds.** ReleaseSafe and ReleaseFast builds now compile for the CPU that `-Dcpu` names, such as `-Dcpu=x86_64_v3`, instead of ignoring it. Without `-Dcpu`, Linux release builds target generic x86-64 or ARMv8-A, as before, and macOS builds target Zig's defaults, `core2` and `apple_m1`. `-Dstatic=true` confirms a static Linux build and stops with a message on macOS.
+- **Speed.** Measured on a Zen 2 CPU on 1 GiB inputs, each change against the build before it, with the same output:
+  - `check` scans the records of each buffer in one loop and ends a bare `+` line without searching for its newline: about 16% faster on 36-base reads and 12% on 150-base reads.
+  - `check --interleaved` takes complete pairs as record spans in one loop: about 12% faster, `sample --interleaved --count` about 4%.
+  - Quality checks no longer stall on a value written in pieces and read back whole: `check` and `sample` 4 to 9% faster.
+  - Mate names without `/1` and `/2`, such as 10x Genomics and SRA names, are matched in one pass: paired sampling of 10x reads about 9% faster, `deinterleave` about 7%.
+  - `--qc-summary` without `--report` or `--qc-tables` keeps per-cycle sums instead of a full quality histogram: about 13% faster.
+  - `--pair-duplication` computes fastp's pair hash in 32-bit lanes: about 14% faster on NovaSeq reads, 10% on 10x reads, and 4% with trimming.
+  - `--report` and `--qc-tables` count reads whose qualities are binned to a few values, as NovaSeq and most current Illumina runs write them, with vector compares: `--report` about 19% faster on NovaSeq reads and 5% on 10x reads; reads with many quality values take the same time as before.
+  - Sampling, `process`, `deinterleave`, and `check --interleaved` check each record inline: 5 to 10% fewer instructions.
+  - QC counts each read's bases to the last one with vectors, finishing on one overlapping block instead of byte by byte: `--qc-summary` about 16% less CPU time.
+  - `--qc-summary` sums each read's qualities to the last one with vectors, the same way: about 15% less CPU time.
+  - The low-quality and N filters count each read to the last base with vectors, the same way: filtering about 10% less CPU time.
+  - Mate names that end in `/1` and `/2` are compared at the full vector width, 32 bytes at a time on AVX2: 2 to 3% fewer instructions in every paired command.
+  - Mate names without `/1` and `/2` are split into words at the full vector width too, finishing on one overlapping block: on 10x Genomics reads, paired sampling and `deinterleave` about 10% faster, with 5 to 9% fewer instructions in sampling, `interleave`, `deinterleave`, `check --interleaved`, and `process`.
+- **Memory.**
+  - The Linux binaries keep the code each command runs together, so a command maps less of the executable: `count`, `check`, and `stats` on a plain file peak at about 0.5 MiB instead of 0.8 to 1.1 MiB, and the other commands outside `process` at 0.2 to 0.3 MiB less.
+  - `process` allocates its detailed QC tables only for `--report` and `--qc-tables`: a run without them, gzip output, or `--pair-duplication` peaks at about 1.3 MiB instead of 2.0 to 2.8 MiB, and the binary is about 550 KB smaller.
+  - `--report` and `--qc-tables` store each duplication key once per mate, in half-size hash tables, at two bits per base for keys made only of A, C, G, and T. On a NovaSeq pair they peak at 10.6 MiB instead of 21.4 MiB with trimming and 7.6 MiB instead of 11.3 MiB without, at least 6 MiB less with UMIs on both mates, and take slightly less CPU time.
+  - `--pair-duplication` packs the positions it has seen, with a denser form for crowded blocks: about 4 to 6 bytes per pair instead of 7 to 10 (176 MiB instead of 341 MiB at 50 million pairs), for about 2% more CPU time. Its bound stays about 1 GiB.
+- **Library.** After a failed `count_scan.Scanner.feed`, `record_index` and `byte_offset` count every record the scanner completed before the failing one; they could stop short of records its fast path completed in the same call.
+
+### Fixed
+
+- **gzip outputs that cannot start.** When `process --gzip` cannot start the gzip stream of an output, it removes the output file before stopping with status `3`, as it does after other output failures.
+
 ## [0.2.1]
 
 Faster gzip input, from Zipir 0.3.0's rebuilt DEFLATE decoder: `count`, `stats`, and `check` take 15 to 18% less CPU time on gzip files. `process` can now move a UMI from the start of the reads into their names, as fastp does. Output bytes, JSON documents, and exit statuses are unchanged, apart from the report fields the UMI options add and the fixes below.

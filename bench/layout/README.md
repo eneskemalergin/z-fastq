@@ -3,7 +3,7 @@
 # Converting paired layouts
 > <sub>`z-fastq interleave` and `deinterleave` against 5 other converters, on 4 real sequencing runs and 1 synthetic shape, plain and gzip. A tool is timed only where its output was byte-exact; time and memory come from the same run, on one CPU.</sub>
 
-- `z-fastq`: *0.2.0, source at 246bbb1*
+- `z-fastq`: *0.3.0*
 - `machine`: *Ryzen 9 3950X, Linux; one CPU per run*
 - `runner`: *zebrac 0.6.2 with zexec*
 - `data`:
@@ -12,19 +12,18 @@
     - `Short, variable length`: *10x mates, 28 and 150 bp*
   - **Synthetic**: *1 shape generated from real reads, each changing one thing; one group in the bars at 1 GiB, and the scaling lines from 1 MiB to 1 GiB*
     - `paired`: *100 bp mate pairs*
-- `date`: *2026-10-30*
 
 ## Findings
 
 - **Right answers:** z-fastq wrote byte-exact output on all 32 checked inputs and rejected every broken pair and record. 4 of the 5 other tools write output from a broken pair or record with exit 0.
 - **Broken pairs:** fqkit, seqtk, SeqFu and fqtools write output from mates whose names differ or whose counts do not match, with exit 0.
 - **Wrong on valid input, exit 0:** annotated plus line (interleave): fqkit, seqtk, IRMA Core, SeqFu, fqtools (plus line changed); valid pair (deinterleave): SeqFu (not a subset); annotated plus line (deinterleave): fqkit, IRMA Core (plus line changed), SeqFu (not a subset), fqtools (plus line changed).
-- **Interleave speed:** the fastest other tool takes 1.12x z-fastq's time on plain input (fqkit) and 1.31x on gzip (seqtk); IRMA Core, the fastest other full-check tool, takes 3.06x z-fastq's time on plain input and 3.04x on gzip.
-- **Deinterleave speed:** the fastest other tool takes 0.94x z-fastq's time on plain input (fqkit) and 1.60x on gzip (fqkit); IRMA Core, the fastest other full-check tool, takes 4.80x z-fastq's time on plain input and 4.03x on gzip.
-- **Memory, interleave:** every other tool peaks at 2.6x to 19x z-fastq's 1.06 MiB.
-- **Memory, deinterleave:** every other tool peaks at 3.8x to 14x z-fastq's 1.06 MiB.
-- **Where z-fastq is not fastest, interleave:** fqkit on plain short, variable length (0.95x).
-- **Where z-fastq is not fastest, deinterleave:** fqkit on plain synthetic (0.84x); fqkit on plain short, variable length (0.86x).
+- **Interleave speed:** the fastest other tool takes 1.27x z-fastq's time on plain input (fqkit) and 1.59x on gzip (seqtk); IRMA Core, the fastest other full-check tool, takes 3.49x z-fastq's time on plain input and 3.57x on gzip.
+- **Deinterleave speed:** the fastest other tool takes 0.99x z-fastq's time on plain input (fqkit) and 1.91x on gzip (fqkit); IRMA Core, the fastest other full-check tool, takes 5.50x z-fastq's time on plain input and 4.89x on gzip.
+- **Memory, interleave:** every other tool peaks at 2.7x to 20x z-fastq's 1.02 MiB.
+- **Memory, deinterleave:** every other tool peaks at 5.3x to 19x z-fastq's 0.78 MiB.
+- **Where z-fastq is not fastest, interleave:** on no kind of input; it is the fastest tool on every kind of input (geometric mean over the group), plain and gzip.
+- **Where z-fastq is not fastest, deinterleave:** fqkit on plain synthetic (0.91x).
 
 ## Compared tools
 > <sub>*complete* tools check pairs and records as much as z-fastq; *partial* tools check less, so they do less work per record. A command is `yes` when the tool was right on every input of it, `partly` on some, `-` when the tool has no such command. Malformed rejected: of the broken pairs and records in the edge cases, how many the tool rejects.</sub>
@@ -112,17 +111,17 @@ z-fastq returned byte-exact output on all 32 inputs it was timed on. Every other
   <img src="results/figures/interleave-overview-light.png" alt="Time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
-z-fastq itself takes 471.5 ms and 1.06 MiB per plain input, 1749.9 ms and 1.06 MiB per gzip input (geometric means over 5 inputs each); the table gives every other tool as a multiple of that.
-Geometric-mean process CPU time is 442.9 ms for plain input and 1551.6 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
+z-fastq itself takes 391.3 ms and 1.02 MiB per plain input, 1250.8 ms and 1.02 MiB per gzip input (geometric means over 5 inputs each); the table gives every other tool as a multiple of that.
+Geometric-mean process CPU time is 388.7 ms for plain input and 1244.0 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
 
 | Tool      | Plain time | Plain memory | Gzip time | Gzip memory | Passes malformed |
 | --------- | ---------: | -----------: | --------: | ----------: | ---------------- |
-| z-fastq   |     471 ms |     1.06 MiB |    1.75 s |    1.06 MiB | none             |
-| fqkit     |      1.12x |       13.10x |     1.76x |      11.88x | 6 of 6           |
-| seqtk     |      1.86x |        2.59x |     1.31x |       2.68x | 6 of 6           |
-| IRMA Core |      3.06x |        3.81x |     3.04x |       4.31x | none             |
-| SeqFu     |      7.21x |        4.21x |     3.61x |      18.69x | 6 of 6           |
-| fqtools   |      8.05x |        3.92x |     2.95x |       4.86x | 1 of 6           |
+| z-fastq   |     391 ms |     1.02 MiB |    1.25 s |    1.02 MiB | none             |
+| fqkit     |      1.27x |       14.26x |     2.15x |      12.94x | 6 of 6           |
+| seqtk     |      2.09x |        2.75x |     1.59x |       2.75x | 6 of 6           |
+| IRMA Core |      3.49x |        4.09x |     3.57x |       4.56x | none             |
+| SeqFu     |      8.11x |        4.48x |     4.43x |      19.67x | 6 of 6           |
+| fqtools   |      9.09x |        4.13x |     3.67x |       5.12x | 1 of 6           |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/interleave-speed-dark.png">
@@ -157,8 +156,8 @@ Geometric-mean process CPU time is 442.9 ms for plain input and 1551.6 ms for gz
 
 
 
-At 1 GiB, z-fastq converts 1.7 GiB/s on plain input and 0.4 GiB/s on gzip input; no other tool is faster there.
-z-fastq peaks at 1.06 MiB at every size of the paired shape. Memory that grows with the input: fqkit by 1.3x on plain paired; fqtools by 1.3x on plain paired.
+At 1 GiB, z-fastq converts 2.0 GiB/s on plain input and 0.6 GiB/s on gzip input; no other tool is faster there.
+z-fastq peaks at 1.02 MiB at every size of the paired shape. Memory that grows with the input: fqkit by 1.3x on plain paired; fqtools by 1.3x on plain paired.
 
 ## Deinterleave
 > <sub>The real runs and synthetic shapes at the medium tier, about 1 GiB of FASTQ each, pooled into kinds of input. Every tool runs on one CPU, with the file in the page cache.</sub>
@@ -169,16 +168,16 @@ z-fastq peaks at 1.06 MiB at every size of the paired shape. Memory that grows w
   <img src="results/figures/deinterleave-overview-light.png" alt="Time and peak RSS relative to z-fastq" width="100%">
 </picture>
 
-z-fastq itself takes 782.0 ms and 1.06 MiB per plain input, 1931.8 ms and 1.06 MiB per gzip input (geometric means over 5 inputs each); the table gives every other tool as a multiple of that.
-Geometric-mean process CPU time is 679.8 ms for plain input and 1769.2 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
+z-fastq itself takes 654.1 ms and 0.78 MiB per plain input, 1489.3 ms and 0.78 MiB per gzip input (geometric means over 5 inputs each); the table gives every other tool as a multiple of that.
+Geometric-mean process CPU time is 618.0 ms for plain input and 1449.0 ms for gzip. Elapsed time also includes launcher overhead and time waiting to run or for I/O.
 
 | Tool      | Plain time | Plain memory | Gzip time | Gzip memory | Passes malformed |
 | --------- | ---------: | -----------: | --------: | ----------: | ---------------- |
-| z-fastq   |     782 ms |     1.06 MiB |    1.93 s |    1.06 MiB | none             |
-| fqkit     |      0.94x |       12.31x |     1.60x |      11.65x | 6 of 6           |
-| IRMA Core |      4.80x |        3.84x |     4.03x |       4.03x | none             |
-| SeqFu     |      3.85x |        4.20x |     3.08x |      13.67x | 4 of 6           |
-| fqtools   |      4.81x |        4.87x |     2.57x |       5.49x | 1 of 6           |
+| z-fastq   |     654 ms |     0.78 MiB |    1.49 s |    0.78 MiB | none             |
+| fqkit     |      0.99x |       17.23x |     1.91x |      16.40x | 6 of 6           |
+| IRMA Core |      5.50x |        5.27x |     4.89x |       5.63x | none             |
+| SeqFu     |      4.33x |        5.82x |     3.56x |      18.57x | 4 of 6           |
+| fqtools   |      5.40x |        6.61x |     3.10x |       7.25x | 1 of 6           |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="results/figures/deinterleave-speed-dark.png">
@@ -215,24 +214,24 @@ Every tool writes its two mate files to disk under the same rules: new files per
 
 
 
-At 1 GiB, z-fastq converts 1.2 GiB/s on plain input and 0.4 GiB/s on gzip input. Faster on a single shape there, as throughput over z-fastq's: fqkit on plain paired (1.19x).
-z-fastq peaks at 1.06 MiB at every size of the paired shape. No other tool grows by more than a quarter either.
+At 1 GiB, z-fastq converts 1.3 GiB/s on plain input and 0.5 GiB/s on gzip input. Faster on a single shape there, as throughput over z-fastq's: fqkit on plain paired (1.10x).
+z-fastq peaks at 0.78 MiB at every size of the paired shape. Memory that grows with the input: fqtools by 1.3x on plain paired.
 
 ## Reproducibility
 
 <details><summary>How it was measured</summary>
 
-Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, 8G for deinterleave, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that `wait4` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Timed by `bench/layout/run.sh release`, last on 2026-10-28; this page written on 2026-10-30.
+Every tool runs through `zexec -r` inside one zebrac batch per case, held to one CPU core by a systemd scope with a CPU quota and a 4G memory cap, 8G for deinterleave, after the input was read once so every run reads from the page cache. zebrac gives wall time; zexec records each run's peak memory, CPU time, and minor faults for the tool alone. Peak RSS is the kernel's peak counter that `wait4` reports, which can lag the true peak by up to about 0.5 MiB, so memory differences smaller than that are inconclusive. Runs per tier, each after one warmup: tiny 31, xsmall 21, small 11, medium 3; sizes 1 MiB to 1 GiB. Timed by `bench/layout/run.sh release`.
 
 </details>
 
 <details><summary>Identity</summary>
 
-- `z-fastq`: *0.2.0, source at 246bbb1*
+- `z-fastq`: *0.3.0*
 - `zebrac`: *0.6.2*
 - `zexec`: *15000 bytes, static, no libc*
 - `cpu`: *AMD Ryzen 9 3950X 16-Core Processor*
-- `load at batch start`: *1.75 to 5.28*
+- `load at batch start`: *1.11 to 2.12*
 
 </details>
 
@@ -256,18 +255,18 @@ Every tool runs through `zexec -r` inside one zebrac batch per case, held to one
 
 Picked from these results: per family, group, and format, the case where z-fastq is closest to, or furthest behind, its fastest rival of any class. `run.sh peer` times z-fastq against a cached reference of the rival on each; `run.sh ab REV` times two z-fastq builds on each.
 
-- `: Short, fixed length, plain`: *NovaSeq, Casava headers*; rival fqkit at 1.08x z-fastq's time
-- `: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival fqkit at 0.95x z-fastq's time
-- `: Synthetic, plain`: *paired: 100 bp mate pairs*; rival fqkit at 1.04x z-fastq's time
-- `: Short, fixed length, gzip`: *BGISEQ, 100 bp*; rival seqtk at 1.24x z-fastq's time
-- `: Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival seqtk at 1.27x z-fastq's time
-- `: Synthetic, gzip`: *paired: 100 bp mate pairs*; rival seqtk at 1.15x z-fastq's time
-- `: Short, fixed length, plain`: *NovaSeq, Casava headers*; rival fqkit at 0.96x z-fastq's time
-- `: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival fqkit at 0.86x z-fastq's time
-- `: Synthetic, plain`: *paired: 100 bp mate pairs*; rival fqkit at 0.84x z-fastq's time
-- `: Short, fixed length, gzip`: *BGISEQ, 100 bp*; rival fqkit at 1.54x z-fastq's time
-- `: Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival fqkit at 1.55x z-fastq's time
-- `: Synthetic, gzip`: *paired: 100 bp mate pairs*; rival fqkit at 1.66x z-fastq's time
+- `: Short, fixed length, plain`: *NovaSeq, Casava headers*; rival fqkit at 1.29x z-fastq's time
+- `: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival fqkit at 1.13x z-fastq's time
+- `: Synthetic, plain`: *paired: 100 bp mate pairs*; rival fqkit at 1.09x z-fastq's time
+- `: Short, fixed length, gzip`: *BGISEQ, 100 bp*; rival seqtk at 1.44x z-fastq's time
+- `: Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival seqtk at 1.62x z-fastq's time
+- `: Synthetic, gzip`: *paired: 100 bp mate pairs*; rival seqtk at 1.47x z-fastq's time
+- `: Short, fixed length, plain`: *NovaSeq, Casava headers*; rival fqkit at 0.97x z-fastq's time
+- `: Short, variable length, plain`: *10x mates, 28 and 150 bp*; rival fqkit at 1.00x z-fastq's time
+- `: Synthetic, plain`: *paired: 100 bp mate pairs*; rival fqkit at 0.91x z-fastq's time
+- `: Short, fixed length, gzip`: *NovaSeq, 150 bp*; rival fqkit at 1.89x z-fastq's time
+- `: Short, variable length, gzip`: *10x mates, 28 and 150 bp*; rival fqkit at 1.84x z-fastq's time
+- `: Synthetic, gzip`: *paired: 100 bp mate pairs*; rival fqkit at 1.88x z-fastq's time
 
 </details>
 
@@ -275,16 +274,16 @@ Picked from these results: per family, group, and format, the case where z-fastq
 
 | Job | Tool      | Instructions per byte | Instructions per cycle | Cache misses per MiB | Branch misses per MiB |
 | --- | --------- | --------------------: | ---------------------: | -------------------: | --------------------: |
-|     | z-fastq   |                  3.78 |                   3.23 |                 2837 |                   936 |
-|     | fqkit     |                  2.94 |                   2.42 |                10929 |                  2619 |
-|     | seqtk     |                  5.95 |                   2.67 |                 5403 |                  5743 |
-|     | IRMA Core |                 10.05 |                   2.65 |                  749 |                  6082 |
-|     | SeqFu     |                 14.24 |                   2.01 |                 2509 |                 48533 |
-|     | fqtools   |                 38.82 |                   3.43 |                 1936 |                 14076 |
-|     | z-fastq   |                  3.77 |                   3.05 |                 5142 |                  1192 |
-|     | fqkit     |                  2.91 |                   2.42 |                10971 |                  1220 |
-|     | IRMA Core |                 10.00 |                   2.66 |                 2884 |                  5885 |
-|     | SeqFu     |                 10.66 |                   2.41 |                 3091 |                  8689 |
-|     | fqtools   |                 38.18 |                   3.54 |                 2300 |                 10609 |
+|     | z-fastq   |                  2.77 |                   2.91 |                 2808 |                   612 |
+|     | fqkit     |                  2.94 |                   2.45 |                10545 |                  2590 |
+|     | seqtk     |                  5.95 |                   2.73 |                 5137 |                  5622 |
+|     | IRMA Core |                 10.05 |                   2.69 |                  300 |                  5958 |
+|     | SeqFu     |                 14.24 |                   2.04 |                  928 |                 48388 |
+|     | fqtools   |                 38.82 |                   3.37 |                 1061 |                 13915 |
+|     | z-fastq   |                  2.79 |                   2.78 |                 5000 |                   817 |
+|     | fqkit     |                  2.91 |                   2.46 |                 9964 |                  1167 |
+|     | IRMA Core |                 10.00 |                   2.69 |                 1373 |                  5485 |
+|     | SeqFu     |                 10.66 |                   2.42 |                 1892 |                  8372 |
+|     | fqtools   |                 38.18 |                   3.48 |                 1750 |                 10475 |
 
 </details>

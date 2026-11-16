@@ -4,14 +4,14 @@ This page is for scripts and workflow engines. The one rule to remember: **trust
 
 ## Exit status
 
-| Status       | Meaning                                           |
-| ------------ | ------------------------------------------------- |
-| `0`          | success                                           |
-| `1`          | a record or pair failed validation                |
-| `2`          | the command line is invalid                       |
-| `3`          | I/O, gzip, output, or memory failure              |
-| `4`          | a line, sampling, or arithmetic limit was reached |
-| `130`, `143` | interrupted by SIGINT or SIGTERM                  |
+| Status       | Meaning                                                                        |
+| ------------ | ------------------------------------------------------------------------------ |
+| `0`          | success                                                                        |
+| `1`          | a record or pair failed validation                                             |
+| `2`          | the command line is invalid                                                    |
+| `3`          | I/O, gzip, output, or memory failure                                           |
+| `4`          | a limit was reached: line, sampling, arithmetic, file size, or an option value |
+| `130`, `143` | interrupted by SIGINT or SIGTERM                                               |
 
 `count`, `stats`, and `check` on several independent inputs carry on past a failed input and exit with the highest status seen. Pair commands and `process` stop at the first failure.
 
@@ -61,7 +61,7 @@ Check the `schema` field before reading a document; `tool.name` and `tool.versio
 Each is one JSON object on one line. After `schema`, `tool`, and `byte_strings` ([Report reference](Report-Reference#shared-conventions)), `results` holds one entry per input:
 
 ```json
-{"schema":"z-fastq/check-v1","tool":{"name":"z-fastq","version":"0.2.1"},"byte_strings":"escaped-bytes-v1","results":[{"input":"ok.fq","status":"ok"},{"input":"bad.fq","status":"error","error":{"code":"S002","message":"sequence byte is outside the selected alphabet","record_index":0,"byte_offset":5,"line_in_record":2}}]}
+{"schema":"z-fastq/check-v1","tool":{"name":"z-fastq","version":"0.3.0"},"byte_strings":"escaped-bytes-v1","results":[{"input":"ok.fq","status":"ok"},{"input":"bad.fq","status":"error","error":{"code":"S002","message":"sequence byte is outside the selected alphabet","record_index":0,"byte_offset":5,"line_in_record":2}}]}
 ```
 
 - **`input`**: the path as given, or **`inputs`**, the two paths, for `check --paired`.

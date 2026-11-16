@@ -1,4 +1,4 @@
-//! Library exports, byte sources, Reader and count scanner behavior, and record validation.
+//! Library exports, byte sources, the reader and count scanner, and record validation.
 
 const std = @import("std");
 const zfastq = @import("z-fastq");
@@ -772,7 +772,7 @@ test "[unit] - [owned record]: copied fields remain stable after Reader advances
     try std.testing.expectEqualStrings("!!!!", owned.quality);
 }
 
-test "[failure] - [reader]: initialization releases partial allocations" {
+test "[failure] - [reader]: initialization fails cleanly when its buffer cannot be allocated" {
     var source = zfastq.io.plain.SliceSource.init("@r\nA\n+\n!\n");
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(
@@ -876,6 +876,7 @@ test "[failure] - [reader]: allocation failure while growing storage propagates"
     defer reader.deinit();
 
     try std.testing.expectError(zfastq.ReaderError.OutOfMemory, reader.next());
+    try std.testing.expect(failing.has_induced_failure);
 }
 
 test "[edge] - [count slice]: the configured line limit is exact on every record line" {

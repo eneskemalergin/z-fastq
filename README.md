@@ -7,11 +7,11 @@
     <source media="(prefers-color-scheme: light)" srcset="assets/tagline-light.svg">
     <img src="assets/tagline-light.svg" alt="Lightning FASTQ work without the toolchain sprawl" width="700">
   </picture>
-  <p><strong>Count, check, sample, interleave, and trim paired FASTQ with one static executable built in Zig.</strong></p>
+  <p><strong>Count, check, sample, interleave, and trim paired FASTQ with one self-contained executable built in Zig.</strong></p>
   <p>
     <a href="https://github.com/eneskemalergin/z-fastq/releases/latest"><img src="https://img.shields.io/github/v/release/eneskemalergin/z-fastq?style=flat-square&amp;label=release" alt="Latest release"></a>
     <a href="https://github.com/eneskemalergin/z-fastq/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/eneskemalergin/z-fastq/ci.yml?branch=main&amp;style=flat-square&amp;label=CI&amp;logo=githubactions&amp;logoColor=white" alt="CI status"></a>
-    <a href="https://github.com/eneskemalergin/z-fastq/wiki/Installation"><img src="https://img.shields.io/badge/Linux-x86--64%20%7C%20aarch64-64748b?style=flat-square&amp;logo=linux&amp;logoColor=white" alt="Linux on x86-64 and aarch64"></a>
+    <a href="https://github.com/eneskemalergin/z-fastq/wiki/Installation"><img src="https://img.shields.io/badge/Linux%20%7C%20macOS-x86--64%20%7C%20aarch64-64748b?style=flat-square" alt="Linux and macOS on x86-64 and aarch64"></a>
     <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-16a34a?style=flat-square" alt="MIT License"></a>
     <br>
@@ -34,7 +34,7 @@ I built z-fastq for the FASTQ work that comes before alignment: the steps that r
 - [`process`](https://github.com/eneskemalergin/z-fastq/wiki/Processing): Trim and filter paired reads with fastp's rules into plain or gzip files, with [FastQC-compatible QC](https://github.com/eneskemalergin/z-fastq/wiki/Quality-Control) that MultiQC reads, in one pass.
 - [Zig package](https://github.com/eneskemalergin/z-fastq/wiki/Zig-Library): the reader, writer, validation, and statistics give other Zig programs the same rules without the CLI.
 
-z-fastq reads plain and gzip FASTQ and writes plain FASTQ, gzip from `process`, and text or JSON reports. It runs on Linux, on x86-64 and aarch64.
+z-fastq reads plain and gzip FASTQ and writes plain FASTQ, gzip from `process`, and text or JSON reports. It runs on Linux and macOS, on x86-64 and aarch64. For FASTA, see [z-fasta](https://github.com/eneskemalergin/z-fasta), built around the same priorities.
 
 ## Speed and memory
 
@@ -54,17 +54,17 @@ Each job against the fastest other tools for it, every tool on one CPU:
 
 | Job                      | z-fastq time | z-fastq memory | Other tool   | Its time | Its memory |
 | ------------------------ | -----------: | -------------: | ------------ | -------: | ---------: |
-| Count records            |       147 ms |       0.81 MiB | Needletail   |     1.4x |       2.6x |
-| Aggregate statistics     |       280 ms |       0.81 MiB | Needletail   |     3.5x |       2.6x |
-| Validate a file          |       216 ms |       0.79 MiB | fq           |     4.1x |       5.3x |
-| Validate a pair          |       435 ms |       1.06 MiB | fq           |     6.7x |      25.4x |
-| Sample by fraction       |       237 ms |       0.98 MiB | IRMA Core    |     5.0x |       4.8x |
-| Sample by count          |       421 ms |       1.34 MiB | IRMA Core    |     2.8x |       3.5x |
-| Sample pairs by fraction |       438 ms |       1.29 MiB | IRMA Core    |     3.7x |       3.4x |
-| Interleave a pair        |       471 ms |       1.06 MiB | IRMA Core    |     3.1x |       3.8x |
-| Deinterleave a pair      |       782 ms |       1.06 MiB | IRMA Core    |     4.8x |       3.8x |
-| Trim a pair              |       3.41 s |      14.68 MiB | fastp*       |    11.0x |      75.9x |
-| QC tables for a pair     |       1.91 s |      10.17 MiB | FastQC-Rust* |     2.1x |       2.8x |
+| Count records            |       144 ms |       0.52 MiB | Needletail   |     1.4x |       4.1x |
+| Aggregate statistics     |       253 ms |       0.52 MiB | Needletail   |     3.9x |       4.2x |
+| Validate a file          |       181 ms |       0.52 MiB | fq           |     4.8x |       8.6x |
+| Validate a pair          |       305 ms |       1.02 MiB | fq           |     7.7x |      26.8x |
+| Sample by fraction       |       211 ms |       0.91 MiB | IRMA Core    |     5.7x |       5.2x |
+| Sample by count          |       400 ms |       1.09 MiB | IRMA Core    |     3.0x |       4.4x |
+| Sample pairs by fraction |       328 ms |       1.03 MiB | IRMA Core    |     4.7x |       4.3x |
+| Interleave a pair        |       391 ms |       1.02 MiB | IRMA Core    |     3.5x |       4.1x |
+| Deinterleave a pair      |       654 ms |       0.78 MiB | IRMA Core    |     5.5x |       5.3x |
+| Trim a pair              |       2.82 s |       8.92 MiB | chelae*      |     1.0x |       5.7x |
+| QC tables for a pair     |       1.60 s |       6.37 MiB | FastQC-Rust* |     2.6x |       4.5x |
 
 On 1 GiB plain inputs, every tool on one CPU; the other tool is the fastest that does the whole job, its time and memory as multiples of z-fastq's; \* marks a job no other tool does whole, with the fastest that does part of it. On the malformed records and pairs of the edge cases, z-fastq stopped on 54 of 54; [the benchmark summary](bench/README.md) has the method, every tool, threads, and the cases where another tool is faster.
 
@@ -72,7 +72,7 @@ On 1 GiB plain inputs, every tool on one CPU; the other tool is the fastest that
 
 ### What threads cost
 
-fastp and FastQC-Rust can use many threads, and with enough of them they match z-fastq's wall time on one core. The threads buy them time, not memory: at every count they hold several times z-fastq's memory, and they spend several cores on a job z-fastq does with one.
+Most of the other tools can use many threads. With enough of them chelae, Trim Galore, fasterp, and FastQC-Rust beat z-fastq's wall time on one core, chelae from 2 threads and the others from 4 to 16; fastp does not, even at 16. The threads buy them time, not memory: from 2 threads on, every one of them holds several times z-fastq's memory, fastp over a hundred times. chelae does its work in about z-fastq's CPU time; the others spend several times as much.
 
 <p align="center">
   <a href="https://github.com/eneskemalergin/z-fastq/wiki/Performance">
@@ -87,9 +87,9 @@ fastp and FastQC-Rust can use many threads, and with enough of them they match z
 
 ## A few honest tradeoffs
 
-I would like to support more than Linux. For now z-fastq is built and tested on Linux, on x86-64 and aarch64; native Windows and macOS builds are not there yet. If you use Windows, WSL is the way to try it. The benchmarks run on x86-64, where AVX2 code is picked at run time; on aarch64, z-fastq uses its portable vector code, and its speed there is not measured yet.
+z-fastq is built and tested on Linux and macOS, each on x86-64 and aarch64. A native Windows build is not there yet; on Windows, WSL is the way to try it. The published benchmarks run on Linux x86-64 with the x86-64-v3 release binary, so its speed on aarch64, where the vector code runs as NEON, and on macOS is not measured there yet.
 
-One core is a choice, not a limit I am waiting to lift. It keeps every run's cost known before it starts, so a pipeline can run one sample per core side by side. The price is one large file on an otherwise idle machine: a tool that spreads it over many cores can finish sooner, and z-fastq does not split a file across cores yet.
+One core is a choice, not a limit I am waiting to lift. It keeps every run's cost known before it starts, so a pipeline can run one sample per core side by side. The price is one large file on an otherwise idle machine: a tool that spreads it over many cores can finish sooner, and z-fastq does not split a file across cores yet. (Maybe ever?)
 
 gzip output uses a fast preset by default, which writes files about 16% larger than fastp's at its default level. `--gzip-preset even` or `dense` makes them smaller, more slowly.
 
@@ -97,10 +97,10 @@ z-fastq writes data, not pages: its QC comes out as FastQC-style tables and a JS
 
 ## Start
 
-Download the static Linux binary for x86-64 or aarch64 from the [latest release](https://github.com/eneskemalergin/z-fastq/releases/latest), or build it from source with [Zig 0.16.0](https://ziglang.org/download/); the [installation page](https://github.com/eneskemalergin/z-fastq/wiki/Installation) covers both.
+Download the binary for Linux or macOS, on x86-64 or aarch64, from the [latest release](https://github.com/eneskemalergin/z-fastq/releases/latest). The x86-64 binaries need a CPU with x86-64-v3 (AVX2, BMI2, FMA); on an older x86-64 CPU, build from source with [Zig 0.16.0](https://ziglang.org/download/), which runs on any. The [installation page](https://github.com/eneskemalergin/z-fastq/wiki/Installation) covers both.
 
 ```bash
-zig build -Dstatic=true -Doptimize=ReleaseFast    # zig-out/bin/z-fastq; put it on your PATH
+zig build -Doptimize=ReleaseFast    # zig-out/bin/z-fastq; put it on your PATH
 z-fastq check --paired reads_R1.fastq.gz reads_R2.fastq.gz
 z-fastq stats reads_R1.fastq.gz
 z-fastq sample --fraction 0.1 --seed 11 reads_R1.fastq.gz > sample.fastq

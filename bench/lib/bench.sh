@@ -24,7 +24,7 @@ BENCH_CPU="${BENCH_CPU:-3}"
 BENCH_MEM="${BENCH_MEM:-4G}"
 BENCH_JOBS="${BENCH_JOBS:-4}"
 # The most cores one batch may hold. A family whose cases need more is not
-# timed until the lead raises this for that run (BENCH_MAX_CORES=16).
+# timed unless BENCH_MAX_CORES is raised for that run.
 BENCH_MAX_CORES="${BENCH_MAX_CORES:-16}"
 REAL="$BENCH/data/real"
 SHAPES="$BENCH/data/synthetic"
@@ -35,9 +35,11 @@ SHAPES="$BENCH/data/synthetic"
 # for Rust, pinks for C++, grays for C, each language's own hue otherwise. A
 # tool's thread variants (fastp -w 2 and so on) share its hue, a step further
 # from the page per thread count, and mark the count by shape: 2 plus, 4 cross,
-# 8 triangle-down, 16 star.
+# 8 triangle-down, 16 star. A tool's own shape is any other: circle, square,
+# diamond, triangle, pentagon, or hexagon.
 # Order here is the order of every table and legend, in every feature: z-fastq,
-# the parser libraries, the Rust tools, SeqFu, SeqKit, seqtk, fastp, FastQC,
+# the parser libraries, the Rust tools, SeqFu, SeqKit, the C trimmers and
+# seqtk, fastp, FastQC,
 # fqtools (by far the slowest counter, so count's bars read from fast to slow),
 # then fastQValidator.
 REGISTRY='z-fastq zig-out/bin/z-fastq - - Zig #f7a41d #f7a41d circle z-fastq
@@ -53,9 +55,25 @@ fastqc-rust-t2 tools/bin/fastqc-rust fastqc-rust FASTQC_RUST_VERSION Rust #81311
 fastqc-rust-t4 tools/bin/fastqc-rust fastqc-rust FASTQC_RUST_VERSION Rust #6b2e1a #f7bda1 cross FastQC-Rust_-t_4
 fastqc-rust-t8 tools/bin/fastqc-rust fastqc-rust FASTQC_RUST_VERSION Rust #582b1e #f5ccb9 triangle-down FastQC-Rust_-t_8
 fastqc-rust-t16 tools/bin/fastqc-rust fastqc-rust FASTQC_RUST_VERSION Rust #462821 #f4d9cd star FastQC-Rust_-t_16
+fasterp tools/bin/fasterp fasterp FASTERP_VERSION Rust #8f1d1d #f28b82 pentagon fasterp
+fasterp-w2 tools/bin/fasterp fasterp FASTERP_VERSION Rust #791e20 #f2a19b plus fasterp_-w_2
+fasterp-w4 tools/bin/fasterp fasterp FASTERP_VERSION Rust #661f23 #f2b3b1 cross fasterp_-w_4
+fasterp-w8 tools/bin/fasterp fasterp FASTERP_VERSION Rust #532026 #f1c5c6 triangle-down fasterp_-w_8
+fasterp-w16 tools/bin/fasterp fasterp FASTERP_VERSION Rust #432128 #f1d4d8 star fasterp_-w_16
+chelae tools/bin/chelae chelae CHELAE_VERSION Rust #c53030 #d64545 diamond chelae
+chelae-t2 tools/bin/chelae chelae CHELAE_VERSION Rust #a32d2f #dc6a6c plus chelae_-t_2
+chelae-t4 tools/bin/chelae chelae CHELAE_VERSION Rust #852a2e #e18a8d cross chelae_-t_4
+chelae-t8 tools/bin/chelae chelae CHELAE_VERSION Rust #6a282e #e6a8ad triangle-down chelae_-t_8
+chelae-t16 tools/bin/chelae chelae CHELAE_VERSION Rust #51262d #eac3c9 star chelae_-t_16
+trim-galore tools/bin/trim_galore trim-galore TRIM_GALORE_VERSION Rust #7b341e #f6ad8b square Trim_Galore
+trim-galore-c2 tools/bin/trim_galore trim-galore TRIM_GALORE_VERSION Rust #693021 #f5bba2 plus Trim_Galore_--cores_2
+trim-galore-c4 tools/bin/trim_galore trim-galore TRIM_GALORE_VERSION Rust #5a2d24 #f4c7b6 cross Trim_Galore_--cores_4
+trim-galore-c8 tools/bin/trim_galore trim-galore TRIM_GALORE_VERSION Rust #4b2926 #f3d3ca triangle-down Trim_Galore_--cores_8
+trim-galore-c16 tools/bin/trim_galore trim-galore TRIM_GALORE_VERSION Rust #3e2628 #f2ddda star Trim_Galore_--cores_16
 seqfu tools/bin/seqfu seqfu SEQFU_VERSION Nim #8f7d1c #d8c55a star SeqFu
 seqkit tools/bin/seqkit seqkit SEQKIT_VERSION Go #007d9c #00add8 diamond SeqKit
 seqtk tools/bin/seqtk seqtk SEQTK_VERSION C #57606a #9198a1 cross seqtk
+fastq-trim tools/bin/fastq-trim fastq-trim FASTQ_TRIM_VERSION C #4b5563 #aab3bf hexagon fastq-trim
 fastp tools/bin/fastp fastp FASTP_VERSION C++ #a61e4d #f9a3c0 triangle fastp
 fastp-w2 tools/bin/fastp fastp FASTP_VERSION C++ #8b1f46 #f7b4cc plus fastp_-w_2
 fastp-w4 tools/bin/fastp fastp FASTP_VERSION C++ #73203f #f6c3d7 cross fastp_-w_4
@@ -91,7 +109,7 @@ declare -A WARM=([tiny]=1 [xsmall]=1 [small]=1 [medium]=1 [many]=1)
 # --- declarations ---------------------------------------------------------
 JOB="" TRUTH="" HEADLINE=medium SCALING="" FAMILIES=() LANES=() CUR_FAMILY=""
 declare -A LANE_CLASS LANE_TMPL LANE_NOTE LANE_HEADLINE LANE_OUTS DESCRIBE
-declare -A LANE_OUTDIR=() LANE_CORES=() LANE_OF=()
+declare -A LANE_OUTDIR=() LANE_CORES=() LANE_OF=() LANE_ONLY=()
 declare -A FAM_DESC FAM_LANES FAM_STDIN FAM_INPUTS FAM_KIND FAM_PARAMS FAM_VARY FAM_FORMATS FAM_LOOK FAM_MEM
 job() { JOB="$1"; }
 # execution bounded: limit the whole run and stop the pool on worker failure.
@@ -123,21 +141,25 @@ group() {
 }
 # A source's name for text: the description for a real run, NAME: description
 # for a synthetic shape.
-# The lanes of FAMILY that run on a TIER: z-fastq alone for the verify set; a
-# headline-only lane (too slow to sweep sizes) only at the headline tier.
-lanes_at() { # family tier
+# The lanes of FAMILY that run on a TIER of SOURCE: z-fastq alone for the
+# verify set; a headline-only lane (too slow to sweep sizes) only at the
+# headline tier; a lane with only=SOURCES only on those sources.
+lanes_at() { # family tier [source]
     local name
     [[ "$1" != verify ]] || { printf 'z-fastq\n'; return; }
     for name in ${FAM_LANES[$1]}; do
-        [[ "${LANE_HEADLINE[$name]}" == 0 || "$2" == "$HEADLINE" ]] && printf '%s\n' "$name"
+        [[ "${LANE_HEADLINE[$name]}" == 0 || "$2" == "$HEADLINE" ]] || continue
+        [[ ! -v "LANE_ONLY[$name]" || " ${LANE_ONLY[$name]} " == *" ${3:-} "* ]] || continue
+        printf '%s\n' "$name"
     done
     return 0
 }
 # lane NAME CLASS "TEMPLATE" [note=TEXT] [outputs=SUFFIXES] [outdir=SUFFIX]
-# [cores=N] [of=LANE] [headline-only]: cores=N times the lane on N physical
-# cores of its batch (the batch holds as many as its largest lane; every lane
-# is pinned to its own); of=LANE marks a thread variant of LANE, a registry
-# entry of its own that shares LANE's binary and stays out of the edge cases.
+# [cores=N] [of=LANE] [headline-only] [only=SOURCES]: cores=N times the lane
+# on N physical cores of its batch (the batch holds as many as its largest
+# lane; every lane is pinned to its own); of=LANE marks a thread variant of
+# LANE, a registry entry of its own that shares LANE's binary and stays out of
+# the edge cases; only=SOURCES runs the lane on those sources' cases alone.
 label_of() { if [[ -d "$SHAPES/$1" ]]; then printf '%s: %s\n' "$1" "${DESCRIBE[$1]:-}"; else printf '%s\n' "${DESCRIBE[$1]:-$1}"; fi; }
 lane() {
     local name="$1" class="$2" tmpl="$3" arg
@@ -152,6 +174,7 @@ lane() {
             outdir=*) LANE_OUTDIR[$name]="${arg#outdir=}" ;;
             cores=*) LANE_CORES[$name]="${arg#cores=}" ;;
             of=*) LANE_OF[$name]="${arg#of=}" ;;
+            only=*) LANE_ONLY[$name]="${arg#only=}" LANE_ONLY[$name]="${LANE_ONLY[$name]//,/ }" ;;
             *) die "lane $name: unknown option $arg" ;;
         esac
     done
@@ -663,8 +686,8 @@ build_subject() {
     [[ "$ZFASTQ" == "$ZFASTQ_DEFAULT" ]] || return 0
     # A newer binary may be Debug or ReleaseSafe. Let Zig check the requested
     # build options and reuse its own cache instead of inferring them from mtime.
-    log build RUN "z-fastq (static ReleaseFast)"
-    (cd "$REPO" && zig build -Dstatic=true -Doptimize=ReleaseFast)
+    log build RUN "z-fastq (static ReleaseFast, x86-64-v3)"
+    (cd "$REPO" && zig build -Dstatic=true -Doptimize=ReleaseFast -Dcpu=x86_64_v3)
 }
 
 # --- checks -----------------------------------------------------------------
@@ -864,9 +887,6 @@ want_of() { # paths truth
     done
     printf '%s\n' "${out%;}"
 }
-same_answer() { # got want
-    if [[ -n "$AGREE_LANE" ]]; then [[ -z "$(field_diff "$1" "$2")" ]]; else [[ "$1" == "$2" ]]; fi
-}
 CHECKS="$RESULTS/checks.tsv"
 declare -A CHECK_STATUS CHECK_VALUE
 # Appends each case's input identity (every path's fileid, joined by ",") as
@@ -879,9 +899,10 @@ with_input_ids() {
         { n = split($4, p, " "); s = ""; for (i = 1; i <= n; i++) s = s (i > 1 ? "," : "") id[p[i]]; print $0 "\t" s }' \
         <(cut -f4 <<<"$rows" | tr ' ' '\n' | sort -u | TZ=UTC xargs -d '\n' stat -L -c $'%n\t'"$FILE_ID_FORMAT") - <<<"$rows"
 }
-# The lanes of FAMILY at TIER, as a space-separated list cached per family and tier.
+# The lanes of FAMILY at TIER of SOURCE, as a space-separated list cached per
+# family, tier, and source.
 declare -A LANES_AT=()
-lanes_of() { [[ -v "LANES_AT[$1|$2]" ]] || LANES_AT[$1|$2]="$(lanes_at "$1" "$2" | tr '\n' ' ')"; }
+lanes_of() { [[ -v "LANES_AT[$1|$2|$3]" ]] || LANES_AT[$1|$2|$3]="$(lanes_at "$1" "$2" "$3" | tr '\n' ' ')"; }
 # Every check of a declared input with the current binaries, one line per
 # lane and input: lane, source, status, exit, printed, path. Older check lines
 # (rebuilt binaries, inputs no longer declared) stay cached but never count.
@@ -891,8 +912,8 @@ current_checks() {
     while IFS=$'\t' read -r fam id fmt paths truth bytes src tier kind params inid; do
         form=file
         [[ "$fam" == verify || "${FAM_STDIN[$fam]}" == 0 ]] || form=stdin
-        lanes_of "$fam" "$tier"
-        for name in ${LANES_AT[$fam|$tier]}; do
+        lanes_of "$fam" "$tier" "$src"
+        for name in ${LANES_AT[$fam|$tier|$src]}; do
             printf '%s\t%s\t%s\t%s\n' "$(status_key "$name" "$fam" "$form" "$inid" "$params")" "$name" "$src" "${paths%% *}"
         done
     done < <({ cases; verify_cases; } | with_input_ids) | awk -F'\t' 'FNR == NR { if (!($1 in want)) { want[$1] = $2 "\t" $3 "\t" $4 } next }
@@ -951,8 +972,8 @@ check_jobs() { # agree | lanes
         form="file"
         [[ "$fam" == verify || "${FAM_STDIN[$fam]}" == 0 ]] || form=stdin
         want=""
-        lanes_of "$fam" "$tier"
-        for name in ${LANES_AT[$fam|$tier]}; do
+        lanes_of "$fam" "$tier" "$src"
+        for name in ${LANES_AT[$fam|$tier|$src]}; do
             key="$(status_key "$name" "$fam" "$form" "$inid" "$params")"
             [[ ! -v "CHECK_STATUS[$key]" && ! -v "queued[$key]" ]] || continue
             queued[$key]=1
@@ -1374,8 +1395,8 @@ cpu_set() { # n [count]
 # Select the verified lanes, CPU set, and metadata used by both timing and
 # reporting. A report must satisfy the same reuse rules as a new timing run.
 BATCH_LANES=() BATCH_RUNS="" BATCH_WARM=""
-plan_batch() { # family paths tier kind params
-    local fam="$1" paths="$2" tier="$3" kind="$4" params="$5" name form inid
+plan_batch() { # family paths tier kind params source
+    local fam="$1" paths="$2" tier="$3" kind="$4" params="$5" src="${6:-}" name form inid
     form="file"
     [[ "${FAM_STDIN[$fam]}" == 0 ]] || form=stdin
     BATCH_LANES=() META="" BATCH_FAM="$fam" BATCH_CPUS=""
@@ -1385,7 +1406,7 @@ plan_batch() { # family paths tier kind params
     # A report plans each batch as it could have been timed, whatever this
     # run's core cap; only timing is held to the cap.
     [[ -z "${REPORTING:-}" ]] || cap="$most"
-    for name in $(lanes_at "$fam" "$tier"); do
+    for name in $(lanes_at "$fam" "$tier" "$src"); do
         [[ "${CHECK_STATUS[$(status_key "$name" "$fam" "$form" "$inid" "$params")]:-}" == pass ]] || continue
         c="${LANE_CORES[$name]:-1}"
         ((c <= cap && c <= most)) || continue
@@ -1401,9 +1422,9 @@ plan_batch() { # family paths tier kind params
 # Times every passing lane of one case in one zebrac batch, unless a cached
 # batch can stand for it.
 run_batch() { # fam id fmt paths truth bytes src tier kind params
-    local fam="$1" id="$2" paths="$4" tier="$8" kind="$9" params="${10}" name form=file
+    local fam="$1" id="$2" paths="$4" src="$7" tier="$8" kind="$9" params="${10}" name form=file
     [[ "${FAM_STDIN[$fam]}" == 0 ]] || form=stdin
-    plan_batch "$fam" "$paths" "$tier" "$kind" "$params"
+    plan_batch "$fam" "$paths" "$tier" "$kind" "$params" "$src"
     if ((${#BATCH_LANES[@]} == 0)); then
         log time SKIP "${PROGRESS:-} $fam $id: no verified lane within the CPU allowance"
         return 0
@@ -1560,7 +1581,7 @@ collect() {
     ZEXEC_ID="$(binid "$ZEXEC")"
     local declared fam id fmt paths truth bytes src tier kind params count=0
     while IFS=$'\t' read -r fam id fmt paths truth bytes src tier kind params; do
-        plan_batch "$fam" "$paths" "$tier" "$kind" "$params"
+        plan_batch "$fam" "$paths" "$tier" "$kind" "$params" "$src"
         if ((${#BATCH_LANES[@]} == 0)) || ! { find_batch "$RESULTS/batches/$fam-${id//:/-}-" || find_batch "$RESULTS/batches/"; }; then
             log report SKIP "$fam $id: no batch with current checks, inputs, commands, and settings"
             continue
@@ -1647,8 +1668,10 @@ quick_check() { # name fam id fmt paths truth bytes params [bin]
     [[ "${FAM_STDIN[$fam]}" == 0 ]] || form=stdin
     truth="$(want_of "$paths" "$6")" || die "no truth for $id: run.sh check first"
     if [[ -n "$bin" ]]; then
-        out="$($(build_cmd "$bin" "$paths" "$fam" "$params") 2>/dev/null | LANE=z-fastq FAMILY="$fam" IN="$paths" TRUTH="$6" PARAMS="$params" fact | paste -sd';' -)" || die "$name failed on $id"
-        same_answer "$out" "$truth" || die "$name printed a wrong answer on $id"
+        # Another build runs the z-fastq lane's full check, exit status and
+        # output files included; its row is read here, not cached.
+        out="$(ZFASTQ="$bin" check_one z-fastq "$form" "$fam" "$id" "$4" "$paths" "$truth" "$7" "$params" "$6")" || die "$name failed on $id"
+        [[ "$(cut -f2 <<<"$out")" == pass ]] || die "$name printed a wrong answer on $id"
         return 0
     fi
     local key
@@ -1694,7 +1717,7 @@ run_peer() {
             time_lanes "$BATCH" "$form" "$paths" "$PEER_RUNS" "$PEER_WARM" "$fam" "$id" "${SPECS[@]}"
         fi
         local ref="$BATCH/summary.tsv"
-        # z-fastq now: headline settings, kept while its binary is unchanged.
+        # z-fastq at the headline settings, kept while its binary is unchanged.
         read -r runs warm <<<"$(batch_settings "$tier" "$kind")"
         batch_meta "$form" "$inid" "$runs" "$warm" z-fastq
         [[ "$params" == - ]] || META+="params $params"$'\n'
@@ -1729,7 +1752,7 @@ build_rev() { # rev -> binary path
     if [[ ! -x "$bin" ]]; then
         if [[ ! -d "$wt" ]]; then git -C "$REPO" worktree add --detach "$wt" "$sha" >&2; else git -C "$wt" checkout -q --detach "$sha"; fi
         log build RUN "z-fastq at ${sha:0:9}"
-        (cd "$wt" && bench_scope 400% 4G zig build -Dstatic=true -Doptimize=ReleaseFast -j4) >&2
+        (cd "$wt" && bench_scope 400% 4G zig build -Dstatic=true -Doptimize=ReleaseFast -Dcpu=x86_64_v3 -j4) >&2
         mkdir -p -- "$(dirname -- "$bin")"
         install -m 755 "$wt/zig-out/bin/z-fastq" "$bin"
     fi
@@ -1742,7 +1765,7 @@ run_ab() {
     a="$(build_rev "$rev_a")"
     if [[ -n "$rev_b" ]]; then b="$(build_rev "$rev_b")"; else b="$ZFASTQ"; fi
     local out="$RESULTS/ab.txt"
-    printf '%-40s %10s %10s %8s %8s %-14s %10s %10s %-8s\n' case "A" "B" change "A/A" verdict "A RSS" "B RSS" "RSS" | tee "$out"
+    printf '%-40s %10s %10s %8s %8s %8s %-14s %10s %10s %-8s\n' case "A" "B" change "A/A" instr verdict "A RSS" "B RSS" "RSS" | tee "$out"
     while IFS=$'\t' read -r fam id fmt paths truth bytes src tier kind params rival mem; do
         quick_check A "$fam" "$id" "$fmt" "$paths" "$truth" "$bytes" "$params" "$a"
         quick_check B "$fam" "$id" "$fmt" "$paths" "$truth" "$bytes" "$params" "$b"
@@ -1755,18 +1778,25 @@ run_ab() {
         timed_spec b z-fastq "$paths" "$fam" "$params" "$b"
         time_lanes "$dir" file "$paths" "$runs" "$warm" "$fam" "$id" "${SPECS[@]}"
         awk -F'\t' -v id="$id" '
-            { w[$3] = $5; r[$3] = $8 }
+            { w[$3] = $5; r[$3] = $8; n[$3] = $15 }
             END {
                 a = (w["a1"] + w["a2"]) / 2; ch = (w["b"] - a) / a * 100; sp = (w["a1"] > w["a2"] ? w["a1"] - w["a2"] : w["a2"] - w["a1"]) / a * 100
                 # One A/A pair underestimates the noise on a busy machine: a change
                 # counts only beyond twice that spread and at least 3%.
                 v = (ch < -2 * sp && ch < -3) ? "faster" : (ch > 2 * sp && ch > 3) ? "slower" : "within noise"
+                # The same work in a different time is usually where the linker put
+                # the code: name it, so it is not read as a code change.
+                ni = "-"
+                if (n["a1"] != "" && n["a2"] != "" && n["b"] != "") {
+                    na = (n["a1"] + n["a2"]) / 2; ich = (n["b"] - na) / na * 100; ni = sprintf("%+.2f%%", ich)
+                    if (v != "within noise" && ich > -1 && ich < 1) v = v ": layout"
+                }
                 ra = (r["a1"] + r["a2"]) / 2; rs = (r["a1"] > r["a2"] ? r["a1"] - r["a2"] : r["a2"] - r["a1"])
                 rv = (r["b"] < ra - rs - 256) ? "smaller" : (r["b"] > ra + rs + 256) ? "larger" : "same"
-                printf "%-40s %8.2fms %8.2fms %+7.1f%% %7.1f%% %-14s %7dKiB %7dKiB %-8s\n", id, a / 1e6, w["b"] / 1e6, ch, sp, v, ra, r["b"], rv
+                printf "%-40s %8.2fms %8.2fms %+7.1f%% %7.1f%% %8s %-14s %7dKiB %7dKiB %-8s\n", id, a / 1e6, w["b"] / 1e6, ch, sp, ni, v, ra, r["b"], rv
             }' "$dir/summary.tsv" | tee -a "$out"
     done < <(pick_rows)
-    note "ab: A=${rev_a} B=${rev_b:-working tree}; a change is real only beyond twice the A/A spread and 3% (time), or one 256 KiB step beyond the A/A spread (RSS)"
+    note "ab: A=${rev_a} B=${rev_b:-working tree}; a change is real only beyond twice the A/A spread and 3% (time), or one 256 KiB step beyond the A/A spread (RSS); instr is B's instruction count against A's, and a time change with under 1% of it is marked layout: where the linker placed the code, not more or less work"
 }
 
 # --- bounded execution -------------------------------------------------------
@@ -1927,8 +1957,8 @@ validate() {
     printf 'run.sh: %s\n' "${errs[@]}" >&2
     exit 2
 }
-# One timing job at a time on this machine: every feature times on the same
-# CPU, so two runs at once would slow each other. The lock is released when
+# One timing job at a time: every feature times on the same CPU, so two runs
+# at once would slow each other. The lock is released when
 # the process exits.
 take_lock() {
     # Process verification uses the whole CPU allowance, even before timing.

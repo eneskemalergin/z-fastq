@@ -1,4 +1,4 @@
-//! Installed `z-fastq process` behavior: paired validation, two outputs, the report, and exit status.
+//! Installed z-fastq process: paired validation, two outputs, the report, and exit status.
 
 const std = @import("std");
 const cli = @import("utilities.zig");
@@ -106,8 +106,11 @@ fn readPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(OUTPUT_READ_LIMIT));
 }
 
-fn pathExists(path: []const u8) bool {
-    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return false;
+fn pathExists(path: []const u8) !bool {
+    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
     return true;
 }
 
@@ -317,7 +320,7 @@ test "[cli] - [process]: invalid invocations fail before any input is read or ou
         errdefer std.debug.print("case {d}\n", .{index});
         const result = try cli.runWith(allocator, case.args, .{ .stdin = .stalled });
         try cli.expectResult(result, case.exit_code, "", case.stderr);
-        for ([_][]const u8{ p.out1, p.out2, gz1, gz2, p.report, tables }) |path| try std.testing.expect(!pathExists(path));
+        for ([_][]const u8{ p.out1, p.out2, gz1, gz2, p.report, tables }) |path| try std.testing.expect(!(try pathExists(path)));
     }
 }
 
@@ -361,15 +364,15 @@ test "[cli] - [process]: QC tables are named per mate and population by the tabl
     const existing = listed[0].object.get("path").?.string;
     const message = try std.fmt.allocPrint(allocator, "error: {s}: output path already exists\n", .{existing});
     try cli.expectResult(try cli.run(allocator, &args), 3, "", message);
-    for ([_][]const u8{ gz1, gz2, p.report }) |path| try std.testing.expect(!pathExists(path));
-    try std.testing.expect(pathExists(existing));
+    for ([_][]const u8{ gz1, gz2, p.report }) |path| try std.testing.expect(!(try pathExists(path)));
+    try std.testing.expect(try pathExists(existing));
 
     const unchanged = try cli.tempPath(allocator, &tmp.sub_path, "unchanged");
     const plain_args = [_][]const u8{ "process", "--qc-tables", unchanged, "--report", p.report, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 };
     try cli.expectResult(try cli.run(allocator, &plain_args), 0, "", "");
     const plain = try parseReport(allocator, try readPath(allocator, p.report));
     try std.testing.expectEqual(@as(usize, 2), plain.get("qc_table_files").?.array.items.len);
-    try std.testing.expect(!pathExists(try std.fmt.allocPrint(allocator, "{s}/out1_fastqc", .{unchanged})));
+    try std.testing.expect(!(try pathExists(try std.fmt.allocPrint(allocator, "{s}/out1_fastqc", .{unchanged}))));
 }
 
 test "[cli] - [process]: the QC summary carries its fields from the same measurements" {
@@ -422,9 +425,9 @@ test "[cli] - [process]: an existing output fails and removes the outputs this r
         errdefer std.debug.print("case {d}\n", .{index});
         const result = try cli.run(allocator, &.{ "process", "--report", case.report, "--out1", case.out1, "--out2", case.out2, p.r1, p.r2 });
         try cli.expectResult(result, 3, "", try std.fmt.allocPrint(allocator, "error: {s}: output path already exists\n", .{case.existing}));
-        try std.testing.expect(!pathExists(p.out1));
-        try std.testing.expect(!pathExists(p.out2));
-        try std.testing.expect(!pathExists(p.report));
+        try std.testing.expect(!(try pathExists(p.out1)));
+        try std.testing.expect(!(try pathExists(p.out2)));
+        try std.testing.expect(!(try pathExists(p.report)));
         try std.testing.expectEqualStrings(R1, try readPath(allocator, p.r1));
         try std.testing.expectEqualStrings(R2, try readPath(allocator, p.r2));
     }
@@ -448,7 +451,7 @@ test "[cli] - [process]: a failed run removes the QC table folders it created an
         const result = try cli.run(allocator, &.{ "process", "--min-length", "1", "--qc-tables", tables, "--out1", out1, "--out2", out2, p.r1, p.r2 });
         try cli.expectResult(result, 1, "", stderr);
     }
-    try std.testing.expect(!pathExists(try cli.tempPath(allocator, &tmp.sub_path, "new")));
+    try std.testing.expect(!(try pathExists(try cli.tempPath(allocator, &tmp.sub_path, "new"))));
     try tmp.dir.deleteDir(std.testing.io, "kept");
 }
 
@@ -592,7 +595,7 @@ test "[cli] - [process]: a report on standard output appended to an input is rej
     const result = try cli.runWith(allocator, &.{ "process", "--report", "-", "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 }, .{ .stdout = .{ .file = stdout_file } });
     try cli.expectResult(result, 2, "", try std.fmt.allocPrint(allocator, "error: {s}: input file is output file\n", .{p.r2}));
     try std.testing.expectEqualStrings(R2, try readPath(allocator, p.r2));
-    try std.testing.expect(!pathExists(p.out1));
+    try std.testing.expect(!(try pathExists(p.out1)));
 }
 
 test "[cli] - [process]: trimming writes the records fastp 1.1.0 writes on the probe pairs" {
@@ -910,7 +913,10 @@ test "[cli] - [process]: contaminant paths use escaped byte strings" {
         const allocator = arena.allocator();
         const paths = try Paths.init(allocator, &tmp);
         try writeInputs(&tmp, R1, R2);
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = case[0], .data = "adapter\tACGTACGT\n" });
+        tmp.dir.writeFile(std.testing.io, .{ .sub_path = case[0], .data = "adapter\tACGTACGT\n" }) catch |err| {
+            if (err == error.BadPathName and !std.unicode.utf8ValidateSlice(case[0])) continue;
+            return err;
+        };
         const contaminants = try cli.tempPath(allocator, &tmp.sub_path, case[0]);
         const expected = try cli.tempPath(allocator, &tmp.sub_path, case[1]);
         const result = try cli.run(allocator, &.{ "process", "--report", "-", "--contaminants", contaminants, "--out1", paths.out1, "--out2", paths.out2, paths.r1, paths.r2 });
@@ -1027,9 +1033,9 @@ test "[cli] - [process]: an unreadable or invalid contaminant list fails before 
         const result = try cli.run(allocator, &.{ "process", "--report", p.report, "--contaminants", path, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 });
         try std.testing.expectEqual(case.exit_code, result.exit_code);
         try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, result.stderr, "\n"), case.message));
-        try std.testing.expect(!pathExists(p.out1));
-        try std.testing.expect(!pathExists(p.out2));
-        try std.testing.expect(!pathExists(p.report));
+        try std.testing.expect(!(try pathExists(p.out1)));
+        try std.testing.expect(!(try pathExists(p.out2)));
+        try std.testing.expect(!(try pathExists(p.report)));
     }
 }
 
@@ -1052,14 +1058,14 @@ test "[edge] - [process]: a contaminant list of 1 MiB is read and one byte more 
         const result = try cli.run(allocator, &.{ "process", "--report", p.report, "--contaminants", list, "--out1", p.out1, "--out2", p.out2, p.r1, p.r2 });
         if (size == limit) {
             try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-            try std.testing.expect(pathExists(p.out1));
+            try std.testing.expect(try pathExists(p.out1));
             for ([_][]const u8{ p.out1, p.out2, p.report }) |path| try std.Io.Dir.cwd().deleteFile(std.testing.io, path);
         } else {
             try std.testing.expectEqual(@as(u8, 4), result.exit_code);
             try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, result.stderr, "\n"), "contaminant list exceeds 1 MiB"));
-            try std.testing.expect(!pathExists(p.out1));
-            try std.testing.expect(!pathExists(p.out2));
-            try std.testing.expect(!pathExists(p.report));
+            try std.testing.expect(!(try pathExists(p.out1)));
+            try std.testing.expect(!(try pathExists(p.out2)));
+            try std.testing.expect(!(try pathExists(p.report)));
         }
     }
 }

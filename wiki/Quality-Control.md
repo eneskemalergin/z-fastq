@@ -65,7 +65,7 @@ where $`\ell_1`$ and $`\ell_2`$ are the mate lengths. Pairs with no overlap, or 
 
 ### Pair duplication
 
-`--pair-duplication` adds fastp's duplication rate for whole pairs: the share of pairs whose sequence, mate 1 followed by mate 2, was seen before. Like fastp, it hashes each pair to one bit in each of two large bit arrays, and a pair whose bits were both set already is a duplicate, so a rare hash collision counts too. fastp keeps a fixed 1 GiB for this; z-fastq keeps only the bits that are set, about 10 bytes per pair, and at most about 1 GiB. It needs `--report` or `--qc-summary`.
+`--pair-duplication` adds fastp's duplication rate for whole pairs: the share of pairs whose sequence, mate 1 followed by mate 2, was seen before. Like fastp, it hashes each pair to one bit in each of two large bit arrays, and a pair whose bits were both set already is a duplicate, so a rare hash collision counts too. fastp keeps a fixed 1 GiB for this; z-fastq keeps only the positions of the bits that are set, about 4 to 6 bytes per pair, and at most about 1 GiB. It needs `--report` or `--qc-summary`.
 
 ## MultiQC-compatible outputs
 
@@ -106,7 +106,7 @@ z-fastq process --adapter1 AGATCGGAAGAGCACACGTCTGAACTCCAGTCA --adapter2 AGATCGGA
   --out1 trimmed_R1.fastq.gz --out2 trimmed_R2.fastq.gz --gzip R1.fastq.gz R2.fastq.gz
 ```
 
-`--qc-summary PATH` writes one JSON file per run in the layout of fastp's JSON report, which MultiQC's fastp module reads: read and base totals before and after filtering, Q20 and Q30 rates, GC, the filter counts, the duplication rate, insert sizes, adapter-trimmed reads and bases, and per-cycle quality and base content. Add `--pair-duplication` to include the duplication rate. Without it, the summary omits the `duplication` section and avoids memory growth from pair-duplication tracking; all other summary measurements remain available. MultiQC names the sample after the file, so `sample.json` shows as `sample`.
+`--qc-summary PATH` writes one JSON file per run in the layout of fastp's JSON report, which MultiQC's fastp module reads. It holds read and base totals before and after filtering, Q20 and Q30 rates, GC, the filter counts, insert sizes, adapter-trimmed reads and bases, and per-cycle quality and base content. Add `--pair-duplication` to include the duplication rate; without it, the summary has no `duplication` section, and memory does not grow with the number of pairs. MultiQC names the sample after the file, so `sample.json` shows as `sample`.
 
 The values describe what z-fastq did with the options you gave; they match fastp's report when the run uses fastp's settings ([Processing](Processing#filtering)). The fields, and what fastp writes that this file leaves out, are in [Report reference](Report-Reference#qc-summary).
 

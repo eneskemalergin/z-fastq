@@ -1,4 +1,4 @@
-//! CLI-private paired-read name parsing and matching.
+//! Paired-read name parsing and matching for the CLI.
 
 const std = @import("std");
 const simd = @import("simd.zig");
@@ -26,6 +26,10 @@ pub fn parseName(header: []const u8, policy: NamePolicy) Name {
         };
     }
 
+    return illuminaName(first_token, nextToken(header, first_token.len));
+}
+
+fn illuminaName(first_token: []const u8, second_token: []const u8) Name {
     var normalized_id = first_token;
     var mate_markers: u2 = 0;
     const first_mate_marker = terminalMateMarker(first_token);
@@ -34,7 +38,6 @@ pub fn parseName(header: []const u8, policy: NamePolicy) Name {
         normalized_id = first_token[0 .. first_token.len - 2];
     }
 
-    const second_token = nextToken(header, first_token.len);
     if (leadingMateMarker(second_token)) |mate| {
         mate_markers |= mateMask(mate);
     }
@@ -64,10 +67,14 @@ pub fn headersMatch(header1: []const u8, header2: []const u8, policy: NamePolicy
 pub fn namesMatch(name1: Name, name2: Name) bool {
     if (name1.normalized_id.len == 0 or name2.normalized_id.len == 0) return false;
     if (!std.mem.eql(u8, name1.normalized_id, name2.normalized_id)) return false;
-    if (name1.mate_markers == 0b11 or name2.mate_markers == 0b11) return false;
-    if ((name1.mate_markers == 0) != (name2.mate_markers == 0)) return false;
-    if (name1.mate_markers == 0) return true;
-    return name1.mate_markers == 0b01 and name2.mate_markers == 0b10;
+    return mateMarkersMatch(name1.mate_markers, name2.mate_markers);
+}
+
+fn mateMarkersMatch(markers1: u2, markers2: u2) bool {
+    if (markers1 == 0b11 or markers2 == 0b11) return false;
+    if ((markers1 == 0) != (markers2 == 0)) return false;
+    if (markers1 == 0) return true;
+    return markers1 == 0b01 and markers2 == 0b10;
 }
 
 const TOKEN_LANES = simd.tierWidth(.baseline);
@@ -80,38 +87,56 @@ fn exactHeadersMatch(header1: []const u8, header2: []const u8) bool {
 
 fn matchingTokenEnd(header1: []const u8, header2: []const u8) ?usize {
     const common_len = @min(header1.len, header2.len);
+    const event = if (common_len >= NAME_LANES)
+        wideTokenEvent(NAME_LANES, header1, header2, common_len)
+    else
+        narrowTokenEvent(header1, header2, common_len);
+    if (event) |at| {
+        return if (at != 0 and isTokenStop(header1[at]) and isTokenStop(header2[at])) at else null;
+    }
+    if (common_len == 0) return null;
+    if (header1.len == header2.len) return common_len;
+    const longer = if (header1.len > header2.len) header1 else header2;
+    return if (isTokenStop(longer[common_len])) common_len else null;
+}
+
+fn isTokenStop(byte: u8) bool {
+    return byte == ' ' or byte == '\t';
+}
+
+fn wideTokenEvent(comptime lanes: comptime_int, header1: []const u8, header2: []const u8, common_len: usize) ?usize {
+    const Vector = @Vector(lanes, u8);
+    const Mask = @Int(.unsigned, lanes);
+    const spaces: Vector = @splat(' ');
+    const tabs: Vector = @splat('\t');
+    std.debug.assert(common_len >= lanes);
+    var offset: usize = 0;
+    while (offset < common_len) {
+        const start = @min(offset, common_len - lanes);
+        const bytes1: Vector = header1[start..][0..lanes].*;
+        const bytes2: Vector = header2[start..][0..lanes].*;
+        const events: Mask = @bitCast((bytes1 == spaces) | (bytes1 == tabs) | (bytes1 != bytes2));
+        const fresh = ~@as(Mask, 0) << @intCast(offset - start);
+        if (events & fresh != 0) return start + @as(usize, @intCast(@ctz(events & fresh)));
+        offset = start + lanes;
+    }
+    return null;
+}
+
+fn narrowTokenEvent(header1: []const u8, header2: []const u8, common_len: usize) ?usize {
     const spaces: TokenVector = @splat(' ');
     const tabs: TokenVector = @splat('\t');
-
     var offset: usize = 0;
     while (common_len - offset >= TOKEN_LANES) : (offset += TOKEN_LANES) {
         const bytes1: TokenVector = header1[offset..][0..TOKEN_LANES].*;
         const bytes2: TokenVector = header2[offset..][0..TOKEN_LANES].*;
-        const stop1: TokenMask = @bitCast((bytes1 == spaces) | (bytes1 == tabs));
-        const stop2: TokenMask = @bitCast((bytes2 == spaces) | (bytes2 == tabs));
-        const mismatch: TokenMask = @bitCast(bytes1 != bytes2);
-        const event = stop1 | stop2 | mismatch;
-        if (event != 0) {
-            const lane = @as(usize, @intCast(@ctz(event)));
-            const bit = @as(TokenMask, 1) << @intCast(lane);
-            const token_end1 = stop1 & bit != 0;
-            const token_end2 = stop2 & bit != 0;
-            return if (offset + lane != 0 and token_end1 and token_end2) offset + lane else null;
-        }
+        const events: TokenMask = @bitCast((bytes1 == spaces) | (bytes1 == tabs) | (bytes1 != bytes2));
+        if (events != 0) return offset + @as(usize, @intCast(@ctz(events)));
     }
     while (offset < common_len) : (offset += 1) {
-        const token_end1 = header1[offset] == ' ' or header1[offset] == '\t';
-        const token_end2 = header2[offset] == ' ' or header2[offset] == '\t';
-        if (token_end1 or token_end2) {
-            return if (offset != 0 and token_end1 and token_end2) offset else null;
-        }
-        if (header1[offset] != header2[offset]) return null;
+        if (isTokenStop(header1[offset]) or header1[offset] != header2[offset]) return offset;
     }
-
-    if (common_len == 0) return null;
-    if (header1.len == header2.len) return common_len;
-    const longer = if (header1.len > header2.len) header1 else header2;
-    return if (longer[common_len] == ' ' or longer[common_len] == '\t') common_len else null;
+    return null;
 }
 
 fn firstTokenEnd(header: []const u8) usize {
@@ -119,6 +144,29 @@ fn firstTokenEnd(header: []const u8) usize {
 }
 
 fn tokenEnd(header: []const u8, start: usize) usize {
+    if (header.len >= NAME_LANES) return wideTokenEnd(NAME_LANES, header, start);
+    return narrowTokenEnd(header, start);
+}
+
+fn wideTokenEnd(comptime lanes: comptime_int, header: []const u8, start: usize) usize {
+    const Vector = @Vector(lanes, u8);
+    const Mask = @Int(.unsigned, lanes);
+    const spaces: Vector = @splat(' ');
+    const tabs: Vector = @splat('\t');
+    std.debug.assert(header.len >= lanes and start <= header.len);
+    var offset = start;
+    while (offset < header.len) {
+        const block = @min(offset, header.len - lanes);
+        const bytes: Vector = header[block..][0..lanes].*;
+        const stops: Mask = @bitCast((bytes == spaces) | (bytes == tabs));
+        const fresh = ~@as(Mask, 0) << @intCast(offset - block);
+        if (stops & fresh != 0) return block + @as(usize, @intCast(@ctz(stops & fresh)));
+        offset = block + lanes;
+    }
+    return header.len;
+}
+
+fn narrowTokenEnd(header: []const u8, start: usize) usize {
     const spaces: TokenVector = @splat(' ');
     const tabs: TokenVector = @splat('\t');
 
@@ -128,7 +176,7 @@ fn tokenEnd(header: []const u8, start: usize) usize {
         const mask: TokenMask = @bitCast((bytes == spaces) | (bytes == tabs));
         if (mask != 0) return end + @as(usize, @intCast(@ctz(mask)));
     }
-    while (end < header.len and header[end] != ' ' and header[end] != '\t') {
+    while (end < header.len and !isTokenStop(header[end])) {
         end += 1;
     }
     return end;
@@ -144,17 +192,21 @@ fn nextToken(header: []const u8, previous_end: usize) []const u8 {
 }
 
 fn illuminaHeadersMatch(header1: []const u8, header2: []const u8) bool {
-    return terminalPairHeadersMatch(header1, header2) or
-        casavaHeadersMatch(header1, header2) or
-        namesMatch(parseName(header1, .illumina), parseName(header2, .illumina));
-}
-
-fn casavaHeadersMatch(header1: []const u8, header2: []const u8) bool {
-    const end = matchingTokenEnd(header1, header2) orelse return false;
-    if (terminalMateMarker(header1[0..end]) != null) return false;
+    if (terminalPairHeadersMatch(header1, header2)) return true;
+    const end = matchingTokenEnd(header1, header2) orelse
+        return namesMatch(parseName(header1, .illumina), parseName(header2, .illumina));
+    const first_token = header1[0..end];
     const token1 = nextToken(header1, end);
     const token2 = nextToken(header2, end);
-    return leadingMateMarker(token1) == 1 and leadingMateMarker(token2) == 2 and
+    if (casavaMarkersMatch(first_token, token1, token2)) return true;
+    const name1 = illuminaName(first_token, token1);
+    const name2 = illuminaName(first_token, token2);
+    return name1.normalized_id.len != 0 and mateMarkersMatch(name1.mate_markers, name2.mate_markers);
+}
+
+fn casavaMarkersMatch(first_token: []const u8, token1: []const u8, token2: []const u8) bool {
+    return terminalMateMarker(first_token) == null and
+        leadingMateMarker(token1) == 1 and leadingMateMarker(token2) == 2 and
         terminalMateMarker(token1) != 2 and terminalMateMarker(token2) != 1;
 }
 
@@ -164,6 +216,48 @@ fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
     if (header1[header1.len - 1] != '1' or header2[header2.len - 1] != '2') return false;
 
     const prefix_len = header1.len - 1;
+    const separator_plus_one = (if (prefix_len >= NAME_LANES)
+        wideTerminalSeparator(NAME_LANES, header1, header2, prefix_len)
+    else
+        narrowTerminalSeparator(header1, header2, prefix_len)) orelse return false;
+
+    if (separator_plus_one == 0) return true;
+    const separator = separator_plus_one - 1;
+    if (separator == 0) return false;
+
+    const first_token = header1[0..separator];
+    if (terminalMateMarker(first_token) != null) return false;
+
+    return leadingMateMarker(header1[separator_plus_one..]) == null;
+}
+
+const NAME_LANES = simd.INLINE_LANES;
+
+fn wideTerminalSeparator(comptime lanes: comptime_int, header1: []const u8, header2: []const u8, prefix_len: usize) ?usize {
+    const Vector = @Vector(lanes, u8);
+    const Mask = @Int(.unsigned, lanes);
+    const spaces: Vector = @splat(' ');
+    const tabs: Vector = @splat('\t');
+    std.debug.assert(prefix_len >= lanes);
+    var separator_plus_one: usize = 0;
+    var offset: usize = 0;
+    while (offset < prefix_len) {
+        const start = @min(offset, prefix_len - lanes);
+        const bytes1: Vector = header1[start..][0..lanes].*;
+        const bytes2: Vector = header2[start..][0..lanes].*;
+        if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return null;
+        const fresh = ~@as(Mask, 0) << @intCast(offset - start);
+        const space_mask = @as(Mask, @bitCast(bytes1 == spaces)) & fresh;
+        if (space_mask != 0) {
+            if (separator_plus_one != 0 or space_mask & (space_mask - 1) != 0) return null;
+            separator_plus_one = start + @as(usize, @intCast(@ctz(space_mask))) + 1;
+        }
+        offset = start + lanes;
+    }
+    return separator_plus_one;
+}
+
+fn narrowTerminalSeparator(header1: []const u8, header2: []const u8, prefix_len: usize) ?usize {
     var separator_plus_one: usize = 0;
     var offset: usize = 0;
     while (prefix_len - offset >= TOKEN_LANES) : (offset += TOKEN_LANES) {
@@ -171,11 +265,11 @@ fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
         const bytes2: TokenVector = header2[offset..][0..TOKEN_LANES].*;
         const spaces: TokenVector = @splat(' ');
         const tabs: TokenVector = @splat('\t');
-        if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return false;
+        if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return null;
 
         const space_mask: TokenMask = @bitCast(bytes1 == spaces);
         if (space_mask != 0) {
-            if (separator_plus_one != 0 or space_mask & (space_mask - 1) != 0) return false;
+            if (separator_plus_one != 0 or space_mask & (space_mask - 1) != 0) return null;
             separator_plus_one = offset + @as(usize, @intCast(@ctz(space_mask))) + 1;
         }
     }
@@ -188,12 +282,12 @@ fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
             const bytes2: Vector = header2[offset..][0..lanes].*;
             const spaces: Vector = @splat(' ');
             const tabs: Vector = @splat('\t');
-            if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return false;
+            if (@reduce(.Or, (bytes1 != bytes2) | (bytes1 == tabs))) return null;
 
             const space_mask: Mask = @bitCast(bytes1 == spaces);
             if (space_mask != 0) {
                 if (separator_plus_one != 0 or space_mask & (space_mask - 1) != 0) {
-                    return false;
+                    return null;
                 }
                 separator_plus_one = offset + @as(usize, @intCast(@ctz(space_mask))) + 1;
             }
@@ -201,21 +295,14 @@ fn terminalPairHeadersMatch(header1: []const u8, header2: []const u8) bool {
         }
     }
     while (offset < prefix_len) : (offset += 1) {
-        if (header1[offset] != header2[offset] or header1[offset] == '\t') return false;
+        if (header1[offset] != header2[offset] or header1[offset] == '\t') return null;
         if (header1[offset] == ' ') {
-            if (separator_plus_one != 0) return false;
+            if (separator_plus_one != 0) return null;
             separator_plus_one = offset + 1;
         }
     }
 
-    if (separator_plus_one == 0) return true;
-    const separator = separator_plus_one - 1;
-    if (separator == 0) return false;
-
-    const first_token = header1[0..separator];
-    if (terminalMateMarker(first_token) != null) return false;
-
-    return leadingMateMarker(header1[separator_plus_one..]) == null;
+    return separator_plus_one;
 }
 
 fn leadingMateMarker(token: []const u8) ?u2 {
@@ -303,7 +390,7 @@ test "[property] - [paired names]: illumina matching keeps mate markers and opaq
         @memcpy(storage2[length..][0..right.len], right);
         const header1 = storage1[0 .. length + left.len];
         const header2 = storage2[0 .. length + right.len];
-        try std.testing.expectEqual(length != 0, casavaHeadersMatch(header1, header2));
+        try std.testing.expectEqual(length != 0, headersMatch(header1, header2, .illumina));
         for (0..length) |mismatch| {
             storage2[mismatch] = 'y';
             try std.testing.expect(!headersMatch(header1, header2, .illumina));
@@ -403,4 +490,119 @@ test "[property] - [paired names]: combined terminal proof covers vector boundar
 
     try std.testing.expect(!terminalPairHeadersMatch(" 1:N:0/1", " 1:N:0/2"));
     try std.testing.expect(!terminalPairHeadersMatch("cluster 1:N:0/1", "cluster 1:N:0/2"));
+}
+
+test "[property] - [paired names]: the wide terminal check finds the separator the narrow check finds at every width" {
+    var prng = std.Random.DefaultPrng.init(0x0e1a_57ed);
+    const random = prng.random();
+    var header1: [120]u8 = undefined;
+    var header2: [120]u8 = undefined;
+    const alphabet = "AC:x12  \t";
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
+        for (0..2_000) |_| {
+            const prefix_len = lanes + random.uintLessThan(usize, header1.len - lanes + 1);
+            for (header1[0..prefix_len]) |*byte| {
+                byte.* = if (random.uintLessThan(u8, 8) == 0) alphabet[random.uintLessThan(usize, alphabet.len)] else 'r';
+            }
+            @memcpy(header2[0..prefix_len], header1[0..prefix_len]);
+            if (random.uintLessThan(u8, 4) == 0) header2[random.uintLessThan(usize, prefix_len)] = 'z';
+            const wide = wideTerminalSeparator(lanes, header1[0..prefix_len], header2[0..prefix_len], prefix_len);
+            const narrow = narrowTerminalSeparator(header1[0..prefix_len], header2[0..prefix_len], prefix_len);
+            errdefer std.debug.print("lanes {d} header {s}\n", .{ lanes, header1[0..prefix_len] });
+            try std.testing.expectEqual(narrow, wide);
+        }
+    }
+}
+
+test "[property] - [paired names]: the wide token scans stop where the narrow scans stop at every width" {
+    var prng = std.Random.DefaultPrng.init(0x70c3_e4d5);
+    const random = prng.random();
+    var header1: [120]u8 = undefined;
+    var header2: [120]u8 = undefined;
+    const alphabet = "AC:x12 \t";
+    inline for (.{ simd.tierWidth(.baseline), simd.tierWidth(.avx2), simd.tierWidth(.avx512) }) |lanes| {
+        for (0..2_000) |_| {
+            const len1 = lanes + random.uintLessThan(usize, header1.len - lanes + 1);
+            const len2 = lanes + random.uintLessThan(usize, header2.len - lanes + 1);
+            const sparse = random.uintLessThan(u8, 64) + 1;
+            for (header1[0..len1]) |*byte| {
+                byte.* = if (random.uintLessThan(u8, sparse) == 0) alphabet[random.uintLessThan(usize, alphabet.len)] else 'r';
+            }
+            @memcpy(header2[0..@min(len1, len2)], header1[0..@min(len1, len2)]);
+            for (header2[@min(len1, len2)..len2]) |*byte| byte.* = 'r';
+            if (random.uintLessThan(u8, 2) == 0) header2[random.uintLessThan(usize, len2)] = "z \t"[random.uintLessThan(usize, 3)];
+            errdefer std.debug.print("lanes {d} headers {s} | {s}\n", .{ lanes, header1[0..len1], header2[0..len2] });
+            const common_len = @min(len1, len2);
+            try std.testing.expectEqual(narrowTokenEvent(&header1, &header2, common_len), wideTokenEvent(lanes, &header1, &header2, common_len));
+            const start = random.uintLessThan(usize, len1 + 1);
+            try std.testing.expectEqual(narrowTokenEnd(header1[0..len1], start), wideTokenEnd(lanes, header1[0..len1], start));
+        }
+    }
+}
+
+test "[property] - [paired names]: illumina matching decides as the terminal, Casava, and parsed checks do in turn" {
+    const Generator = struct {
+        const token_pieces = [_][]const u8{
+            "x", "SRR19571648.1", "A01039:164:HHHJYDSX2:4:1101:1470:1000", "/1", "/2", "/3",       "/",
+            "1", "2",             ":",                                     "1:", "2:", "N:0:ACGT", "length=150",
+        };
+        const delimiters = [_][]const u8{ " ", "\t", "  " };
+
+        fn append(random: std.Random, out: []u8, len: *usize, pieces: []const []const u8, count: usize) void {
+            for (0..count) |_| {
+                const piece = pieces[random.uintLessThan(usize, pieces.len)];
+                if (len.* + piece.len > out.len) return;
+                @memcpy(out[len.*..][0..piece.len], piece);
+                len.* += piece.len;
+            }
+        }
+
+        fn rest(random: std.Random, out: []u8, start: usize) []const u8 {
+            var len = start;
+            for (0..random.uintLessThan(usize, 3)) |_| {
+                append(random, out, &len, &delimiters, 1);
+                append(random, out, &len, &token_pieces, random.uintLessThan(usize, 4));
+            }
+            return out[0..len];
+        }
+
+        fn reference(header1: []const u8, header2: []const u8) bool {
+            if (terminalPairHeadersMatch(header1, header2)) return true;
+            if (matchingTokenEnd(header1, header2)) |end| {
+                if (terminalMateMarker(header1[0..end]) == null) {
+                    const token1 = nextToken(header1, end);
+                    const token2 = nextToken(header2, end);
+                    if (leadingMateMarker(token1) == 1 and leadingMateMarker(token2) == 2 and
+                        terminalMateMarker(token1) != 2 and terminalMateMarker(token2) != 1) return true;
+                }
+            }
+            return namesMatch(parseName(header1, .illumina), parseName(header2, .illumina));
+        }
+    };
+
+    var prng = std.Random.DefaultPrng.init(0x7a1f_e5c0);
+    const random = prng.random();
+    var storage1: [128]u8 = undefined;
+    var storage2: [128]u8 = undefined;
+    var shared_first_token: usize = 0;
+    var matches: usize = 0;
+    for (0..20_000) |_| {
+        var first_len: usize = 0;
+        Generator.append(random, &storage1, &first_len, &Generator.token_pieces, 1 + random.uintLessThan(usize, 4));
+        const header1 = Generator.rest(random, &storage1, first_len);
+        var second_first_len: usize = 0;
+        if (random.uintLessThan(u8, 10) < 6) {
+            @memcpy(storage2[0..first_len], storage1[0..first_len]);
+            second_first_len = first_len;
+        } else {
+            Generator.append(random, &storage2, &second_first_len, &Generator.token_pieces, 1 + random.uintLessThan(usize, 4));
+        }
+        const header2 = Generator.rest(random, &storage2, second_first_len);
+        const expected = Generator.reference(header1, header2);
+        try std.testing.expectEqual(expected, illuminaHeadersMatch(header1, header2));
+        if (matchingTokenEnd(header1, header2) != null) shared_first_token += 1;
+        if (expected) matches += 1;
+    }
+    try std.testing.expect(shared_first_token > 5_000);
+    try std.testing.expect(matches > 1_000);
 }
