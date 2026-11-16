@@ -32,6 +32,10 @@ PEER_NAMES=(
     bbtools
     fastqc
     fastqc-rust
+    fastq-trim
+    trim-galore
+    fasterp
+    chelae
 )
 
 # shellcheck source=tools/versions.sh
@@ -50,7 +54,7 @@ Usage:
 
 Names: venv, zebrac, wrappers, seqtk, fqtools, fq, fqkit, seqkit, rasusa,
        fasten, seqfu, irma-core, fastqvalidator, fastp, bbtools, fastqc,
-       fastqc-rust, peers, all
+       fastqc-rust, fastq-trim, trim-galore, fasterp, chelae, peers, all
 
 venv also installs the pinned matplotlib, pandas, and tabulate packages used
 by bench report generation. zebrac is a check-only name: place the binary at
@@ -164,13 +168,21 @@ cleanup_smoke() {
     [[ ! -L "$dir" ]] || { echo "keep: $dir: replaced smoke directory" >&2; return 1; }
     for name in basic_valid.fastq.gz needletail.stats helicase.stats needletail-gzip.stats helicase-gzip.stats \
         rasusa.fastq interleaved.fastq fasten.fastq basic.fastq.gz sample.fastq source-r1.fastq source-r2.fastq \
-        r1.fastq r2.fastq fastp.fastq fastp.json fastp.html reformat.fastq repaired-r1.fastq repaired-r2.fastq; do
+        r1.fastq r2.fastq fastp.fastq fastp.json fastp.html reformat.fastq repaired-r1.fastq repaired-r2.fastq \
+        fastq-trim.fastq fastq-trim-in.fastq fastq-trim-want.fastq trim-in.fastq trim-want.fastq \
+        fasterp.fastq fasterp.json fasterp.html chelae.fastq; do
         files+=("$dir/$name")
     done
     rm -f -- "${files[@]}"
     if [[ -d "$dir/fastqc-out" && ! -L "$dir/fastqc-out" ]]; then
         rm -f -- "$dir/fastqc-out/basic_valid_fastqc.html" "$dir/fastqc-out/basic_valid_fastqc.zip"
         rmdir -- "$dir/fastqc-out" 2>/dev/null || true
+    fi
+    if [[ -d "$dir/trim-galore" && ! -L "$dir/trim-galore" ]]; then
+        rm -f -- "$dir/trim-galore/trim-in_trimmed.fq" \
+            "$dir/trim-galore/trim-in.fastq_trimming_report.txt" \
+            "$dir/trim-galore/trim-in.fastq_trimming_report.json"
+        rmdir -- "$dir/trim-galore" 2>/dev/null || true
     fi
     rmdir -- "$dir" 2>/dev/null || { echo "keep: $dir: unexpected smoke outputs remain" >&2; return 1; }
 }
@@ -647,6 +659,10 @@ peer_version() {
         bbtools) printf '%s\n' "$BBTOOLS_VERSION" ;;
         fastqc) printf '%s\n' "$FASTQC_VERSION" ;;
         fastqc-rust) printf '%s\n' "$FASTQC_RUST_VERSION" ;;
+        fastq-trim) printf '%s\n' "$FASTQ_TRIM_VERSION" ;;
+        trim-galore) printf '%s\n' "$TRIM_GALORE_VERSION" ;;
+        fasterp) printf '%s\n' "$FASTERP_VERSION" ;;
+        chelae) printf '%s\n' "$CHELAE_VERSION" ;;
         *) return 1 ;;
     esac
 }
@@ -667,6 +683,10 @@ peer_recipe() {
         bbtools) printf '%s\n' "$BBTOOLS_RECIPE" ;;
         fastqc) printf '%s\n' "$FASTQC_RECIPE" ;;
         fastqc-rust) printf '%s\n' "$FASTQC_RUST_RECIPE" ;;
+        fastq-trim) printf '%s\n' "$FASTQ_TRIM_RECIPE" ;;
+        trim-galore) printf '%s\n' "$TRIM_GALORE_RECIPE" ;;
+        fasterp) printf '%s\n' "$FASTERP_RECIPE" ;;
+        chelae) printf '%s\n' "$CHELAE_RECIPE" ;;
         *) return 1 ;;
     esac
 }
@@ -687,6 +707,10 @@ peer_binaries() {
         bbtools) printf 'bbversion.sh reformat.sh repair.sh\n' ;;
         fastqc) printf 'fastqc\n' ;;
         fastqc-rust) printf 'fastqc-rust\n' ;;
+        fastq-trim) printf 'fastq-trim\n' ;;
+        trim-galore) printf 'trim_galore\n' ;;
+        fasterp) printf 'fasterp\n' ;;
+        chelae) printf 'chelae\n' ;;
         *) return 1 ;;
     esac
 }
@@ -711,24 +735,33 @@ peer_source() {
         bbtools) printf 'tag v%s\n' "$BBTOOLS_VERSION" ;;
         fastqc) printf 'zip v%s\n' "$FASTQC_VERSION" ;;
         fastqc-rust) printf 'release v%s\n' "$FASTQC_RUST_VERSION" ;;
+        fastq-trim)
+            printf 'tag %s; biolibc %s; libxtend %s; static\n' \
+                "$FASTQ_TRIM_VERSION" \
+                "$BIOLIBC_VERSION" \
+                "$LIBXTEND_VERSION"
+            ;;
+        trim-galore) printf 'release v%s\n' "$TRIM_GALORE_VERSION" ;;
+        fasterp) printf 'release v%s\n' "$FASTERP_VERSION" ;;
+        chelae) printf 'tag v%s with Cargo.lock; x86-64-v2\n' "$CHELAE_VERSION" ;;
         *) return 1 ;;
     esac
 }
 
 peer_uses_build_jobs() {
     case "$1" in
-        seqtk|fqtools|fqkit|fasten|seqfu|fastqvalidator) return 0 ;;
+        seqtk|fqtools|fqkit|fasten|seqfu|fastqvalidator|fastq-trim|chelae) return 0 ;;
         *) return 1 ;;
     esac
 }
 
 peer_build_environment() {
     case "$1" in
-        seqtk|fqtools)
+        seqtk|fqtools|fastq-trim)
             require_command cc >/dev/null
             cc --version | sed -n '1p'
             ;;
-        fqkit|fasten)
+        fqkit|fasten|chelae)
             require_command rustc >/dev/null
             rustc --version
             ;;
@@ -854,6 +887,22 @@ check_peer_version() {
         fastqc-rust)
             output="$("$root/bin/fastqc-rust" --version 2>&1)"
             [[ "$output" == *"v$FASTQC_RUST_VERSION"* ]]
+            ;;
+        fastq-trim)
+            output="$("$root/bin/fastq-trim" --version 2>&1)"
+            [[ "$output" == *"$FASTQ_TRIM_VERSION"* ]]
+            ;;
+        trim-galore)
+            output="$("$root/bin/trim_galore" --version 2>&1)"
+            [[ "$output" == *"trim_galore $TRIM_GALORE_VERSION"* ]]
+            ;;
+        fasterp)
+            output="$("$root/bin/fasterp" --version 2>&1)"
+            [[ "$output" == *"fasterp $FASTERP_VERSION"* ]]
+            ;;
+        chelae)
+            output="$("$root/bin/chelae" --version 2>&1)"
+            [[ "$output" == *"$CHELAE_VERSION"* ]]
             ;;
     esac || {
         echo "error: $name did not report version $(peer_version "$name")" >&2
@@ -1006,6 +1055,50 @@ check_peer_smoke() {
                 [[ -s "$smoke_dir/fastqc-out/basic_valid_fastqc.zip" ]] || return
                 unzip -p "$smoke_dir/fastqc-out/basic_valid_fastqc.zip" basic_valid_fastqc/fastqc_data.txt | \
                     grep -Fx $'Total Sequences\t5' >/dev/null || return
+                ;;
+            fastq-trim)
+                printf '%s\n' \
+                    '@a' 'ACGTACGTACGTACGTACGTAGATCGGAAGAGCACACG' '+' 'IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII' \
+                    '@b' 'TTGGCCAATTGGCCAATTGG' '+' 'IIIIIIIIIIIIIIIIIIII' \
+                    >"$smoke_dir/fastq-trim-in.fastq"
+                printf '%s\n' \
+                    '@a' 'ACGTACGTACGTACGTACGT' '+' 'IIIIIIIIIIIIIIIIIIII' \
+                    '@b' 'TTGGCCAATTGGCCAATTGG' '+' 'IIIIIIIIIIIIIIIIIIII' \
+                    >"$smoke_dir/fastq-trim-want.fastq"
+                "$root/bin/fastq-trim" \
+                    --3p-adapter1 AGATCGGAAGAGC \
+                    --min-length 1 \
+                    "$smoke_dir/fastq-trim-in.fastq" \
+                    "$smoke_dir/fastq-trim.fastq" >/dev/null 2>&1 || return
+                cmp "$smoke_dir/fastq-trim-want.fastq" "$smoke_dir/fastq-trim.fastq"
+                ;;
+            trim-galore|fasterp|chelae)
+                printf '%s\n' \
+                    '@a' 'ACGTACGTACGTACGTACGTAGATCGGAAGAGCACACG' '+' 'IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII' \
+                    '@b' 'TTGGCCAATTGGCCAATTGG' '+' 'IIIIIIIIIIIIIIIIIIII' \
+                    >"$smoke_dir/trim-in.fastq"
+                printf '%s\n' \
+                    '@a' 'ACGTACGTACGTACGTACGT' '+' 'IIIIIIIIIIIIIIIIIIII' \
+                    '@b' 'TTGGCCAATTGGCCAATTGG' '+' 'IIIIIIIIIIIIIIIIIIII' \
+                    >"$smoke_dir/trim-want.fastq"
+                if [[ "$name" == trim-galore ]]; then
+                    mkdir -p "$smoke_dir/trim-galore"
+                    "$root/bin/trim_galore" -a AGATCGGAAGAGC --dont_gzip \
+                        -o "$smoke_dir/trim-galore" \
+                        "$smoke_dir/trim-in.fastq" >/dev/null 2>&1 || return
+                    cmp "$smoke_dir/trim-want.fastq" "$smoke_dir/trim-galore/trim-in_trimmed.fq"
+                elif [[ "$name" == chelae ]]; then
+                    "$root/bin/chelae" trim -i "$smoke_dir/trim-in.fastq" \
+                        -o "$smoke_dir/chelae.fastq" \
+                        -a AGATCGGAAGAGC --trim-polyg 0 -l 1 -t 1 >/dev/null 2>&1 || return
+                    cmp "$smoke_dir/trim-want.fastq" "$smoke_dir/chelae.fastq"
+                else
+                    "$root/bin/fasterp" -i "$smoke_dir/trim-in.fastq" \
+                        -o "$smoke_dir/fasterp.fastq" \
+                        --adapter_sequence AGATCGGAAGAGC -Q -l 1 -w 1 \
+                        -j "$smoke_dir/fasterp.json" -h "$smoke_dir/fasterp.html" >/dev/null 2>&1 || return
+                    cmp "$smoke_dir/trim-want.fastq" "$smoke_dir/fasterp.fastq"
+                fi
                 ;;
         esac
     ) || {
@@ -1416,6 +1509,114 @@ build_fastqc_rust() {
     BUILD_DESCRIPTION='upstream Linux x86-64 release binary'
 }
 
+build_fastq_trim() {
+    local stage="$1"
+    local prefix="$ACTIVE_WORK/prefix"
+    local build_log="$ACTIVE_WORK/fastq-trim-build.log"
+    local name version repository
+    mkdir -p "$prefix"
+    echo "build: fastq-trim $FASTQ_TRIM_VERSION"
+    for name in libxtend biolibc fastq-trim; do
+        case "$name" in
+            libxtend) version="$LIBXTEND_VERSION" repository=outpaddling/libxtend ;;
+            biolibc) version="$BIOLIBC_VERSION" repository=auerlab/biolibc ;;
+            fastq-trim) version="$FASTQ_TRIM_VERSION" repository=auerlab/fastq-trim ;;
+        esac
+        download \
+            "https://github.com/$repository/archive/refs/tags/$version.tar.gz" \
+            "$ACTIVE_WORK/$name.tar.gz"
+        tar -xzf "$ACTIVE_WORK/$name.tar.gz" -C "$ACTIVE_WORK"
+        if [[ "$name" == fastq-trim ]]; then
+            # The libraries also install shared objects; remove them so the
+            # binary links the static archives and needs nothing at run time.
+            rm -f -- "$prefix"/lib/lib*.so "$prefix"/lib/lib*.so.*
+            if ! env CFLAGS="-O2 -DNDEBUG" make --no-print-directory -s -C "$ACTIVE_WORK/$name-$version" \
+                -j "$TOOL_JOBS" \
+                CC=cc \
+                VERSION="$version" \
+                PREFIX="$prefix" \
+                LOCALBASE="$prefix" \
+                >>"$build_log" 2>&1; then
+                echo "error: fastq-trim build failed" >&2
+                tail -n 100 "$build_log" >&2
+                return 1
+            fi
+        elif ! make --no-print-directory -s -C "$ACTIVE_WORK/$name-$version" \
+            -j "$TOOL_JOBS" \
+            CC=cc \
+            PREFIX="$prefix" \
+            LOCALBASE="$prefix" \
+            >>"$build_log" 2>&1 ||
+            ! make --no-print-directory -s -C "$ACTIVE_WORK/$name-$version" \
+                CC=cc \
+                PREFIX="$prefix" \
+                LOCALBASE="$prefix" \
+                install >>"$build_log" 2>&1; then
+            echo "error: $name build failed" >&2
+            tail -n 100 "$build_log" >&2
+            return 1
+        fi
+    done
+    install -m 755 "$ACTIVE_WORK/fastq-trim-$FASTQ_TRIM_VERSION/fastq-trim" "$stage/bin/fastq-trim"
+    printf -v BUILD_DESCRIPTION \
+        'make -j %s CC=cc CFLAGS=-O2 -DNDEBUG with static biolibc v%s and libxtend v%s' \
+        "$TOOL_JOBS" \
+        "$BIOLIBC_VERSION" \
+        "$LIBXTEND_VERSION"
+}
+
+build_trim_galore() {
+    local stage="$1"
+    local asset="trim_galore-linux-x86_64.tar.gz"
+    local archive="$ACTIVE_WORK/$asset"
+    download \
+        "https://github.com/FelixKrueger/TrimGalore/releases/download/v$TRIM_GALORE_VERSION/$asset" \
+        "$archive"
+    printf '%s  %s\n' "$TRIM_GALORE_LINUX_X64_SHA256" "$archive" | sha256sum -c - >/dev/null
+    tar -xzf "$archive" -C "$ACTIVE_WORK"
+    install -m 755 "$ACTIVE_WORK/trim_galore-linux-x86_64/trim_galore" "$stage/bin/trim_galore"
+    BUILD_DESCRIPTION='upstream Linux x86-64 release binary'
+}
+
+build_fasterp() {
+    local stage="$1"
+    local asset="fasterp-v$FASTERP_VERSION-linux-x86_64.tar.gz"
+    local archive="$ACTIVE_WORK/$asset"
+    download \
+        "https://github.com/drbh/fasterp/releases/download/v$FASTERP_VERSION/$asset" \
+        "$archive"
+    printf '%s  %s\n' "$FASTERP_LINUX_X64_SHA256" "$archive" | sha256sum -c - >/dev/null
+    mkdir -p "$ACTIVE_WORK/extract"
+    tar -xzf "$archive" -C "$ACTIVE_WORK/extract"
+    install -m 755 "$ACTIVE_WORK/extract/fasterp" "$stage/bin/fasterp"
+    BUILD_DESCRIPTION='upstream Linux x86-64 release binary'
+}
+
+build_chelae() {
+    local stage="$1"
+    local archive="$ACTIVE_WORK/chelae.tar.gz"
+    local source="$ACTIVE_WORK/chelae-$CHELAE_VERSION"
+    download \
+        "https://github.com/fulcrumgenomics/chelae/archive/refs/tags/v$CHELAE_VERSION.tar.gz" \
+        "$archive"
+    tar -xzf "$archive" -C "$ACTIVE_WORK"
+    # The release binary carries x86-64, x86-64-v2, and x86-64-v4 copies and
+    # runs the best one the CPU has; x86-64-v2 is the copy an AVX2 CPU runs.
+    env \
+        RUSTUP_TOOLCHAIN=stable \
+        RUSTFLAGS="-C target-cpu=x86-64-v2" \
+        CARGO_HOME="$ACTIVE_WORK/cargo-home" \
+        CARGO_TARGET_DIR="$ACTIVE_WORK/cargo-target" \
+        cargo build \
+            --quiet \
+            --locked \
+            --release \
+            --jobs "$TOOL_JOBS" \
+            --manifest-path "$source/Cargo.toml"
+    install -m 755 "$ACTIVE_WORK/cargo-target/release/chelae" "$stage/bin/chelae"
+    printf -v BUILD_DESCRIPTION 'cargo build --locked --release -j %s; stable Rust; target-cpu x86-64-v2' "$TOOL_JOBS"
+}
+
 build_peer() {
     local name="$1"
     local stage="$2"
@@ -1434,6 +1635,10 @@ build_peer() {
         bbtools) build_bbtools "$stage" ;;
         fastqc) build_fastqc "$stage" ;;
         fastqc-rust) build_fastqc_rust "$stage" ;;
+        fastq-trim) build_fastq_trim "$stage" ;;
+        trim-galore) build_trim_galore "$stage" ;;
+        fasterp) build_fasterp "$stage" ;;
+        chelae) build_chelae "$stage" ;;
         *) return 1 ;;
     esac
 }
@@ -1467,9 +1672,13 @@ require_peer_commands() {
             require_command cc
             require_command patch
             ;;
-        fqkit|fasten)
+        fqkit|fasten|chelae)
             require_command cargo
             require_command rustc
+            ;;
+        fastq-trim)
+            require_command make
+            require_command cc
             ;;
         seqfu)
             require_command cc
@@ -1488,7 +1697,7 @@ require_peer_commands() {
         fastqc)
             require_command unzip
             ;;
-        fastqc-rust)
+        fastqc-rust|trim-galore|fasterp)
             require_command sha256sum
             ;;
     esac
@@ -1628,7 +1837,7 @@ run_install_target() {
             install_wrappers
             install_peers
             ;;
-        seqtk|fqtools|fq|fqkit|seqkit|rasusa|fasten|seqfu|irma-core|fastqvalidator|fastp|bbtools|fastqc|fastqc-rust)
+        seqtk|fqtools|fq|fqkit|seqkit|rasusa|fasten|seqfu|irma-core|fastqvalidator|fastp|bbtools|fastqc|fastqc-rust|fastq-trim|trim-galore|fasterp|chelae)
             install_peer "$1"
             ;;
         *) return 1 ;;
@@ -1647,7 +1856,7 @@ run_check_target() {
             check_wrappers
             check_peers
             ;;
-        seqtk|fqtools|fq|fqkit|seqkit|rasusa|fasten|seqfu|irma-core|fastqvalidator|fastp|bbtools|fastqc|fastqc-rust)
+        seqtk|fqtools|fq|fqkit|seqkit|rasusa|fasten|seqfu|irma-core|fastqvalidator|fastp|bbtools|fastqc|fastqc-rust|fastq-trim|trim-galore|fasterp|chelae)
             check_peer "$1"
             ;;
         *) return 1 ;;

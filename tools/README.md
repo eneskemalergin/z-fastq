@@ -24,6 +24,7 @@ The table lists the pinned comparison tools and the retained Linux x86-64 size o
 
 | Tool                 |              Version | Size (bytes) |
 | -------------------- | -------------------: | -----------: |
+| `fastq-trim`         |                0.1.4 |       35,776 |
 | `seqtk`              |             1.5-r133 |       77,552 |
 | `FastQValidator`     |               0.1.1a |      169,072 |
 | `Fasten`             |                0.9.0 |      470,288 |
@@ -33,10 +34,13 @@ The table lists the pinned comparison tools and the retained Linux x86-64 size o
 | `SeqFu`              |               1.29.0 |    2,227,064 |
 | `IRMA Core`          |               0.11.0 |    2,601,752 |
 | `fq`                 |               0.12.0 |    2,740,832 |
+| `chelae`             |                0.2.1 |    2,837,688 |
 | `fastp`              |                1.4.0 |    3,007,424 |
 | `Rasusa`             |                5.1.0 |    5,640,352 |
 | `fqkit`              |               0.4.14 |    6,007,912 |
 | `fastqc-rust`        |                1.1.0 |    6,278,600 |
+| `Trim Galore`        |                2.5.0 |    9,009,320 |
+| `fasterp`            |                0.3.0 |   13,250,824 |
 | `FastQC`             |               0.13.0 |   14,418,443 |
 | `SeqKit`             |               2.14.0 |   20,473,816 |
 | `BBTools`            |                40.05 |   27,434,020 |
@@ -58,6 +62,10 @@ What each tool is used for here:
 - `BBTools`: sampling, pair validation, interleave, and deinterleave.
 - `FastQC`: descriptive Java QC report peer.
 - `fastqc-rust`: descriptive Rust QC report peer with Java matching text output.
+- `fasterp`: trimming peer with fastp's rules and interface.
+- `chelae`: trimming peer with its own rules, paired-end overlap and adapter matching.
+- `Trim Galore`: trimming peer with Cutadapt's rules.
+- `fastq-trim`: one-thread trimming peer with its own rules.
 
 This list describes local comparison inputs; it does not rank the tools.
 
