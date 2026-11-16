@@ -71,6 +71,7 @@ z-fastq process --gzip --adapter1 CTGTCTCTTATACACATCT --adapter2 CTGTCTCTTATACAC
 - `-h`, `--help`: help, before or after a command. `-V`, `--version`: the version, before a command.
 - `--max-line-bytes N`: the longest line accepted, 16 MiB by default ([Limits](Limits-and-Supported-Formats#line-length)).
 - `--`: ends the options, for a path that starts with `-`, as in `z-fastq count -- ./-odd.fastq`.
+- `ZFASTQ_TIER=baseline`, `avx2`, or `avx512` (environment variable): run that x86-64 kernel tier instead of the fastest the CPU has ([Installation](Installation#faster-code-on-newer-cpus)).
 
 An option that takes a value may be given only once; a repeat is an error rather than the last one winning.
 

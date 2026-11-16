@@ -2,7 +2,7 @@
 
 z-fastq is a FASTQ toolkit in a single executable for Linux and macOS. It counts and summarizes reads, checks that files are well formed, takes reproducible samples, moves paired reads between two files and one, and processes pairs: trimming, filtering, and quality control in one streaming pass. The reader, writer, and statistics behind it are also available as a small Zig library.
 
-I am building it because everyday FASTQ work should run well on an ordinary machine. A tool can be fast and still be a poor neighbour in a workflow if every step holds more memory than the job needs, or if a malformed record slips through without a word. z-fastq streams its input, keeps its memory bounded, and says exactly what went wrong when something does.
+I am building it because everyday FASTQ work should run well on an ordinary machine. A tool can be fast and still be a poor neighbor in a workflow if every step holds more memory than the job needs, or if a malformed record slips through without a word. z-fastq streams its input, keeps its memory bounded, and says exactly what went wrong when something does.
 
 ```mermaid
 flowchart TB
@@ -53,9 +53,9 @@ New here? [Install z-fastq](Installation), then follow [Getting started](Getting
 ## At a glance
 
 - One executable for Linux (static) and macOS, on x86-64 or aarch64, written in Zig 0.16.0, with a single package dependency, [zipir](https://github.com/eneskemalergin/zipir), for gzip.
-- Single-threaded and streaming: memory does not grow with the size of a file. The two exceptions grow on purpose and are documented: exact-count sampling keeps a small entry per chosen read, and the pair duplication rate a few bytes per pair.
+- Single-threaded and streaming: memory does not grow with the size of a file. The two exceptions grow on purpose and are documented: exact-count sampling keeps a small entry per chosen read, and the pair duplication rate keeps a few bytes per pair.
 - Trimming and filtering follow fastp 1.1.0's rules, and quality control follows FastQC 0.13.0's definitions. z-fastq covers part of what those tools do and replaces neither ([References](References)).
-- Version 0.2.0 adds `process`: paired trimming, filtering, and QC in one pass. Version 0.2.1 reads gzip faster and can move a UMI into the read names. Version 0.3.0 runs on macOS and picks AVX-512 code at run time.
+- x86-64 builds pick AVX2 or AVX-512 code at run time on CPUs that have it. What each version added is in the [changelog](https://github.com/eneskemalergin/z-fastq/blob/main/CHANGELOG.md).
 
 > [!NOTE]
 > z-fastq never repairs a malformed record silently. A file it cannot read correctly fails with an error code, the position of the problem, and a nonzero exit status.

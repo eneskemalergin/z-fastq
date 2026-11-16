@@ -2,7 +2,7 @@
 
 Paired-end sequencing reads each DNA fragment from both ends, giving two reads per fragment: mate 1 and mate 2, usually stored in two files, R1 and R2. Everything downstream assumes the files stay in step, record for record. z-fastq treats a pair as one unit everywhere: it never keeps, drops, or moves one mate without the other.
 
-A pair is one record from each of two files, or two neighbouring records in one interleaved file ([Interleaving](Interleaving)).
+A pair is one record from each of two files, or two neighboring records in one interleaved file ([Interleaving](Interleaving)).
 
 ## Check pairs
 
@@ -33,8 +33,8 @@ Sequencers mark the mate in the read name in one of two ways: a `/1` or `/2` at 
 
 Step by step:
 
-1. Take the first word of each header, and drop a final `/1` or `/2` from it.
-2. Read a mate marker from the second word, if there is one: a leading `1:` or `2:`, or a final `/1` or `/2`.
+1. Take the first word of each header. A final `/1` or `/2` on it is a mate marker; drop it from the identifier.
+2. Read a mate marker from the second word too, if there is one: a leading `1:` or `2:`, or a final `/1` or `/2`.
 3. The identifiers left must be equal and not empty.
 4. If both headers carry markers, mate 1 must say 1 and mate 2 must say 2, and markers within one header must agree. A marker on one side only is a mismatch.
 

@@ -87,9 +87,9 @@ Most of the other tools can use many threads. With enough of them chelae, Trim G
 
 ## A few honest tradeoffs
 
-z-fastq is built and tested on Linux and macOS, each on x86-64 and aarch64; a native Windows build is not there yet, so on Windows, WSL is the way to try it. The benchmarks run on Linux x86-64, with z-fastq built as its release binary is, for x86-64-v3; on aarch64, z-fastq runs its 16-lane vector code as NEON, and its speed there and on macOS is not in the published benchmarks yet.
+z-fastq is built and tested on Linux and macOS, each on x86-64 and aarch64. A native Windows build is not there yet; on Windows, WSL is the way to try it. The published benchmarks run on Linux x86-64 with the x86-64-v3 release binary, so its speed on aarch64, where the vector code runs as NEON, and on macOS is not measured there yet.
 
-One core is a choice, not a limit I am waiting to lift. It keeps every run's cost known before it starts, so a pipeline can run one sample per core side by side. The price is one large file on an otherwise idle machine: a tool that spreads it over many cores can finish sooner, and z-fastq does not split a file across cores yet.
+One core is a choice, not a limit I am waiting to lift. It keeps every run's cost known before it starts, so a pipeline can run one sample per core side by side. The price is one large file on an otherwise idle machine: a tool that spreads it over many cores can finish sooner, and z-fastq does not split a file across cores yet. (Maybe ever?)
 
 gzip output uses a fast preset by default, which writes files about 16% larger than fastp's at its default level. `--gzip-preset even` or `dense` makes them smaller, more slowly.
 
@@ -97,7 +97,7 @@ z-fastq writes data, not pages: its QC comes out as FastQC-style tables and a JS
 
 ## Start
 
-Download the binary for Linux or macOS, on x86-64 or aarch64, from the [latest release](https://github.com/eneskemalergin/z-fastq/releases/latest), or build it from source with [Zig 0.16.0](https://ziglang.org/download/); the [installation page](https://github.com/eneskemalergin/z-fastq/wiki/Installation) covers both.
+Download the binary for Linux or macOS, on x86-64 or aarch64, from the [latest release](https://github.com/eneskemalergin/z-fastq/releases/latest). The x86-64 binaries need a CPU with x86-64-v3 (AVX2, BMI2, FMA); on an older x86-64 CPU, build from source with [Zig 0.16.0](https://ziglang.org/download/), which runs on any. The [installation page](https://github.com/eneskemalergin/z-fastq/wiki/Installation) covers both.
 
 ```bash
 zig build -Doptimize=ReleaseFast    # zig-out/bin/z-fastq; put it on your PATH

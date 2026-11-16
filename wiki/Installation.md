@@ -1,6 +1,6 @@
 # Installation
 
-Each [release](https://github.com/eneskemalergin/z-fastq/releases) has a ready-made binary for Linux and for macOS, each on x86-64 and on aarch64; anything else is built from source with Zig. The x86-64 binaries need a CPU with the x86-64-v3 set, which adds AVX2, BMI2, FMA, and a few more instructions (Intel since 2013, AMD since 2015); on an older CPU the Linux binary stops with a message, and z-fastq is built from source instead.
+Each [release](https://github.com/eneskemalergin/z-fastq/releases) has a ready-made binary for Linux and for macOS, each on x86-64 and on aarch64; anything else is built from source with Zig. The x86-64 binaries need a CPU with the x86-64-v3 set, which adds AVX2, BMI2, FMA, and a few more instructions (Intel since 2013, AMD since 2015); on an older CPU the Linux binary stops with status `2` and a message, and z-fastq is built from source instead.
 
 ## Download a release
 
@@ -46,7 +46,7 @@ The binary stays in `zig-out/bin/`; there is no package-manager install yet. Cop
 
 ## Faster code on newer CPUs
 
-The x86-64 release binaries, for Linux and for macOS, are built for the x86-64-v3 set, so every command runs AVX2 code. Where the CPU also has the x86-64-v4 set (AVX-512 F, BW, CD, DQ, and VL) and the operating system enables it, line search, validation, and base and quality counting on records of 1 KiB or more, and the pair hash of `--pair-duplication` at any length, switch to AVX-512 code at run time. A build from source without `-Dcpu` targets generic x86-64 and runs on any x86-64 CPU, switching to AVX2 or AVX-512 code at run time for records of 1 KiB or more and for the pair hash at any length, and PCLMUL and SSE4.1 for the gzip checksum. The output is identical either way. The aarch64 release binaries select nothing at run time: the Linux one runs on any ARMv8-A CPU, the macOS one on any Apple Silicon Mac.
+The x86-64 release binaries, for Linux and for macOS, are built for the x86-64-v3 set, so every command runs AVX2 code. Where the CPU also has the x86-64-v4 set (AVX-512 F, BW, CD, DQ, and VL) and the operating system enables it, they switch to AVX-512 code at run time for line search, validation, and base and quality counting on records of 1 KiB or more, and for the pair hash of `--pair-duplication` at any length. A build from source without `-Dcpu` targets generic x86-64 on Linux and `core2` on macOS, so it runs on any x86-64 CPU or Intel Mac. It switches to AVX2 or AVX-512 code at run time for the same records and the pair hash, and to PCLMUL and SSE4.1 for the gzip checksum. The output is identical either way. The aarch64 release binaries select nothing at run time: the Linux one runs on any ARMv8-A CPU, the macOS one on any Apple Silicon Mac.
 
 To run slower kernels than the CPU allows, for example to compare speeds or to rule a kernel set out, set `ZFASTQ_TIER=avx2`, or `ZFASTQ_TIER=baseline` in a build for generic x86-64 (the release binaries' lowest tier is `avx2`); `ZFASTQ_TIER=avx512` names the default on a CPU with AVX-512. A tier the binary cannot run on the CPU, or any other value, stops the command with status 2 and names the tiers it can run. Unset, z-fastq picks the fastest tier.
 

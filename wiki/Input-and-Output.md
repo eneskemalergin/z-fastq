@@ -18,7 +18,7 @@ A command reads standard input at most once. A pipe can be read only once, so ot
 
 ## Writing
 
-Results, JSON, and FASTQ go to standard output; messages go to standard error. FASTQ is always written as four lines per record with LF endings. A field that ends in a carriage return of its own, beyond the CR of a CRLF ending, cannot be written that way and read back the same, so a command fails with status `1` when it would write such a record; `check`, which writes no FASTQ, accepts it, and `sample` fails only when it selects one.
+Results, JSON, and FASTQ go to standard output; messages go to standard error. FASTQ is always written as four lines per record with LF endings. A field that ends in a carriage return of its own, beyond the CR of a CRLF ending, cannot be written and read back the same. A command fails with status `1` when it would write such a record. `check`, which writes no FASTQ, accepts it, and `sample` fails only when it selects one.
 
 | Command                                       | Reads              | Writes                       |
 | --------------------------------------------- | ------------------ | ---------------------------- |

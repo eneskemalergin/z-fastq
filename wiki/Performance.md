@@ -4,7 +4,7 @@ z-fastq is built to finish a FASTQ job quickly on one core while holding only a 
 
 ## How it is measured
 
-- **Right answers first.** Every tool's output is checked against an independent truth before anything is timed: the record count recorded when the corpus was cut, fastp's own records for trimming, or, for a tool with its own trimming rules, that every pair it writes is a cut of its input pair in input order; FastQC-Rust's tables for QC. A tool is timed only on the inputs it got right.
+- **Right answers first.** Every tool's output is checked against an independent truth before anything is timed: the record count recorded when the corpus was cut, fastp's own records for trimming, and FastQC-Rust's tables for QC. A tool with its own trimming rules must write every pair as a cut of its input pair, in input order. A tool is timed only on the inputs it got right.
 - **The same conditions for every tool.** Each case runs all its tools in one batch on a pinned CPU each, with the input already in the page cache, so a disk does not decide the result. Thread counts are compared separately, on as many physical cores as threads.
 - **Real data.** Public sequencing runs (Illumina, BGISEQ, ONT, PacBio) and synthetic shapes that change one thing at a time, from 1 MiB to 1 GiB, plain and gzip.
 - **Wall time and peak memory.** Wall time comes from the runner, peak memory and CPU time from the kernel for the tool alone. Peak memory can lag the true peak by up to about 0.5 MiB, so smaller memory differences are not a result.
@@ -33,7 +33,7 @@ A tool counts as *complete* only when it does everything z-fastq does on that jo
 </p>
 <p align="center"><sub><b>Figure 2.</b> Of the malformed inputs in the edge cases (truncated records, mismatched lengths, a wrong separator line, mates out of step, damaged gzip), how many each tool rejected. A tool counts only on the jobs it does.</sub></p>
 
-Speed is only half of a comparison. A tool that writes output from a truncated record and exits with status 0 leaves a pipeline no way to notice, and the error surfaces later, if at all. z-fastq stops with the record, the byte offset, and the rule it broke ([Validation](Validation)).
+Speed is only half of a comparison. A tool that writes output from a truncated record and exits with status 0 leaves a script no way to notice, and the error surfaces later, if at all. z-fastq stops with the record, the byte offset, and the rule it broke ([Validation](Validation)).
 
 ## One core against many
 
@@ -68,7 +68,7 @@ The summary lists these from the current results; they are worth knowing before 
 
 ## Memory
 
-Every command streams, so its memory does not grow with the size of the input: across the benchmarks, from 1 MiB to 1 GiB of FASTQ, z-fastq's peak stays within a few MiB, and moves only with the shape of the reads. The exceptions are documented and deliberate: exact-count sampling keeps a small entry per chosen record, and the pair duplication rate a few bytes per pair ([Limits and supported formats](Limits-and-Supported-Formats#memory)).
+Every command streams, so its memory does not grow with the size of the input: across the benchmarks, from 1 MiB to 1 GiB of FASTQ, z-fastq's peak stays within a few MiB, and moves only with the shape of the reads. The exceptions are documented and deliberate: exact-count sampling keeps a small entry per chosen record, and the pair duplication rate keeps a few bytes per pair ([Limits and supported formats](Limits-and-Supported-Formats#memory)).
 
 ## Run the benchmarks
 

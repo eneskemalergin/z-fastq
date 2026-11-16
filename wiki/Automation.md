@@ -4,14 +4,14 @@ This page is for scripts and workflow engines. The one rule to remember: **trust
 
 ## Exit status
 
-| Status       | Meaning                                           |
-| ------------ | ------------------------------------------------- |
-| `0`          | success                                           |
-| `1`          | a record or pair failed validation                |
-| `2`          | the command line is invalid                       |
-| `3`          | I/O, gzip, output, or memory failure              |
-| `4`          | a line, sampling, or arithmetic limit was reached |
-| `130`, `143` | interrupted by SIGINT or SIGTERM                  |
+| Status       | Meaning                                                                        |
+| ------------ | ------------------------------------------------------------------------------ |
+| `0`          | success                                                                        |
+| `1`          | a record or pair failed validation                                             |
+| `2`          | the command line is invalid                                                    |
+| `3`          | I/O, gzip, output, or memory failure                                           |
+| `4`          | a limit was reached: line, sampling, arithmetic, file size, or an option value |
+| `130`, `143` | interrupted by SIGINT or SIGTERM                                               |
 
 `count`, `stats`, and `check` on several independent inputs carry on past a failed input and exit with the highest status seen. Pair commands and `process` stop at the first failure.
 

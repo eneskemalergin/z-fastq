@@ -63,7 +63,7 @@ The trims run in this order on every pair, after the UMI, each only when its opt
 
 ### Quality tail
 
-`--trim-tail-window W --trim-tail-quality Q` looks at windows of W bases, starting at the 3' end and moving toward the 5' end, and stops at the first window whose mean quality is at least Q (Figure 2). If the final window already passes, the full read is kept. Otherwise, the read is cut after the first base of the passing window. Trailing `N` bases are then removed. Reads no longer than the window are trimmed to zero bases.
+`--trim-tail-window W --trim-tail-quality Q` looks at windows of W bases, starting at the 3' end and moving toward the 5' end, and stops at the first window whose mean quality is at least Q (Figure 2). If the final window already passes, the full read is kept. Otherwise, the read is cut after the first base of the passing window. Trailing `N` bases are then removed.
 
 <p align="center">
   <picture>
@@ -78,7 +78,7 @@ W is 1 to 1000 and Q is 1 to 30, given together. A read no longer than W is empt
 
 ### Poly-G
 
-`--trim-poly-g N` removes the run of `G` that two-colour instruments write when the signal ends; N is at least 1. Bases are scanned from the 3' end; the scan stops after more than 5 other bases, or, from the Nth base on, when other bases exceed one in eight. If at least N bases come before the base that stopped the scan, or the scan reaches the 5' end of a read of N bases or more, the read is cut before the leftmost `G` seen. A shorter run can still go when the scan carries past it: with N = 10, a read ending in nine `G` loses them.
+`--trim-poly-g N` removes the run of `G` that two-color instruments write when the signal ends; N is at least 1. Bases are scanned from the 3' end; the scan stops after more than 5 other bases, or, from the Nth base on, when other bases exceed one in eight. If at least N bases come before the base that stopped the scan, or the scan reaches the 5' end of a read of N bases or more, the read is cut before the leftmost `G` seen. A shorter run can still go when the scan carries past it: with N = 10, a read ending in nine `G` loses them.
 
 ### Adapters
 
@@ -102,12 +102,13 @@ Adapters are 4 to 128 uppercase bases of `A`, `C`, `G`, and `T`. The adapter sea
 
 Each read is checked after trimming, and a pair is written only when both mates pass. A read fails on the first check below that applies.
 
-| Check                                         | A read fails when                 | Range                 |
-| --------------------------------------------- | --------------------------------- | --------------------- |
-| always, with any trim or filter               | no bases are left                 |                       |
-| `--low-quality Q --max-low-quality-percent P` | more than P% of bases are below Q | Q 0 to 93, P 0 to 100 |
-| `--max-n N`                                   | more than N uppercase `N`         | 0 to 50               |
-| `--min-length N`                              | fewer than N bases                | 0 to 4,294,967,295    |
+| Check                         | A read fails when                 | Range              |
+| ----------------------------- | --------------------------------- | ------------------ |
+| any trim or filter            | no bases are left                 |                    |
+| `--low-quality Q`             | more than P% of bases are below Q | 0 to 93            |
+| `--max-low-quality-percent P` | (given with `--low-quality`)      | 0 to 100           |
+| `--max-n N`                   | more than N uppercase `N`         | 0 to 50            |
+| `--min-length N`              | fewer than N bases                | 0 to 4,294,967,295 |
 
 - With adapters, a pair whose adapter or overlap step cut a mate and left both mates at 2 bases or fewer is an adapter dimer, and is dropped.
 - A pair is dropped whole. Its reason is the worse of its mates' reasons, in the order adapter dimer, low quality, too short, too many `N`.
@@ -141,13 +142,13 @@ z-fastq  --umi-length 8 --umi-skip 4 --umi-mates both
 fastp    --umi --umi_loc per_read --umi_len 8 --umi_skip 4
 ```
 
-`--umi-mates 1` or `2` matches `--umi_loc read1` or `read2`. The names differ in three cases: fastp adds the UMI after a trailing `/1` or `/2`, so its two mates no longer share a name, and aligners that cut names at `/`, such as STAR by default, lose the UMI; fastp looks only for a space, so in a name with a tab before any space its UMI lands after the comment; and fastp leaves a header repeated on the plus line unchanged. fastp also keeps one base of a read shorter than the UMI and spacer, where z-fastq drops the pair.
+`--umi-mates 1` or `2` matches `--umi_loc read1` or `read2`. The names differ in three cases. fastp adds the UMI after a trailing `/1` or `/2`, so its two mates no longer share a name, and aligners that cut names at `/`, such as STAR by default, lose the UMI. fastp looks only for a space, so in a name with a tab before any space, its UMI lands after the comment. And fastp leaves a header repeated on the plus line unchanged. fastp also keeps one base of a read shorter than the UMI and spacer, where z-fastq drops the pair.
 
 </details>
 
 ## When a run fails
 
-A failure stops the run and exits with a nonzero status: `1` for invalid input, `2` for a usage error, `3` for I/O or memory, `4` for a limit. Pairs written before the failure stay in the outputs: after an input failure both files end with the same complete pairs, but after a failed write to an output, such as a full disk, the files can end inside a record and hold different numbers of pairs. The report is still written, with `"status": "error"` and the reason, unless the report itself cannot be written, in which case it is removed; the [MultiQC-compatible files](Quality-Control#multiqc-compatible-outputs) are written only when the run succeeds.
+A failure stops the run and exits with a nonzero status: `1` for invalid input, `2` for a usage error, `3` for I/O or memory, `4` for a limit. Pairs written before the failure stay in the outputs: after an input failure both files end with the same complete pairs, but after a failed write to an output, such as a full disk, the files can end inside a record and hold different numbers of pairs. The report is still written, with `"status": "error"` and the reason; if the report itself cannot be written, it is removed. The [MultiQC-compatible files](Quality-Control#multiqc-compatible-outputs) are written only when the run succeeds.
 
 Treat a run as complete only when it exits with `0`.
 
