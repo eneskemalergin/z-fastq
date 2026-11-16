@@ -7,7 +7,7 @@ authors:
   - family-names: "Ergin"
     given-names: "Enes Kemal"
 version: "0.3.0"
-date-released: "2026-11-15"
+date-released: "2026-11-16"
 license: MIT
 repository-code: "https://github.com/eneskemalergin/z-fastq"
 url: "https://github.com/eneskemalergin/z-fastq/wiki"
