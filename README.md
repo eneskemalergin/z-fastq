@@ -72,7 +72,7 @@ On 1 GiB plain inputs, every tool on one CPU; the other tool is the fastest that
 
 ### What threads cost
 
-Most of the other tools can use many threads. With enough of them chelae, Trim Galore, fasterp, and FastQC-Rust beat z-fastq's wall time on one core, chelae from 2 threads and the others from 8 or 16; fastp does not, even at 16. The threads buy them time, not memory: from 2 threads on, every one of them holds several times z-fastq's memory, fastp over a hundred times. chelae does its work in about z-fastq's CPU time; the others spend several times as much.
+Most of the other tools can use many threads. With enough of them chelae, Trim Galore, fasterp, and FastQC-Rust beat z-fastq's wall time on one core, chelae from 2 threads and the others from 4 to 16; fastp does not, even at 16. The threads buy them time, not memory: from 2 threads on, every one of them holds several times z-fastq's memory, fastp over a hundred times. chelae does its work in about z-fastq's CPU time; the others spend several times as much.
 
 <p align="center">
   <a href="https://github.com/eneskemalergin/z-fastq/wiki/Performance">
